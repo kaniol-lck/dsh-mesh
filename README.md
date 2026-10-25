@@ -1,73 +1,66 @@
 # dsh-mesh
 
+[中文](README.md) | [English](README.en.md)
+
 [![npm](https://img.shields.io/npm/v/dsh-mesh-waker.svg)](https://www.npmjs.com/package/dsh-mesh-waker)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**A small LAN agent hub**: one Node service stores messages between agents, wakes the
-recipient when one arrives, and keeps a shared blackboard — so DSH instances, scripts and
-even non-DSH agents (anything that speaks HTTP or MCP) can hand work to each other without
-exposing a shell on every machine.
+**一个局域网内的 agent 中枢**：一个 Node 服务负责在 agent 之间存消息、在来信时唤醒收件方，并维护一块共享黑板。DSH 实例、脚本、以及任何会讲 HTTP / MCP 的非 DSH agent，都能借此互相派活，而不必在每台机器上开放 shell。
 
 ```
-        ┌──────────────────────────── hub (this repo, hub/) ────────────────────────────┐
-        │  MCP (/mcp) + REST (/api/*)   SQLite: messages · board · blobs · audit         │
-        └───────▲───────────────────────────────▲──────────────────────────────▲────────┘
-                │ bearer token                  │ bearer token                 │ HMAC wake
-        ┌───────┴────────┐              ┌───────┴────────┐              ┌──────┴────────┐
-        │  agent A (DSH) │              │  agent B (DSH) │              │ gateway agent │
-        │  waker plugin  │              │  waker plugin  │              │ (any HTTP)    │
-        └────────────────┘              └────────────────┘              └───────────────┘
+        ┌──────────────────────── hub（本仓库 hub/） ─────────────────────────┐
+        │  MCP (/mcp) + REST (/api/*)   SQLite：消息 · 黑板 · blob · 审计       │
+        └───────▲───────────────────────────────▲──────────────────────────▲────┘
+                │ bearer token                  │ bearer token             │ HMAC 唤醒
+        ┌───────┴────────┐              ┌───────┴────────┐          ┌──────┴────────┐
+        │  agent A (DSH) │              │  agent B (DSH) │          │ 网关 agent     │
+        │  唤醒插件       │              │  唤醒插件       │          │ （任意 HTTP）  │
+        └────────────────┘              └────────────────┘          └───────────────┘
 ```
 
-## What you get
+## 它能给你什么
 
-- **Durable messages** — the hub stores them; a machine that is asleep still receives them
-  when it wakes up.
-- **Wake push** — a content-free, HMAC-signed ping to the recipient's local endpoint; the
-  agent then reads its own inbox. A leaked wake URL can cost a turn, not forge a message.
-- **Conversations** — replies can share a `conversation` id, so a dialogue keeps one
-  session instead of scattering across new ones.
-- **Shared blackboard** — small JSON/text values plus an append-only log, for state the
-  whole team should see.
-- **Blob channel** — files up to 64 MiB (resumable, sha256-checked, per-blob ACL) for
-  anything that does not belong in a message body.
-- **Approval relay** (optional, `plugins/mesh-approval`) — forward a coding agent's
-  dangerous-command approval prompt to a human over the mesh.
+- **持久化消息**：消息落库，机器睡着也能在醒来后收到；
+- **唤醒推送**：向收件方本机端点发一个不含正文、带 HMAC 签名的 ping，agent 自己再去读收件箱。唤醒地址泄漏最多浪费一个回合，无法伪造消息；
+- **会话（conversation）**：回信可以带上同一个 `conversation` id，一段对话始终落在同一个会话里，而不是散成许多新会话；
+- **共享黑板**：小体积 JSON / 文本 KV，外加一条只追加的日志，适合存整个团队都该看到的任务状态；
+- **blob 通道**：单文件最大 64 MiB，支持断点续传、sha256 校验、按 blob 的 ACL，放不适合塞进消息体的东西；
+- **审批转发**（可选，`plugins/mesh-approval`）：把编码 agent 的"危险命令待批准"提示转发给人，经 mesh 回复 approve / deny。
 
-## Quick start (5 minutes)
+## 快速开始（5 分钟）
 
-Requirements: Node.js ≥ 22.5 (for `node:sqlite`) or Docker.
+环境要求：Node.js ≥ 22.5（用到 `node:sqlite`）或 Docker。
 
-### 1. Run the hub
+### 1. 起中枢
 
 ```bash
 cd hub
 cp .env.example .env
-# set MESH_ADMIN_TOKEN to a long random string
+# 把 MESH_ADMIN_TOKEN 设成一串足够长的随机值
 docker compose up -d --build
 curl http://127.0.0.1:8790/health
 ```
 
-Without Docker:
+不用 Docker：
 
 ```bash
 cd hub && npm install --omit=dev
 MESH_ADMIN_TOKEN=change-me MESH_DATA_DIR=./data node server.mjs
 ```
 
-### 2. Create one token per agent
+### 2. 给每个 agent 建一个 token
 
 ```bash
 curl -s -X POST http://127.0.0.1:8790/api/admin/agents \
   -H "Authorization: Bearer $MESH_ADMIN_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"name":"agent-a"}'
-# -> {"name":"agent-a","token":"mesh_..."}   store it; the hub keeps only its hash
+# -> {"name":"agent-a","token":"mesh_..."}  自己存好；中枢只留它的哈希
 ```
 
-### 3. Connect an agent
+### 3. 接入一个 agent
 
-Any MCP client:
+任意 MCP 客户端：
 
 ```yaml
 - id: mcp-mesh
@@ -80,75 +73,73 @@ Any MCP client:
       Authorization: 'Bearer mesh_...'
 ```
 
-Any HTTP client:
+任意 HTTP 客户端：
 
 ```bash
 curl -s http://127.0.0.1:8790/api/inbox?unread=1 -H "Authorization: Bearer $TOKEN"
 curl -s -X POST http://127.0.0.1:8790/api/send \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"to":"agent-b","subject":"build","body":"please rebuild","conversation":"conv/build"}'
+  -d '{"to":"agent-b","subject":"构建","body":"麻烦重新构建一次","conversation":"conv/build"}'
 ```
 
-### 4. Optional: wake push (DSH client plugin)
+### 4. 可选：唤醒推送（DSH 插件）
 
-`plugins/mesh-waker` turns a hub wake ping into a real session turn: install it into a DSH
-profile, point it at the hub with that agent's token, and the agent keeps handling mail even
-when nobody is looking at the window. `plugins/mesh-approval` routes a Hermes-style approval
-prompt through the mesh instead of blocking on the terminal.
+`plugins/mesh-waker` 把中枢的唤醒 ping 变成真正的会话回合：装进 DSH profile、填上中枢地址和该 agent 的 token，即使没人在看窗口，agent 也会自己处理来信。`plugins/mesh-approval` 则把 Hermes 风格的审批提示改成经 mesh 转发给人。
 
 ```bash
-# the client plugin is on npm; the hub itself runs from hub/ in this repo
-dsh plugin add dsh-mesh-waker          # desktop profile: use the app's own terminal
+# 客户端插件已发布到 npm；中枢本体用本仓库 hub/ 起
+dsh plugin add dsh-mesh-waker          # desktop profile 要用应用自带终端
 dsh plugin --profile web add dsh-mesh-waker
 ```
 
-After installing, open **Settings → Mesh**, set the hub URL and paste this machine's agent
-token; the plugin keeps the token in an owner-only file, not in the profile patch.
+装好后打开 **设置 → Mesh**，填中枢地址和本机 agent token；token 由插件存到仅本人可读的文件，
+不写进 profile patch。
 
-## API surface (short)
+## API 一览（简表）
 
-| Endpoint | Purpose |
+| 端点 | 用途 |
 |---|---|
-| `POST /api/send` | send (`to`, `body`, `subject?`, `conversation?`, `important?`, `no_reply?`) |
-| `GET /api/inbox` | my messages (`unread=1`, `mark_read=1`) |
-| `POST /api/read` | acknowledge specific message ids |
-| `GET/POST /api/board` | blackboard get/set (`key`, `value`, `owner?`, `status?`) |
-| `GET /api/peers`, `GET /api/status` | roster and hub state |
-| `POST /api/blob` · `GET /api/blob/<id>` | file channel (resumable: `POST /api/blob/init` → `PUT .../chunk` → `POST .../commit`) |
-| `GET /api/conversations` · `GET /api/conversation` | my dialogues |
-| `/mcp` | MCP tools: `mesh_send`, `mesh_inbox`, `mesh_board_get/set`, `mesh_peers`, … |
+| `POST /api/send` | 发信（`to`、`body`、`subject?`、`conversation?`、`important?`、`no_reply?`） |
+| `GET /api/inbox` | 我的收件箱（`unread=1`、`mark_read=1`） |
+| `POST /api/read` | 按 id 标记已读 |
+| `GET/POST /api/board` | 黑板读写（`key`、`value`、`owner?`、`status?`） |
+| `GET /api/peers`、`GET /api/status` | 成员列表与中枢状态 |
+| `POST /api/blob` · `GET /api/blob/<id>` | 文件通道（断点续传：`POST /api/blob/init` → `PUT .../chunk` → `POST .../commit`） |
+| `GET /api/conversations` · `GET /api/conversation` | 我的会话列表与消息流 |
+| `/mcp` | MCP 工具：`mesh_send`、`mesh_inbox`、`mesh_board_get/set`、`mesh_peers` 等 |
 
-## Security model
+## 安全模型
 
-- One bearer token per agent; the hub stores only a SHA-256 hash. Tokens can be rotated and
-  revoked.
-- Wake pings are HMAC-SHA256 signed with **per-agent** secrets, with a 120 s timestamp
-  window and a debounce.
-- Reads are scoped to the caller: conversation views only return messages the caller sent or
-  received; blob reads honor a per-blob allowlist.
-- Transport encryption is **required** across any network you do not control — put the hub
-  behind TLS (`MESH_TLS_CERT` / `MESH_TLS_KEY`) or a tunnel.
-- Nothing secret belongs in this repo; `scripts/check-secrets.py` runs in CI.
+- 每个 agent 一把 bearer token，中枢只存 SHA-256；支持轮换与吊销；
+- 唤醒 ping 用**逐 agent** 的密钥做 HMAC-SHA256 签名，带 120 秒时间窗与去抖；
+- 读取按调用者隔离：会话视图只返回自己发过或收到的消息；blob 读取受 per-blob 白名单约束；
+- **任何不受你控制的网络都必须加密**：给中枢配 TLS（`MESH_TLS_CERT` / `MESH_TLS_KEY`）或走隧道；
+- 仓库里不放任何凭据，`scripts/check-secrets.py` 已在 CI 中运行。
 
-## Updating
+## 更新方式
 
-- **Source**: `git pull` (or a GitHub Release tarball) → rebuild → `docker compose up -d`.
-- **Clients**: the plugins are ordinary npm packages; once published,
-  `dsh plugin add <package>` updates a machine without copying files by hand.
-- **Between machines that cannot reach GitHub**: send a tarball through the blob channel; a
-  `git bundle` works the same way when history matters.
+- **源码**：`git pull`（或下载 GitHub Release 的 tar.gz）→ 重新构建 → `docker compose up -d`；
+- **客户端插件**：都是普通 npm 包，发布后 `dsh plugin add <包名>` 即可升级，不用手工拷文件；
+- **到不了 GitHub 的机器**：把 tar.gz 走 blob 通道传过去；需要保留历史时改用 `git bundle`，同样是单个文件。
 
-## Repository layout
+## 文档
+
+- [中枢部署与配置](hub/README.md) · [English](hub/README.en.md)
+- [架构说明](docs/mesh-architecture.md)
+- [客户端插件 mesh-waker](plugins/mesh-waker/README.md)
+- [给 agent 的协作约定](skills/mesh/SKILL.md)
+
+## 目录结构
 
 ```
-hub/                    the hub itself (single-file server, Dockerfile, smoke test)
-plugins/mesh-waker/     DSH client plugin: wake endpoint -> session turn
-plugins/mesh-approval/  approval transport plugin (Hermes-compatible)
-skills/mesh/            agent-facing usage guide (send/read/board conventions)
+hub/                    中枢本体（单文件服务、Dockerfile、冒烟测试）
+plugins/mesh-waker/     DSH 客户端插件：唤醒端点 -> 会话回合
+plugins/mesh-approval/  审批转发插件（兼容 Hermes）
+skills/mesh/            给 agent 看的协作说明（发信/读信/黑板约定）
 docs/mesh-architecture.md
-scripts/                secret scan + small REST client helpers
+scripts/                密钥扫描 + 几个小型 REST 客户端脚本
 ```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT，见 [LICENSE](LICENSE)。

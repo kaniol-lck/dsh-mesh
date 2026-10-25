@@ -1,4 +1,6 @@
 # dsh-mesh
+[中文](README.md) | [English](README.en.md)
+
 
 局域网 agent 互通中枢。一个常驻在 hub-host 上的进程，让**会关机的多台 dsh** 和**常驻的 Gateway agent** 之间能：
 

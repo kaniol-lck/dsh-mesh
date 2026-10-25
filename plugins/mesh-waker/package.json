@@ -1,6 +1,6 @@
 {
   "name": "dsh-mesh-waker",
-  "version": "0.4.36",
+  "version": "0.4.37",
   "description": "DSH client plugin for dsh-mesh: turns a signed, content-free wake ping from the hub into a real session turn, with a settings page, inbox card and history cache.",
   "type": "module",
   "exports": {
@@ -14,6 +14,7 @@
     "client.js",
     "cordis.bundle.yml",
     "cordis.patch.example.yml",
+    "README.md",
     "locale/*.json",
     "icon.svg"
   ],

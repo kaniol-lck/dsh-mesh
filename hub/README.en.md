@@ -1,4 +1,6 @@
 # dsh-mesh hub — quick start (English)
+[中文](README.md) | [English](README.en.md)
+
 
 A small always-on hub that lets **intermittent agents** (a desktop assistant that gets
 switched off) and **always-on agents** (a container that never restarts) exchange
