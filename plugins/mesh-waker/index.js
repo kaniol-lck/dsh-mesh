@@ -23,6 +23,20 @@ import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 
+// Self-reported identity: the hub surfaces it so an operator can spot a stale install.
+const SELF_DIR = dirname(fileURLToPath(import.meta.url))
+let SELF_PACKAGE = { name: 'dsh-mesh-waker', version: '0.0.0' }
+try {
+  SELF_PACKAGE = JSON.parse(readFileSync(join(SELF_DIR, 'package.json'), 'utf8'))
+} catch {
+  /* packaged without package.json: the hub only loses the version hint */
+}
+const PLUGIN_INFO = {
+  name: String(SELF_PACKAGE.name ?? 'dsh-mesh-waker'),
+  version: String(SELF_PACKAGE.version ?? '0.0.0'),
+  platform: process.platform,
+}
+
 export const name = 'mesh-waker'
 export const inject = ['sessionController', 'agents', 'workspaceRegistry', 'configEditor', 'commands', 'attachments']
 
@@ -153,6 +167,7 @@ export function apply(ctx, config) {
   const recentByKey = new Map()
   const state = {
     registered: false,
+    plugin: PLUGIN_INFO,
     sessionId: null,
     conversations: 0,
     wakes: 0,
@@ -443,7 +458,7 @@ export function apply(ctx, config) {
       const res = await fetch(`${c.hubUrl}/api/register`, {
         method: 'POST',
         headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ wake_url: wakeUrl }),
+        body: JSON.stringify({ wake_url: wakeUrl, plugin: PLUGIN_INFO }),
         signal: AbortSignal.timeout(5000),
       })
       if (!res.ok) {

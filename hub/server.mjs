@@ -29,6 +29,11 @@ import { randomUUID, randomBytes, createHash, createHmac, timingSafeEqual } from
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, createReadStream, statSync, unlinkSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+// Hub version and the oldest plugin build the hub still fully understands. Both are
+// advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
+const HUB_VERSION = '0.7.4'
+const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 import { DatabaseSync } from 'node:sqlite'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
@@ -223,6 +228,12 @@ CREATE TABLE IF NOT EXISTS blobs (
   // interrupt = the sender wants this message to steer a running turn instead of queueing
   // behind it. The receiver still decides (its waker policy), this is only a hint.
   if (!messageColumns.some((c) => c.name === 'interrupt')) db.exec('ALTER TABLE messages ADD COLUMN interrupt INTEGER DEFAULT 0')
+  // Self-reported plugin identity: advisory only (an agent can lie), used to surface version
+  // drift and compatibility hints in /api/peers and /api/status.
+  if (!agentColumns.some((c) => c.name === 'plugin_name')) db.exec('ALTER TABLE agents ADD COLUMN plugin_name TEXT')
+  if (!agentColumns.some((c) => c.name === 'plugin_version')) db.exec('ALTER TABLE agents ADD COLUMN plugin_version TEXT')
+  if (!agentColumns.some((c) => c.name === 'plugin_platform')) db.exec('ALTER TABLE agents ADD COLUMN plugin_platform TEXT')
+  if (!agentColumns.some((c) => c.name === 'plugin_reported_at')) db.exec('ALTER TABLE agents ADD COLUMN plugin_reported_at INTEGER')
   const boardColumns = db.prepare('PRAGMA table_info(board)').all()
   if (!boardColumns.some((c) => c.name === 'owner')) db.exec('ALTER TABLE board ADD COLUMN owner TEXT')
   if (!boardColumns.some((c) => c.name === 'status')) db.exec('ALTER TABLE board ADD COLUMN status TEXT')
@@ -235,6 +246,17 @@ CREATE TABLE IF NOT EXISTS blobs (
 }
 
 const now = () => Date.now()
+
+/** Numeric compare of dotted versions; unparseable parts count as 0. Advisory only. */
+function compareVersion(left, right) {
+  const parts = (value) => String(value || '').split('.').map((piece) => Number.parseInt(piece, 10) || 0)
+  const a = parts(left)
+  const b = parts(right)
+  for (let index = 0; index < 3; index += 1) {
+    if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) > (b[index] || 0) ? 1 : -1
+  }
+  return 0
+}
 
 /** Touch an agent row, creating it on first sight. */
 function touchAgent(name, host) {
@@ -521,7 +543,7 @@ function parseLimit(raw, fallback, max) {
 
 /** Build one MCP server bound to one agent identity. */
 function buildServer(agentName, agentHost, publicUrl) {
-  const server = new McpServer({ name: 'dsh-mesh', version: '0.7.2' })
+  const server = new McpServer({ name: 'dsh-mesh', version: HUB_VERSION })
 
   const tool = (name, description, inputSchema, handler) => {
     server.registerTool(name, { description, inputSchema }, async (args, _extra) => {
@@ -953,13 +975,27 @@ async function handleRest(req, res, url) {
       const wakeApi = wakeApiOf(body.wake_api)
       db.prepare('UPDATE agents SET host = COALESCE(?, host), description = COALESCE(?, description), wake_url = COALESCE(?, wake_url), wake_api = COALESCE(?, wake_api) WHERE name = ?')
         .run(body.host ?? null, body.description ?? null, wakeUrl, wakeApi, id.name)
-      return sendJson(res, 200, db.prepare('SELECT name, host, description, wake_url, wake_api, last_seen FROM agents WHERE name = ?').get(id.name))
+      // Optional, self-reported plugin identity. Never trusted for authorization; only shown
+      // so an operator can spot a machine running an old build.
+      const plugin = body.plugin && typeof body.plugin === 'object' ? body.plugin : null
+      if (plugin) {
+        const pluginName = typeof plugin.name === 'string' ? plugin.name.slice(0, 80) : null
+        const pluginVersion = typeof plugin.version === 'string' ? plugin.version.slice(0, 40) : null
+        const pluginPlatform = typeof plugin.platform === 'string' ? plugin.platform.slice(0, 40) : null
+        if (pluginVersion) {
+          db.prepare('UPDATE agents SET plugin_name = ?, plugin_version = ?, plugin_platform = ?, plugin_reported_at = ? WHERE name = ?')
+            .run(pluginName, pluginVersion, pluginPlatform, now(), id.name)
+        }
+      }
+      return sendJson(res, 200, db.prepare('SELECT name, host, description, wake_url, wake_api, plugin_name, plugin_version, plugin_platform, last_seen FROM agents WHERE name = ?').get(id.name))
     }
 
     if (path === '/api/peers' && req.method === 'GET') {
       const ts = now()
       const offline = q.get('offline') === '1'
-      const rows = db.prepare('SELECT name, host, description, last_seen FROM agents ORDER BY last_seen DESC').all()
+      const rows = db
+        .prepare('SELECT name, host, description, last_seen, plugin_name, plugin_version, plugin_platform, plugin_reported_at FROM agents ORDER BY last_seen DESC')
+        .all()
       const peers = rows
         .map((r) => ({
           name: r.name,
@@ -967,9 +1003,13 @@ async function handleRest(req, res, url) {
           description: r.description,
           online: ts - r.last_seen <= ONLINE_TTL_MS,
           last_seen_seconds_ago: Math.round((ts - r.last_seen) / 1000),
+          plugin: r.plugin_version
+            ? { name: r.plugin_name, version: r.plugin_version, platform: r.plugin_platform, reported_at: r.plugin_reported_at,
+                compat: compareVersion(r.plugin_version, MIN_WAKER) >= 0 ? 'ok' : 'outdated' }
+            : null,
         }))
         .filter((p) => offline || p.online)
-      return sendJson(res, 200, { self: id.name, peers })
+      return sendJson(res, 200, { self: id.name, hub: { version: HUB_VERSION, min_waker: MIN_WAKER }, peers })
     }
 
     // Each agent fetches ITS OWN wake secret over the authenticated channel: a leaked key
@@ -1083,6 +1123,13 @@ async function handleRest(req, res, url) {
 
     if (path === '/api/status' && req.method === 'GET') {
       const ts = now()
+      const pluginVersions = db
+        .prepare('SELECT plugin_version AS version, COUNT(*) AS agents FROM agents WHERE plugin_version IS NOT NULL GROUP BY plugin_version ORDER BY agents DESC')
+        .all()
+      const outdatedAgents = db
+        .prepare('SELECT name, plugin_version FROM agents WHERE plugin_version IS NOT NULL')
+        .all()
+        .filter((row) => compareVersion(row.plugin_version, MIN_WAKER) < 0)
       return sendJson(res, 200, {
         agents: db.prepare('SELECT COUNT(*) AS n FROM agents').get().n,
         online: db.prepare('SELECT COUNT(*) AS n FROM agents WHERE last_seen >= ?').get(ts - ONLINE_TTL_MS).n,
@@ -1090,6 +1137,9 @@ async function handleRest(req, res, url) {
         board_entries: db.prepare('SELECT COUNT(*) AS n FROM board').get().n,
         blobs: db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS bytes FROM blobs').get(),
         uptime_seconds: Math.round(process.uptime()),
+        hub: { version: HUB_VERSION, min_waker: MIN_WAKER },
+        plugin_versions: pluginVersions,
+        outdated: outdatedAgents,
       })
     }
 
@@ -1454,7 +1504,7 @@ const httpServer = makeServer(async (req, res) => {
   if (url.pathname === '/health' && req.method === 'GET') {
     res.writeHead(200, { 'content-type': 'application/json' })
     const blobStats = db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS bytes FROM blobs').get()
-    res.end(JSON.stringify({ ok: true, service: 'dsh-mesh', version: '0.7.2', sessions: sessions.size, persisted_sessions: db.prepare('SELECT COUNT(*) AS n FROM mcp_sessions').get().n, lenient_session: MCP_LENIENT_SESSION, session_cap: MAX_SESSIONS, wake: Boolean(WAKE_SECRET), relay: RELAY_ENABLED ? RELAY_TARGET : null, blobs: { count: blobStats.n, bytes: blobStats.bytes, max_file: MAX_BLOB_BYTES, max_total: MAX_BLOB_TOTAL_BYTES },
+    res.end(JSON.stringify({ ok: true, service: 'dsh-mesh', version: HUB_VERSION, sessions: sessions.size, persisted_sessions: db.prepare('SELECT COUNT(*) AS n FROM mcp_sessions').get().n, lenient_session: MCP_LENIENT_SESSION, session_cap: MAX_SESSIONS, wake: Boolean(WAKE_SECRET), relay: RELAY_ENABLED ? RELAY_TARGET : null, blobs: { count: blobStats.n, bytes: blobStats.bytes, max_file: MAX_BLOB_BYTES, max_total: MAX_BLOB_TOTAL_BYTES },
       pinned_messages: db.prepare('SELECT COUNT(*) AS n FROM messages WHERE pinned = 1').get().n, uptime_seconds: Math.round(process.uptime()) }))
     return
   }
