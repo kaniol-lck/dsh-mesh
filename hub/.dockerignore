@@ -1,0 +1,6 @@
+data/
+certs/
+.git/
+*.log
+Dockerfile
+.dockerignore

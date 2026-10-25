@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Mesh Waker",
+    "description": "Listens for signed mesh mail pings and turns them into a dsh session turn, so messages are handled even when no session is open."
+  }
+}

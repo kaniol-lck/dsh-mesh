@@ -1,0 +1,39 @@
+services:
+  dsh-mesh:
+    build: .
+    container_name: dsh-mesh
+    restart: unless-stopped
+    ports:
+      - "8790:8790"
+    volumes:
+      - ./data:/app/data
+      # 证书目录只有在启用 TLS 时才需要。默认注释掉：目录不存在时 Docker 会以 root
+      # 建一个空目录，之后非 root 跑 make-cert 会写不进去。启用 TLS 前先
+      #   mkdir -p certs && node scripts/make-cert.mjs --out certs --ip <frps地址>
+      # 再取消下面这行注释。
+      # - ./certs:/app/certs:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      MESH_HOST: 0.0.0.0
+      MESH_PORT: 8790
+      MESH_AUTH_MODE: token
+      # 必填：在 .env 里设置一个长随机串
+      MESH_ADMIN_TOKEN: ${MESH_ADMIN_TOKEN:?set MESH_ADMIN_TOKEN in .env}
+      # 启用 TLS 时在 .env 里指向容器内路径；留空则以 HTTP 提供服务
+      MESH_TLS_CERT: ${MESH_TLS_CERT:-}
+      MESH_TLS_KEY: ${MESH_TLS_KEY:-}
+      MESH_ONLINE_TTL_MS: ${MESH_ONLINE_TTL_MS:-120000}
+      MESH_MESSAGE_TTL_MS: ${MESH_MESSAGE_TTL_MS:-604800000}
+      # 资源上限：常驻进程不允许无界增长，默认值见 README「六、环境变量」
+      MESH_MAX_BODY_BYTES: ${MESH_MAX_BODY_BYTES:-1048576}
+      MESH_MAX_MESSAGE_BYTES: ${MESH_MAX_MESSAGE_BYTES:-65536}
+      MESH_MAX_BOARD_BYTES: ${MESH_MAX_BOARD_BYTES:-65536}
+      MESH_SESSION_IDLE_MS: ${MESH_SESSION_IDLE_MS:-1800000}
+      MESH_MAX_SESSIONS: ${MESH_MAX_SESSIONS:-128}
+      MESH_LOG_TTL_MS: ${MESH_LOG_TTL_MS:-2592000000}
+      MESH_LOG_MAX_ROWS: ${MESH_LOG_MAX_ROWS:-20000}
+      MESH_PRINT_ADMIN_TOKEN: ${MESH_PRINT_ADMIN_TOKEN:-0}

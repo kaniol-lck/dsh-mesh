@@ -1,0 +1,224 @@
+# v0.2.x 加固记录
+
+v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审计 + 本机实跑，
+发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
+v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
+
+复验方式：`node smoke-client.mjs`（26/26）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+
+---
+
+## v0.7.2（2026-10-25，修复会话持久化被 idle sweep 抹掉）
+
+**问题**：`sweepSessions` 关闭 transport 时会触发 `onclose`，而 `onclose` 会 `forgetSession(sid)`
+删掉 `mcp_sessions` 行——空闲 30 分钟后持久化记录被一起删了，客户端再连就是 404，等于 0.7.1 白做。
+
+**修复**：sweep 关 transport 前先 `transport.onclose = undefined`，只释放内存会话，保留 DB 行；
+只有显式 `DELETE /mcp` 才真正删除记录。
+
+**验证**：部署 0.7.2（进程重启）后**不重挂 MCP 插件**直接调用工具成功，说明按 DB 行重建生效。
+
+## v0.7.1（2026-10-25，发送时标记"重要"）
+
+| 项 | 内容 |
+|---|---|
+| MCP | `mesh_send` 新增 `important?: boolean`；为 true 时落库即 `pinned = 1`，不随 7 天 TTL 删除 |
+| REST | `POST /api/send` 接受 `important`（或 `pinned`） |
+| 语义 | 重要由**发件人发送时**决定；收件人仍可事后 `POST /api/message/<id>/pin` 补标，两者共用同一列 |
+| 其他 | `/api/inbox`（REST 与 MCP）都返回 `pinned`，客户端可据此持久化重要状态 |
+
+验证：smoke **49/49**（新增 2 项：发送时 important 进入 pinned 列表、inbox 暴露 pinned 标记）。
+
+## v0.7.0（2026-10-25，会话视图 + 重要标记）
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/conversations` | 我的对话列表（按 conversation 聚合：条数、未读、重要数、参与者、最后时间） |
+| `GET /api/conversation?conversation=&limit=&before=&full=` | 某个会话的消息流（只含我参与的）；body 默认截断 4 KiB，`full=1` 取全文 |
+| `GET /api/message?id=` | 单条消息（参与者或 admin） |
+| `POST /api/message/<id>/pin` | 标/取消"重要"（参与者或 admin） |
+| `GET /api/pinned` | 我的重要消息列表 |
+
+`messages.pinned` 列新增；`purgeExpired` 跳过 `pinned = 1` 的行——**重要消息不随 7 天 TTL 删除**，
+其余消息保留策略不变（云端不扩展）。
+
+验证：smoke **47/47**（新增 5 项：会话聚合、截断、全文、pin、非参与者 403）。
+
+## v0.6.2（2026-10-25，MCP 会话持久化 + 可选宽松重建）
+
+**背景**：dsh 的 MCP 客户端在收到 404（会话过期/中枢重启）后**不会自动重新 initialize**，
+此后每次工具调用都报 `-32001 unknown or expired session`，只能手动重挂插件。实测本轮会话中
+至少撞到 3 次。
+
+| 项 | 内容 |
+|---|---|
+| A. 持久化 | `mcp_sessions(sid, agent, created_at, last_used)`；initialize 时写入，close/DELETE 时删除；重启后按 id 重建 transport（注入 `sessionId` + `_initialized`），**无需重新握手** |
+| 过期 | 内存会话仍按 `MESH_SESSION_IDLE_MS`（30 min）回收；DB 行按 `MESH_MCP_SESSION_TTL_MS`（默认 7 天）清理 |
+| B. 宽松开关 | `MESH_MCP_LENIENT_SESSION=1` 时，未知 session id 也重建；默认关闭以保持 404 语义 |
+| 约束 | 会话 id 仍绑定 agent：别的 token 拿同 id 会 403 |
+
+验证：smoke **42/42**；独立重启测试三项全过 —— 重启后同 sid 调 `tools/list` 返回 200（10 个工具）、
+严格模式未知 sid 404、宽松模式未知 sid 200。
+
+## v0.6.1（2026-10-25，断点续传 + blob ACL）
+
+| 项 | 内容 |
+|---|---|
+| 断点续传 | `POST /api/blob/init`（声明 name/bytes/sha256）→ `PUT /api/blob/<id>/chunk?offset=N` 追加 → `POST /api/blob/<id>/commit` 校验大小与 sha256；offset 不符返回 409 并告知已收字节；校验失败删除整包 |
+| 清理 | 1 小时未完成的上传与过期 blob 一并由 sweep 删除 |
+| ACL | `visible_to` = `*` 或 agent 白名单；GET/meta 受约束，`PATCH /api/blob/<id>` 由上传者/admin 修改；仍不支持下载过期后的续期 |
+
+验证：smoke **41/41**（新增：断点续传 commit 校验、下载一致性、ACL 拒绝、ACL 重开）。
+
+## v0.6.0（2026-10-25，blob 通道：大于 64 KiB 的文件）
+
+**背景**：黑板单值上限 64 KiB。技能包、工作区快照、构建产物只能拆成上百个黑板键，没有校验、没有过期、失败要整体重来。
+
+**改动**：
+
+| 端点 | 说明 |
+|---|---|
+| `POST /api/blob?name=&sha256=` | 原始字节上传；sha256 不符直接 400 且不落盘；返回 id/url/过期时间 |
+| `GET /api/blob/<id>` | 下载原始字节，响应头带 `x-blob-sha256` / `x-blob-name` |
+| `GET /api/blob/<id>/meta` | 元数据 |
+| `GET /api/blobs?mine=1` | 列表（默认最近 100 条） |
+| `DELETE /api/blob/<id>` | 仅上传者或 admin |
+
+**上限与清理**：单文件 `MESH_MAX_BLOB_BYTES`（默认 64 MiB）、总量 `MESH_MAX_BLOB_TOTAL_BYTES`（2 GiB）、
+`MESH_BLOB_TTL_MS`（24h）到期由逐小时 sweep 删除文件与记录；上传记录进 `audit` 表。
+
+**验证**：smoke 37/37（新增 5 项：上传/sha 校验/下载一致/错误 sha 拒绝/删除）；跨机实测 laptop
+下载 512 KB 文件，`sha256` 完全一致。
+
+## v0.5.x（2026-10-23~24，对话协议 + 每 agent 密钥 + relay 唤醒）
+
+| 版本 | 改动 |
+|---|---|
+| 0.5.0 | 消息加 `conversation`（对话分组）与 `no_reply`（收尾不唤醒）；黑板加 `owner`/`status`；广播 `to:"*"`；`POST /api/read` 按 id 确认；`GET /api/wake-secret` |
+| 0.5.4 | wake secret 从全局改为**每 agent 一把**（`ensureWakeSecret`），旧全局密钥签名被拒；`/api/wake-secret` 返回 `scope:"agent"` |
+| 0.5.5 | 新增 **relay 唤醒**：`wake_api` 注册项可让中枢直接调用宿主 loopback 上的 OpenAI 兼容 API；目标是**硬编码白名单**，中枢不能当通用代理；`/health` 暴露 `relay` |
+| 0.5.6 | relay 提示词收紧（只许两次工具调用，禁止跑飞） |
+| 0.5.7 | relay 带 `X-Gateway agent-Session-Key: mesh:<conversation>`（api_server 的会话身份来源是 header，不是 OpenAI `user` 字段）；修 12 处编码损坏的破折号；补 LICENSE / 英文 README / CI |
+
+复验：`node smoke-client.mjs`（32/32，含「每 agent 密钥」与「relay 白名单」两项回归）。
+
+## v0.4.0（2026-10-23，对话分组 + 唤醒带上对话 id）
+
+**背景**：dsh 的 MCP 工具调用不携带会话上下文（`dsh-mcp-client` 只发 `{name, arguments}`），
+中枢按 token 识别 agent，因此同一台机器的多个 dsh 会话在中枢看来是同一个身份，
+接收侧无法把"同一轮对话"归到同一个会话里。
+
+**改动**：
+
+| 项 | 内容 |
+|---|---|
+| 消息表 | 新增 `conversation TEXT`（自动迁移）；`mesh_send` / `POST /api/send` 接受可选 `conversation`（≤120 字节） |
+| 收件箱 | `mesh_inbox` / `GET /api/inbox` 返回 `conversation` 字段 |
+| 唤醒 | wake ping 体带上 `conversation`，接收侧的 waker 据此把同一对话落到同一个 dsh 会话 |
+| 回归 | 新增"conversation 落库并原样返回"，共 26 项 |
+
+**约定**：`conversation` 由调用方声明（skill §10），不是 dsh 真实 session id——
+后者需要改上游 `dsh-mcp-client` 才能自动带出，暂不做。
+
+---
+
+
+## v0.2.2（2026-10-22，升级中枢时暴露的会话恢复缺陷）
+
+**现象**：替换容器（升级镜像）后，所有在线客户端的 `Mcp-Session-Id` 都失效，但服务端对"未知会话"不返回 404，
+而是当作新会话建了一个**尚未初始化**的 transport，于是每个请求都回 `Bad Request: Server not initialized`。
+客户端拿不到"该重新 initialize"的信号——Gateway agent 那类按规范处理 404 的客户端还能自愈，dsh 侧只能重启或重挂插件。
+
+**修法**：请求带 `Mcp-Session-Id` 但表里没有该会话时，直接返回 **404** + JSON-RPC 错误（MCP 规范要求）。
+回归新增一项（"未知 session id 返回 404"），总数 23。
+
+**升级操作约定**（写进 `docs/` 与技能）：
+1. 升级前知会各 agent；
+2. 替换容器后，dsh 侧若报 `Server not initialized`，重挂插件（`plugin_manager set_plugin` 关闭再开启）或重启 dsh；
+3. Gateway agent 侧保持常连，收到 404 会自行重新 initialize。
+
+---
+
+## v0.2.1（2026-10-22，使用中发现的展示层缺陷）
+
+`mesh_whoami` 报的信息不可用，两处都在它自己身上：
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| `host` 恒为 `null` | 取自请求头 `X-Mesh-Host`，而 dsh / Gateway agent 客户端都不发这个头 | 改查名册行（token 决定身份，名册决定 host / description），并回传 `description`、`last_seen` |
+| `hub` 回显 `http://0.0.0.0:8790/mcp` | 直接拼接了监听地址 | 用调用方实际请求的 `Host` 头拼出可达 URL；反代 / 隧道（TLS 在外部终结）场景可用新增的 `MESH_PUBLIC_URL` 覆盖 |
+
+回归扩到 22 项：新增"whoami 报的是名册 host，不是请求头"与"whoami 的 hub 不是 0.0.0.0"。
+顺带把 smoke 客户端里那个 `x-mesh-host` 头去掉——真实客户端本来就不发，留着会掩盖这类缺陷。
+
+---
+
+## P1（跨网上线前必须修）
+
+### 1. MCP 会话永不回收
+
+- **现象**：`sessions` 只在 `transport.onclose` 删除；dsh 被关机/kill 时不会发 `DELETE /mcp`，
+  会话条目永久驻留。实测：跑完一次正常回归仍残留 4 个；5 次"异常重连"后 4 → 9 且不降。
+- **修法**：条目增加 `lastUsed`，每 `min(60s, max(5s, idle/2))` 扫一次，超过
+  `MESH_SESSION_IDLE_MS`（默认 30 分钟）的会话 `close()` 并删除；`MESH_MAX_SESSIONS`
+  （默认 128）封顶，超出返回 503。
+- **验证**：`MESH_SESSION_IDLE_MS=1000` 起服务，5 个被遗弃的连接 8 秒后 sessions → 0。
+
+### 2. 按 IP 的认证限流会把整个 mesh 熔断
+
+- **现象**：`resolveIdentity` 入口先判 `isThrottled(ip)`，同一 IP 失败 8 次/分钟后，
+  该 IP 的**有效 token** 也返回 429。实测已复现。
+- **为什么致命**：`docs/transport-security.md` 的形态是 frp `type="tcp"` 透传，frpc 不注入
+  `X-Forwarded-For`，所有外部 agent 的源地址都是 `127.0.0.1`。公网端口必然被扫
+  （文档自己写了这句），扫描器一分钟的失败次数远超 8 次 → 全网持续 429，且
+  `MESH_TRUST_PROXY` 帮不上忙。
+- **修法**：先校验 token，有效就放行并清零计数；只有**失败请求**才计数、才可能拿到 429。
+  同时只审计窗口内前 `FAIL_LIMIT` 次失败，防止扫描器把 `audit` 表刷爆。
+- **验证**：连续 12 次错 token 后，同一 IP 的有效 token 仍返回 200；错 token 自身返回 429。
+
+## P2（常驻会累积）
+
+### 3. 没有任何体积上限
+
+- **现象**：`readJson` 全量拼接后 `JSON.parse`；`board.value`、消息 `body` 无上限。
+  实测 8 MB 的黑板值写入返回 200。
+- **修法**：`readBody` 边读边计，超过 `MESH_MAX_BODY_BYTES`（默认 1 MiB）直接 413 且不缓冲；
+  消息正文 / 黑板值 `MESH_MAX_MESSAGE_BYTES` / `MESH_MAX_BOARD_BYTES`（各 64 KiB），
+  key / subject 200 B，超限 400 并说明字节数。
+- **验证**：8 MB → 413；70 KB 黑板值 → 400；正常写入仍是 200。
+
+### 4. `board_log` 与 `audit` 只写不读不清理
+
+- **现象**：`board_log` 三处引用全是 INSERT，没有任何读取入口（README 却承诺"变更日志"），
+  两张表都不清理。
+- **修法**：新增 `GET /api/board/log?key=&prefix=&limit=`（倒序，agent token）；
+  `purgeExpired` 增加时间窗口（`MESH_LOG_TTL_MS`，默认 30 天）+ 行数上限
+  （`MESH_LOG_MAX_ROWS`，默认 2 万），每小时执行。
+- **验证**：写黑板后能读到日志条目，`actor` 正确。
+
+### 5. 开 TLS 后容器健康检查永远失败
+
+- **现象**：`Dockerfile` 的 HEALTHCHECK 硬编码 `http://127.0.0.1:8790/health`，
+  TLS 模式下该端口只答 HTTPS → 容器永久 `unhealthy`（`restart: unless-stopped` 又不重启，
+  等于"看着在跑、监控一直红"）。
+- **修法**：新增 `scripts/healthcheck.mjs`，按 `MESH_TLS_CERT`/`MESH_TLS_KEY` 选择 http/https，
+  loopback 自签场景 `rejectUnauthorized:false`（只是确认监听还活着）。
+- **验证**：HTTP 与 TLS 两种形态下均退出码 0。
+
+## P3（顺手修）
+
+| 问题 | 修法 |
+|---|---|
+| 会话命中后不校验归属，`Mcp-Session-Id` 泄漏即可冒充 | `sessionFor()` 比对 `agentName`，不符 403 |
+| `smoke-client.mjs` / `tls-check.mjs` 硬编码 `D:/dsh/mesh/data/admin.token`（作者机器残留） | 改为相对脚本目录的 `data/admin.token`，失败时给出可读提示 |
+| 首次启动把 admin token 打进 stdout，长期留在 `docker logs` | 默认不打印，改用 `cat data/admin.token`；要打印设 `MESH_PRINT_ADMIN_TOKEN=1` |
+| compose 无条件挂载 `./certs`，目录不存在时被 Docker 建成 root 属主 | 默认注释该挂载，启用 TLS 前先建目录 |
+| `?limit=abc` 触发 `datatype mismatch` | `parseLimit()` 校验，返回可读 400 |
+
+## 没做的（有意留白，等你决定）
+
+- **per-agent ACL**：现在任何 agent token 都能读全板、给任何人发消息。家庭规模可接受，
+  但真要分权就得引入角色/命名空间——属于功能扩展，不在本次范围。
+- **消息 TTL 语义**：默认 7 天仍会静默丢弃"对端关机超过一周"的消息。当前只能调
+  `MESH_MESSAGE_TTL_MS`；如果希望"未读永不删"，需要改清理策略（按已读时间而非创建时间）。
+- **黑板 CAS**：仍是 last-write-wins，SKILL.md 的"写前先 get"只是约定。

@@ -1,0 +1,25 @@
+# Credentials and machine state never belong in this repository.
+token
+wake-secret
+*.token
+*.secret
+trust.json
+conversations.json
+*.env
+.env*
+# ...but the example template must ship
+!.env.example
+
+# Machine-specific bundle patch (use cordis.patch.example.yml instead)
+plugins/**/cordis.patch.yml
+
+# Caches and OS noise
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+sessions/
+
+# Hub runtime state
+hub/data/
+hub/certs/

@@ -1,0 +1,38 @@
+name: hub smoke
+
+on:
+  push:
+    paths:
+      - "hub/**"
+      - ".github/workflows/smoke.yml"
+  pull_request:
+    paths:
+      - "hub/**"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+      - name: Start hub and run smoke suite
+        env:
+          MESH_HOST: 127.0.0.1
+          MESH_PORT: "8791"
+          MESH_ADMIN_TOKEN: ciadmin_0123456789abcdef0123456789abcdef
+          MESH_WAKE_SECRET: ciwake_0123456789abcdef
+        run: |
+          export MESH_DATA_DIR="$(mktemp -d)"
+          node server.mjs &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8791/health >/dev/null && break
+            sleep 1
+          done
+          MESH_BASE=http://127.0.0.1:8791 node smoke-client.mjs

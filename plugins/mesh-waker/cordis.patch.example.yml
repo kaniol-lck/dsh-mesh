@@ -1,0 +1,34 @@
+# Inbound wake endpoint for dsh-mesh (config template — no secrets in this file).
+#
+# The hub POSTs a signed, content-free "you have mail" ping here; this plugin turns that
+# ping into a real session turn (create session -> prompt), so a running dsh reacts to
+# mesh messages without anyone opening a session first.
+#
+# Secrets live in owner-only files, not here:
+#   %USERPROFILE%\.dsh\mesh-waker\token         (this machine's mesh agent token)
+#   %USERPROFILE%\.dsh\mesh-waker\wake-secret   (shared HMAC secret with the hub)
+# `rotate_mesh_secrets.py` writes both and regenerates cordis.patch.yml from this file.
+- insert:
+    - id: mesh-waker
+      name: '@local/dsh-mesh-waker'
+      config:
+        hubUrl: 'http://HUB_IP:8790'
+        tokenFile: 'C:\Users\YOU\.dsh\mesh-waker\token'
+        wakeSecretFile: 'C:\Users\YOU\.dsh\mesh-waker\wake-secret'
+        listenHost: '0.0.0.0'
+        listenPort: 8795
+        advertiseHost: 'THIS_MACHINE_LAN_IP'
+        wakePath: '/mesh/wake'
+        sessionCwd: 'D:\path\to\workdir'
+        workspacePath: 'D:\path\to\workdir\sessions\_mesh-inbox'
+        workspaceTitle: 'Mesh 收件箱'
+        sessionTitle: 'mesh 收件箱'
+        resetAfterHours: 12
+        maxWakes: 60
+        trust: 'normal'
+        delivery: 'inline'
+        catchUpOnStart: true
+        catchUpDelayMs: 12000
+        catchUpMaxConversations: 3
+        cooldownMs: 1500
+        registerIntervalMs: 300000

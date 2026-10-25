@@ -1,0 +1,5 @@
+name: mesh-approval
+version: 0.1.0
+description: "Forward dangerous-command approvals to the dsh-mesh inbox and block until a human replies approve/deny."
+author: operator
+kind: standalone
