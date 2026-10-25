@@ -1,0 +1,35 @@
+name: plugin check
+
+# Pre-publish gate: syntax + the client-bundle id resolution test. Both failures that
+# reached npm (0.4.36 and 0.4.40) would have been caught here before publishing.
+on:
+  push:
+    paths:
+      - 'plugins/mesh-waker/**'
+      - 'test/**'
+      - '.github/workflows/plugin-check.yml'
+  pull_request:
+    paths:
+      - 'plugins/mesh-waker/**'
+      - 'test/**'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Syntax check
+        run: |
+          node --check plugins/mesh-waker/index.js
+          node --check plugins/mesh-waker/client.js
+
+      - name: Client bundle id resolution
+        run: node test/dynamic-id.test.js
+
+      - name: Secret scan
+        run: python3 scripts/check-secrets.py
