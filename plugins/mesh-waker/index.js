@@ -1391,7 +1391,14 @@ export function apply(ctx, config) {
             return
           }
           const send = (payload, status = 200) => {
-            res.writeHead(status, { 'content-type': 'application/json' })
+            // The settings page runs in the DSH renderer, a different origin from this
+            // loopback listener: without CORS the browser turns every call into
+            // "Failed to fetch" even though the request never left the machine.
+            res.writeHead(status, {
+              'content-type': 'application/json',
+              'access-control-allow-origin': '*',
+              'cache-control': 'no-store',
+            })
             res.end(JSON.stringify(payload))
           }
           try {
