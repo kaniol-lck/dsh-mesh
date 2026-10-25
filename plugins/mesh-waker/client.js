@@ -3,12 +3,35 @@
 // Renders an editable card on the bundle's page in Settings -> Plugins: live status from
 // the plugin's loopback endpoint, the workspace / rotation settings that used to require
 // hand-editing cordis.patch.yml, and the other mesh agents with a direct-send box.
+// The loader keys factories by the id in window.__DSH_BOOT__.entries[] — the package name
+// this copy was installed as (the profile-link name for a linked copy, the bare package name for
+// the npm package). Derive it from the running bundle's own URL; a hardcoded id registers
+// under the wrong name and the entry then fails to activate, aborting the whole web boot.
+const MESH_WAKER_ID = (() => {
+  const fallback = 'dsh-mesh-waker'
+  try {
+    const script = document.currentScript
+    const url = script && script.src ? String(script.src) : ''
+    const entries = (window.__DSH_BOOT__ && window.__DSH_BOOT__.entries) || []
+    const bare = (value) => String(value || '').split('?')[0].split('#')[0]
+    const hit = url ? entries.find((row) => row && row.url && bare(row.url) === bare(url)) : null
+    if (hit && typeof hit.id === 'string' && hit.id) return hit.id.replace(/\/client$/, '')
+    // currentScript is unavailable for module-script transports; fall back to the single
+    // entry whose URL carries our bundle, if exactly one does.
+    const matches = entries.filter((row) => row && typeof row.url === 'string' && /mesh-waker/.test(row.url))
+    if (matches.length === 1 && typeof matches[0].id === 'string') return matches[0].id.replace(/\/client$/, '')
+  } catch (error) {
+    /* keep the fallback: a wrong-but-present id is better than no registration at all */
+  }
+  return fallback
+})()
+
 // Two copies of this plugin can coexist (a linked copy plus the npm package). The loader
 // throws on a duplicate module id, and that aborts the whole web boot, so degrade to a
 // warning instead of killing the app.
 try {
   window.__ModuleLoader__.load({
-    id: 'dsh-mesh-waker',
+    id: MESH_WAKER_ID,
   factory(require) {
     const React = require('react')
     const h = React.createElement
