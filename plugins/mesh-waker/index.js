@@ -18,6 +18,7 @@
  */
 import { createServer } from 'node:http'
 import { appendFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { statSync } from 'node:fs'
 import { tmpdir, networkInterfaces, homedir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1382,6 +1383,111 @@ export function apply(ctx, config) {
           }
           return
         }
+        // ---- maintenance (loopback only): everything the settings page may change --------
+        if (path.startsWith('/mesh/admin/')) {
+          if (!fromLoopback(req)) {
+            res.writeHead(403, { 'content-type': 'application/json' })
+            res.end('{"error":"loopback only"}')
+            return
+          }
+          const send = (payload, status = 200) => {
+            res.writeHead(status, { 'content-type': 'application/json' })
+            res.end(JSON.stringify(payload))
+          }
+          try {
+            if (req.method === 'GET' && path === '/mesh/admin/bindings') {
+              const bindings = Object.entries(conversations)
+                .filter(([, entry]) => entry.panelSessionId || entry.deliverTo)
+                .map(([conversation, entry]) => ({
+                  conversation,
+                  panelSessionId: entry.panelSessionId ?? null,
+                  deliverTo: entry.deliverTo ?? null,
+                  wakes: entry.wakes ?? 0,
+                  title: entry.title ?? null,
+                }))
+              send({ ok: true, self: selfName, bindings })
+              return
+            }
+            if (req.method === 'POST' && path === '/mesh/admin/unbind') {
+              const draft = await readJsonRequest(req)
+              const conversation = String(draft.conversation ?? '').trim()
+              const entry = conversations[conversation]
+              if (!entry) throw new Error('unknown conversation')
+              if (draft.keepDisplaying === true) {
+                entry.deliverTo = null
+              } else {
+                entry.panelSessionId = null
+                entry.deliverTo = null
+                entry.bound = false
+              }
+              saveConversations()
+              fileLog(`unbind ${conversation} (keepDisplaying=${draft.keepDisplaying === true})`)
+              send({ ok: true, conversation, entry })
+              return
+            }
+            if (req.method === 'GET' && path === '/mesh/admin/cache') {
+              let bytes = 0
+              try {
+                bytes = statSync(HISTORY_PATH).size
+              } catch {
+                bytes = 0
+              }
+              send({ ok: true, path: HISTORY_PATH, bytes, messages: history.size })
+              return
+            }
+            if (req.method === 'POST' && path === '/mesh/admin/cache/clear') {
+              history.clear()
+              state.historyCached = 0
+              try {
+                mkdirSync(dirname(HISTORY_PATH), { recursive: true })
+                writeFileSync(HISTORY_PATH, JSON.stringify({ savedAt: Date.now(), messages: [] }))
+              } catch (error) {
+                throw new Error(`clearing cache failed: ${error.message}`)
+              }
+              fileLog('history cache cleared by the settings page')
+              send({ ok: true, messages: 0 })
+              return
+            }
+            if (req.method === 'POST' && path === '/mesh/admin/token/rotate') {
+              // Rotation needs the hub admin token; it lives in an owner-only file next to
+              // this machine's agent token and is never sent to the browser.
+              const adminPath = join(dirname(c.tokenFile ?? join(tmpdir(), 'x')), 'admin-token')
+              let admin = ''
+              try {
+                admin = readFileSync(adminPath, 'utf8').trim()
+              } catch {
+                throw new Error(`no admin token at ${adminPath}`)
+              }
+              if (!admin) throw new Error('admin token file is empty')
+              if (!c.tokenFile) throw new Error('tokenFile is not configured, cannot store a new token')
+              const response = await fetch(`${c.hubUrl}/api/admin/rotate`, {
+                method: 'POST',
+                headers: { authorization: `Bearer ${admin}`, 'content-type': 'application/json' },
+                body: JSON.stringify({ name: selfName || undefined }),
+                signal: AbortSignal.timeout(10_000),
+              })
+              const body = await response.text()
+              if (!response.ok) throw new Error(`hub HTTP ${response.status}: ${body.slice(0, 200)}`)
+              const rotated = JSON.parse(body)
+              if (!rotated?.token) throw new Error('hub returned no token')
+              mkdirSync(dirname(c.tokenFile), { recursive: true })
+              writeFileSync(c.tokenFile, rotated.token)
+              c.token = rotated.token
+              state.registered = false
+              fileLog(`agent token rotated for ${rotated.name ?? selfName} (fingerprint ${rotated.token.slice(0, 6)}…)`)
+              await registerWakeUrl()
+              await refreshWakeSecret()
+              send({ ok: true, name: rotated.name ?? selfName, tokenPath: c.tokenFile })
+              return
+            }
+            send({ error: 'unknown maintenance endpoint' }, 404)
+          } catch (error) {
+            fileLog(`maintenance request failed: ${error.message}`)
+            send({ ok: false, error: error.message }, 400)
+          }
+          return
+        }
+
         if (req.method !== 'POST' || path !== c.wakePath) {
           res.writeHead(404, { 'content-type': 'application/json' })
           res.end('{"error":"not found"}')

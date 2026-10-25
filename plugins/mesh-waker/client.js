@@ -812,6 +812,8 @@ try {
       const [historyNote, setHistoryNote] = React.useState(null)
       const [leftWidth, setLeftWidth] = React.useState(250)
       const [peerFilter, setPeerFilter] = React.useState('')
+      const [bindings, setBindings] = React.useState(null)
+      const [maintenanceNote, setMaintenanceNote] = React.useState(null)
 
       const startDrag = (event) => {
         event.preventDefault()
@@ -827,6 +829,49 @@ try {
         }
         window.addEventListener('mousemove', onMove)
         window.addEventListener('mouseup', onUp)
+      }
+
+      const loadBindings = async () => {
+        try {
+          const data = await json(BASE + '/mesh/admin/bindings')
+          setBindings(data.bindings ?? [])
+        } catch (error) {
+          setMaintenanceNote('读取绑定失败：' + error.message)
+        }
+      }
+
+      const unbind = async (conversation) => {
+        try {
+          await json(BASE + '/mesh/admin/unbind', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ conversation }),
+          })
+          setMaintenanceNote('已解除 ' + conversation + ' 的绑定')
+          await loadBindings()
+        } catch (error) {
+          setMaintenanceNote('解除失败：' + error.message)
+        }
+      }
+
+      const clearLocalCache = async () => {
+        if (!window.confirm('清空本地历史缓存？中枢上的消息不受影响，但下次唤醒前本地看不到旧历史。')) return
+        try {
+          const data = await json(BASE + '/mesh/admin/cache/clear', { method: 'POST' })
+          setMaintenanceNote('本地缓存已清空（剩余 ' + (data.messages ?? 0) + ' 条）')
+        } catch (error) {
+          setMaintenanceNote('清理失败：' + error.message)
+        }
+      }
+
+      const rotateToken = async () => {
+        if (!window.confirm('轮换本机 agent token？轮换后旧的立即失效，插件会自动写入新 token 并重新注册。')) return
+        try {
+          const data = await json(BASE + '/mesh/admin/token/rotate', { method: 'POST' })
+          setMaintenanceNote('令牌已轮换：' + (data.name ?? '') + ' · 写入 ' + (data.tokenPath ?? ''))
+        } catch (error) {
+          setMaintenanceNote('轮换失败：' + error.message + '（需要本机 admin-token 文件）')
+        }
       }
 
       const reload = React.useCallback(async () => {
@@ -1120,6 +1165,61 @@ try {
           ),
         ),
         historyNote ? h('div', { style: { fontSize: 12, opacity: 0.7, padding: '4px 0 8px' } }, historyNote) : null,
+        h(
+          Row,
+          { title: '绑定管理', description: '已绑定到 DSH 会话的 mesh 对话；解除后新邮件回到「Mesh 收件箱」' },
+          h(
+            'div',
+            { style: { display: 'flex', gap: 8 } },
+            h(Btn, { onClick: () => void loadBindings() }, '列出绑定'),
+            h(
+              Btn,
+              {
+                onClick: async () => {
+                  try {
+                    const cache = await json(BASE + '/mesh/admin/cache')
+                    setMaintenanceNote('本地缓存 ' + (cache.messages ?? 0) + ' 条 · ' + Math.round((cache.bytes ?? 0) / 1024) + ' KB · ' + (cache.path ?? ''))
+                  } catch (error) {
+                    setMaintenanceNote('读取缓存信息失败：' + error.message)
+                  }
+                },
+              },
+              '缓存状态',
+            ),
+            h(Btn, { onClick: () => void clearLocalCache() }, '清空本地缓存'),
+            h(Btn, { onClick: () => void rotateToken() }, '轮换本机令牌'),
+          ),
+        ),
+        bindings && bindings.length
+          ? h(
+              'div',
+              { style: { display: 'flex', flexDirection: 'column', gap: 6, padding: '2px 0 10px' } },
+              bindings.map((binding) =>
+                h(
+                  'div',
+                  {
+                    key: binding.conversation,
+                    style: {
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      fontSize: 12,
+                      padding: '6px 8px',
+                      borderRadius: 6,
+                      background: 'var(--dsw-alias-bg-layer-1)',
+                      border: '0.5px solid var(--dsw-alias-border-l1)',
+                    },
+                  },
+                  h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, binding.conversation),
+                  h('span', { style: { opacity: 0.65 } }, binding.deliverTo ? '插队投递' : '仅展示'),
+                  h(Btn, { onClick: () => void unbind(binding.conversation) }, '解除'),
+                ),
+              ),
+            )
+          : bindings
+            ? h('div', { style: { fontSize: 12, opacity: 0.6, padding: '2px 0 10px' } }, '没有已绑定的对话')
+            : null,
+        maintenanceNote ? h('div', { style: { fontSize: 12, opacity: 0.75, padding: '2px 0 8px' } }, maintenanceNote) : null,
         h(
           'div',
           {
