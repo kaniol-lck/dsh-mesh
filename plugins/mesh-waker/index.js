@@ -91,6 +91,13 @@ function normalize(config) {
     // remote message can never turn this machine into an unapproved execution surface.
     trust: ['strict', 'normal', 'full'].includes(String(c.trust)) ? String(c.trust) : 'normal',
     trustByPeer: c.trustByPeer && typeof c.trustByPeer === 'object' ? c.trustByPeer : {},
+    // How mail for a bound conversation enters that session by default: 'queue' waits for the
+    // running turn to finish, 'steer' interrupts it (the composer's insert action). A message
+    // carrying interrupt:true always asks for steer; the cap below stops a sender from
+    // thrashing the turn.
+    boundDeliveryMode: c.boundDeliveryMode === 'steer' ? 'steer' : 'queue',
+    maxSteerPerWindow: Number(c.maxSteerPerWindow ?? 1),
+    steerWindowMs: Number(c.steerWindowMs ?? 60_000),
     delivery: ['inline', 'attachment', 'both', 'prompt-only'].includes(String(c.delivery))
       ? String(c.delivery)
       : 'inline',
@@ -572,9 +579,11 @@ export function apply(ctx, config) {
     return { parts, trust }
   }
 
-  async function promptWithResume(sid, content) {
+  async function promptWithResume(sid, content, mode = 'queue') {
     // The controller's second parameter is the caller's AbortSignal and its internals
     // call signal.throwIfAborted(); omitting it throws a TypeError instead of a prompt.
+    // mode 'steer' calls agent.steer() — the composer's 插队 action — while 'queue' turns
+    // into followup() and waits for the running turn to finish.
     const controller = new AbortController()
     const parts = typeof content === 'string' ? [{ type: 'text', text: content }] : content
     const send = (payload) =>
@@ -582,7 +591,7 @@ export function apply(ctx, config) {
         {
           requestId: randomUUID(),
           sessionId: sid,
-          mode: 'queue',
+          mode,
           content: payload,
         },
         controller.signal,
@@ -698,6 +707,33 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Steer or queue? A sender can ask for `interrupt: true` (correction, cancellation,
+   * blocker); routine mail never does. Local policy is the default, and a rolling window
+   * caps how often one session may be steered so a chatty peer cannot thrash a running turn.
+   */
+  const steerHistory = new Map()
+
+  function steerModeFor(sessionId, messages) {
+    const wanted = Array.isArray(messages) && messages.some((m) => m.interrupt === 1 || m.interrupt === true)
+    let mode = wanted ? 'steer' : c.boundDeliveryMode
+    if (mode !== 'steer') return 'queue'
+    const now = Date.now()
+    const record = steerHistory.get(sessionId) ?? { count: 0, since: 0 }
+    if (now - record.since > c.steerWindowMs) {
+      record.count = 0
+      record.since = now
+    }
+    if (record.count >= c.maxSteerPerWindow) {
+      fileLog(`steer budget exhausted for ${sessionId} (${record.count}/${c.maxSteerPerWindow} in ${Math.round((now - record.since) / 1000)}s); queueing instead`)
+      steerHistory.set(sessionId, record)
+      return 'queue'
+    }
+    record.count += 1
+    steerHistory.set(sessionId, record)
+    return 'steer'
+  }
+
+  /**
    * One session per conversation id: the same dialogue keeps landing in the same dsh
    * session, and a different dialogue gets its own, so their context never mixes.
    */
@@ -728,14 +764,15 @@ export function apply(ctx, config) {
       try {
         const built = await buildContent(meta, messages)
         applyTrustPolicy(target, trustFor(meta.sender))
-        await promptWithResume(target, built.parts)
+        const mode = steerModeFor(target, messages)
+        await promptWithResume(target, built.parts, mode)
         await markRead(messages)
         entry.wakes = (entry.wakes ?? 0) + 1
         entry.createdAt = entry.createdAt || Date.now()
         saveConversations()
         state.sessionId = target
         state.conversations = Object.keys(conversations).length
-        fileLog(`delivered ${messages.length} msg into bound session ${target} (${conversation})`)
+        fileLog(`delivered ${messages.length} msg into bound session ${target} (${conversation}) mode=${mode}`)
         return
       } catch (error) {
         fileLog(`delivery to bound session ${target} failed (${error.message}); falling back to inbox session`)

@@ -1,13 +1,13 @@
 /**
  * dsh-mesh 鈥?LAN agent mesh hub.
  *
- * A single always-on process that lives on the hub-host. It speaks MCP over
+ * A single always-on process that lives on the NAS. It speaks MCP over
  * Streamable HTTP, so every DSH machine reaches it with nothing but an
  * `@deepseek-ai/dsh-mcp-client` entry (transport: streamable-http).
  *
  * Why this shape: DSH machines get switched off. Anything that requires them
  * to be reachable (A2A server, MCP server, remote GUI) only works while they
- * are on. The hub-host is the one thing that is always up, so it owns the state:
+ * are on. The NAS is the one thing that is always up, so it owns the state:
  * presence, a durable message queue, and a shared board.
  *
  * Tools exposed:
@@ -44,7 +44,7 @@ const MESSAGE_TTL_MS = Number(process.env.MESH_MESSAGE_TTL_MS ?? 7 * 24 * 3600_0
 // --- resource caps -----------------------------------------------------------
 // The hub is a long-lived process. Everything a caller can create without bound
 // (request bodies, board values, message bodies, MCP sessions, append-only logs)
-// gets a ceiling, otherwise one runaway agent can exhaust memory or the hub-host disk.
+// gets a ceiling, otherwise one runaway agent can exhaust memory or the NAS disk.
 const MAX_BODY_BYTES = Number(process.env.MESH_MAX_BODY_BYTES ?? 1_048_576) // 1 MiB per request
 const MAX_MESSAGE_BYTES = Number(process.env.MESH_MAX_MESSAGE_BYTES ?? 65_536) // message body
 const MAX_BOARD_BYTES = Number(process.env.MESH_MAX_BOARD_BYTES ?? 65_536) // board value
@@ -220,6 +220,9 @@ CREATE TABLE IF NOT EXISTS blobs (
   if (!messageColumns.some((c) => c.name === 'no_reply')) db.exec('ALTER TABLE messages ADD COLUMN no_reply INTEGER DEFAULT 0')
   // pinned = "important": exempt from the message TTL purge (see purgeExpired).
   if (!messageColumns.some((c) => c.name === 'pinned')) db.exec('ALTER TABLE messages ADD COLUMN pinned INTEGER DEFAULT 0')
+  // interrupt = the sender wants this message to steer a running turn instead of queueing
+  // behind it. The receiver still decides (its waker policy), this is only a hint.
+  if (!messageColumns.some((c) => c.name === 'interrupt')) db.exec('ALTER TABLE messages ADD COLUMN interrupt INTEGER DEFAULT 0')
   const boardColumns = db.prepare('PRAGMA table_info(board)').all()
   if (!boardColumns.some((c) => c.name === 'owner')) db.exec('ALTER TABLE board ADD COLUMN owner TEXT')
   if (!boardColumns.some((c) => c.name === 'status')) db.exec('ALTER TABLE board ADD COLUMN status TEXT')
@@ -250,7 +253,7 @@ function purgeExpired() {
   db.prepare('DELETE FROM messages WHERE created_at < ? AND pinned = 0').run(ts - MESSAGE_TTL_MS)
 
   // board_log and audit are append-only; without this they grow for the life of the
-  // hub-host. Keep a time window and a row cap (whichever bites first).
+  // NAS. Keep a time window and a row cap (whichever bites first).
   db.prepare('DELETE FROM board_log WHERE at < ?').run(ts - LOG_KEEP_MS)
   db.prepare('DELETE FROM audit WHERE at < ?').run(ts - LOG_KEEP_MS)
   for (const table of ['board_log', 'audit']) {
@@ -322,9 +325,9 @@ function relayWake(agentName, conversation, meta = {}) {
     headers: {
       authorization: `Bearer ${RELAY_API_KEY}`,
       'content-type': 'application/json',
-      // Gateway agent' api_server derives session identity from this header, NOT from the
-      // OpenAI `user` field, so each mesh conversation gets its own Gateway agent session.
-      'x-gateway-agent-session-key': user,
+      // Hermes' api_server derives session identity from this header, NOT from the
+      // OpenAI `user` field, so each mesh conversation gets its own Hermes session.
+      'x-hermes-session-key': user,
     },
     body: payload,
     signal: AbortSignal.timeout(RELAY_TIMEOUT_MS),
@@ -585,7 +588,7 @@ function buildServer(agentName, agentHost, publicUrl) {
 
   tool(
     'mesh_send',
-    'Send a durable message to another agent. It is stored on the hub and delivered when that agent next checks its inbox, even if the target machine is switched off. Pass `conversation` (a short id you keep for the whole dialogue) so the receiver can keep this dialogue in one session, and so replies can be grouped with it. Pass `important: true` to keep a message exempt from the 7-day message TTL (pin). Pass `no_reply: true` for the closing message of a dialogue: it is delivered and readable but does NOT wake the recipient, so two auto-waking agents cannot answer each other forever.',
+    'Send a durable message to another agent. It is stored on the hub and delivered when that agent next checks its inbox, even if the target machine is switched off. Pass `conversation` (a short id you keep for the whole dialogue) so the receiver can keep this dialogue in one session, and so replies can be grouped with it. Pass `important: true` to keep a message exempt from the 7-day message TTL (pin). Pass `no_reply: true` for the closing message of a dialogue: it is delivered and readable but does NOT wake the recipient, so two auto-waking agents cannot answer each other forever. Pass `interrupt: true` only for a correction, cancellation or blocker: it asks the receiver to steer its running turn with this message instead of queueing it for later. Routine messages should leave it off.',
     {
       to: z.string(),
       body: z.string(),
@@ -594,21 +597,23 @@ function buildServer(agentName, agentHost, publicUrl) {
       conversation: z.string().optional(),
       no_reply: z.boolean().optional(),
       important: z.boolean().optional(),
+      interrupt: z.boolean().optional(),
     },
-    ({ to, body, subject, reply_to, conversation, no_reply, important }) => {
+    ({ to, body, subject, reply_to, conversation, no_reply, important, interrupt }) => {
       assertText('to', to, MAX_RECIPIENT_BYTES)
       assertText('body', body, MAX_MESSAGE_BYTES)
       if (subject !== undefined) assertText('subject', subject, MAX_SUBJECT_BYTES)
       if (conversation !== undefined) assertText('conversation', conversation, MAX_CONVERSATION_BYTES)
       const closing = no_reply === true ? 1 : 0
       const flagged = important === true ? 1 : 0
+      const urgent = interrupt === true ? 1 : 0
       if (to === '*') {
         // Broadcast: one durable copy per other registered agent (still per-recipient, so
         // each side reads/marks its own inbox and the wake ping stays per agent).
         const recipients = db.prepare('SELECT name FROM agents WHERE name != ?').all(agentName).map((row) => row.name)
-        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         for (const name of recipients) {
-          insert.run(randomUUID(), agentName, name, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged)
+          insert.run(randomUUID(), agentName, name, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent)
           if (!closing) wakeAgent(name, conversation, { sender: agentName, subject })
         }
         return { to: '*', recipients: recipients.length, conversation: conversation ?? null, no_reply: Boolean(closing), note: 'broadcast to every other registered agent' }
@@ -616,8 +621,8 @@ function buildServer(agentName, agentHost, publicUrl) {
       if (to === agentName) throw new Error('refusing to send a message to yourself')
       const target = db.prepare('SELECT name FROM agents WHERE name = ?').get(to)
       const id = randomUUID()
-      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(id, agentName, to, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged)
+      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(id, agentName, to, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent)
       if (!closing) wakeAgent(to, conversation, { sender: agentName, subject })
       return {
         id,
@@ -638,7 +643,7 @@ function buildServer(agentName, agentHost, publicUrl) {
       const onlyUnread = unread_only ?? true
       const rows = db
         .prepare(
-          `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned FROM messages
+          `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned, interrupt FROM messages
            WHERE recipient = ? ${onlyUnread ? 'AND read_at IS NULL' : ''}
            ORDER BY created_at ASC LIMIT ?`,
         )
@@ -877,7 +882,7 @@ async function handleMcp(req, res, body) {
 }
 
 /**
- * Plain REST face, for agents that are not MCP clients (Gateway agent, cron jobs,
+ * Plain REST face, for agents that are not MCP clients (Hermes, cron jobs,
  * curl, shell scripts). Same store, same identity header, no protocol required.
  *
  *   POST /api/send      {to, body, subject?, reply_to?}
@@ -987,17 +992,18 @@ async function handleRest(req, res, url) {
       if (conversation !== null) assertText('conversation', conversation, MAX_CONVERSATION_BYTES)
       const closing = body.no_reply === true ? 1 : 0
       const important = body.important === true || body.pinned === true
+      const urgent = body.interrupt === true ? 1 : 0
       if (body.to === '*') {
         const recipients = db.prepare('SELECT name FROM agents WHERE name != ?').all(id.name).map((row) => row.name)
-        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         for (const name of recipients) {
-          insert.run(randomUUID(), id.name, name, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0)
+          insert.run(randomUUID(), id.name, name, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent)
           if (!closing) wakeAgent(name, conversation, { sender: id.name, subject: body.subject })
         }
         return sendJson(res, 201, { to: '*', recipients: recipients.length, conversation, no_reply: Boolean(closing) })
       }
-      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(messageId, id.name, body.to, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0)
+      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(messageId, id.name, body.to, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent)
       if (!closing) wakeAgent(body.to, conversation, { sender: id.name, subject: body.subject })
       return sendJson(res, 201, { id: messageId, to: body.to, conversation, no_reply: Boolean(closing) })
     }
@@ -1007,7 +1013,7 @@ async function handleRest(req, res, url) {
       const limit = parseLimit(q.get('limit'), 20, 100)
       const rows = db
         .prepare(
-          `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned FROM messages
+          `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned, interrupt FROM messages
            WHERE recipient = ? ${unreadOnly ? 'AND read_at IS NULL' : ''}
            ORDER BY created_at ASC LIMIT ?`,
         )
@@ -1127,7 +1133,7 @@ async function handleRest(req, res, url) {
       const before = Number(q.get('before') ?? 0)
       const full = q.get('full') === '1'
       const rows = db.prepare(
-        `SELECT id, sender, recipient, subject, body, conversation, no_reply, pinned, read_at, created_at, reply_to
+        `SELECT id, sender, recipient, subject, body, conversation, no_reply, pinned, interrupt, read_at, created_at, reply_to
            FROM messages
           WHERE COALESCE(conversation, 'default') = ?
             AND (sender = ? OR recipient = ?)
