@@ -1,0 +1,9 @@
+# dsh-mesh-waker bundle patch.
+#
+# Registers the plugin entry only. Everything machine-specific (hub URL, token file,
+# workspace paths) is configured from the plugin's own settings page afterwards, which
+# writes the profile's cordis.patch.yml with your values — no secrets or paths belong here.
+- insert:
+    - id: mesh-waker
+      name: 'dsh-mesh-waker'
+      config: {}
