@@ -1,8 +1,7 @@
 {
-  "name": "@local/dsh-mesh-waker",
+  "name": "dsh-mesh-waker",
   "version": "0.4.36",
-  "private": true,
-  "description": "Inbound wake endpoint: turns a signed mesh mail ping into a dsh session turn.",
+  "description": "DSH client plugin for dsh-mesh: turns a signed, content-free wake ping from the hub into a real session turn, with a settings page, inbox card and history cache.",
   "type": "module",
   "exports": {
     ".": "./index.js",
@@ -14,6 +13,7 @@
     "index.js",
     "client.js",
     "cordis.patch.yml",
+    "cordis.patch.example.yml",
     "locale/*.json",
     "icon.svg"
   ],
@@ -29,5 +29,29 @@
         "@deepseek-ai/dsh-client-ui-settings-general"
       ]
     }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "mesh",
+    "agent",
+    "lan",
+    "wake"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaniol-lck/dsh-mesh.git"
+  },
+  "homepage": "https://github.com/kaniol-lck/dsh-mesh#readme",
+  "bugs": {
+    "url": "https://github.com/kaniol-lck/dsh-mesh/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
