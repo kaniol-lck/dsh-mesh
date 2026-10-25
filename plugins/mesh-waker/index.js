@@ -720,6 +720,29 @@ export function apply(ctx, config) {
       entry = { sessionId: null, createdAt: 0, wakes: 0, title: null }
       conversations[conversation] = entry
     }
+    // Delivery target: a session the user bound this conversation to. Try it first — the
+    // prompt goes in with mode 'queue', so it behaves like the user typing while the agent
+    // is busy rather than replacing its turn. A dead binding falls back to the inbox session.
+    if (entry.deliverTo) {
+      const target = entry.deliverTo
+      try {
+        const built = await buildContent(meta, messages)
+        applyTrustPolicy(target, trustFor(meta.sender))
+        await promptWithResume(target, built.parts)
+        await markRead(messages)
+        entry.wakes = (entry.wakes ?? 0) + 1
+        entry.createdAt = entry.createdAt || Date.now()
+        saveConversations()
+        state.sessionId = target
+        state.conversations = Object.keys(conversations).length
+        fileLog(`delivered ${messages.length} msg into bound session ${target} (${conversation})`)
+        return
+      } catch (error) {
+        fileLog(`delivery to bound session ${target} failed (${error.message}); falling back to inbox session`)
+        entry.deliverTo = null
+        saveConversations()
+      }
+    }
     const current = Date.now()
     const ageHours = entry.createdAt ? (current - entry.createdAt) / 3_600_000 : 0
     if (entry.sessionId && (ageHours >= c.resetAfterHours || entry.wakes >= c.maxWakes)) {
@@ -1289,16 +1312,19 @@ export function apply(ctx, config) {
             if (!conversation || !sessionId) throw new Error('conversation and sessionId are required')
             if (conversation.length > 120) throw new Error('conversation is too long (max 120)')
             const entry = conversations[conversation] ?? { sessionId: null, createdAt: 0, wakes: 0, title: null }
-            // Display binding only: wakes for this conversation must NOT be injected into
-            // the user's own session; they keep going to the waker's inbox session.
+            const deliver = draft.deliver !== false
             entry.panelSessionId = sessionId
             entry.createdAt = Date.now()
             entry.bound = true
+            // A bound conversation is delivered straight into the user's own session: the
+            // mail lands in the conversation they already have open (queued as an input,
+            // like typing during a turn) instead of in the waker's inbox session.
+            entry.deliverTo = deliver ? sessionId : null
             entry.title = entry.title ?? `mesh \u00b7 ${conversation}`
             conversations[conversation] = entry
             saveConversations()
-            fileLog(`bound session ${sessionId} to conversation ${conversation}`)
-            res.end(JSON.stringify({ ok: true, conversation, sessionId }))
+            fileLog(`bound session ${sessionId} to conversation ${conversation} (deliver=${deliver})`)
+            res.end(JSON.stringify({ ok: true, conversation, sessionId, deliverTo: entry.deliverTo }))
           } catch (error) {
             res.end(JSON.stringify({ ok: false, error: error.message }))
           }
@@ -1399,17 +1425,17 @@ export function apply(ctx, config) {
     ctx.commands.register({
       name: 'mesh',
       description: '和指定 agent 开始一轮 mesh 对话：自动生成会话 id 并把你的回复绑定到当前会话',
-      input: { hint: 'agent[,agent2] [要发送的内容]，例如 /mesh gateway-agent 看一下 8790' },
+      input: { hint: 'agent[,agent2] [要发送的内容]，例如 /mesh hermes 看一下 8790' },
       handler: async (invocation) => {
         const raw = String(invocation.rawInput ?? '').trim()
-        if (!raw) return { kind: 'error', text: '用法：/mesh <agent[,agent2]> [要发送的内容]，例如 /mesh gateway-agent 看一下 8790' }
+        if (!raw) return { kind: 'error', text: '用法：/mesh <agent[,agent2]> [要发送的内容]，例如 /mesh hermes 看一下 8790' }
 
         const tokens = raw.split(/\s+/)
         let conversation
         let targets
         let rest
         if (/^conv[/:]/.test(tokens[0])) {
-          // Backward-compatible explicit form: /mesh conv/x gateway-agent [message]
+          // Backward-compatible explicit form: /mesh conv/x hermes [message]
           conversation = tokens.shift()
           targets = (tokens.shift() ?? '').split(',').map((name) => name.trim()).filter(Boolean)
           rest = tokens.join(' ')
@@ -1418,7 +1444,7 @@ export function apply(ctx, config) {
           conversation = 'conv/' + randomUUID().replace(/-/g, '').slice(0, 8)
           rest = tokens.join(' ')
         }
-        if (!targets.length) return { kind: 'error', text: '至少指定一个协同对象，例如 /mesh gateway-agent' }
+        if (!targets.length) return { kind: 'error', text: '至少指定一个协同对象，例如 /mesh hermes' }
         if (targets.some((name) => name.length > 64)) return { kind: 'error', text: 'agent 名太长' }
         if (conversation.length > 120) return { kind: 'error', text: 'conversation 太长（最多 120 字符）' }
 

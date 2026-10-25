@@ -1399,6 +1399,8 @@ try {
 
       React.useEffect(() => {
         void loadList()
+        const timer = setInterval(() => void loadList(), 10000)
+        return () => clearInterval(timer)
       }, [loadList])
 
       const sync = async () => {
@@ -1755,7 +1757,7 @@ try {
                   await json(BASE + '/mesh/bind', {
                     method: 'POST',
                     headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify({ conversation: mine.conversation, sessionId }),
+                    body: JSON.stringify({ conversation: mine.conversation, sessionId, deliver: true }),
                   })
                   const fresh = await json(BASE + '/mesh/history/conversations')
                   conversations = fresh.conversations ?? conversations
@@ -1780,8 +1782,13 @@ try {
         [sessionId, openThread],
       )
 
+      // New mail can start a brand-new conversation; without polling the list the page keeps
+      // showing yesterday's dialogues until someone presses 刷新. Poll in the background and
+      // keep the open thread where the user left it.
       React.useEffect(() => {
         void loadList(false)
+        const timer = setInterval(() => void loadList(true), 10000)
+        return () => clearInterval(timer)
       }, [loadList])
 
       // Follow the open dialogue: refresh it from the hub every 15s.
@@ -1813,7 +1820,7 @@ try {
           await json(BASE + '/mesh/bind', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ conversation: active, sessionId }),
+            body: JSON.stringify({ conversation: active, sessionId, deliver: true }),
           })
           setNote('已把 ' + active + ' 绑定到当前会话')
           await loadList(true)

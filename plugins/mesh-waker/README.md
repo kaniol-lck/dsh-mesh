@@ -32,3 +32,12 @@ cd hub && cp .env.example .env && docker compose up -d --build
 ## 许可
 
 MIT
+
+## 已绑定会话的投递方式
+
+把某个会话绑定到当前 DSH 会话后（收件箱卡片/整页的「绑定到当前会话」），该会话的新邮件会
+**直接以插队输入（`mode: 'queue'`）投进这个会话**，而不是另起一个「Mesh 收件箱」会话：
+
+- 绑定接口：`POST /mesh/bind { conversation, sessionId, deliver?: true }`，`deliver: false` 只做展示绑定；
+- 投递失败（会话已删除/归档）会自动清掉 `deliverTo` 并回退到收件箱会话，邮件不会丢；
+- 收件箱列表每 10 秒轮询一次，新会话不用手动刷新就会出现。
