@@ -127,7 +127,7 @@ def detect_requirements(workspace: Path) -> dict:
         requirements["commands"].append({"name": "npm", "blocking": False})
     if (workspace / "requirements.txt").exists() or any(workspace.rglob("*.py")):
         requirements["commands"].append({"name": "python", "minVersion": "3.10", "blocking": True})
-    for candidate in ("manifest.json", "handoff.requires.json"):
+    for candidate in ("handoff.requires.json",):
         path = workspace / candidate
         if path.exists():
             try:
@@ -135,7 +135,10 @@ def detect_requirements(workspace: Path) -> dict:
             except json.JSONDecodeError:
                 continue
             for key in requirements:
-                requirements[key].extend(extra.get(key, []))
+                value = extra.get(key) or []
+                if isinstance(value, dict):
+                    value = [{"name": k, "minVersion": v} for k, v in value.items()]
+                requirements[key].extend(value)
             break
     return requirements
 
@@ -370,11 +373,18 @@ def cmd_msg(args) -> int:
     body = args.body
     if args.body_file:
         body = Path(args.body_file).read_text(encoding="utf-8")
+    missing = None
+    if args.missing_file:
+        missing = json.loads(Path(args.missing_file).read_text(encoding="utf-8"))
+    elif args.missing == "-":
+        missing = json.loads(sys.stdin.read())
+    elif args.missing:
+        missing = json.loads(args.missing)
     payload = {
         "type": args.type,
         "handoffId": args.id,
         "round": args.round,
-        "missing": json.loads(args.missing) if args.missing else None,
+        "missing": missing,
         "note": body,
     }
     message = api("/api/send", {
@@ -439,7 +449,8 @@ def main(argv=None) -> int:
     msg.add_argument("--conversation", required=True)
     msg.add_argument("--id", required=True)
     msg.add_argument("--round", type=int, default=0)
-    msg.add_argument("--missing", default="")
+    msg.add_argument("--missing", default="", help="JSON inline; '-' reads stdin")
+    msg.add_argument("--missing-file", default="", help="JSON from a file (safer: no shell quoting)")
     msg.add_argument("--body", default="")
     msg.add_argument("--body-file", default="")
     msg.set_defaults(func=cmd_msg)

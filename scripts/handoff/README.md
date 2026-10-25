@@ -81,3 +81,15 @@ python handoff.py msg --type accepted --to agent-a --conversation conv/handoff-0
 - 单文件 ≤64 MiB、总量 2 GiB、blob 默认 24h 过期；更大的工作区要分卷或调大中枢限制；
 - **跨机不能续同一个 DSH 会话**，只带结构化摘要 + 文件 + 下一步；同机才谈得上"续会话"；
 - 打包前会做一次密钥扫描，命中即拒绝（`--force` 可覆盖，但不建议）。
+
+## Windows 下传 JSON 参数
+
+PowerShell 5.1 调原生程序时会剥掉 JSON 里的引号，--missing '[{"kind":"command"}]' 会失败。
+用文件或 stdin：
+
+`powershell
+'[{"kind":"command","name":"node","need":">=22.5"}]' | Set-Content needs.json -Encoding utf8
+python handoff.py msg --type needs --to agent-a --conversation conv/x --id x --missing-file needs.json
+# 或
+Get-Content needs.json -Raw | python handoff.py msg ... --missing -
+`
