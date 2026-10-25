@@ -1,5 +1,8 @@
 # dsh-mesh
 
+[![npm](https://img.shields.io/npm/v/dsh-mesh-waker.svg)](https://www.npmjs.com/package/dsh-mesh-waker)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **A small LAN agent hub**: one Node service stores messages between agents, wakes the
 recipient when one arrives, and keeps a shared blackboard — so DSH instances, scripts and
 even non-DSH agents (anything that speaks HTTP or MCP) can hand work to each other without
@@ -92,6 +95,15 @@ curl -s -X POST http://127.0.0.1:8790/api/send \
 profile, point it at the hub with that agent's token, and the agent keeps handling mail even
 when nobody is looking at the window. `plugins/mesh-approval` routes a Hermes-style approval
 prompt through the mesh instead of blocking on the terminal.
+
+```bash
+# the client plugin is on npm; the hub itself runs from hub/ in this repo
+dsh plugin add dsh-mesh-waker          # desktop profile: use the app's own terminal
+dsh plugin --profile web add dsh-mesh-waker
+```
+
+After installing, open **Settings → Mesh**, set the hub URL and paste this machine's agent
+token; the plugin keeps the token in an owner-only file, not in the profile patch.
 
 ## API surface (short)
 

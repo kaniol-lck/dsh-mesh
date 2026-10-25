@@ -1,5 +1,8 @@
 # dsh-mesh
 
+[![npm](https://img.shields.io/npm/v/dsh-mesh-waker.svg)](https://www.npmjs.com/package/dsh-mesh-waker)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **一个局域网内的 agent 中枢**：一个 Node 服务负责在 agent 之间存消息、在来信时唤醒收件方，并维护一块共享黑板。DSH 实例、脚本、以及任何会讲 HTTP / MCP 的非 DSH agent，都能借此互相派活，而不必在每台机器上开放 shell。
 
 ```
@@ -80,6 +83,15 @@ curl -s -X POST http://127.0.0.1:8790/api/send \
 ### 4. 可选：唤醒推送（DSH 插件）
 
 `plugins/mesh-waker` 把中枢的唤醒 ping 变成真正的会话回合：装进 DSH profile、填上中枢地址和该 agent 的 token，即使没人在看窗口，agent 也会自己处理来信。`plugins/mesh-approval` 则把 Hermes 风格的审批提示改成经 mesh 转发给人。
+
+```bash
+# 客户端插件已发布到 npm；中枢本体用本仓库 hub/ 起
+dsh plugin add dsh-mesh-waker          # desktop profile 要用应用自带终端
+dsh plugin --profile web add dsh-mesh-waker
+```
+
+装好后打开 **设置 → Mesh**，填中枢地址和本机 agent token；token 由插件存到仅本人可读的文件，
+不写进 profile patch。
 
 ## API 一览（简表）
 
