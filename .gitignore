@@ -23,3 +23,5 @@ sessions/
 # Hub runtime state
 hub/data/
 hub/certs/
+
+.npmrc
