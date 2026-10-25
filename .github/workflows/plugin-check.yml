@@ -7,11 +7,13 @@ on:
     paths:
       - 'plugins/mesh-waker/**'
       - 'test/**'
+      - 'scripts/**'
       - '.github/workflows/plugin-check.yml'
   pull_request:
     paths:
       - 'plugins/mesh-waker/**'
       - 'test/**'
+      - 'scripts/**'
 
 jobs:
   check:
