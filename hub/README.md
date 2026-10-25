@@ -317,3 +317,14 @@ agent 就能把内存或 hub-host 磁盘耗尽：
 - 没有端到端加密（TLS 保护传输层）；库内明文存储，依赖 hub-host 的磁盘权限。
 - 单进程 SQLite，写并发在几十次/秒级，家庭规模足够。
 - 自签证书需要客户端 `NODE_EXTRA_CA_CERTS` 信任，详见传输文档。
+
+## 只读控制台
+
+中枢自带一个只读状态页：GET /console（例如 <http://192.168.10.2:8790/console>）。
+
+- 需要 MESH_VIEW_TOKEN；未设置时回退到 MESH_ADMIN_TOKEN；两者都没有时 /console 返回 404，
+  不会出现默认无鉴权面板；
+- 登录把令牌换成 **HttpOnly + SameSite=Strict** 的 12 小时 cookie，令牌不留在 URL 或 localStorage；
+- 连续 5 次错误令牌锁 60 秒；所有交互只读，写操作仍留在 DSH 插件里；
+- 页面展示：中枢版本 / 在线数 / 未读 / 黑板 / blob / 运行时长、成员与插件版本（含 outdated 标记）、最近审计；
+- 若前面有 TLS，请把 MESH_VIEW_TOKEN 单独设一个只读令牌，不要复用 admin 令牌。

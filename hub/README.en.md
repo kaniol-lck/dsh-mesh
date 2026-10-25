@@ -180,3 +180,16 @@ MESH_BASE=http://127.0.0.1:8791 MESH_ADMIN_TOKEN="$MESH_ADMIN_TOKEN" node smoke-
 ## License
 
 MIT — see [../LICENSE](../LICENSE).
+
+## Read-only console
+
+The hub serves a read-only status page at GET /console.
+
+- Requires MESH_VIEW_TOKEN (falls back to MESH_ADMIN_TOKEN); with neither set the page is a 404
+  rather than an unauthenticated dashboard;
+- Login exchanges the token for an HttpOnly + SameSite=Strict cookie valid for 12 hours — the token
+  never sits in the URL or localStorage;
+- Five failed attempts per minute lock the IP out for 60 seconds; every endpoint is read-only, all
+  mutations stay in the DSH plugin;
+- Shows hub version, online count, unread mail, board size, blobs, uptime, members with plugin
+  versions (outdated badge) and the latest audit rows.

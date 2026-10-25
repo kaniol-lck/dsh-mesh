@@ -32,8 +32,11 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.4'
+const HUB_VERSION = '0.7.5'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
+// Read-only console. Without a view token (or an admin token to fall back on) the
+// console does not exist at all — a default-open dashboard is how tokens leak.
+const VIEW_TOKEN = process.env.MESH_VIEW_TOKEN || process.env.MESH_ADMIN_TOKEN || null
 import { DatabaseSync } from 'node:sqlite'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
@@ -960,6 +963,259 @@ function blobReadable(row, agentName, req) {
   return visible === '*' || visible.split(',').includes(agentName)
 }
 
+
+// ---------------------------------------------------------------- read-only console
+// A single page served by the hub itself: no assets, no build step, no write endpoints.
+// Login exchanges the view token for an HttpOnly cookie; mutating operations stay in the
+// DSH plugin, which already runs on the trusted machine with an owner-only token file.
+const consoleSessions = new Map()
+const consoleFailures = new Map()
+const CONSOLE_SESSION_MS = 12 * 60 * 60 * 1000
+
+function parseCookies(req) {
+  const jar = {}
+  for (const part of String(req.headers.cookie ?? '').split(';')) {
+    const index = part.indexOf('=')
+    if (index < 0) continue
+    jar[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim())
+  }
+  return jar
+}
+
+function consoleAuthorized(req) {
+  if (!VIEW_TOKEN) return false
+  // A bearer token also works, so scripts and curl do not need the cookie dance.
+  const header = String(req.headers.authorization ?? '')
+  if (header.startsWith('Bearer ')) {
+    const offered = header.slice(7).trim()
+    if (offered.length === VIEW_TOKEN.length && timingSafeEqual(Buffer.from(offered), Buffer.from(VIEW_TOKEN))) return true
+  }
+  const session = parseCookies(req).mesh_console
+  if (!session) return false
+  const expires = consoleSessions.get(session)
+  if (!expires) return false
+  if (expires < Date.now()) {
+    consoleSessions.delete(session)
+    return false
+  }
+  return true
+}
+
+function sendHtml(res, status, body, extraHeaders) {
+  res.writeHead(status, {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer',
+    'x-frame-options': 'DENY',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'",
+    ...(extraHeaders ?? {}),
+  })
+  res.end(body)
+}
+
+const CONSOLE_STYLE = `
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.55 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+       background: #f6f7f9; color: #1c1f23; }
+@media (prefers-color-scheme: dark) { body { background: #16181c; color: #e6e8eb; } .card { background: #1f2227 !important; border-color: #2c3036 !important; } th { color: #9aa0a6 !important; } td, th { border-color: #2c3036 !important; } }
+main { max-width: 1040px; margin: 0 auto; padding: 28px 20px 60px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: #6b7280; font-size: 12.5px; margin-bottom: 22px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 22px; }
+.card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 16px; }
+.card .k { font-size: 12px; color: #6b7280; }
+.card .v { font-size: 22px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+h2 { font-size: 14px; margin: 26px 0 10px; }
+table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #eef0f2; font-size: 13px; }
+th { color: #6b7280; font-weight: 600; font-size: 12px; }
+tr:last-child td { border-bottom: none; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11.5px; border: 1px solid transparent; }
+.ok { color: #15803d; background: #dcfce7; border-color: #bbf7d0; }
+.warn { color: #b45309; background: #fef3c7; border-color: #fde68a; }
+.off { color: #6b7280; background: #f1f3f5; border-color: #e5e7eb; }
+form { max-width: 360px; }
+input[type=password] { width: 100%; padding: 9px 11px; border-radius: 8px; border: 1px solid #d1d5db; font-size: 14px; }
+button { margin-top: 10px; padding: 8px 16px; border-radius: 8px; border: 1px solid #111827;
+         background: #111827; color: #fff; font-size: 13.5px; cursor: pointer; }
+.err { color: #b91c1c; margin: 8px 0 0; font-size: 13px; }
+`
+
+function consoleLoginPage(error) {
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>dsh-mesh 控制台</title>
+<style>${CONSOLE_STYLE}</style></head><body><main>
+<h1>dsh-mesh 控制台</h1>
+<p class="sub">只读视图 · 仅展示状态，不提供任何写操作</p>
+<form method="post" action="/console/login">
+  <input type="password" name="token" placeholder="view token" autocomplete="current-password" autofocus>
+  <button type="submit">进入</button>
+  ${error ? `<p class="err">${error}</p>` : ''}
+</form>
+</main></body></html>`
+}
+
+function consolePage() {
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>dsh-mesh 控制台</title>
+<style>${CONSOLE_STYLE}</style></head><body><main>
+<h1>dsh-mesh 控制台</h1>
+<p class="sub" id="sub">加载中…</p>
+<div class="grid" id="cards"></div>
+<h2>成员与插件版本</h2>
+<table><thead><tr><th>agent</th><th>状态</th><th>插件</th><th>版本</th><th>兼容</th><th>最后活动</th></tr></thead>
+<tbody id="peers"></tbody></table>
+<h2>审计（最近 20 条）</h2>
+<table><thead><tr><th>时间</th><th>agent</th><th>动作</th><th>结果</th></tr></thead>
+<tbody id="audit"></tbody></table>
+<script>
+const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const card = (label, value) => '<div class="card"><div class="k">' + esc(label) + '</div><div class="v">' + esc(value) + '</div></div>';
+async function refresh() {
+  try {
+    const [overview, peers, audit] = await Promise.all([
+      fetch('/console/api/overview').then((r) => r.json()),
+      fetch('/console/api/peers').then((r) => r.json()),
+      fetch('/console/api/audit?limit=20').then((r) => r.json()),
+    ]);
+    document.getElementById('sub').textContent =
+      '中枢 ' + (overview.hub?.version ?? '?') + ' · 最低要求 waker ' + (overview.hub?.min_waker ?? '?') +
+      ' · 更新于 ' + new Date().toLocaleTimeString();
+    document.getElementById('cards').innerHTML = [
+      card('在线 / 总数', (overview.online ?? 0) + ' / ' + (overview.agents ?? 0)),
+      card('未读消息', overview.queued_messages ?? 0),
+      card('黑板条目', overview.board_entries ?? 0),
+      card('Blob', (overview.blobs?.n ?? 0) + ' 个 / ' + Math.round((overview.blobs?.bytes ?? 0) / 1048576) + ' MiB'),
+      card('运行时长', Math.round((overview.uptime_seconds ?? 0) / 3600) + ' 小时'),
+    ].join('');
+    document.getElementById('peers').innerHTML = (peers.peers || []).map((p) => {
+      const plugin = p.plugin || {};
+      const compat = plugin.compat === 'ok' ? '<span class="badge ok">ok</span>'
+        : plugin.compat === 'outdated' ? '<span class="badge warn">outdated</span>'
+        : '<span class="badge off">未上报</span>';
+      return '<tr><td>' + esc(p.name) + '</td>' +
+        '<td>' + (p.online ? '<span class="badge ok">在线</span>' : '<span class="badge off">离线</span>') + '</td>' +
+        '<td>' + esc(plugin.name || '—') + '</td><td>' + esc(plugin.version || '—') + '</td>' +
+        '<td>' + compat + '</td><td>' + esc((p.last_seen_seconds_ago ?? 0) + 's 前') + '</td></tr>';
+    }).join('');
+    document.getElementById('audit').innerHTML = (audit.entries || []).map((row) =>
+      '<tr><td>' + esc(new Date(row.at).toLocaleTimeString()) + '</td><td>' + esc(row.agent || '—') + '</td>' +
+      '<td>' + esc(row.action) + '</td><td>' + (row.ok ? '<span class="badge ok">ok</span>' : '<span class="badge warn">fail</span>') + '</td></tr>'
+    ).join('');
+  } catch (error) {
+    document.getElementById('sub').textContent = '刷新失败：' + error.message;
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</main></body></html>`
+}
+
+async function handleConsole(req, res, url) {
+  if (!VIEW_TOKEN) {
+    res.writeHead(404, { 'content-type': 'application/json' })
+    res.end('{"error":"console disabled: set MESH_VIEW_TOKEN (or MESH_ADMIN_TOKEN)"}')
+    return
+  }
+  const path = url.pathname
+  const ip = clientIp(req)
+
+  if (path === '/console/login' && req.method === 'POST') {
+    const raw = (await readBody(req, 4096)).toString('utf8')
+    const offered = new URLSearchParams(raw).get('token') ?? ''
+    const record = consoleFailures.get(ip) ?? { count: 0, until: 0 }
+    if (record.until > Date.now()) {
+      sendHtml(res, 429, consoleLoginPage('尝试过于频繁，请稍后再试'))
+      return
+    }
+    const matches =
+      offered.length === VIEW_TOKEN.length && timingSafeEqual(Buffer.from(offered), Buffer.from(VIEW_TOKEN))
+    if (!matches) {
+      record.count += 1
+      if (record.count >= 5) {
+        record.count = 0
+        record.until = Date.now() + 60_000
+      }
+      consoleFailures.set(ip, record)
+      audit('console_login', null, ip, false)
+      sendHtml(res, 401, consoleLoginPage('令牌不正确'))
+      return
+    }
+    const session = randomBytes(24).toString('hex')
+    consoleSessions.set(session, Date.now() + CONSOLE_SESSION_MS)
+    audit('console_login', null, ip, true)
+    sendHtml(res, 303, '', {
+      location: '/console',
+      'set-cookie': `mesh_console=${session}; HttpOnly; SameSite=Strict; Path=/console; Max-Age=${CONSOLE_SESSION_MS / 1000}`,
+    })
+    return
+  }
+
+  if (path === '/console/logout' && req.method === 'POST') {
+    const session = parseCookies(req).mesh_console
+    if (session) consoleSessions.delete(session)
+    sendHtml(res, 303, '', { location: '/console', 'set-cookie': 'mesh_console=; HttpOnly; SameSite=Strict; Path=/console; Max-Age=0' })
+    return
+  }
+
+  if (path === '/console' && req.method === 'GET') {
+    if (!consoleAuthorized(req)) {
+      sendHtml(res, 401, consoleLoginPage(''))
+      return
+    }
+    sendHtml(res, 200, consolePage())
+    return
+  }
+
+  if (path.startsWith('/console/api/') && req.method === 'GET') {
+    if (!consoleAuthorized(req)) return sendJson(res, 401, { error: 'unauthorized' })
+    if (path === '/console/api/overview') {
+      const ts = Date.now()
+      const blobStats = db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS bytes FROM blobs').get()
+      return sendJson(res, 200, {
+        hub: { version: HUB_VERSION, min_waker: MIN_WAKER },
+        agents: db.prepare('SELECT COUNT(*) AS n FROM agents').get().n,
+        online: db.prepare('SELECT COUNT(*) AS n FROM agents WHERE last_seen >= ?').get(ts - ONLINE_TTL_MS).n,
+        queued_messages: db.prepare('SELECT COUNT(*) AS n FROM messages WHERE read_at IS NULL').get().n,
+        board_entries: db.prepare('SELECT COUNT(*) AS n FROM board').get().n,
+        blobs: blobStats,
+        uptime_seconds: Math.round(process.uptime()),
+      })
+    }
+    if (path === '/console/api/peers') {
+      const ts = Date.now()
+      const rows = db
+        .prepare('SELECT name, host, description, last_seen, plugin_name, plugin_version, plugin_platform FROM agents ORDER BY last_seen DESC')
+        .all()
+      return sendJson(res, 200, {
+        hub: { version: HUB_VERSION, min_waker: MIN_WAKER },
+        peers: rows.map((r) => ({
+          name: r.name,
+          host: r.host,
+          online: ts - r.last_seen <= ONLINE_TTL_MS,
+          last_seen_seconds_ago: Math.round((ts - r.last_seen) / 1000),
+          plugin: r.plugin_version
+            ? { name: r.plugin_name, version: r.plugin_version, platform: r.plugin_platform,
+                compat: compareVersion(r.plugin_version, MIN_WAKER) >= 0 ? 'ok' : 'outdated' }
+            : null,
+        })),
+      })
+    }
+    if (path === '/console/api/audit') {
+      const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit') ?? 20) || 20))
+      const rows = db.prepare('SELECT at, agent, action, ok FROM audit ORDER BY at DESC LIMIT ?').all(limit)
+      return sendJson(res, 200, { entries: rows })
+    }
+    return sendJson(res, 404, { error: 'unknown console endpoint' })
+  }
+
+  res.writeHead(404, { 'content-type': 'application/json' })
+  res.end('{"error":"not found"}')
+}
+
 async function handleRest(req, res, url) {
   const id = resolveIdentity(req)
   if (!id.ok) return sendJson(res, id.status, { error: id.reason })
@@ -1506,6 +1762,11 @@ const httpServer = makeServer(async (req, res) => {
     const blobStats = db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS bytes FROM blobs').get()
     res.end(JSON.stringify({ ok: true, service: 'dsh-mesh', version: HUB_VERSION, sessions: sessions.size, persisted_sessions: db.prepare('SELECT COUNT(*) AS n FROM mcp_sessions').get().n, lenient_session: MCP_LENIENT_SESSION, session_cap: MAX_SESSIONS, wake: Boolean(WAKE_SECRET), relay: RELAY_ENABLED ? RELAY_TARGET : null, blobs: { count: blobStats.n, bytes: blobStats.bytes, max_file: MAX_BLOB_BYTES, max_total: MAX_BLOB_TOTAL_BYTES },
       pinned_messages: db.prepare('SELECT COUNT(*) AS n FROM messages WHERE pinned = 1').get().n, uptime_seconds: Math.round(process.uptime()) }))
+    return
+  }
+
+  if (url.pathname === '/console' || url.pathname.startsWith('/console/')) {
+    await handleConsole(req, res, url)
     return
   }
 

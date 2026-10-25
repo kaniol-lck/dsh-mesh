@@ -1,6 +1,6 @@
 {
   "name": "dsh-mesh",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "private": true,
   "type": "module",
   "description": "LAN agent mesh hub: an MCP-over-HTTP server that lets intermittent DSH agents and an always-on Gateway agent exchange presence, messages and shared board state.",
