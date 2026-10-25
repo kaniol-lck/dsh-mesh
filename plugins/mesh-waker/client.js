@@ -1,10 +1,14 @@
-// Client half of @local/dsh-mesh-waker.
+// Client half of dsh-mesh-waker.
 //
 // Renders an editable card on the bundle's page in Settings -> Plugins: live status from
 // the plugin's loopback endpoint, the workspace / rotation settings that used to require
 // hand-editing cordis.patch.yml, and the other mesh agents with a direct-send box.
-window.__ModuleLoader__.load({
-  id: '@local/dsh-mesh-waker',
+// Two copies of this plugin can coexist (a linked copy plus the npm package). The loader
+// throws on a duplicate module id, and that aborts the whole web boot, so degrade to a
+// warning instead of killing the app.
+try {
+  window.__ModuleLoader__.load({
+    id: 'dsh-mesh-waker',
   factory(require) {
     const React = require('react')
     const h = React.createElement
@@ -2132,4 +2136,7 @@ window.__ModuleLoader__.load({
       },
     }
   },
-})
+  });
+} catch (error) {
+  console.warn('[mesh-waker] duplicate registration skipped:', error && error.message ? error.message : error);
+}
