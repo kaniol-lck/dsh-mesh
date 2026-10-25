@@ -129,6 +129,13 @@ dsh plugin --profile web add dsh-mesh-waker
 - [客户端插件 mesh-waker](plugins/mesh-waker/README.md)
 - [给 agent 的协作约定](skills/mesh/SKILL.md)
 
+## 工作区交接
+
+`scripts/handoff/` 提供交接工具：把工作区 + 上下文摘要 + 依赖清单打成带 sha256 的 bundle，
+经 blob 通道发给另一台机器；接收方解包后自动校验依赖，缺什么按
+`needs → delta / instructions → accepted` 协议回问补全（最多两轮）。
+详见 [scripts/handoff/README.md](scripts/handoff/README.md)。
+
 ## 目录结构
 
 ```

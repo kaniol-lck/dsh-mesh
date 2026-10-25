@@ -147,6 +147,13 @@ token; the plugin keeps the token in an owner-only file, not in the profile patc
 - [Client plugin: mesh-waker](plugins/mesh-waker/README.md)
 - [Agent-facing conventions](skills/mesh/SKILL.md)
 
+## Workspace handoff
+
+`scripts/handoff/` packages a workspace plus a context summary and a requirement manifest into a
+sha256-checked bundle, ships it over the blob channel, and on the receiving side verifies the
+requirements — negotiating missing pieces with `needs -> delta / instructions -> accepted`
+(at most two rounds). See [scripts/handoff/README.md](scripts/handoff/README.md).
+
 ## Repository layout
 
 ```

@@ -1,14 +1,14 @@
 ---
 name: mesh
-description: 局域网 agent 中枢 dsh-mesh 的协作约定：开工查收件箱、找在线伙伴、发离线可靠消息、维护共享黑板。当任务涉及 mesh、dsh-mesh、跨机器 agent、gateway-agent、共享黑板，或需要与其他 agent 交换消息时使用。
-whenToUse: 会话开始时检查有没有别的 agent 留言；需要找另一台机器/另一个 agent 协作或交接；需要把结论、环境变更、待办共享出去；或用户提到 mesh / 其他电脑 / 其他 agent / Gateway agent / hub-host 时
+description: 局域网 agent 中枢 dsh-mesh 的协作约定：开工查收件箱、找在线伙伴、发离线可靠消息、维护共享黑板。当任务涉及 mesh、dsh-mesh、跨机器 agent、hermes、共享黑板，或需要与其他 agent 交换消息时使用。
+whenToUse: 会话开始时检查有没有别的 agent 留言；需要找另一台机器/另一个 agent 协作或交接；需要把结论、环境变更、待办共享出去；或用户提到 mesh / 其他电脑 / 其他 agent / Hermes / NAS 时
 ---
 
 # dsh-mesh 协作约定
 
-中枢是一个常驻在 hub-host 上的服务，同时提供 MCP 工具和 REST 接口。**dsh 会关机，Gateway agent 常在线**，所以消息一律落库，不依赖对端当时在线。
+中枢是一个常驻在 NAS 上的服务，同时提供 MCP 工具和 REST 接口。**dsh 会关机，Hermes 常在线**，所以消息一律落库，不依赖对端当时在线。
 
-工具不可用时（hub-host 没开、MCP 没连上），用 REST 兜底，见文末。
+工具不可用时（NAS 没开、MCP 没连上），用 REST 兜底，见文末。
 
 ## 0. 会话开始：先收信
 
@@ -93,10 +93,10 @@ MCP 工具不可用而中枢还活着时（例如只在命令行里）。**所�
 ```powershell
 $t = 'mesh_...'                                  # 本机的 agent token
 $h = @{ 'Authorization' = "Bearer $t"; 'Content-Type' = 'application/json' }
-$base = 'http://<hub-host-IP>:8790'
+$base = 'http://<NAS-IP>:8790'
 
 Invoke-RestMethod "$base/api/inbox?mark_read=1" -Headers $h
-Invoke-RestMethod "$base/api/send" -Method Post -Headers $h -Body '{"to":"gateway-agent","body":"..."}'
+Invoke-RestMethod "$base/api/send" -Method Post -Headers $h -Body '{"to":"hermes","body":"..."}'
 Invoke-RestMethod "$base/api/peers?offline=1" -Headers $h
 Invoke-RestMethod "$base/api/board?key=task/备份迁移" -Headers $h
 ```
@@ -144,7 +144,7 @@ curl.exe -s -H "Authorization: Bearer $t" "$base/api/blob/<id>" -o downloaded.bi
 | 对端类型 | 谁去取信 | 你发完消息之后 |
 |---|---|---|
 | 装了 wake 插件的 dsh（`mesh-waker`） | 中枢签名 POST 到它的 8795，插件**自动建/复用会话**并投递提示词 | 十几秒内自动处理；**不需要踢** |
-| 常驻 daemon（hub-host 上的 Gateway agent） | 它自己的 cron 每 5 分钟检查收件箱变化，**有变化才唤醒 agent**（空闲时零 token） | 一般 **5 分钟内**自动回复，**不需要踢** |
+| 常驻 daemon（NAS 上的 Hermes） | 它自己的 cron 每 5 分钟检查收件箱变化，**有变化才唤醒 agent**（空闲时零 token） | 一般 **5 分钟内**自动回复，**不需要踢** |
 | 没装插件的 dsh | 没有常驻进程，只在下次开会话时按 §0 收信 | 可能要等几小时/几天；急事别指望它 |
 
 ### 被唤醒的轮次能做什么（0.3.1 起的规则）
@@ -181,11 +181,11 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 唤醒提示词里**直接内联未读正文**（0.4.0 起），会话里能直接看见双方交流的内容，不需要再展开工具结果。`.md` 附件投递仍是实验态（宿主要求文件经 `fileUploads` 绑定到会话），失败会自动回退为内联。
 
 
-**要"立刻"叫醒 Gateway agent**（仅在你有 hub-host 运维通道的机器上）：在它的容器里跑一个 one-shot 回合，让它读收件箱并回复。
+**要"立刻"叫醒 Hermes**（仅在你有 NAS 运维通道的机器上）：在它的容器里跑一个 one-shot 回合，让它读收件箱并回复。
 
 ```bash
-# 容器内脚本已放好：<agent-home>/scripts/kick-mesh.sh
-<python> lan-ops/scripts/cexec.py bg gateway-agent sh <agent-home>/scripts/kick-mesh.sh --log /tmp/kick-mesh.log
+# 容器内脚本已放好：/opt/data/scripts/kick-mesh.sh
+<python> lan-ops/scripts/cexec.py bg hermes sh /opt/data/scripts/kick-mesh.sh --log /tmp/kick-mesh.log
 ```
 
 - 用 `bg` 是因为容器 exec 有 60 秒读超时，而一个回合通常更久。
@@ -209,9 +209,9 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 5. 对话达成结论、或对方说"完事"时**立即停止轮询**，不要在后台继续查；
 6. 同一会话里只维持**一个**轮询循环；不要一边等 A 一边再开一个循环等 B。
 
-为什么是 10 秒：中枢每次请求都会更新 `last_seen`（一次 SQLite 写）。10 秒足够产生"对话感"，又不会让家庭 hub-host 上的单进程 SQLite 每秒写；低于 5 秒没有实际收益。
+为什么是 10 秒：中枢每次请求都会更新 `last_seen`（一次 SQLite 写）。10 秒足够产生"对话感"，又不会让家庭 NAS 上的单进程 SQLite 每秒写；低于 5 秒没有实际收益。
 
-**不要做**：把轮询塞进后台任务常驻——dsh 会话结束轮询就没了，这是设计如此；真有长期等待需求，转 §8（让对方自动醒）或让 Gateway agent 代理。
+**不要做**：把轮询塞进后台任务常驻——dsh 会话结束轮询就没了，这是设计如此；真有长期等待需求，转 §8（让对方自动醒）或让 Hermes 代理。
 
 ## 10. 对话 id：让同一轮对话落在同一个会话
 
@@ -223,7 +223,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 - 接收侧的唤醒插件（`mesh-waker`）按 `conversation` 维护 **对话 → dsh 会话** 的映射（持久化在 `%USERPROFILE%\.dsh\mesh-waker\conversations.json`）：
   - 同一 `conversation` 的后续消息**复用同一个 dsh 会话**；
   - 不同 `conversation` 各自一个会话，上下文不混；
-  - **会话标题直接取 `发件人 · 主题`**（如 `gateway-agent · 提示词评审`），不花模型调用；
+  - **会话标题直接取 `发件人 · 主题`**（如 `hermes · 提示词评审`），不花模型调用；
   - 没有 `conversation` 的消息走默认的"收件箱"会话。
 
 ### 收尾标记：`no_reply`（防复读，必读）
@@ -238,7 +238,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 - **例外：对方需要知道的结果，别带 `no_reply`。** 判定标准是"这条消息是否要求对方知道并可能行动"：
   - 带 → 对方会醒，能及时看到（如"已装好、版本 0.4.3、registered=true"这种**任务完成回执**）；
   - 不带但又是纯确认（"收到""好的"）→ 会引发复读，**这种情况应该干脆不发**。
-  - 反过来，**任务完成回执不要一律带 `no_reply`**：实测 laptop 把"已装好"也标了 `no_reply`，
+  - 反过来，**任务完成回执不要一律带 `no_reply`**：实测 matebook 把"已装好"也标了 `no_reply`，
     结果对方没有任何唤醒、只能靠主动查库才发现——**回执等于没送到**。
   - 一句话：`no_reply` 只用于"对话到此结束、对方无需再动"，**不用于"我完成了，你要知道"**。
 
@@ -253,7 +253,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
   ```
   mesh_board_set({ key: "task/mesh-waker-install", value: "...",
-                   owner: "agent-b", status: "todo" })
+                   owner: "dsh-kaniol-matebooke2016", status: "todo" })
   ```
 
   `get` / `list` 会返回这两个字段。约定 `status` ∈ `todo` / `doing` / `done`；谁认领谁改状态，完成时写 `done` + 时间。
@@ -264,8 +264,8 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 装了 wake 插件的机器上，输入框支持一条 slash 命令：
 
 ```
-/mesh gateway-agent                          # 和 gateway-agent 开一轮对话，conversation 自动生成并绑定到当前会话
-/mesh gateway-agent,agent-b 看一下 8790   # 点名多个对象，并立即把这句发出去
+/mesh hermes                          # 和 hermes 开一轮对话，conversation 自动生成并绑定到当前会话
+/mesh hermes,dsh-kaniol-matebooke2016 看一下 8790   # 点名多个对象，并立即把这句发出去
 ```
 
 - conversation id 自动生成（`conv/<8位>`），**不用自己起名字**；
@@ -284,18 +284,18 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
    ```
    mesh_send({ to: "*", subject: "插件更新 0.3.0 (f89073fb)",
-               body: "变更：… 取包：\\\\<lan-ip>\\Media\\_handoff\\mesh-waker-handoff.tar.gz
+               body: "变更：… 取包：\\\\192.168.10.2\\Media\\_handoff\\mesh-waker-handoff.tar.gz
                      （sha256 6e2bdb3b…） 步骤：解包→覆盖 index.js/client.js/package.json→重启 dsh→自检
                      回执：更新完回一条 no_reply:true 的消息" })
    ```
 
-3. 公告正文**必须**含：变更摘要、取包位置（hub-host 路径 + sha256，或黑板分片键）、替换/安装步骤、是否需要重启、回执要求。
+3. 公告正文**必须**含：变更摘要、取包位置（NAS 路径 + sha256，或黑板分片键）、替换/安装步骤、是否需要重启、回执要求。
 4. 同时写黑板 `env/client-plugin-version`：
 
    ```json
    {"plugin":"@local/dsh-mesh-waker","version":"0.3.0",
     "index_sha256":"…","tar_sha256":"…","hub_version":"0.5.2",
-    "updated_at":"2026-10-23T02:20+08:00","updated_by":"agent-a"}
+    "updated_at":"2026-10-23T02:20+08:00","updated_by":"dsh-kaniol-pc"}
    ```
 
 5. **接收方**：按公告更新 → 自检 `registered:true` → 回一条 **`no_reply: true`** 回执（避免复读）；没更新的也要回一条说明原因。
@@ -303,13 +303,36 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
 ## 本环境速查（2026-10-21 接入，已实测）
 
-- 中枢：`http://127.0.0.1:8790/mcp`（hub-host 上的容器 `dsh-mesh` v0.2.0，数据卷 `dsh-mesh-data`）
-- 本机身份：`agent-a`（由 token 决定，不是自报）；同伴：`gateway-agent`（hub-host 容器，已接入 `mcp_servers.mesh`）、
-  `agent-b`（agent-b-host / <lan-ip>，笔记本）
-- 令牌都在加密库：本机 `MESH_TOKEN_AGENT_A`、Gateway agent `MESH_TOKEN_GATEWAY`、管理员 `MESH_ADMIN_TOKEN`。
+- 中枢：`http://192.168.10.2:8790/mcp`（NAS 上的容器 `dsh-mesh` v0.2.0，数据卷 `dsh-mesh-data`）
+- 本机身份：`dsh-kaniol-pc`（由 token 决定，不是自报）；同伴：`hermes`（NAS 容器，已接入 `mcp_servers.mesh`）、
+  `dsh-kaniol-matebooke2016`（KANIOL-MATEBOOKE2016 / 192.168.10.239，笔记本）
+- 令牌都在加密库：本机 `MESH_TOKEN_DSH_KANIOL_PC`、Hermes `MESH_TOKEN_HERMES`、管理员 `MESH_ADMIN_TOKEN`。
   明文只出现在本机 profile 的 `mcp-mesh` 配置里——轮换令牌后要同步改那一处，否则会 401。
-- 自证：`mesh_whoami` 返回的 `agent` 应是 `agent-a`；`mesh_status` 能看到中枢计数。
+- 自证：`mesh_whoami` 返回的 `agent` 应是 `dsh-kaniol-pc`；`mesh_status` 能看到中枢计数。
 - **`mesh_whoami` 的两个已知缺陷**（v0.2.1 修）：`hub` 回显监听地址 `http://0.0.0.0:8790/mcp`（不是可达地址）；
   `host` 取自请求头、名册里没有时恒为 `null`。**身份、host、描述一律以 `mesh_peers` 为准**，whoami 只用来确认"我是谁"。
 - 中枢没开 / 断网时 dsh 照常启动（`failOnStartupError: false`），连接恢复后自动重连；
   此时不要改用 REST 兜底去猜地址，等工具回来即可。
+
+
+## 14. 工作区交接（mesh handoff）
+
+需要把一整块工作交给另一台机器继续做时，**不要手打包**，用工具：
+
+```bash
+# 发送方
+python scripts/handoff/handoff.py pack --workspace DIR --out bundle.tar.gz \
+  --id <id> --conversation conv/handoff-<id> --next "解包|读摘要|继续构建"
+python scripts/handoff/handoff.py send --file bundle.tar.gz --to <peer> \
+  --conversation conv/handoff-<id> --id <id> --visible-to <me>,<peer>
+
+# 接收方
+python scripts/handoff/handoff.py receive --id <blob> --dir ./incoming --sha256 <sha>
+# 缺依赖时：msg --type needs → 发送方 delta/instructions/release → verify → msg --type accepted
+```
+
+- 打包自动排除 `.git` / `node_modules` / `*.env` / `token*`，并在打包前做密钥扫描（命中即拒绝）；
+- manifest 里 `blocking: false` 表示"缺了也不阻塞交接"；
+- 同一 `conversation` 贯穿全程，消息用 `important: true`；`round` 最多 2 轮，超过转人工；
+- blob 单文件 ≤64 MiB、默认 24h 过期，大工作区分卷；
+- **跨机不搬会话**：只带结构化摘要 + 文件 + 下一步；同机才能续同一个会话。
