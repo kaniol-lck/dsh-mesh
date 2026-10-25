@@ -10,7 +10,7 @@
 # `rotate_mesh_secrets.py` writes both and regenerates cordis.patch.yml from this file.
 - insert:
     - id: mesh-waker
-      name: '@local/dsh-mesh-waker'
+      name: 'dsh-mesh-waker'
       config:
         hubUrl: 'http://HUB_IP:8790'
         tokenFile: 'C:\Users\YOU\.dsh\mesh-waker\token'
