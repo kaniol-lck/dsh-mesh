@@ -2,6 +2,7 @@
 
 Env:
     MESH_HUB        hub base URL, default http://127.0.0.1:8790
+    DSH_SESSION_ID  this DSH session; sent as session so the reply binds back to it
     MESH_TOKEN      bearer token, or
     MESH_TOKEN_FILE path to a file holding the token (preferred)
 
@@ -44,6 +45,11 @@ def main():
         payload["conversation"] = args.conversation
     if args.no_reply:
         payload["no_reply"] = True
+    # Reporting the session makes the reply bind itself: the hub echoes it in the wake and
+    # the local waker delivers the answer into this conversation instead of a new inbox one.
+    session = os.environ.get("DSH_SESSION_ID") or os.environ.get("MESH_SESSION_ID")
+    if session:
+        payload["session"] = session
 
     req = urllib.request.Request(
         HUB + "/api/send",

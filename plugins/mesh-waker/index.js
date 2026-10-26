@@ -750,6 +750,65 @@ export function apply(ctx, config) {
   }
 
   /**
+   * A reply can tell us which DSH session started the conversation (the hub echoes the
+   * origin_session of our own latest message). Adopt it unless the user already bound the
+   * conversation — an explicit binding always wins.
+   */
+  function adoptOriginSession(conversation, originSession) {
+    const sid = typeof originSession === 'string' ? originSession.trim() : ''
+    if (!conversation || !sid) return null
+    const existing = conversations[conversation]
+    if (existing?.deliverTo) return null
+    let live = null
+    try {
+      live = ctx.agents?.get?.(sid) ?? ctx.get?.('sessions')?.get?.(sid) ?? null
+    } catch {
+      live = null
+    }
+    if (!live) {
+      fileLog(`origin session ${sid} for ${conversation} is not live; skipping adoption`)
+      return null
+    }
+    const entry = existing ?? { sessionId: null, createdAt: 0, wakes: 0, title: null }
+    entry.panelSessionId = sid
+    entry.deliverTo = sid
+    entry.bound = true
+    entry.createdAt = entry.createdAt || Date.now()
+    conversations[conversation] = entry
+    saveConversations()
+    fileLog(`adopted origin session ${sid} for ${conversation}`)
+    return sid
+  }
+
+  /**
+   * Binding happens after the fact more often than one would like: the reply was already
+   * delivered to an auto-created inbox session. Inject the recent thread so the session
+   * that just bound the conversation still sees what was said.
+   */
+  async function backfillConversation(conversation, sessionId, limit = 12) {
+    const res = await fetch(`${c.hubUrl}/api/conversation?conversation=${encodeURIComponent(conversation)}`, {
+      headers: { authorization: `Bearer ${c.token}` },
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!res.ok) throw new Error(`hub HTTP ${res.status}`)
+    const data = await res.json()
+    const messages = (data.messages ?? []).slice(-limit)
+    if (!messages.length) return 0
+    const lines = messages.map(
+      (m, index) =>
+        `${index + 1}) ${m.sender} → ${m.recipient}${m.subject ? ` 主题：${m.subject}` : ''}\n${String(m.body ?? '').slice(0, 400)}`,
+    )
+    const text =
+      `【绑定补投】对话 ${conversation} 在绑定到本会话之前已有以下消息（最近 ${messages.length} 条），` +
+      `请把它们当作本会话已有的上下文，不要重复提问：\n\n` +
+      lines.join('\n\n') +
+      `\n\n如需回复，按 mesh 约定带 conversation:"${conversation}"。`
+    await promptWithResume(sessionId, text, 'queue')
+    fileLog(`backfilled ${messages.length} message(s) of ${conversation} into ${sessionId}`)
+    return messages.length
+  }
+
+  /**
    * One session per conversation id: the same dialogue keeps landing in the same dsh
    * session, and a different dialogue gets its own, so their context never mixes.
    */
@@ -852,6 +911,7 @@ export function apply(ctx, config) {
     busy = true
     const t0 = Date.now()
     try {
+      if (meta.conversation) adoptOriginSession(meta.conversation, meta.origin_session || meta.originSession)
       const messages = await fetchUnread(meta.conversation)
       if (meta.conversation) {
         await wakeConversation(meta.conversation, meta, messages)
@@ -1377,7 +1437,15 @@ export function apply(ctx, config) {
             conversations[conversation] = entry
             saveConversations()
             fileLog(`bound session ${sessionId} to conversation ${conversation} (deliver=${deliver})`)
-            res.end(JSON.stringify({ ok: true, conversation, sessionId, deliverTo: entry.deliverTo }))
+            let backfilled = 0
+            if (deliver && draft.backfill) {
+              try {
+                backfilled = await backfillConversation(conversation, sessionId, Number(draft.backfill) > 1 ? Number(draft.backfill) : 12)
+              } catch (error) {
+                fileLog(`backfill of ${conversation} failed: ${error.message}`)
+              }
+            }
+            res.end(JSON.stringify({ ok: true, conversation, sessionId, deliverTo: entry.deliverTo, backfilled }))
           } catch (error) {
             res.end(JSON.stringify({ ok: false, error: error.message }))
           }

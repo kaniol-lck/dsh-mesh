@@ -336,3 +336,24 @@ python scripts/handoff/handoff.py receive --id <blob> --dir ./incoming --sha256 
 - 同一 `conversation` 贯穿全程，消息用 `important: true`；`round` 最多 2 轮，超过转人工；
 - blob 单文件 ≤64 MiB、默认 24h 过期，大工作区分卷；
 - **跨机不搬会话**：只带结构化摘要 + 文件 + 下一步；同机才能续同一个会话。
+
+### 接收方实跑要点（2026-10-25 跨机演练实测）
+
+- **必须显式设 `MESH_HUB_URL`**：`handoff.py` 默认连 `127.0.0.1:8790`，跨机不设必失败；
+- token 默认读 `~/.dsh/mesh-waker/token`；`PATH` 上的 python 若是 Microsoft Store stub，先把真实 python 目录前置；
+- 主包 `receive` 预期 **exit 2**（缺 blocking 依赖）；把输出里的 `missing` 原样作为 `msg --type needs` 的 `--missing`；
+- **delta 用同一条 `receive --dir <同一 incoming>` 下**：会解出 `vendor/` 并自动重新 verify，不必再单独跑 verify；补完 `exit 0` 才算过；
+- verify 对 `.cmd`/脚本工具常记 `version: null`，而 `minVersion` 只在取到版本号时才比较——null 仍可能判满足，别当失败信号；
+- 发送方动手前先在本机干跑一遍 `receive → delta → build`，能提前发现指令错误；
+- 对方可能重复发 needs（重连/补收）：先看中枢已读状态，再决定是否重发 delta，别重复上传。
+
+
+## 15. 会话绑定与回信落点
+
+发起对话时把回信钉在当前会话，别让它落进「Mesh 收件箱」：
+
+- **MCP 发信**：mesh_send 带 session: <本会话 id>（shell 里可用 $DSH_SESSION_ID）；
+- **脚本发信**：直接用 scripts/mesh-send.py，它会自动读 DSH_SESSION_ID 带上；
+- 远端回信到达时，waker 看到 origin_session 会把该对话**自动绑定**到发起会话（用户手动绑定优先）；
+- 绑定晚于消息也不丢：POST /mesh/bind {conversation, sessionId, deliver:true, backfill:12} 会把最近消息补投进会话；
+- 已读消息不会自动重投——历史只能靠 ackfill 补，绑定时值得顺手带上。

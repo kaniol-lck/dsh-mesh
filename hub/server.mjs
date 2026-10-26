@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.5'
+const HUB_VERSION = '0.7.6'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
@@ -231,6 +231,10 @@ CREATE TABLE IF NOT EXISTS blobs (
   // interrupt = the sender wants this message to steer a running turn instead of queueing
   // behind it. The receiver still decides (its waker policy), this is only a hint.
   if (!messageColumns.some((c) => c.name === 'interrupt')) db.exec('ALTER TABLE messages ADD COLUMN interrupt INTEGER DEFAULT 0')
+  // origin_session: the DSH session that authored this message, when the agent passed one.
+  // A reply's wake carries it back so the sender's waker can bind the conversation to the
+  // session that actually started it.
+  if (!messageColumns.some((c) => c.name === 'origin_session')) db.exec('ALTER TABLE messages ADD COLUMN origin_session TEXT')
   // Self-reported plugin identity: advisory only (an agent can lie), used to surface version
   // drift and compatibility hints in /api/peers and /api/status.
   if (!agentColumns.some((c) => c.name === 'plugin_name')) db.exec('ALTER TABLE agents ADD COLUMN plugin_name TEXT')
@@ -388,6 +392,8 @@ function wakeAgent(agentName, conversation, meta = {}) {
     ...(conversation ? { conversation } : {}),
     ...(meta.sender ? { sender: String(meta.sender).slice(0, 64) } : {}),
     ...(meta.subject ? { subject: String(meta.subject).slice(0, 120) } : {}),
+    // Let the receiver's waker bind this conversation to the session that started it.
+    ...(originSessionFor(conversation, agentName) ? { origin_session: originSessionFor(conversation, agentName) } : {}),
   })
   // Sign with the recipient's own secret; fall back to the deployment secret only for a
   // client that has not fetched its per-agent key yet (transitional).
@@ -405,6 +411,18 @@ function wakeAgent(agentName, conversation, meta = {}) {
     body,
     signal: AbortSignal.timeout(WAKE_TIMEOUT_MS),
   }).catch(() => {})
+}
+
+/**
+ * The session a woken agent started this conversation from: its own latest message in the
+ * conversation that carried an origin_session. Advisory only — the waker decides.
+ */
+function originSessionFor(conversation, agentName) {
+  if (!conversation) return null
+  const row = db
+    .prepare('SELECT origin_session FROM messages WHERE conversation = ? AND sender = ? AND origin_session IS NOT NULL ORDER BY created_at DESC LIMIT 1')
+    .get(conversation, agentName)
+  return row?.origin_session ?? null
 }
 
 /** Lazily mint one wake secret per agent; the value is only ever shown to its owner. */
@@ -623,8 +641,9 @@ function buildServer(agentName, agentHost, publicUrl) {
       no_reply: z.boolean().optional(),
       important: z.boolean().optional(),
       interrupt: z.boolean().optional(),
+      session: z.string().optional(),
     },
-    ({ to, body, subject, reply_to, conversation, no_reply, important, interrupt }) => {
+    ({ to, body, subject, reply_to, conversation, no_reply, important, interrupt, session }) => {
       assertText('to', to, MAX_RECIPIENT_BYTES)
       assertText('body', body, MAX_MESSAGE_BYTES)
       if (subject !== undefined) assertText('subject', subject, MAX_SUBJECT_BYTES)
@@ -632,13 +651,14 @@ function buildServer(agentName, agentHost, publicUrl) {
       const closing = no_reply === true ? 1 : 0
       const flagged = important === true ? 1 : 0
       const urgent = interrupt === true ? 1 : 0
+      const originSession = typeof session === 'string' && session.trim() ? session.trim().slice(0, 80) : null
       if (to === '*') {
         // Broadcast: one durable copy per other registered agent (still per-recipient, so
         // each side reads/marks its own inbox and the wake ping stays per agent).
         const recipients = db.prepare('SELECT name FROM agents WHERE name != ?').all(agentName).map((row) => row.name)
-        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         for (const name of recipients) {
-          insert.run(randomUUID(), agentName, name, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent)
+          insert.run(randomUUID(), agentName, name, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent, originSession)
           if (!closing) wakeAgent(name, conversation, { sender: agentName, subject })
         }
         return { to: '*', recipients: recipients.length, conversation: conversation ?? null, no_reply: Boolean(closing), note: 'broadcast to every other registered agent' }
@@ -646,8 +666,8 @@ function buildServer(agentName, agentHost, publicUrl) {
       if (to === agentName) throw new Error('refusing to send a message to yourself')
       const target = db.prepare('SELECT name FROM agents WHERE name = ?').get(to)
       const id = randomUUID()
-      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(id, agentName, to, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent)
+      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(id, agentName, to, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent, originSession)
       if (!closing) wakeAgent(to, conversation, { sender: agentName, subject })
       return {
         id,
@@ -1289,17 +1309,18 @@ async function handleRest(req, res, url) {
       const closing = body.no_reply === true ? 1 : 0
       const important = body.important === true || body.pinned === true
       const urgent = body.interrupt === true ? 1 : 0
+      const originSession = typeof body.session === 'string' && body.session.trim() ? body.session.trim().slice(0, 80) : null
       if (body.to === '*') {
         const recipients = db.prepare('SELECT name FROM agents WHERE name != ?').all(id.name).map((row) => row.name)
-        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         for (const name of recipients) {
-          insert.run(randomUUID(), id.name, name, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent)
+          insert.run(randomUUID(), id.name, name, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent, originSession)
           if (!closing) wakeAgent(name, conversation, { sender: id.name, subject: body.subject })
         }
         return sendJson(res, 201, { to: '*', recipients: recipients.length, conversation, no_reply: Boolean(closing) })
       }
-      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(messageId, id.name, body.to, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent)
+      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(messageId, id.name, body.to, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent, originSession)
       if (!closing) wakeAgent(body.to, conversation, { sender: id.name, subject: body.subject })
       return sendJson(res, 201, { id: messageId, to: body.to, conversation, no_reply: Boolean(closing) })
     }
@@ -1439,7 +1460,7 @@ async function handleRest(req, res, url) {
       const before = Number(q.get('before') ?? 0)
       const full = q.get('full') === '1'
       const rows = db.prepare(
-        `SELECT id, sender, recipient, subject, body, conversation, no_reply, pinned, interrupt, read_at, created_at, reply_to
+        `SELECT id, sender, recipient, subject, body, conversation, no_reply, pinned, interrupt, origin_session, read_at, created_at, reply_to
            FROM messages
           WHERE COALESCE(conversation, 'default') = ?
             AND (sender = ? OR recipient = ?)
