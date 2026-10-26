@@ -812,7 +812,6 @@ try {
       const [historyNote, setHistoryNote] = React.useState(null)
       const [leftWidth, setLeftWidth] = React.useState(250)
       const [peerFilter, setPeerFilter] = React.useState('')
-      const [bindings, setBindings] = React.useState(null)
       const [maintenanceNote, setMaintenanceNote] = React.useState(null)
 
       const startDrag = (event) => {
@@ -829,29 +828,6 @@ try {
         }
         window.addEventListener('mousemove', onMove)
         window.addEventListener('mouseup', onUp)
-      }
-
-      const loadBindings = async () => {
-        try {
-          const data = await json(BASE + '/mesh/admin/bindings')
-          setBindings(data.bindings ?? [])
-        } catch (error) {
-          setMaintenanceNote('读取绑定失败：' + error.message)
-        }
-      }
-
-      const unbind = async (conversation) => {
-        try {
-          await json(BASE + '/mesh/admin/unbind', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ conversation }),
-          })
-          setMaintenanceNote('已解除 ' + conversation + ' 的绑定')
-          await loadBindings()
-        } catch (error) {
-          setMaintenanceNote('解除失败：' + error.message)
-        }
       }
 
       const clearLocalCache = async () => {
@@ -1167,11 +1143,10 @@ try {
         historyNote ? h('div', { style: { fontSize: 12, opacity: 0.7, padding: '4px 0 8px' } }, historyNote) : null,
         h(
           Row,
-          { title: '绑定管理', description: '已绑定到 DSH 会话的 mesh 对话；解除后新邮件回到「Mesh 收件箱」' },
+          { title: '维护', description: '本地历史缓存与本机令牌；绑定管理在「Mesh 信箱」页面里' },
           h(
             'div',
             { style: { display: 'flex', gap: 8 } },
-            h(Btn, { onClick: () => void loadBindings() }, '列出绑定'),
             h(
               Btn,
               {
@@ -1190,35 +1165,6 @@ try {
             h(Btn, { onClick: () => void rotateToken() }, '轮换本机令牌'),
           ),
         ),
-        bindings && bindings.length
-          ? h(
-              'div',
-              { style: { display: 'flex', flexDirection: 'column', gap: 6, padding: '2px 0 10px' } },
-              bindings.map((binding) =>
-                h(
-                  'div',
-                  {
-                    key: binding.conversation,
-                    style: {
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 8,
-                      fontSize: 12,
-                      padding: '6px 8px',
-                      borderRadius: 6,
-                      background: 'var(--dsw-alias-bg-layer-1)',
-                      border: '0.5px solid var(--dsw-alias-border-l1)',
-                    },
-                  },
-                  h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, binding.conversation),
-                  h('span', { style: { opacity: 0.65 } }, binding.deliverTo ? '插队投递' : '仅展示'),
-                  h(Btn, { onClick: () => void unbind(binding.conversation) }, '解除'),
-                ),
-              ),
-            )
-          : bindings
-            ? h('div', { style: { fontSize: 12, opacity: 0.6, padding: '2px 0 10px' } }, '没有已绑定的对话')
-            : null,
         maintenanceNote ? h('div', { style: { fontSize: 12, opacity: 0.75, padding: '2px 0 8px' } }, maintenanceNote) : null,
         h(
           'div',
@@ -1293,7 +1239,7 @@ try {
                       h(
                         'span',
                         { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 } },
-                        convTitle(entry),
+                        convTitle(entry) + (isBoundConversation(entry.conversation) ? ' · 已绑定' : ''),
                       ),
                       entry.unread
                         ? h(
@@ -1952,12 +1898,28 @@ try {
         }
       }
 
+      const unbindHere = async () => {
+        if (!active) return
+        try {
+          await json(BASE + '/mesh/admin/unbind', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ conversation: active }),
+          })
+          setNote('已解除 ' + active + ' 的绑定，新邮件回到「Mesh 收件箱」')
+          await loadList(true)
+        } catch (error) {
+          setNote('解除失败：' + error.message)
+        }
+      }
+
       const openAllMail = () => {
         setPicker((previous) => !previous)
       }
 
       const boundConvs = boundTo(list, sessionId)
       const isBound = active && boundConvs.some((entry) => entry.conversation === active)
+      const isBoundConversation = (conversation) => boundConvs.some((entry) => entry.conversation === conversation)
       const activeEntry = list.find((entry) => entry.conversation === active)
       const unread = list.reduce((sum, entry) => sum + (entry.unread ?? 0), 0)
 
@@ -1991,7 +1953,28 @@ try {
           h('span', { style: { fontWeight: 600, flex: '0 0 auto' } }, 'Mesh 信箱'),
           unread ? h('span', { style: { fontSize: 10, padding: '1px 6px', borderRadius: 8, background: 'rgba(99,102,241,0.85)', color: '#fff' } }, unread + ' 未读') : null,
           h('div', { style: { flex: 1 } }),
-          active && sessionId && !isBound ? h(Btn, { onClick: bindHere, title: '把这个 mesh 会话绑定到当前 DSH 会话' }, '绑定') : null,
+          active && isBound
+            ? h(
+                'span',
+                { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                h(
+                  'span',
+                  {
+                    style: {
+                      fontSize: 10,
+                      padding: '1px 6px',
+                      borderRadius: 8,
+                      background: 'rgba(16,185,129,0.16)',
+                      color: 'var(--dsw-alias-state-success-primary, #2f9e6e)',
+                    },
+                  },
+                  '已绑定',
+                ),
+                h(Btn, { onClick: unbindHere, title: '解除这个 mesh 会话与当前 DSH 会话的绑定' }, '解除'),
+              )
+            : active && sessionId
+              ? h(Btn, { onClick: bindHere, title: '把这个 mesh 会话绑定到当前 DSH 会话' }, '绑定')
+              : null,
           h(
             'div',
             { style: { position: 'relative' }, 'data-mesh-picker': 'true' },
