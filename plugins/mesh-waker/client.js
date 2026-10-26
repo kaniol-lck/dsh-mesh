@@ -1239,7 +1239,7 @@ try {
                       h(
                         'span',
                         { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 } },
-                        convTitle(entry) + (isBoundConversation(entry.conversation) ? ' · 已绑定' : ''),
+                        convTitle(entry),
                       ),
                       entry.unread
                         ? h(
@@ -2061,7 +2061,7 @@ try {
                       fontWeight: entry.conversation === active ? 600 : 400,
                     },
                   },
-                  convTitle(entry),
+                  convTitle(entry) + (isBoundConversation(entry.conversation) ? ' · 已绑定' : ''),
                 ),
               ),
             )
