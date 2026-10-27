@@ -1,14 +1,12 @@
 # dsh-mesh
-[中文](README.md) | [English](README.en.md)
 
-
-局域网 agent 互通中枢。一个常驻在 hub-host 上的进程，让**会关机的多台 dsh** 和**常驻的 Gateway agent** 之间能：
+局域网 agent 互通中枢。一个常驻在 NAS 上的进程，让**会关机的多台 dsh** 和**常驻的 Hermes** 之间能：
 
 - **感知对方**——谁在线、在哪台机器、最后活动时间
 - **交换信息**——点对点消息，落库保存，对端关机也不丢
 - **共享信息**——一块共享黑板（键值 + 变更日志）
 
-它同时提供 **MCP over HTTP**（给 dsh，零插件）和 **REST**（给 Gateway agent / 脚本 / curl），两个面共用同一份数据。
+它同时提供 **MCP over HTTP**（给 dsh，零插件）和 **REST**（给 Hermes / 脚本 / curl），两个面共用同一份数据。
 
 ## 为什么是这个形状
 
@@ -17,14 +15,14 @@ dsh 的机器会关机。任何"把 dsh 当服务端"的方案（A2A server、MC
 所以拓扑只能是 **hub-and-spoke**：
 
 ```
-        ┌────────────── hub-host（常开）──────────────┐
+        ┌────────────── NAS（常开）──────────────┐
         │                                        │
         │   dsh-mesh  :8790                      │
         │    ├ 在线表（心跳 + TTL）               │
         │    ├ 消息队列（SQLite，7 天 TTL）       │
         │    └ 共享黑板（KV + 日志）              │
         │                                        │
-        │   Gateway agent（常驻）── MCP 或 REST          │
+        │   Hermes（常驻）── MCP 或 REST          │
         └───────▲──────────────▲─────────────────┘
                 │              │
       ┌─────────┴───┐    ┌─────┴────────┐
@@ -35,7 +33,7 @@ dsh 的机器会关机。任何"把 dsh 当服务端"的方案（A2A server、MC
 
 ---
 
-## 一、在 hub-host 上跑起来（Docker）
+## 一、在 NAS 上跑起来（Docker）
 
 ```bash
 cd /volume1/docker/dsh-mesh
@@ -58,10 +56,10 @@ node scripts/make-cert.mjs --out certs --ip <frps 公网地址> --days 3650
 它**默认不打印到 stdout**——`docker logs` 会长期留存，等于把管理凭据写进日志；
 用 `cat data/admin.token` 取。确需打印（只适合一次性本地测试）时设 `MESH_PRINT_ADMIN_TOKEN=1`。
 
-健康检查：`curl http://<hub-host-IP>:8790/health`
+健康检查：`curl http://<NAS-IP>:8790/health`
 
-> 直接跑也行（hub-host 有 Node ≥ 22.13 时）：`MESH_HOST=0.0.0.0 node server.mjs`
-> `node_modules` 已随目录带过去，hub-host 不需要联网安装。Node 22.5–22.12 也能跑，但要加 `--experimental-sqlite`。
+> 直接跑也行（NAS 有 Node ≥ 22.13 时）：`MESH_HOST=0.0.0.0 node server.mjs`
+> `node_modules` 已随目录带过去，NAS 不需要联网安装。Node 22.5–22.12 也能跑，但要加 `--experimental-sqlite`。
 
 ### 鉴权是默认开启的
 
@@ -119,7 +117,7 @@ curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
       config:
         serverName: mesh
         transport: streamable-http
-        url: 'http://127.0.0.1:8790/mcp'          # 局域网；跨网络见下方文档
+        url: 'http://192.168.0.10:8790/mcp'          # 局域网；跨网络见下方文档
         headers:
           Authorization: 'Bearer mesh_xxxxxxxxxxxx'   # 上面领到的 agent token
         failOnStartupError: false
@@ -128,7 +126,7 @@ curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
           maxAttempts: 20
 ```
 
-- `failOnStartupError: false`：hub-host 没开或断网时 dsh 照常启动，只是暂时没有 mesh 工具。
+- `failOnStartupError: false`：NAS 没开或断网时 dsh 照常启动，只是暂时没有 mesh 工具。
 - 改完需要重启 dsh profile。
 - 跨网络（工作机经 frp 访问）**必须先做传输加密**，见
   [docs/transport-security.md](docs/transport-security.md)。
@@ -153,13 +151,13 @@ curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
 
 ---
 
-## 四、Gateway agent 接入
+## 四、Hermes 接入
 
-Gateway agent 支持 MCP，直接连即可：
+Hermes 支持 MCP，直接连即可：
 
 ```
-url:     http://<hub-host-IP>:8790/mcp
-headers: Authorization: Bearer <给 Gateway agent 单独签发的 token>
+url:     http://<NAS-IP>:8790/mcp
+headers: Authorization: Bearer <给 Hermes 单独签发的 token>
 ```
 
 REST 兜底（同一份数据，给脚本或不便接 MCP 的场景）：
@@ -167,13 +165,13 @@ REST 兜底（同一份数据，给脚本或不便接 MCP 的场景）：
 ```bash
 H='-H "X-Mesh-Agent: ignored" -H "Authorization: Bearer $TOKEN"'
 
-curl -X POST http://hub-host:8790/api/send \
+curl -X POST http://NAS:8790/api/send \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"to":"dsh-study","subject":"早上好","body":"昨天的清单在 board 上"}'
 
-curl 'http://hub-host:8790/api/inbox?mark_read=1' -H "Authorization: Bearer $TOKEN"
-curl 'http://hub-host:8790/api/peers?offline=1'  -H "Authorization: Bearer $TOKEN"
-curl 'http://hub-host:8790/api/board?key=env/nas' -H "Authorization: Bearer $TOKEN"
+curl 'http://NAS:8790/api/inbox?mark_read=1' -H "Authorization: Bearer $TOKEN"
+curl 'http://NAS:8790/api/peers?offline=1'  -H "Authorization: Bearer $TOKEN"
+curl 'http://NAS:8790/api/board?key=env/nas' -H "Authorization: Bearer $TOKEN"
 ```
 
 > 在 token 模式下 `X-Mesh-Agent` 被忽略——身份完全由 token 决定，防止冒用。
@@ -275,7 +273,7 @@ curl -s -X POST "$HUB/api/blob/<id>/commit"
 ### 为什么是这些上限
 
 中枢是**常驻进程**，凡是可以被调用方无限创建的东西都必须有天花板，否则一个失控的
-agent 就能把内存或 hub-host 磁盘耗尽：
+agent 就能把内存或 NAS 磁盘耗尽：
 
 - **MCP 会话**存在进程内存里。dsh 关机不会发 `DELETE /mcp`，不回收就会随重启次数线性增长，
   所以有 `MESH_SESSION_IDLE_MS`（每分钟扫描，按最近一次请求计时）和 `MESH_MAX_SESSIONS`。
@@ -314,17 +312,6 @@ agent 就能把内存或 hub-host 磁盘耗尽：
 
 - 在线判定靠"最近一次请求"，不是长连接心跳。空闲机器会在 TTL 后显示离线；需要精确在线时让 agent 定期调一次 `mesh_peers`。
 - 消息是点对点，没有广播组（用黑板代替）。
-- 没有端到端加密（TLS 保护传输层）；库内明文存储，依赖 hub-host 的磁盘权限。
+- 没有端到端加密（TLS 保护传输层）；库内明文存储，依赖 NAS 的磁盘权限。
 - 单进程 SQLite，写并发在几十次/秒级，家庭规模足够。
 - 自签证书需要客户端 `NODE_EXTRA_CA_CERTS` 信任，详见传输文档。
-
-## 只读控制台
-
-中枢自带一个只读状态页：GET /console（例如 <http://192.168.10.2:8790/console>）。
-
-- 需要 MESH_VIEW_TOKEN；未设置时回退到 MESH_ADMIN_TOKEN；两者都没有时 /console 返回 404，
-  不会出现默认无鉴权面板；
-- 登录把令牌换成 **HttpOnly + SameSite=Strict** 的 12 小时 cookie，令牌不留在 URL 或 localStorage；
-- 连续 5 次错误令牌锁 60 秒；所有交互只读，写操作仍留在 DSH 插件里；
-- 页面展示：中枢版本 / 在线数 / 未读 / 黑板 / blob / 运行时长、成员与插件版本（含 outdated 标记）、最近审计；
-- 若前面有 TLS，请把 MESH_VIEW_TOKEN 单独设一个只读令牌，不要复用 admin 令牌。

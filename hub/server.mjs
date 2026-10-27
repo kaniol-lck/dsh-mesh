@@ -32,11 +32,14 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.8'
+const HUB_VERSION = '0.7.9'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
 const VIEW_TOKEN = process.env.MESH_VIEW_TOKEN || process.env.MESH_ADMIN_TOKEN || null
+// Who may even open the console. Default: loopback + RFC1918, because a management page on
+// a plain-HTTP LAN is only acceptable when it cannot be reached from outside that LAN.
+const CONSOLE_ALLOW = String(process.env.MESH_CONSOLE_ALLOW ?? '').trim()
 import { DatabaseSync } from 'node:sqlite'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
@@ -238,6 +241,12 @@ CREATE TABLE IF NOT EXISTS blobs (
   // delivery_mode: what the sender would like the receiver's waker to do with this message
   // (queue | steer | branch). Advisory: the receiver's local policy and rate caps still win.
   if (!messageColumns.some((c) => c.name === 'delivery_mode')) db.exec('ALTER TABLE messages ADD COLUMN delivery_mode TEXT')
+  // Console P1: least privilege per agent. Empty scopes means the historical full set, so
+  // existing nodes keep working after the upgrade.
+  if (!agentColumns.some((c) => c.name === 'scopes')) db.exec('ALTER TABLE agents ADD COLUMN scopes TEXT')
+  if (!agentColumns.some((c) => c.name === 'allowed_cidrs')) db.exec('ALTER TABLE agents ADD COLUMN allowed_cidrs TEXT')
+  if (!agentColumns.some((c) => c.name === 'token_expires_at')) db.exec('ALTER TABLE agents ADD COLUMN token_expires_at INTEGER')
+  if (!agentColumns.some((c) => c.name === 'token_issued_at')) db.exec('ALTER TABLE agents ADD COLUMN token_issued_at INTEGER')
   // Self-reported plugin identity: advisory only (an agent can lie), used to surface version
   // drift and compatibility hints in /api/peers and /api/status.
   if (!agentColumns.some((c) => c.name === 'plugin_name')) db.exec('ALTER TABLE agents ADD COLUMN plugin_name TEXT')
@@ -454,6 +463,52 @@ function ensureWakeSecret(agentName) {
 const hashToken = (token) => createHash('sha256').update(token).digest('hex')
 const mintToken = (prefix = 'mesh') => `${prefix}_${randomBytes(32).toString('base64url')}`
 
+const ALL_SCOPES = ['read', 'send', 'board', 'blob']
+const TOOL_SCOPE = {
+  mesh_send: 'send',
+  mesh_board_set: 'board',
+  mesh_blob_upload: 'blob',
+  mesh_blob_download: 'blob',
+  mesh_blob_list: 'blob',
+  mesh_blob_delete: 'blob',
+}
+
+function scopesOfRow(row) {
+  const raw = String(row?.scopes ?? '').trim()
+  if (!raw) return ALL_SCOPES
+  const parsed = raw.split(',').map((s) => s.trim()).filter(Boolean)
+  return ALL_SCOPES.filter((scope) => parsed.includes(scope))
+}
+
+function ipInCidr(ip, cidr) {
+  const [network, bitsRaw] = String(cidr).trim().split('/')
+  const bits = Number(bitsRaw ?? 32)
+  const toInt = (value) => {
+    const parts = String(value).trim().split('.')
+    if (parts.length !== 4) return null
+    let result = 0
+    for (const part of parts) {
+      const octet = Number(part)
+      if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null
+      result = (result << 8) | octet
+    }
+    return result >>> 0
+  }
+  const a = toInt(ip)
+  const b = toInt(network)
+  if (a === null || b === null || !Number.isInteger(bits) || bits < 0 || bits > 32) return false
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
+  return (a & mask) === (b & mask)
+}
+
+function ipAllowed(ip, row) {
+  const raw = String(row?.allowed_cidrs ?? '').trim()
+  if (!raw) return true
+  const list = raw.split(',').map((entry) => entry.trim()).filter(Boolean)
+  if (!list.length) return true
+  return list.some((entry) => (entry.includes('/') ? ipInCidr(ip, entry) : entry === ip))
+}
+
 function bearerOf(req) {
   const auth = String(req.headers['authorization'] ?? '')
   return auth.startsWith('Bearer ') ? auth.slice(7).trim() : undefined
@@ -517,11 +572,20 @@ function resolveIdentity(req) {
   }
 
   const token = bearerOf(req)
-  const row = token ? db.prepare('SELECT name FROM agents WHERE token_hash = ?').get(hashToken(token)) : undefined
+  const row = token
+    ? db.prepare('SELECT name, scopes, allowed_cidrs, token_expires_at FROM agents WHERE token_hash = ?').get(hashToken(token))
+    : undefined
   if (token && row) {
-    // A good token always wins, and resets this caller's failure streak.
     clearFailures(ip)
-    return { ok: true, name: row.name, host: headerValue(req, 'x-mesh-host'), ip }
+    if (row.token_expires_at && Number(row.token_expires_at) <= now()) {
+      audit('auth.expired', row.name, ip, false)
+      return { ok: false, status: 401, reason: 'token expired; rotate or re-enroll this agent', ip }
+    }
+    if (!ipAllowed(ip, row)) {
+      audit('auth.ip_blocked', row.name, ip, false)
+      return { ok: false, status: 403, reason: `source address ${ip} is not in this agent's allowlist`, ip }
+    }
+    return { ok: true, name: row.name, host: headerValue(req, 'x-mesh-host'), ip, scopes: scopesOfRow(row) }
   }
 
   // Only the failing path is throttled, and only the first FAIL_LIMIT misses per
@@ -571,6 +635,14 @@ function buildServer(agentName, agentHost, publicUrl) {
 
   const tool = (name, description, inputSchema, handler) => {
     server.registerTool(name, { description, inputSchema }, async (args, _extra) => {
+      const required = TOOL_SCOPE[name]
+      if (required) {
+        const row = db.prepare('SELECT scopes FROM agents WHERE name = ?').get(agentName)
+        const granted = scopesOfRow(row)
+        if (!granted.includes(required)) {
+          return { isError: true, content: [{ type: 'text', text: `${name} requires scope "${required}"; this agent has: ${granted.join(', ') || 'none'}` }] }
+        }
+      }
       touchAgent(agentName, agentHost)
       try {
         return text(await handler(args ?? {}))
@@ -1006,23 +1078,42 @@ function parseCookies(req) {
   return jar
 }
 
+function consoleAllowed(ip) {
+  const entries = CONSOLE_ALLOW
+    ? CONSOLE_ALLOW.split(',').map((entry) => entry.trim()).filter(Boolean)
+    : ['127.0.0.1', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
+  return entries.some((entry) => (entry.includes('/') ? ipInCidr(ip, entry) : entry === ip))
+}
+
+function tokenMatches(offered, expected) {
+  return Boolean(expected) && offered.length === expected.length && timingSafeEqual(Buffer.from(offered), Buffer.from(expected))
+}
+
+/** Returns { role: 'admin' | 'view', csrf } or null. */
 function consoleAuthorized(req) {
-  if (!VIEW_TOKEN) return false
-  // A bearer token also works, so scripts and curl do not need the cookie dance.
   const header = String(req.headers.authorization ?? '')
   if (header.startsWith('Bearer ')) {
     const offered = header.slice(7).trim()
-    if (offered.length === VIEW_TOKEN.length && timingSafeEqual(Buffer.from(offered), Buffer.from(VIEW_TOKEN))) return true
+    if (tokenMatches(offered, ADMIN_TOKEN)) return { role: 'admin', csrf: null }
+    if (tokenMatches(offered, VIEW_TOKEN)) return { role: 'view', csrf: null }
+    return null
   }
   const session = parseCookies(req).mesh_console
-  if (!session) return false
-  const expires = consoleSessions.get(session)
-  if (!expires) return false
-  if (expires < Date.now()) {
+  if (!session) return null
+  const record = consoleSessions.get(session)
+  if (!record) return null
+  if (record.expires < Date.now()) {
     consoleSessions.delete(session)
-    return false
+    return null
   }
-  return true
+  return record
+}
+
+function csrfOk(req, auth) {
+  if (auth.role !== 'admin') return false
+  if (!auth.csrf) return true // bearer admin: no ambient cookie, nothing to forge
+  const offered = String(req.headers['x-mesh-csrf'] ?? '')
+  return offered.length === auth.csrf.length && timingSafeEqual(Buffer.from(offered), Buffer.from(auth.csrf))
 }
 
 function sendHtml(res, status, body, extraHeaders) {
@@ -1043,7 +1134,7 @@ const CONSOLE_STYLE = `
 * { box-sizing: border-box; }
 body { margin: 0; font: 14px/1.55 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
        background: #f6f7f9; color: #1c1f23; }
-@media (prefers-color-scheme: dark) { body { background: #16181c; color: #e6e8eb; } .card { background: #1f2227 !important; border-color: #2c3036 !important; } th { color: #9aa0a6 !important; } td, th { border-color: #2c3036 !important; } }
+@media (prefers-color-scheme: dark) { body { background: #16181c; color: #e6e8eb; } .card { background: #1f2227 !important; border-color: #2c3036 !important; } th { color: #9aa0a6 !important; } td, th { border-color: #2c3036 !important; } input, select { background: #1f2227; color: #e6e8eb; border-color: #2c3036; } }
 main { max-width: 1040px; margin: 0 auto; padding: 28px 20px 60px; }
 h1 { font-size: 20px; margin: 0 0 4px; }
 .sub { color: #6b7280; font-size: 12.5px; margin-bottom: 22px; }
@@ -1053,18 +1144,22 @@ h1 { font-size: 20px; margin: 0 0 4px; }
 .card .v { font-size: 22px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
 h2 { font-size: 14px; margin: 26px 0 10px; }
 table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; }
-th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #eef0f2; font-size: 13px; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #eef0f2; font-size: 13px; vertical-align: top; }
 th { color: #6b7280; font-weight: 600; font-size: 12px; }
 tr:last-child td { border-bottom: none; }
 .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11.5px; border: 1px solid transparent; }
 .ok { color: #15803d; background: #dcfce7; border-color: #bbf7d0; }
 .warn { color: #b45309; background: #fef3c7; border-color: #fde68a; }
 .off { color: #6b7280; background: #f1f3f5; border-color: #e5e7eb; }
-form { max-width: 360px; }
-input[type=password] { width: 100%; padding: 9px 11px; border-radius: 8px; border: 1px solid #d1d5db; font-size: 14px; }
-button { margin-top: 10px; padding: 8px 16px; border-radius: 8px; border: 1px solid #111827;
-         background: #111827; color: #fff; font-size: 13.5px; cursor: pointer; }
+form.inline { display: inline-block; margin: 0 6px 0 0; }
+input[type=password], input[type=text] { padding: 7px 10px; border-radius: 8px; border: 1px solid #d1d5db; font-size: 13px; }
+button { margin-top: 6px; padding: 6px 12px; border-radius: 8px; border: 1px solid #111827;
+         background: #111827; color: #fff; font-size: 13px; cursor: pointer; }
+button.danger { background: #b91c1c; border-color: #b91c1c; }
+.token { font-family: ui-monospace, Consolas, monospace; font-size: 13px; padding: 10px 12px;
+         background: #f1f3f5; border: 1px dashed #9ca3af; border-radius: 8px; word-break: break-all; }
 .err { color: #b91c1c; margin: 8px 0 0; font-size: 13px; }
+.muted { color: #6b7280; font-size: 12px; }
 `
 
 function consoleLoginPage(error) {
@@ -1072,37 +1167,67 @@ function consoleLoginPage(error) {
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>dsh-mesh 控制台</title>
 <style>${CONSOLE_STYLE}</style></head><body><main>
 <h1>dsh-mesh 控制台</h1>
-<p class="sub">只读视图 · 仅展示状态，不提供任何写操作</p>
+<p class="sub">只读令牌：看状态 · 管理员令牌：可铸令牌、改权限、吊销节点</p>
 <form method="post" action="/console/login">
-  <input type="password" name="token" placeholder="view token" autocomplete="current-password" autofocus>
+  <input type="password" name="token" placeholder="view / admin token" autocomplete="current-password" autofocus>
   <button type="submit">进入</button>
   ${error ? `<p class="err">${error}</p>` : ''}
 </form>
 </main></body></html>`
 }
 
-function consolePage() {
+function consoleTokenPage(title, name, token, note) {
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>${title}</title><style>${CONSOLE_STYLE}</style></head><body><main>
+<h1>${title}</h1>
+<p class="sub">${note}</p>
+<p class="muted">agent: <b>${name}</b></p>
+<p class="token">${token}</p>
+<p class="muted">只显示这一次，中枢只保存 SHA-256。写进节点侧 <code>~/.dsh/mesh-waker/token</code> 后重载插件。</p>
+<p><a href="/console">返回控制台</a></p>
+</main></body></html>`
+}
+
+function consolePage(auth) {
+  const csrf = auth.csrf ?? ''
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>dsh-mesh 控制台</title>
 <style>${CONSOLE_STYLE}</style></head><body><main>
-<h1>dsh-mesh 控制台</h1>
+<h1>dsh-mesh 控制台 <span class="badge ${auth.role === 'admin' ? 'ok' : 'off'}">${auth.role === 'admin' ? '管理员' : '只读'}</span></h1>
 <p class="sub" id="sub">加载中…</p>
 <div class="grid" id="cards"></div>
 <h2>成员与插件版本</h2>
 <table><thead><tr><th>agent</th><th>状态</th><th>插件</th><th>版本</th><th>兼容</th><th>最后活动</th></tr></thead>
 <tbody id="peers"></tbody></table>
+
+<h2>节点权限与令牌</h2>
+<p class="muted">scope：read（读消息/黑板）· send（发消息）· board（写黑板）· blob（文件）。IP 白名单留空=不限；填 CIDR 用逗号分隔。</p>
+<table><thead><tr><th>agent</th><th>scopes</th><th>IP 白名单</th><th>令牌过期</th><th>操作</th></tr></thead>
+<tbody id="agents"></tbody></table>
+<p class="muted" id="adminNote"></p>
+
 <h2>审计（最近 20 条）</h2>
 <table><thead><tr><th>时间</th><th>agent</th><th>动作</th><th>结果</th></tr></thead>
 <tbody id="audit"></tbody></table>
 <script>
+const ROLE = ${JSON.stringify(auth.role)};
+const CSRF = ${JSON.stringify(csrf)};
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const card = (label, value) => '<div class="card"><div class="k">' + esc(label) + '</div><div class="v">' + esc(value) + '</div></div>';
+const ALL_SCOPES = ['read', 'send', 'board', 'blob'];
+async function post(path, payload) {
+  const response = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json', 'x-mesh-csrf': CSRF }, body: JSON.stringify(payload) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) { alert(data.error || ('HTTP ' + response.status)); return null; }
+  return data;
+}
 async function refresh() {
   try {
-    const [overview, peers, audit] = await Promise.all([
+    const [overview, peers, audit, agents] = await Promise.all([
       fetch('/console/api/overview').then((r) => r.json()),
       fetch('/console/api/peers').then((r) => r.json()),
       fetch('/console/api/audit?limit=20').then((r) => r.json()),
+      fetch('/console/api/agents').then((r) => r.json()),
     ]);
     document.getElementById('sub').textContent =
       '中枢 ' + (overview.hub?.version ?? '?') + ' · 最低要求 waker ' + (overview.hub?.min_waker ?? '?') +
@@ -1124,16 +1249,58 @@ async function refresh() {
         '<td>' + esc(plugin.name || '—') + '</td><td>' + esc(plugin.version || '—') + '</td>' +
         '<td>' + compat + '</td><td>' + esc((p.last_seen_seconds_ago ?? 0) + 's 前') + '</td></tr>';
     }).join('');
+    const isAdmin = ROLE === 'admin';
+    document.getElementById('agents').innerHTML = (agents.agents || []).map((a) => {
+      const scopeBoxes = ALL_SCOPES.map((scope) =>
+        '<label style="margin-right:6px"><input type="checkbox" data-scope="' + scope + '" ' +
+        ((a.scopes || ALL_SCOPES).includes(scope) ? 'checked' : '') + (isAdmin ? '' : ' disabled') + '> ' + scope + '</label>'
+      ).join('');
+      const cidrs = '<input type="text" data-cidrs value="' + esc((a.allowed_cidrs || '')) + '" placeholder="192.168.10.0/24,10.0.0.0/8" size="22"' + (isAdmin ? '' : ' disabled') + '>';
+      const expiry = a.token_expires_at ? new Date(a.token_expires_at).toLocaleDateString() : '不过期';
+      const actions = isAdmin
+        ? '<button data-act="save">保存</button> ' +
+          '<button data-act="rotate" class="danger">轮换</button> ' +
+          '<button data-act="revoke" class="danger">吊销</button>'
+        : '<span class="muted">只读</span>';
+      return '<tr data-name="' + esc(a.name) + '"><td>' + esc(a.name) + '</td><td>' + scopeBoxes + '</td>' +
+        '<td>' + cidrs + '</td><td>' + esc(expiry) + '</td><td>' + actions + '</td></tr>';
+    }).join('');
+    document.getElementById('adminNote').textContent = isAdmin
+      ? '管理员会话：可直接改权限；轮换/吊销会立即影响对应节点。'
+      : '只读会话：如需修改权限或令牌，请用管理员令牌登录。';
     document.getElementById('audit').innerHTML = (audit.entries || []).map((row) =>
       '<tr><td>' + esc(new Date(row.at).toLocaleTimeString()) + '</td><td>' + esc(row.agent || '—') + '</td>' +
       '<td>' + esc(row.action) + '</td><td>' + (row.ok ? '<span class="badge ok">ok</span>' : '<span class="badge warn">fail</span>') + '</td></tr>'
     ).join('');
   } catch (error) {
-    document.getElementById('sub').textContent = '刷新失败：' + error.message;
+    document.getElementById('sub').textContent = '读取失败：' + error.message;
   }
 }
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('button[data-act]');
+  if (!button) return;
+  const row = button.closest('tr');
+  const name = row.getAttribute('data-name');
+  const act = button.getAttribute('data-act');
+  if (act === 'save') {
+    const scopes = [...row.querySelectorAll('input[data-scope]')].filter((box) => box.checked).map((box) => box.dataset.scope);
+    const cidrs = row.querySelector('input[data-cidrs]').value;
+    const result = await post('/console/agents/update', { name, scopes, allowed_cidrs: cidrs });
+    if (result) refresh();
+  }
+  if (act === 'rotate') {
+    if (!confirm('轮换 ' + name + ' 的令牌？旧令牌立即失效。')) return;
+    const result = await post('/console/agents/rotate', { name });
+    if (result) { alert('新令牌（只显示一次）：\n\n' + result.token); refresh(); }
+  }
+  if (act === 'revoke') {
+    if (!confirm('吊销 ' + name + '？该节点将无法认证，需重新注册。')) return;
+    const result = await post('/console/agents/revoke', { name });
+    if (result) refresh();
+  }
+});
 refresh();
-setInterval(refresh, 5000);
+setInterval(refresh, 15000);
 </script>
 </main></body></html>`
 }
@@ -1144,8 +1311,14 @@ async function handleConsole(req, res, url) {
     res.end('{"error":"console disabled: set MESH_VIEW_TOKEN (or MESH_ADMIN_TOKEN)"}')
     return
   }
-  const path = url.pathname
   const ip = clientIp(req)
+  if (!consoleAllowed(ip)) {
+    audit('console_blocked', null, ip, false)
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end('console is not reachable from this address (MESH_CONSOLE_ALLOW)')
+    return
+  }
+  const path = url.pathname
 
   if (path === '/console/login' && req.method === 'POST') {
     const raw = (await readBody(req, 4096)).toString('utf8')
@@ -1155,9 +1328,8 @@ async function handleConsole(req, res, url) {
       sendHtml(res, 429, consoleLoginPage('尝试过于频繁，请稍后再试'))
       return
     }
-    const matches =
-      offered.length === VIEW_TOKEN.length && timingSafeEqual(Buffer.from(offered), Buffer.from(VIEW_TOKEN))
-    if (!matches) {
+    const role = tokenMatches(offered, ADMIN_TOKEN) ? 'admin' : tokenMatches(offered, VIEW_TOKEN) ? 'view' : null
+    if (!role) {
       record.count += 1
       if (record.count >= 5) {
         record.count = 0
@@ -1169,8 +1341,8 @@ async function handleConsole(req, res, url) {
       return
     }
     const session = randomBytes(24).toString('hex')
-    consoleSessions.set(session, Date.now() + CONSOLE_SESSION_MS)
-    audit('console_login', null, ip, true)
+    consoleSessions.set(session, { expires: Date.now() + CONSOLE_SESSION_MS, role, csrf: randomBytes(16).toString('hex') })
+    audit(role === 'admin' ? 'console_login_admin' : 'console_login', null, ip, true)
     sendHtml(res, 303, '', {
       location: '/console',
       'set-cookie': `mesh_console=${session}; HttpOnly; SameSite=Strict; Path=/console; Max-Age=${CONSOLE_SESSION_MS / 1000}`,
@@ -1186,16 +1358,18 @@ async function handleConsole(req, res, url) {
   }
 
   if (path === '/console' && req.method === 'GET') {
-    if (!consoleAuthorized(req)) {
+    const auth = consoleAuthorized(req)
+    if (!auth) {
       sendHtml(res, 401, consoleLoginPage(''))
       return
     }
-    sendHtml(res, 200, consolePage())
+    sendHtml(res, 200, consolePage(auth))
     return
   }
 
   if (path.startsWith('/console/api/') && req.method === 'GET') {
-    if (!consoleAuthorized(req)) return sendJson(res, 401, { error: 'unauthorized' })
+    const auth = consoleAuthorized(req)
+    if (!auth) return sendJson(res, 401, { error: 'unauthorized' })
     if (path === '/console/api/overview') {
       const ts = Date.now()
       const blobStats = db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS bytes FROM blobs').get()
@@ -1207,6 +1381,7 @@ async function handleConsole(req, res, url) {
         board_entries: db.prepare('SELECT COUNT(*) AS n FROM board').get().n,
         blobs: blobStats,
         uptime_seconds: Math.round(process.uptime()),
+        role: auth.role,
       })
     }
     if (path === '/console/api/peers') {
@@ -1228,12 +1403,83 @@ async function handleConsole(req, res, url) {
         })),
       })
     }
+    if (path === '/console/api/agents') {
+      const rows = db.prepare('SELECT name, host, scopes, allowed_cidrs, token_expires_at, token_issued_at, last_seen, token_hash FROM agents ORDER BY name').all()
+      return sendJson(res, 200, {
+        agents: rows.map((r) => ({
+          name: r.name,
+          host: r.host,
+          scopes: scopesOfRow(r),
+          allowed_cidrs: r.allowed_cidrs ?? '',
+          token_expires_at: r.token_expires_at ?? null,
+          token_issued_at: r.token_issued_at ?? null,
+          has_token: Boolean(r.token_hash),
+          last_seen: r.last_seen,
+        })),
+      })
+    }
     if (path === '/console/api/audit') {
       const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit') ?? 20) || 20))
       const rows = db.prepare('SELECT at, agent, action, ok FROM audit ORDER BY at DESC LIMIT ?').all(limit)
       return sendJson(res, 200, { entries: rows })
     }
     return sendJson(res, 404, { error: 'unknown console endpoint' })
+  }
+
+  if (path.startsWith('/console/agents/') && req.method === 'POST') {
+    const auth = consoleAuthorized(req)
+    if (!auth || auth.role !== 'admin') return sendJson(res, 403, { error: 'admin role required' })
+    if (!csrfOk(req, auth)) return sendJson(res, 403, { error: 'bad csrf token' })
+    let body
+    try {
+      body = await readJson(req)
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message })
+    }
+    const name = String(body.name ?? '').trim()
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: 'invalid agent name' })
+    const action = path.slice('/console/agents/'.length)
+    if (action === 'update') {
+      const scopes = Array.isArray(body.scopes) ? body.scopes.filter((scope) => ALL_SCOPES.includes(scope)) : []
+      const cidrs = String(body.allowed_cidrs ?? '').trim()
+      if (cidrs && !cidrs.split(',').every((entry) => /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(entry.trim()))) {
+        return sendJson(res, 400, { error: 'allowed_cidrs must be comma separated IPv4 or IPv4/CIDR' })
+      }
+      db.prepare('UPDATE agents SET scopes = ?, allowed_cidrs = ? WHERE name = ?').run(scopes.join(','), cidrs || null, name)
+      audit('console.scopes', name, ip, true)
+      return sendJson(res, 200, { ok: true, name, scopes, allowed_cidrs: cidrs })
+    }
+    if (action === 'rotate') {
+      const row = db.prepare('SELECT name FROM agents WHERE name = ?').get(name)
+      if (!row) return sendJson(res, 404, { error: 'unknown agent' })
+      const token = mintToken('mesh')
+      db.prepare('UPDATE agents SET token_hash = ?, token_issued_at = ? WHERE name = ?').run(hashToken(token), now(), name)
+      audit('console.rotate', name, ip, true)
+      return sendJson(res, 200, { ok: true, name, token })
+    }
+    if (action === 'revoke') {
+      db.prepare('UPDATE agents SET token_hash = NULL WHERE name = ?').run(name)
+      audit('console.revoke', name, ip, true)
+      return sendJson(res, 200, { ok: true, name, revoked: true })
+    }
+    return sendJson(res, 404, { error: 'unknown action' })
+  }
+
+  if (path === '/console/enroll-code' && req.method === 'POST') {
+    const auth = consoleAuthorized(req)
+    if (!auth || auth.role !== 'admin') return sendJson(res, 403, { error: 'admin role required' })
+    if (!csrfOk(req, auth)) return sendJson(res, 403, { error: 'bad csrf token' })
+    let body
+    try {
+      body = await readJson(req)
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message })
+    }
+    const name = body.name === undefined ? '' : String(body.name).trim()
+    if (name && !/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: 'invalid agent name' })
+    const code = mintEnrollCode(name || null)
+    audit('admin.enroll_code', name || null, ip, true)
+    return sendJson(res, 201, { code, name: name || null, expires_in_seconds: ENROLL_CODE_TTL_MS / 1000 })
   }
 
   res.writeHead(404, { 'content-type': 'application/json' })
