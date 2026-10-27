@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.9'
+const HUB_VERSION = '0.7.10'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
@@ -1291,7 +1291,7 @@ document.addEventListener('click', async (event) => {
   if (act === 'rotate') {
     if (!confirm('轮换 ' + name + ' 的令牌？旧令牌立即失效。')) return;
     const result = await post('/console/agents/rotate', { name });
-    if (result) { alert('新令牌（只显示一次）：\n\n' + result.token); refresh(); }
+    if (result) { alert('新令牌（只显示一次）：\\n\\n' + result.token); refresh(); }
   }
   if (act === 'revoke') {
     if (!confirm('吊销 ' + name + '？该节点将无法认证，需重新注册。')) return;
