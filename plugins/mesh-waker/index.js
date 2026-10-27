@@ -72,6 +72,7 @@ const WAKE_PROMPT = [
 
 const SAVED_CONFIG_KEYS = [
   'boundDeliveryMode',
+  'allowSenderDeliveryMode',
   'branchReuseHours',
   'branchTitlePrefix',
   'delivery',
@@ -154,6 +155,8 @@ function normalizeBase(config) {
     boundDeliveryMode: ['queue', 'steer', 'branch'].includes(String(c.boundDeliveryMode))
       ? String(c.boundDeliveryMode)
       : 'queue',
+    // Whether a sender may pick the delivery mode (queue | steer | branch) per message.
+    allowSenderDeliveryMode: c.allowSenderDeliveryMode !== false,
     maxSteerPerWindow: Number(c.maxSteerPerWindow ?? 1),
     steerWindowMs: Number(c.steerWindowMs ?? 60_000),
     branchReuseHours: Number(c.branchReuseHours ?? 12),
@@ -767,6 +770,16 @@ export function apply(ctx, config) {
     return c.sessionTitle
   }
 
+  /** The mode the newest message asked for, when the receiver allows senders to choose. */
+  function requestedDeliveryMode(messages) {
+    if (!c.allowSenderDeliveryMode) return null
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const requested = messages[index]?.delivery_mode
+      if (requested === 'queue' || requested === 'steer' || requested === 'branch') return requested
+    }
+    return null
+  }
+
   /** Fork a session, trying the services a host may expose. Returns the child id. */
   async function forkSession(sourceSessionId) {
     const attempts = [
@@ -826,9 +839,9 @@ export function apply(ctx, config) {
    */
   const steerHistory = new Map()
 
-  function steerModeFor(sessionId, messages) {
+  function steerModeFor(sessionId, messages, forceSteer = false) {
     const wanted = Array.isArray(messages) && messages.some((m) => m.interrupt === 1 || m.interrupt === true)
-    let mode = wanted ? 'steer' : c.boundDeliveryMode
+    let mode = forceSteer || wanted ? 'steer' : c.boundDeliveryMode
     if (mode !== 'steer') return 'queue'
     const now = Date.now()
     const record = steerHistory.get(sessionId) ?? { count: 0, since: 0 }
@@ -936,8 +949,10 @@ export function apply(ctx, config) {
       try {
         const built = await buildContent(meta, messages)
         applyTrustPolicy(target, trustFor(meta.sender))
-        const mode = steerModeFor(target, messages)
-        if (c.boundDeliveryMode === 'branch' && mode === 'queue') {
+        const requested = requestedDeliveryMode(messages)
+        const wanted = requested ?? (steerModeFor(target, messages) === 'steer' ? 'steer' : c.boundDeliveryMode)
+        const mode = wanted === 'steer' ? steerModeFor(target, messages, requested === 'steer') : 'queue'
+        if (wanted === 'branch') {
           const branch = await ensureBranchSession(conversation, entry, meta, target)
           applyTrustPolicy(branch, trustFor(meta.sender))
           await promptWithResume(branch, built.parts, 'queue')
@@ -1115,6 +1130,7 @@ export function apply(ctx, config) {
     trustByPeer: trustOverrides,
     delivery: c.delivery,
     boundDeliveryMode: c.boundDeliveryMode,
+    allowSenderDeliveryMode: c.allowSenderDeliveryMode,
     branchReuseHours: c.branchReuseHours,
     catchUpOnStart: c.catchUpOnStart,
     catchUpDelayMs: c.catchUpDelayMs,
@@ -1196,6 +1212,7 @@ export function apply(ctx, config) {
       }
       next.boundDeliveryMode = String(patch.boundDeliveryMode)
     }
+    if (patch.allowSenderDeliveryMode !== undefined) next.allowSenderDeliveryMode = Boolean(patch.allowSenderDeliveryMode)
     if (patch.branchReuseHours !== undefined) {
       const hours = Number(patch.branchReuseHours)
       if (!Number.isFinite(hours) || hours <= 0) throw new Error('branchReuseHours must be a positive number')

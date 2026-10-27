@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.6'
+const HUB_VERSION = '0.7.7'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
@@ -235,6 +235,9 @@ CREATE TABLE IF NOT EXISTS blobs (
   // A reply's wake carries it back so the sender's waker can bind the conversation to the
   // session that actually started it.
   if (!messageColumns.some((c) => c.name === 'origin_session')) db.exec('ALTER TABLE messages ADD COLUMN origin_session TEXT')
+  // delivery_mode: what the sender would like the receiver's waker to do with this message
+  // (queue | steer | branch). Advisory: the receiver's local policy and rate caps still win.
+  if (!messageColumns.some((c) => c.name === 'delivery_mode')) db.exec('ALTER TABLE messages ADD COLUMN delivery_mode TEXT')
   // Self-reported plugin identity: advisory only (an agent can lie), used to surface version
   // drift and compatibility hints in /api/peers and /api/status.
   if (!agentColumns.some((c) => c.name === 'plugin_name')) db.exec('ALTER TABLE agents ADD COLUMN plugin_name TEXT')
@@ -642,8 +645,9 @@ function buildServer(agentName, agentHost, publicUrl) {
       important: z.boolean().optional(),
       interrupt: z.boolean().optional(),
       session: z.string().optional(),
+      delivery: z.enum(['queue', 'steer', 'branch']).optional(),
     },
-    ({ to, body, subject, reply_to, conversation, no_reply, important, interrupt, session }) => {
+    ({ to, body, subject, reply_to, conversation, no_reply, important, interrupt, session, delivery }) => {
       assertText('to', to, MAX_RECIPIENT_BYTES)
       assertText('body', body, MAX_MESSAGE_BYTES)
       if (subject !== undefined) assertText('subject', subject, MAX_SUBJECT_BYTES)
@@ -656,9 +660,9 @@ function buildServer(agentName, agentHost, publicUrl) {
         // Broadcast: one durable copy per other registered agent (still per-recipient, so
         // each side reads/marks its own inbox and the wake ping stays per agent).
         const recipients = db.prepare('SELECT name FROM agents WHERE name != ?').all(agentName).map((row) => row.name)
-        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session, delivery_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         for (const name of recipients) {
-          insert.run(randomUUID(), agentName, name, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent, originSession)
+          insert.run(randomUUID(), agentName, name, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent, originSession, delivery ?? null)
           if (!closing) wakeAgent(name, conversation, { sender: agentName, subject })
         }
         return { to: '*', recipients: recipients.length, conversation: conversation ?? null, no_reply: Boolean(closing), note: 'broadcast to every other registered agent' }
@@ -666,8 +670,8 @@ function buildServer(agentName, agentHost, publicUrl) {
       if (to === agentName) throw new Error('refusing to send a message to yourself')
       const target = db.prepare('SELECT name FROM agents WHERE name = ?').get(to)
       const id = randomUUID()
-      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(id, agentName, to, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent, originSession)
+      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session, delivery_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(id, agentName, to, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent, originSession, delivery ?? null)
       if (!closing) wakeAgent(to, conversation, { sender: agentName, subject })
       return {
         id,
@@ -688,7 +692,7 @@ function buildServer(agentName, agentHost, publicUrl) {
       const onlyUnread = unread_only ?? true
       const rows = db
         .prepare(
-          `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned, interrupt FROM messages
+          `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned, interrupt, delivery_mode FROM messages
            WHERE recipient = ? ${onlyUnread ? 'AND read_at IS NULL' : ''}
            ORDER BY created_at ASC LIMIT ?`,
         )
@@ -1310,17 +1314,18 @@ async function handleRest(req, res, url) {
       const important = body.important === true || body.pinned === true
       const urgent = body.interrupt === true ? 1 : 0
       const originSession = typeof body.session === 'string' && body.session.trim() ? body.session.trim().slice(0, 80) : null
+      const deliverMode = ['queue', 'steer', 'branch'].includes(String(body.delivery)) ? String(body.delivery) : null
       if (body.to === '*') {
         const recipients = db.prepare('SELECT name FROM agents WHERE name != ?').all(id.name).map((row) => row.name)
-        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session, delivery_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         for (const name of recipients) {
-          insert.run(randomUUID(), id.name, name, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent, originSession)
+          insert.run(randomUUID(), id.name, name, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent, originSession, deliverMode)
           if (!closing) wakeAgent(name, conversation, { sender: id.name, subject: body.subject })
         }
         return sendJson(res, 201, { to: '*', recipients: recipients.length, conversation, no_reply: Boolean(closing) })
       }
-      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(messageId, id.name, body.to, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent, originSession)
+      db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session, delivery_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(messageId, id.name, body.to, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent, originSession, deliverMode)
       if (!closing) wakeAgent(body.to, conversation, { sender: id.name, subject: body.subject })
       return sendJson(res, 201, { id: messageId, to: body.to, conversation, no_reply: Boolean(closing) })
     }
@@ -1330,7 +1335,7 @@ async function handleRest(req, res, url) {
       const limit = parseLimit(q.get('limit'), 20, 100)
       const rows = db
         .prepare(
-          `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned, interrupt FROM messages
+          `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned, interrupt, delivery_mode FROM messages
            WHERE recipient = ? ${unreadOnly ? 'AND read_at IS NULL' : ''}
            ORDER BY created_at ASC LIMIT ?`,
         )
@@ -1460,7 +1465,7 @@ async function handleRest(req, res, url) {
       const before = Number(q.get('before') ?? 0)
       const full = q.get('full') === '1'
       const rows = db.prepare(
-        `SELECT id, sender, recipient, subject, body, conversation, no_reply, pinned, interrupt, origin_session, read_at, created_at, reply_to
+        `SELECT id, sender, recipient, subject, body, conversation, no_reply, pinned, interrupt, origin_session, delivery_mode, read_at, created_at, reply_to
            FROM messages
           WHERE COALESCE(conversation, 'default') = ?
             AND (sender = ? OR recipient = ?)
