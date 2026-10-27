@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.10'
+const HUB_VERSION = '0.7.11'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
@@ -1167,7 +1167,7 @@ function consoleLoginPage(error) {
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>dsh-mesh 控制台</title>
 <style>${CONSOLE_STYLE}</style></head><body><main>
 <h1>dsh-mesh 控制台</h1>
-<p class="sub">只读令牌：看状态 · 管理员令牌：可铸令牌、改权限、吊销节点</p>
+<p class="sub">只读令牌：看状态 · 管理员令牌：可铸令牌、改权限、吊销节点。登录后可在右上角「退出 / 切换令牌」换角色。</p>
 <form method="post" action="/console/login">
   <input type="password" name="token" placeholder="view / admin token" autocomplete="current-password" autofocus>
   <button type="submit">进入</button>
@@ -1193,8 +1193,14 @@ function consolePage(auth) {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>dsh-mesh 控制台</title>
 <style>${CONSOLE_STYLE}</style></head><body><main>
+<div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
 <h1>dsh-mesh 控制台 <span class="badge ${auth.role === 'admin' ? 'ok' : 'off'}">${auth.role === 'admin' ? '管理员' : '只读'}</span></h1>
+<form method="post" action="/console/logout" style="margin:0">
+  <button type="submit">退出 / 切换令牌</button>
+</form>
+</div>
 <p class="sub" id="sub">加载中…</p>
+${auth.role === 'admin' ? '' : '<p class="muted">只读会话：需要轮换令牌、改 scopes、改 IP 白名单时，点右上角「退出 / 切换令牌」用管理员令牌重新登录。</p>'}
 <div class="grid" id="cards"></div>
 <h2>成员与插件版本</h2>
 <table><thead><tr><th>agent</th><th>状态</th><th>插件</th><th>版本</th><th>兼容</th><th>最后活动</th></tr></thead>
