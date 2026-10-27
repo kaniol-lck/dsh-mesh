@@ -144,6 +144,7 @@ token; the plugin keeps the token in an owner-only file, not in the profile patc
 
 - [Hub deployment and configuration](hub/README.en.md) · [中文](hub/README.md)
 - [Architecture](docs/mesh-architecture.md)
+- [Auth & console](docs/auth-and-console.md) (token lifecycle, scopes, IP allowlist, enrollment codes, console roles)
 - [Client plugin: mesh-waker](plugins/mesh-waker/README.md)
 - [Agent-facing conventions](skills/mesh/SKILL.md)
 

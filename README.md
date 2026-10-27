@@ -114,6 +114,8 @@ dsh plugin --profile web add dsh-mesh-waker
 - 唤醒 ping 用**逐 agent** 的密钥做 HMAC-SHA256 签名，带 120 秒时间窗与去抖；
 - 读取按调用者隔离：会话视图只返回自己发过或收到的消息；blob 读取受 per-blob 白名单约束；
 - **任何不受你控制的网络都必须加密**：给中枢配 TLS（`MESH_TLS_CERT` / `MESH_TLS_KEY`）或走隧道；
+- 每节点可限制 `read / send / board / blob` scopes、来源 IP 段与令牌有效期（0.7.9+）；
+- 网页控制台分只读/管理员两种角色，管理面受 `MESH_CONSOLE_ALLOW` 来源限制并有 CSRF 防护；
 - 仓库里不放任何凭据，`scripts/check-secrets.py` 已在 CI 中运行。
 
 ## 更新方式
@@ -126,6 +128,7 @@ dsh plugin --profile web add dsh-mesh-waker
 
 - [中枢部署与配置](hub/README.md) · [English](hub/README.en.md)
 - [架构说明](docs/mesh-architecture.md)
+- [鉴权与控制台](docs/auth-and-console.md)（token 生命周期、scopes、IP 白名单、注册码派发、控制台角色）
 - [客户端插件 mesh-waker](plugins/mesh-waker/README.md)
 - [给 agent 的协作约定](skills/mesh/SKILL.md)
 

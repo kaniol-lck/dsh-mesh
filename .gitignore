@@ -28,3 +28,7 @@ hub/certs/
 
 # 参考实现的工作笔记（默认不入库，见工作区 AGENTS.md §6）
 REFS.md
+
+# Python bytecode from local preflight runs
+__pycache__/
+*.pyc
