@@ -356,4 +356,5 @@ python scripts/handoff/handoff.py receive --id <blob> --dir ./incoming --sha256 
 - **脚本发信**：直接用 scripts/mesh-send.py，它会自动读 DSH_SESSION_ID 带上；
 - 远端回信到达时，waker 看到 origin_session 会把该对话**自动绑定**到发起会话（用户手动绑定优先）；
 - 绑定晚于消息也不丢：POST /mesh/bind {conversation, sessionId, deliver:true, backfill:12} 会把最近消息补投进会话；
+- **三种投递模式**：queue（排队，默认）/ steer（插队）/ ranch（fork 侧会话）。在 设置 → Mesh → 投递模式 切换；侧会话标题 mesh · <主题> · 分支，12 小时内复用。
 - 已读消息不会自动重投——历史只能靠 ackfill 补，绑定时值得顺手带上。

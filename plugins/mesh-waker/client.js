@@ -1143,6 +1143,50 @@ try {
         historyNote ? h('div', { style: { fontSize: 12, opacity: 0.7, padding: '4px 0 8px' } }, historyNote) : null,
         h(
           Row,
+          {
+            title: '投递模式',
+            description:
+              '绑定会话收到邮件时：排队等当前回合结束；插队打断当前回合；分支则 fork 一个继承上下文的侧会话，原会话不动',
+          },
+          h(
+            'div',
+            { style: { display: 'flex', gap: 8 } },
+            ...[
+              ['queue', '排队'],
+              ['steer', '插队'],
+              ['branch', '分支'],
+            ].map(([value, label]) =>
+              h(
+                Btn,
+                {
+                  key: value,
+                  onClick: async () => {
+                    try {
+                      const result = await json(BASE + '/mesh/config', {
+                        method: 'POST',
+                        headers: { 'content-type': 'application/json' },
+                        body: JSON.stringify({ boundDeliveryMode: value }),
+                      })
+                      setMaintenanceNote(
+                        '投递模式：' + label + (result.persisted ? '（已保存）' : '（仅本次运行生效）'),
+                      )
+                      await load()
+                    } catch (error) {
+                      setMaintenanceNote('设置投递模式失败：' + error.message)
+                    }
+                  },
+                  style:
+                    config && config.boundDeliveryMode === value
+                      ? { background: 'var(--dsw-alias-interactive-bg-active, rgba(127,127,127,0.18))', fontWeight: 600 }
+                      : undefined,
+                },
+                label,
+              ),
+            ),
+          ),
+        ),
+        h(
+          Row,
           { title: '维护', description: '本地历史缓存与本机令牌；绑定管理在「Mesh 信箱」页面里' },
           h(
             'div',
