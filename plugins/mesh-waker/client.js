@@ -1180,29 +1180,11 @@ try {
             title: '发送方指定',
             description: '允许对方在消息里用 delivery 字段指定排队/插队/分支；关闭后只按本机默认值处理',
           },
-          h(
-            'label',
-            { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 } },
-            h('input', {
-              type: 'checkbox',
-              checked: Boolean(config && config.allowSenderDeliveryMode),
-              onChange: async (event) => {
-                const checked = event.target.checked
-                try {
-                  await json(BASE + '/mesh/config', {
-                    method: 'POST',
-                    headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify({ allowSenderDeliveryMode: checked }),
-                  })
-                  setMaintenanceNote(checked ? '已允许发送方指定投递模式' : '已忽略发送方的投递模式')
-                  await reload()
-                } catch (error) {
-                  setMaintenanceNote('切换失败：' + error.message)
-                }
-              },
-            }),
-            '允许发送方指定',
-          ),
+          h(SwitchControl, {
+            checked: Boolean(config && config.allowSenderDeliveryMode),
+            label: '允许发送方指定',
+            onChange: (next) => void save({ allowSenderDeliveryMode: next }),
+          }),
         ),
         h(
           Row,
