@@ -1149,9 +1149,9 @@ try {
               '本机默认值：排队等当前回合结束 / 插队打断 / 分支 fork 侧会话。优先级：消息自带 delivery > interrupt > 本机默认；发送方指定插队时仍受本机频率上限约束',
           },
           h(
-            'select',
+            MiniSelect,
             {
-              style: { ...selectStyle, width: 190, height: 28, fontSize: 12, padding: '0 24px 0 8px' },
+              style: selectStyle,
               value: (config && config.boundDeliveryMode) || 'queue',
               onChange: async (event) => {
                 const value = event.target.value
