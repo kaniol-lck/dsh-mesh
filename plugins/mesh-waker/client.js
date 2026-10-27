@@ -1146,43 +1146,32 @@ try {
           {
             title: '投递模式',
             description:
-              '绑定会话收到邮件时：排队等当前回合结束；插队打断当前回合；分支则 fork 一个继承上下文的侧会话，原会话不动',
+              '绑定会话收到邮件时：排队等当前回合结束；插队打断当前回合；分支 fork 一个继承上下文的侧会话，原会话不动',
           },
           h(
-            'div',
-            { style: { display: 'flex', gap: 8 } },
-            ...[
-              ['queue', '排队'],
-              ['steer', '插队'],
-              ['branch', '分支'],
-            ].map(([value, label]) =>
-              h(
-                Btn,
-                {
-                  key: value,
-                  onClick: async () => {
-                    try {
-                      const result = await json(BASE + '/mesh/config', {
-                        method: 'POST',
-                        headers: { 'content-type': 'application/json' },
-                        body: JSON.stringify({ boundDeliveryMode: value }),
-                      })
-                      setMaintenanceNote(
-                        '投递模式：' + label + (result.persisted ? '（已保存）' : '（仅本次运行生效）'),
-                      )
-                      await load()
-                    } catch (error) {
-                      setMaintenanceNote('设置投递模式失败：' + error.message)
-                    }
-                  },
-                  style:
-                    config && config.boundDeliveryMode === value
-                      ? { background: 'var(--dsw-alias-interactive-bg-active, rgba(127,127,127,0.18))', fontWeight: 600 }
-                      : undefined,
-                },
-                label,
-              ),
-            ),
+            'select',
+            {
+              style: { ...selectStyle, width: 190, height: 28, fontSize: 12, padding: '0 24px 0 8px' },
+              value: (config && config.boundDeliveryMode) || 'queue',
+              onChange: async (event) => {
+                const value = event.target.value
+                const label = { queue: '排队', steer: '插队', branch: '分支' }[value] ?? value
+                try {
+                  const result = await json(BASE + '/mesh/config', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ boundDeliveryMode: value }),
+                  })
+                  setMaintenanceNote('投递模式已切换为「' + label + '」' + (result.persisted ? '，已保存' : '，仅本次运行'))
+                  await reload()
+                } catch (error) {
+                  setMaintenanceNote('设置投递模式失败：' + error.message)
+                }
+              },
+            },
+            h('option', { value: 'queue' }, '排队（等待当前回合结束）'),
+            h('option', { value: 'steer' }, '插队（打断当前回合）'),
+            h('option', { value: 'branch' }, '分支（fork 侧会话）'),
           ),
         ),
         h(
