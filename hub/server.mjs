@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.7'
+const HUB_VERSION = '0.7.8'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
@@ -1689,6 +1689,65 @@ async function handleRest(req, res, url) {
 }
 
 /**
+ * Enrollment codes: the admin mints a short-lived, single-use code; the new node calls
+ * POST /api/enroll with it and gets its own agent token. The token is still shown exactly
+ * once, but it never has to travel through chat or a copy-paste.
+ *
+ *   POST /api/admin/enroll-codes {name?, ttl_ms?}  -> {code, expires_at}
+ *   POST /api/enroll           {code, name?, host?} -> {name, token}
+ */
+const enrollCodes = new Map()
+const ENROLL_CODE_TTL_MS = 10 * 60_000
+const enrollAttempts = new Map()
+
+function mintEnrollCode(name) {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  let code = ''
+  for (let index = 0; index < 8; index += 1) code += alphabet[randomBytes(1)[0] % alphabet.length]
+  enrollCodes.set(code, { name: name || null, expiresAt: now() + ENROLL_CODE_TTL_MS, createdAt: now() })
+  for (const [key, value] of enrollCodes) if (value.expiresAt <= now()) enrollCodes.delete(key)
+  return code
+}
+
+async function handleEnroll(req, res) {
+  if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
+  const ip = clientIp(req)
+  const attempts = (enrollAttempts.get(ip) ?? 0) + 1
+  enrollAttempts.set(ip, attempts)
+  if (attempts > 10) {
+    audit('enroll', null, ip, false)
+    return sendJson(res, 429, { error: 'too many enrollment attempts, retry later' })
+  }
+  try {
+    const body = await readJson(req)
+    const code = String(body.code ?? '').trim().toUpperCase()
+    const entry = enrollCodes.get(code)
+    if (!entry || entry.expiresAt <= now()) {
+      enrollCodes.delete(code)
+      audit('enroll', null, ip, false)
+      return sendJson(res, 401, { error: 'invalid or expired enrollment code' })
+    }
+    const name = String(body.name ?? entry.name ?? '').trim()
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: 'name must match [A-Za-z0-9_-]{1,32} (pass name or bind it when minting the code)' })
+    enrollCodes.delete(code) // single use, even if the insert below fails
+    const token = mintToken('mesh')
+    const ts = now()
+    const existing = db.prepare('SELECT name FROM agents WHERE name = ?').get(name)
+    if (existing) {
+      db.prepare('UPDATE agents SET token_hash = ?, host = COALESCE(?, host) WHERE name = ?').run(hashToken(token), body.host ?? null, name)
+    } else {
+      db.prepare('INSERT INTO agents (name, host, description, first_seen, last_seen, token_hash) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(name, body.host ?? null, body.description ?? null, ts, ts, hashToken(token))
+    }
+    audit('enroll', name, ip, true)
+    console.log(`[mesh] enrolled ${name} from ${ip}`)
+    return sendJson(res, 201, { name, token, note: 'store this now; rotate or re-enroll if lost' })
+  } catch (error) {
+    return sendJson(res, 400, { error: error.message })
+  }
+}
+
+/**
  * Admin face: mint, rotate and revoke agent tokens.
  * Requires `Authorization: Bearer <MESH_ADMIN_TOKEN>` (or the generated
  * data/admin.token on first boot). A minted token is returned exactly once 鈥? * the hub only keeps its SHA-256.
@@ -1739,6 +1798,15 @@ async function handleAdmin(req, res, url) {
       db.prepare('UPDATE agents SET token_hash = ? WHERE name = ?').run(hashToken(token), name)
       audit('admin.rotate', name, ip, true)
       return sendJson(res, 200, { name, token, note: 'previous token is now invalid' })
+    }
+
+    if (path === '/api/admin/enroll-codes' && req.method === 'POST') {
+      const body = await readJson(req)
+      const name = body.name === undefined ? '' : String(body.name).trim()
+      if (name && !/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: 'name must match [A-Za-z0-9_-]{1,32}' })
+      const code = mintEnrollCode(name || null)
+      audit('admin.enroll_code', name || null, ip, true)
+      return sendJson(res, 201, { code, name: name || null, expires_in_seconds: ENROLL_CODE_TTL_MS / 1000 })
     }
 
     if (path === '/api/admin/agents' && req.method === 'GET') {
@@ -1798,6 +1866,11 @@ const httpServer = makeServer(async (req, res) => {
 
   if (url.pathname.startsWith('/api/admin/')) {
     await handleAdmin(req, res, url)
+    return
+  }
+
+  if (url.pathname === '/api/enroll') {
+    await handleEnroll(req, res)
     return
   }
 

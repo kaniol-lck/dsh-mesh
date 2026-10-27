@@ -38,6 +38,20 @@ const PLUGIN_INFO = {
   platform: process.platform,
 }
 
+/**
+ * The version the running process loaded, versus the version on disk right now.
+ * Two different failures live here: "loaded but not restarted" (disk newer than the
+ * process) and "half-loaded" (handled by scripts/check-loadable.mjs before a restart).
+ * Capability/plugin fields are hot and can never prove which code is running.
+ */
+function readDiskVersion() {
+  try {
+    return String(JSON.parse(readFileSync(join(SELF_DIR, 'package.json'), 'utf8')).version ?? '0.0.0')
+  } catch {
+    return null
+  }
+}
+
 export const name = 'mesh-waker'
 export const inject = ['sessionController', 'agents', 'workspaceRegistry', 'configEditor', 'commands', 'attachments']
 
@@ -82,6 +96,10 @@ const SAVED_CONFIG_KEYS = [
   'maxWakes',
   'catchUpOnStart',
   'catchUpDelayMs',
+  'minMessageChars',
+  'throttleMaxWakesPerWindow',
+  'throttleWindowMs',
+  'conversationCooldownMs',
 ]
 
 const savedConfigPath = () => join(homedir(), '.dsh', 'mesh-waker', 'config.json')
@@ -141,6 +159,11 @@ function normalizeBase(config) {
     // Conversations move slower on purpose: two auto-waking agents can otherwise answer
     // each other in a tight loop and multiply sessions.
     conversationCooldownMs: Number(c.conversationCooldownMs ?? 60000),
+    // Loop brakes, persisted: a restart must not reset the ledger, otherwise a peer can
+    // flood a fresh window simply by waiting for one. Blocked mail stays unread in the hub.
+    minMessageChars: Number(c.minMessageChars ?? 24),
+    throttleMaxWakesPerWindow: Number(c.throttleMaxWakesPerWindow ?? 30),
+    throttleWindowMs: Number(c.throttleWindowMs ?? 3_600_000),
     registerIntervalMs: Number(c.registerIntervalMs ?? 300000),
     // Trust is deliberately a LOCAL setting: neither the hub nor a peer can raise it, so a
     // remote message can never turn this machine into an unapproved execution surface.
@@ -430,6 +453,66 @@ export function apply(ctx, config) {
   // Per-peer trust overrides live in their own JSON file: the bundle patch stays flat and
   // readable, and the UI can edit one peer without rewriting YAML.
   const TRUST_PATH = c.tokenFile ? join(dirname(c.tokenFile), 'trust.json') : join(tmpdir(), 'mesh-waker-trust.json')
+
+  // ---------------------------------------------------------------- throttle ledger
+  const THROTTLE_PATH = c.tokenFile ? join(dirname(c.tokenFile), 'throttle.json') : join(tmpdir(), 'mesh-waker-throttle.json')
+  const TRIVIAL_RE = /^(ping|pong|ack|acknowledged|ok|okay|roger|received|thanks?|thx|收到|好的|好|谢谢|了解|明白|已阅)[。.!！?？,，\s]*$/i
+  let throttleLedger = (() => {
+    try {
+      const parsed = JSON.parse(readFileSync(THROTTLE_PATH, 'utf8'))
+      return parsed && typeof parsed === 'object' && parsed.conversations ? parsed : { conversations: {} }
+    } catch {
+      return { conversations: {} }
+    }
+  })()
+
+  function saveThrottle() {
+    try {
+      writeFileSync(THROTTLE_PATH, JSON.stringify(throttleLedger, null, 1))
+    } catch (error) {
+      fileLog(`saving throttle ledger failed: ${error.message}`)
+    }
+  }
+
+  function throttleEntry(conversation) {
+    const key = conversation || '_default'
+    if (!throttleLedger.conversations[key]) {
+      throttleLedger.conversations[key] = { wakes: [], blocked: 0, lastReason: null, capOverride: null, lastBlockedAt: 0, lastWakeAt: 0 }
+    }
+    return [key, throttleLedger.conversations[key]]
+  }
+
+  function recordBlocked(conversation, reason, detail = '') {
+    const [key, entry] = throttleEntry(conversation)
+    entry.blocked = (entry.blocked ?? 0) + 1
+    entry.lastReason = reason
+    entry.lastBlockedAt = Date.now()
+    saveThrottle()
+    fileLog(`throttled ${key}: ${reason}${detail ? ` (${detail})` : ''}`)
+  }
+
+  function recordWake(conversation) {
+    const [key, entry] = throttleEntry(conversation)
+    const now = Date.now()
+    entry.wakes = (entry.wakes ?? []).filter((at) => now - at < c.throttleWindowMs)
+    entry.wakes.push(now)
+    entry.lastWakeAt = now
+    saveThrottle()
+  }
+
+  function throttleSummary() {
+    const now = Date.now()
+    return Object.entries(throttleLedger.conversations)
+      .filter(([, entry]) => (entry.blocked ?? 0) > 0)
+      .map(([conversation, entry]) => ({
+        conversation,
+        blocked: entry.blocked ?? 0,
+        reason: entry.lastReason,
+        blockedAt: entry.lastBlockedAt ?? null,
+        wakesInWindow: (entry.wakes ?? []).filter((at) => now - at < c.throttleWindowMs).length,
+        cap: entry.capOverride ?? c.throttleMaxWakesPerWindow,
+      }))
+  }
 
   function loadTrustOverrides() {
     try {
@@ -1038,8 +1121,23 @@ export function apply(ctx, config) {
     try {
       if (meta.conversation) adoptOriginSession(meta.conversation, meta.origin_session || meta.originSession)
       const messages = await fetchUnread(meta.conversation)
+      if (meta.conversation && messages.length) {
+        const bodies = messages.map((message) => String(message.body ?? '').trim())
+        if (bodies.every((body) => body.length < c.minMessageChars && TRIVIAL_RE.test(body))) {
+          recordBlocked(meta.conversation, 'trivial', 'ack-only batch')
+          return
+        }
+        const [, entry] = throttleEntry(meta.conversation)
+        const cap = entry.capOverride ?? c.throttleMaxWakesPerWindow
+        const recent = (entry.wakes ?? []).filter((at) => Date.now() - at < c.throttleWindowMs)
+        if (recent.length >= cap) {
+          recordBlocked(meta.conversation, 'cap', `${recent.length}/${cap} in window`)
+          return
+        }
+      }
       if (meta.conversation) {
         await wakeConversation(meta.conversation, meta, messages)
+        recordWake(meta.conversation)
         state.lastWakeAt = Date.now()
         state.lastError = null
         state.lastDurationMs = Date.now() - t0
@@ -1310,7 +1408,22 @@ export function apply(ctx, config) {
           // The settings panel runs in the browser on another origin; this route carries
           // no secrets (no token, no message body), so a permissive CORS header is fine.
           res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-          res.end(JSON.stringify({ ok: true, wakeUrl, config: editable(), ...state, historyCached: history.size }))
+          const diskVersion = readDiskVersion()
+          res.end(
+            JSON.stringify({
+              ok: true,
+              wakeUrl,
+              config: editable(),
+              pluginVersions: {
+                process: PLUGIN_INFO.version,
+                disk: diskVersion,
+                stale: diskVersion !== null && diskVersion !== PLUGIN_INFO.version,
+              },
+              ...state,
+              throttled: throttleSummary(),
+              historyCached: history.size,
+            }),
+          )
           return
         }
         if (req.method === 'GET' && path === '/mesh/dirs') {
@@ -1674,7 +1787,69 @@ export function apply(ctx, config) {
               send({ ok: true, messages: 0 })
               return
             }
-            if (req.method === 'POST' && path === '/mesh/admin/token/rotate') {
+            if (path === '/mesh/admin/throttle' && req.method === 'GET') {
+          if (!fromLoopback(req)) {
+            res.writeHead(403, { 'content-type': 'application/json' })
+            res.end('{"error":"loopback only"}')
+            return
+          }
+          res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+          res.end(JSON.stringify({ ok: true, throttled: throttleSummary(), ledger: THROTTLE_PATH }))
+          return
+        }
+
+        if (path === '/mesh/admin/throttle/raise' && req.method === 'POST') {
+          // Release the newest blocked message only: releasing the whole backlog at once
+          // would create a fresh burst, which is exactly what the brake exists to stop.
+          if (!fromLoopback(req)) {
+            res.writeHead(403, { 'content-type': 'application/json' })
+            res.end('{"error":"loopback only"}')
+            return
+          }
+          const chunks = []
+          for await (const chunk of req) chunks.push(chunk)
+          const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+          const conversation = String(draft.conversation ?? '').trim()
+          if (!conversation) {
+            res.writeHead(400, { 'content-type': 'application/json' })
+            res.end('{"error":"conversation is required"}')
+            return
+          }
+          const [, entry] = throttleEntry(conversation)
+          const current = entry.capOverride ?? c.throttleMaxWakesPerWindow
+          entry.capOverride = Number(draft.cap) > current ? Number(draft.cap) : Math.max(current + 10, current * 2)
+          entry.blocked = 0
+          entry.lastReason = null
+          saveThrottle()
+          fileLog(`throttle cap for ${conversation} raised to ${entry.capOverride}; releasing one wake`)
+          res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+          res.end(JSON.stringify({ ok: true, conversation, cap: entry.capOverride }))
+          void wake({ conversation })
+          return
+        }
+
+        if (path === '/mesh/admin/throttle/dismiss' && req.method === 'POST') {
+          if (!fromLoopback(req)) {
+            res.writeHead(403, { 'content-type': 'application/json' })
+            res.end('{"error":"loopback only"}')
+            return
+          }
+          const chunks = []
+          for await (const chunk of req) chunks.push(chunk)
+          const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+          const conversation = String(draft.conversation ?? '').trim()
+          if (conversation) {
+            const [, entry] = throttleEntry(conversation)
+            entry.blocked = 0
+            entry.lastReason = null
+            saveThrottle()
+          }
+          res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+          res.end('{"ok":true}')
+          return
+        }
+
+        if (req.method === 'POST' && path === '/mesh/admin/token/rotate') {
               // Rotation needs the hub admin token; it lives in an owner-only file next to
               // this machine's agent token and is never sent to the browser.
               const adminPath = join(dirname(c.tokenFile ?? join(tmpdir(), 'x')), 'admin-token')

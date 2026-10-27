@@ -54,6 +54,7 @@ def preflight() -> int:
     failures = 0
     failures += step("node --check index.js", ["node", "--check", str(PLUGIN / "index.js")])
     failures += step("node --check client.js", ["node", "--check", str(PLUGIN / "client.js")])
+    failures += step("loadable entry (real import)", ["node", str(ROOT / "scripts" / "check-loadable.mjs"), str(PLUGIN / "index.js")])
     failures += step("client bundle id test", ["node", str(TEST)])
     if SECRET_SCAN.exists():
         failures += step("secret scan", [sys.executable, str(SECRET_SCAN)])

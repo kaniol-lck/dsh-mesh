@@ -1,4 +1,4 @@
-# Credentials and machine state never belong in this repository.
+﻿# Credentials and machine state never belong in this repository.
 token
 wake-secret
 *.token
@@ -25,3 +25,6 @@ hub/data/
 hub/certs/
 
 .npmrc
+
+# 参考实现的工作笔记（默认不入库，见工作区 AGENTS.md §6）
+REFS.md
