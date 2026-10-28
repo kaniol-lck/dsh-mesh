@@ -74,6 +74,11 @@
 
 只能归档**已绑定工作区**的会话；没有 workspaceId 的会话会返回 400（这类会话本来也不出现在侧栏）。
 
+
+> **cwd 怎么选**：项目有两个仓时（如 dsh-mesh/public 与 dsh-mesh/transfer），
+> workspacePath 要指向**具体仓库根**，不要指向包含两个仓的上级目录——否则会话里的
+> hub/、plugins/ 这类相对路径全部找不到。
+
 ## 典型用法：一个协调会话 + 多个执行会话
 
 ```powershell

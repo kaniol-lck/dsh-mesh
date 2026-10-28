@@ -613,7 +613,21 @@ export function apply(ctx, config) {
     }
   }
 
+  function archivedSessionIds() {
+    try {
+      const value = ctx.workspaceRegistry?.archivedSessionIds
+      const resolved = typeof value === 'function' ? value.call(ctx.workspaceRegistry) : value
+      if (resolved instanceof Set) return resolved
+      if (Array.isArray(resolved)) return new Set(resolved)
+      if (resolved && typeof resolved.has === 'function') return resolved
+    } catch {
+      /* older host */
+    }
+    return new Set()
+  }
+
   function listLocalSessions() {
+    const archived = archivedSessionIds()
     return discoverSessions().map((entry) => {
       const meta = sessionMeta(entry)
       return {
@@ -623,6 +637,15 @@ export function apply(ctx, config) {
         workspace: entry.workspace,
         last_active: entry.mtime,
         live: isLive(entry.id),
+        archived: archived.has(entry.id),
+        known: (() => {
+          try {
+            const check = ctx.workspaceRegistry?.sessionKnown
+            return typeof check === 'function' ? Boolean(check.call(ctx.workspaceRegistry, entry.id)) : true
+          } catch {
+            return true
+          }
+        })(),
       }
     })
   }
@@ -1564,6 +1587,41 @@ export function apply(ctx, config) {
         res.end(JSON.stringify({ ok: true, sessions }))
       } catch (error) {
         res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
+      return
+    }
+
+    if (path === '/mesh/sessions/delete' && req.method === 'POST') {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      try {
+        const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        const id = String(draft.session ?? '').trim()
+        if (!id) throw new Error('session is required')
+        let removed = 'unknown'
+        try {
+          if (typeof ctx.workspaceRegistry?.deleteKnown === 'function') {
+            await ctx.workspaceRegistry.deleteKnown(id)
+            removed = 'deleteKnown'
+          }
+        } catch (error) {
+          fileLog(`workspaceRegistry.deleteKnown failed for ${id}: ${error.message}`)
+        }
+        if (removed === 'unknown' && typeof ctx.workspaceRegistry?.delete === 'function') {
+          await ctx.workspaceRegistry.delete(id)
+          removed = 'delete'
+        }
+        fileLog(`deleted local session ${id} via ${removed}`)
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: true, sessionId: id, method: removed }))
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: false, error: error.message }))
       }
       return
