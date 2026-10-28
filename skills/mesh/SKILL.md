@@ -356,5 +356,28 @@ python scripts/handoff/handoff.py receive --id <blob> --dir ./incoming --sha256 
 - **脚本发信**：直接用 scripts/mesh-send.py，它会自动读 DSH_SESSION_ID 带上；
 - 远端回信到达时，waker 看到 origin_session 会把该对话**自动绑定**到发起会话（用户手动绑定优先）；
 - 绑定晚于消息也不丢：POST /mesh/bind {conversation, sessionId, deliver:true, backfill:12} 会把最近消息补投进会话；
-- **三种投递模式**：queue（排队，默认）/ steer（插队）/ ranch（fork 侧会话）。在 设置 → Mesh → 投递模式 切换；侧会话标题 mesh · <主题> · 分支，12 小时内复用。
+- **三种投递模式**：queue（排队，默认）/ steer（插队）/ ranch（fork 侧会话）。
+  接收方在 设置 → Mesh → 投递模式 设默认值；**发送方可以按消息指定**：mesh_send 带 delivery: queue|steer|branch。
+  优先级：消息 delivery > interrupt:true（等同 steer）> 接收方默认；接收方可关闭「允许发送方指定」，插队仍受本机频率上限约束。
+  侧会话标题 mesh · <主题> · 分支，12 小时内复用。
 - 已读消息不会自动重投——历史只能靠 ackfill 补，绑定时值得顺手带上。
+
+## 17. 本机会话协作（不经中枢）
+
+同一台机器、同一个 DSH 里的会话可以直接互相派活，走 waker 的 loopback 接口：
+
+```powershell
+curl.exe -s http://127.0.0.1:8795/mesh/sessions          # 列会话：id/标题/cwd/live/archived
+curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: application/json' `
+  -d '{"title":"mesh · hub","text":"核对 README 与文档，只列不改"}'
+curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/create -H 'content-type: application/json' `
+  -d '{"title":"mesh · docs","workspacePath":"D:/Libraries/Documents/projects/dsh-mesh/public","prompt":"先读 docs/ 列待办"}'
+```
+
+铁律：
+
+1. **cwd/workspacePath 必须指向具体仓库根**，不要指向包含多个仓的上级目录，否则相对路径找不到文件；
+2. 新建会话要传 `workspacePath`（只传 cwd 不绑工作区，侧栏不显示）；
+3. 注入默认 `queue`，`steer` 会打断当前回合，慎用；
+4. 一个任务派一个会话，明确“只改哪里 / 什么算完成 / 怎么回报”；
+5. 清理重复会话用 `/mesh/sessions/archive`（侧栏隐藏）或 `/mesh/sessions/delete`（文件可能仍在磁盘）。
