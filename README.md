@@ -129,6 +129,7 @@ dsh plugin --profile web add dsh-mesh-waker
 - [中枢部署与配置](hub/README.md) · [English](hub/README.en.md)
 - [架构说明](docs/mesh-architecture.md)
 - [鉴权与控制台](docs/auth-and-console.md)（token 生命周期、scopes、IP 白名单、注册码派发、控制台角色）
+- [本机会话协作](docs/local-sessions.md)（会话发现与定向注入，不经过中枢）（token 生命周期、scopes、IP 白名单、注册码派发、控制台角色）
 - [客户端插件 mesh-waker](plugins/mesh-waker/README.md)
 - [给 agent 的协作约定](skills/mesh/SKILL.md)
 

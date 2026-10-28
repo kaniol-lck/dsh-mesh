@@ -23,6 +23,7 @@ import { tmpdir, networkInterfaces, homedir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { zstdDecompressSync } from 'node:zlib'
 
 // Self-reported identity: the hub surfaces it so an operator can spot a stale install.
 const SELF_DIR = dirname(fileURLToPath(import.meta.url))
@@ -498,6 +499,153 @@ export function apply(ctx, config) {
     entry.wakes.push(now)
     entry.lastWakeAt = now
     saveThrottle()
+  }
+
+  // ---------------------------------------------------------------- local sessions
+  //
+  // Session-to-session work inside one DSH: every session lives under
+  // ~/.dsh/sessions/<workspace>/<session-id>/session.v4.jsonl.zstd, so the waker can
+  // enumerate them and prompt one directly. This never touches the hub, which keeps the
+  // latency in the millisecond range and works offline.
+  const SESSIONS_ROOT = join(homedir(), '.dsh', 'sessions')
+  const SESSION_INDEX_PATH = c.tokenFile ? join(dirname(c.tokenFile), 'sessions-index.json') : join(tmpdir(), 'mesh-waker-sessions.json')
+  const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+
+  function loadSessionIndex() {
+    try {
+      return JSON.parse(readFileSync(SESSION_INDEX_PATH, 'utf8'))
+    } catch {
+      return {}
+    }
+  }
+  let sessionIndex = loadSessionIndex()
+
+  function saveSessionIndex() {
+    try {
+      writeFileSync(SESSION_INDEX_PATH, JSON.stringify(sessionIndex))
+    } catch {
+      /* cache only */
+    }
+  }
+
+  /** Decompress the frames we can find in the head of a session log and look for a title. */
+  function readSessionMeta(logPath) {
+    let head
+    try {
+      head = readFileSync(logPath)
+    } catch {
+      return {}
+    }
+    const slice = head.subarray(0, Math.min(head.length, 2 * 1024 * 1024))
+    const offsets = []
+    for (let index = 0; index + 4 <= slice.length; index += 1) {
+      if (slice[index] === 0x28 && slice[index + 1] === 0xb5 && slice[index + 2] === 0x2f && slice[index + 3] === 0xfd) offsets.push(index)
+    }
+    let cwd = null
+    let title = null
+    const frames = Math.min(offsets.length, 120)
+    for (let index = 0; index < frames; index += 1) {
+      const start = offsets[index]
+      const end = index + 1 < offsets.length ? offsets[index + 1] : slice.length
+      let chunk
+      try {
+        chunk = zstdDecompressSync(slice.subarray(start, end)).toString('utf8')
+      } catch {
+        continue
+      }
+      if (!cwd) {
+        const match = chunk.match(/"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+        if (match) cwd = match[1].replace(/\\\\/g, '\\')
+      }
+      const titleMatch = chunk.match(/"title"\s*:\s*"([^"]{1,120})"/)
+      if (titleMatch) title = titleMatch[1]
+    }
+    return { cwd, title }
+  }
+
+  function discoverSessions() {
+    const found = []
+    let workspaces = []
+    try {
+      workspaces = readdirSync(SESSIONS_ROOT, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name)
+    } catch {
+      return found
+    }
+    for (const workspace of workspaces) {
+      let sessions = []
+      try {
+        sessions = readdirSync(join(SESSIONS_ROOT, workspace), { withFileTypes: true })
+          .filter((entry) => entry.isDirectory() && entry.name.startsWith('session-'))
+          .map((entry) => entry.name)
+      } catch {
+        continue
+      }
+      for (const id of sessions) {
+        const log = join(SESSIONS_ROOT, workspace, id, 'session.v4.jsonl.zstd')
+        let stat
+        try {
+          stat = statSync(log)
+        } catch {
+          continue
+        }
+        found.push({ id, workspace, log, mtime: stat.mtimeMs })
+      }
+    }
+    found.sort((left, right) => right.mtime - left.mtime)
+    return found.slice(0, 80)
+  }
+
+  function sessionMeta(entry) {
+    const cached = sessionIndex[entry.id]
+    if (cached && cached.mtime === entry.mtime) return cached
+    const meta = readSessionMeta(entry.log)
+    const record = { mtime: entry.mtime, title: meta.title ?? null, cwd: meta.cwd ?? null }
+    sessionIndex[entry.id] = record
+    saveSessionIndex()
+    return record
+  }
+
+  function isLive(sessionId) {
+    try {
+      return Boolean(ctx.agents?.get?.(sessionId))
+    } catch {
+      return false
+    }
+  }
+
+  function listLocalSessions() {
+    return discoverSessions().map((entry) => {
+      const meta = sessionMeta(entry)
+      return {
+        id: entry.id,
+        title: meta.title,
+        cwd: meta.cwd,
+        workspace: entry.workspace,
+        last_active: entry.mtime,
+        live: isLive(entry.id),
+      }
+    })
+  }
+
+  /** Resolve `{id}` then exact title, then a unique title substring; ambiguous is an error. */
+  function resolveLocalSession(draft) {
+    const sessions = listLocalSessions()
+    const wanted = String(draft.session ?? draft.id ?? '').trim()
+    const title = String(draft.title ?? '').trim()
+    if (wanted) {
+      const hit = sessions.find((session) => session.id === wanted || session.id === 'session-' + wanted)
+      if (hit) return hit
+    }
+    if (title) {
+      const exact = sessions.filter((session) => session.title === title)
+      if (exact.length === 1) return exact[0]
+      const fuzzy = sessions.filter((session) => session.title && session.title.includes(title))
+      if (fuzzy.length === 1) return fuzzy[0]
+      if (fuzzy.length > 1) {
+        throw new Error('标题匹配到多个会话，请改用 id：' + fuzzy.slice(0, 5).map((session) => `${session.id}(${session.title})`).join(', '))
+      }
+    }
+    throw new Error('找不到会话；可用 GET /mesh/sessions 查看本机会话列表')
   }
 
   function throttleSummary() {
@@ -1404,6 +1552,57 @@ export function apply(ctx, config) {
           res.end()
           return
         }
+        if (path === '/mesh/sessions' && req.method === 'GET') {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      try {
+        const sessions = listLocalSessions()
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: true, sessions }))
+      } catch (error) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
+      return
+    }
+
+    if (path === '/mesh/inject' && req.method === 'POST') {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const chunks = []
+      let size = 0
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size > MAX_BODY) {
+          res.writeHead(413).end()
+          return
+        }
+        chunks.push(chunk)
+      }
+      try {
+        const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        const text = String(draft.text ?? '').trim()
+        if (!text) throw new Error('text is required')
+        const target = resolveLocalSession(draft)
+        const mode = draft.mode === 'steer' ? 'steer' : 'queue'
+        await promptWithResume(target.id, text, mode)
+        fileLog(`injected ${text.length} chars into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}`)
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: true, sessionId: target.id, title: target.title, mode }))
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
+      return
+    }
+
+
         if (req.method === 'GET' && path === '/mesh/status') {
           // The settings panel runs in the browser on another origin; this route carries
           // no secrets (no token, no message body), so a permissive CORS header is fine.
@@ -1787,7 +1986,7 @@ export function apply(ctx, config) {
               send({ ok: true, messages: 0 })
               return
             }
-            if (path === '/mesh/admin/throttle' && req.method === 'GET') {
+        if (path === '/mesh/admin/throttle' && req.method === 'GET') {
           if (!fromLoopback(req)) {
             res.writeHead(403, { 'content-type': 'application/json' })
             res.end('{"error":"loopback only"}')
