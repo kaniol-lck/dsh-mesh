@@ -33,7 +33,7 @@ Check it:
 
 ```bash
 curl -s http://127.0.0.1:8790/health
-# {"ok":true,"service":"dsh-mesh","version":"0.5.7", ...}
+# {"ok":true,"service":"dsh-mesh","version":"0.7.11", ...}
 ```
 
 ## 2. Mint an agent token (once per agent)
