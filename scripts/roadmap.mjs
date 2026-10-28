@@ -17,7 +17,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { readFile, writeFile, readdir, stat } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
 
@@ -384,8 +384,72 @@ async function writeRoadmap(roadmapPath, entries, generatedAt, hash, versions) {
     segment +
     newline +
     original.slice(markers.end)
-  await writeFile(roadmapPath, next, 'utf8')
+  await atomicWrite(roadmapPath, next)
   return next
+}
+
+const LOCK_STALE_MS = 10_000
+const LOCK_RETRY_DELAY_MS = 300
+const LOCK_RETRIES = 3
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** Replace via a same-directory temp file + rename, so concurrent readers never see half a file. */
+async function atomicWrite(file, content) {
+  const dir = path.dirname(file)
+  const tmp = path.join(dir, `${path.basename(file)}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`)
+  try {
+    await writeFile(tmp, content, 'utf8')
+    await rename(tmp, file)
+  } catch (error) {
+    try {
+      await unlink(tmp)
+    } catch {
+      /* temp already gone */
+    }
+    throw error
+  }
+}
+
+/**
+ * Best-effort mutex for generated artifacts. Five sessions may refresh at once; the loser
+ * retries briefly, then gives up with a WARN (exit 0) so a busy lock never blocks a caller.
+ * A lock older than 10s is assumed to be a crash leftover and is taken over.
+ */
+async function acquireLock(repo) {
+  const lockPath = path.join(repo, '.worklog', 'roadmap.lock')
+  await mkdir(path.dirname(lockPath), { recursive: true })
+  const stamp = `${process.pid} ${new Date().toISOString()}`
+  const release = async () => {
+    try {
+      await unlink(lockPath)
+    } catch {
+      /* already released or taken over */
+    }
+  }
+  for (let attempt = 0; attempt <= LOCK_RETRIES; attempt += 1) {
+    try {
+      await writeFile(lockPath, stamp, { flag: 'wx' })
+      return { release }
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+      try {
+        const info = await stat(lockPath)
+        if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+          console.log('WARN: stale roadmap lock (older than 10s), taking over')
+          await writeFile(lockPath, stamp)
+          return { release }
+        }
+      } catch {
+        /* lock disappeared between stat and now — retry */
+      }
+      if (attempt < LOCK_RETRIES) await delay(LOCK_RETRY_DELAY_MS)
+    }
+  }
+  console.log('WARN: roadmap lock busy, skipped write')
+  return null
 }
 
 function escapeHtml(value) {
@@ -573,7 +637,7 @@ ${cards}
 }
 
 async function writeHtml(htmlPath, entries, generatedAt, hash) {
-  await writeFile(htmlPath, renderHtml(entries, generatedAt, hash), 'utf8')
+  await atomicWrite(htmlPath, renderHtml(entries, generatedAt, hash))
 }
 
 async function assertRepo(repo) {
@@ -653,9 +717,22 @@ async function main() {
     process.exit(1)
   }
 
+  // Fail before taking the lock: process.exit while holding it would leak the lock file.
+  if (!options.htmlOnly && options.mode !== 'check') {
+    const original = await readRoadmap(roadmapPath)
+    const markers = locateMarkers(original)
+    if (!markers.ok) fail(2, `missing marker ${markers.missing} in ${roadmapPath}`)
+  }
+
   if (options.htmlOnly) {
-    await writeHtml(htmlPath, entries, generatedAt, hash)
-    console.log(`wrote HTML -> ${htmlPath}`)
+    const lock = await acquireLock(repo)
+    if (!lock) return
+    try {
+      await writeHtml(htmlPath, entries, generatedAt, hash)
+      console.log(`wrote HTML -> ${htmlPath}`)
+    } finally {
+      await lock.release()
+    }
     return
   }
 
@@ -664,14 +741,20 @@ async function main() {
     return
   }
 
-  await writeRoadmap(roadmapPath, entries, generatedAt, hash, versions)
-  const counts = countEntries(entries)
-  console.log(`wrote ROADMAP: ${counts.total} items (P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}, done ${counts.done}) -> ${roadmapPath}`)
+  const lock = await acquireLock(repo)
+  if (!lock) return
   try {
-    await writeHtml(htmlPath, entries, generatedAt, hash)
-    console.log(`wrote HTML -> ${htmlPath}`)
-  } catch (error) {
-    console.warn(`warning: HTML render failed (ROADMAP was written): ${error.message}`)
+    await writeRoadmap(roadmapPath, entries, generatedAt, hash, versions)
+    const counts = countEntries(entries)
+    console.log(`wrote ROADMAP: ${counts.total} items (P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}, done ${counts.done}) -> ${roadmapPath}`)
+    try {
+      await writeHtml(htmlPath, entries, generatedAt, hash)
+      console.log(`wrote HTML -> ${htmlPath}`)
+    } catch (error) {
+      console.warn(`warning: HTML render failed (ROADMAP was written): ${error.message}`)
+    }
+  } finally {
+    await lock.release()
   }
 }
 

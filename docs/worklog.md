@@ -89,5 +89,6 @@ YYYY-MM-DD HH:mm · <会话> · <动作> · <产物或 commit>
 
 - `git status` 必须干净：`.worklog/` 全部被忽略，不会出现在 status 里；`git ls-files .worklog` 应为空；
 - `node scripts/roadmap.mjs --check` 必须退出 0（1=漂移、2=缺标记），否则先 `--write` 再复查；
+- `--write` 对并发安全（同目录临时文件 + rename 原子替换，`.worklog/roadmap.lock` 互斥；拿不到锁只 WARN 不阻塞、退出 0）；会话改完自己的 todo 可自行运行 `--write`；`--check` 只读、不写；
 - 不要把 `.worklog/` 下任何文件加入暂存区（不要用 `git add -A`，也不要 `git add -f`）；
 - 需要把日志带进交接包/镜像仓时，导出摘要到 `docs/`，不要整体拷贝本目录。
