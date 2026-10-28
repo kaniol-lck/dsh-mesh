@@ -66,11 +66,60 @@ cd hub && cp .env.example .env && docker compose up -d --build
 
 MIT
 
-## 已绑定会话的投递方式
+## 跨机消息绑定（`/mesh/bind`）
 
-把某个会话绑定到当前 DSH 会话后（收件箱卡片/整页的「绑定到当前会话」），该会话的新邮件会
-**直接以插队输入（`mode: 'queue'`）投进这个会话**，而不是另起一个「Mesh 收件箱」会话：
+这条路径**只服务跨机来件**：hub 把消息 ping 给 waker，若该 `conversation` 有 `deliverTo`，waker 直接把 wake prompt 投进那个会话（默认 `mode: 'queue'`，像用户打字一样排队），而不是另起/复用「Mesh 收件箱」会话。
 
-- 绑定接口：`POST /mesh/bind { conversation, sessionId, deliver?: true }`，`deliver: false` 只做展示绑定；
-- 投递失败（会话已删除/归档）会自动清掉 `deliverTo` 并回退到收件箱会话，邮件不会丢；
-- 收件箱列表每 10 秒轮询一次，新会话不用手动刷新就会出现。
+> **本机会话之间不要用这套。** 同机派活走 `/mesh/inject`（命令行：`node scripts/mesh-dispatch.mjs --title "mesh · hub" --file .worklog/dispatch/hub.txt`，叫协调会话加 `--wake`）——毫秒级、离线可用，不必让消息绕中枢一圈。
+
+### `POST /mesh/bind`
+
+```json
+{ "conversation": "conv/wake-verify", "sessionId": "session-…", "deliver": true, "backfill": 12 }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `conversation` | 必填，≤120 字节，与对方 `mesh_send` 用的 conversation 一致 |
+| `sessionId` | 必填，本机会话 id（`GET /mesh/sessions`） |
+| `deliver` | 默认 `true`；`false` 只做面板展示绑定（写 `panelSessionId`），不投递 |
+| `backfill` | 可选，绑定时把该 conversation 最近 N 条补投进会话（默认 12，仅 `deliver:true` 时生效） |
+
+响应：`{ "ok": true, "conversation": "conv/wake-verify", "sessionId": "session-…", "deliverTo": "session-…", "backfilled": 0 }`
+
+投递失败（会话已删除/归档、prompt 被拒）会**自动清掉 `deliverTo`** 并回退到「Mesh 收件箱」会话，邮件不会丢；此时 `POST /mesh/admin/bindings` 里该条的 `deliverTo` 会变成 `null`，这是排查的第一现场。
+
+### `GET /mesh/admin/bindings`
+
+```json
+{
+  "ok": true,
+  "self": "dsh-kaniol-pc",
+  "bindings": [
+    { "conversation": "conv/wake-verify", "panelSessionId": "session-…", "deliverTo": "session-…", "wakes": 1, "title": "mesh · conv/wake-verify" }
+  ]
+}
+```
+
+只列 `panelSessionId` 或 `deliverTo` 非空的 conversation；`wakes` 是该 conversation 的累计投递次数（每次成功投进绑定会话 +1）。
+
+### `POST /mesh/admin/unbind`
+
+```json
+{ "conversation": "conv/wake-verify", "keepDisplaying": false }
+```
+
+清掉绑定；`keepDisplaying: true` 只清 `deliverTo`、保留面板展示绑定，默认两个都清。响应 `{ "ok": true, "conversation": "conv/wake-verify", "entry": { … } }`。
+
+以上管理端点都**只接受 loopback**；绑定的读写落在 token 同目录的 `conversations.json`，重启后保留。
+
+### 端到端自检
+
+1. `POST /mesh/sessions/create` 建一个临时会话（`cwd` 指向具体仓库根）；
+2. `POST /mesh/bind` 把 `conv/x` 绑到它；
+3. 从**另一台机器或另一身份**发：`mesh_send({ to: "<本机>", conversation: "conv/x", body: "…" })`；
+4. 判据：`GET /mesh/admin/bindings` 中该条 `wakes` +1，临时会话 `last_active` 前进，且会话日志里出现带消息正文的 wake prompt；
+5. 清理：`POST /mesh/admin/unbind` → 归档/删除临时会话 → `/mesh/admin/bindings` 无残留。
+
+**常见「投了但没落到绑定会话」**：正文 <24 字且是 ack 词（`收到`/`ok`/`ping`…）被 trivial 拦；同一 conversation 60 秒内的重复 ping 被 cooldown 吃掉；waker 正忙（`busy`）或该 conversation 触顶（默认 30 次/小时）。命中时会写进 waker 日志与 `/mesh/status` 的 `throttled`。
+
