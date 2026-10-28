@@ -111,6 +111,7 @@ node scripts/mesh-dispatch.mjs --wake --title "mesh · 协调" --text "[WAKE] la
 
 - 触发门槛（满足其一才叫）：P0 / 安全；需要 owner 决策；阻塞自己 ≥30 分钟；任务完成且结论会影响别人下一步；
 - **不唤醒**：普通进度、「我做完了」、todo 更新、例行问答 —— 写进 `.worklog/todo/<自己>.md` 和 `WORKLOG`，协调会话下一轮会扫到；
+- **回复不等于送达**：`/mesh/inject` 是单向投递（响应只有 `{ok, sessionId, title, mode}`，不含回复正文），你的回复不会自动回到协调会话；需要它行动就必须 `--wake`，除非派活正文明确写了「本轮不用叫我，我会读 X 文件」；
 - 正文首行必须是 `[WAKE] <一句话摘要>`，细节写后面；一次任务最多叫一次，等回执期间不要重复叫；
 - `--wake` 对「同一目标会话 + 同一正文」做 60 秒防抖，重复投递会打印 `deduped: same payload within 60s` 并退出 0。
 
