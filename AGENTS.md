@@ -48,7 +48,9 @@
 
 ## 本机运维会话（mesh · ops）
 
-- **做什么**：本机 DSH 部署态巡检（hub `/health` 版本 vs 仓库、waker `process/disk` stale、8790/8795 端口、三道门禁、未推送提交、磁盘与日志）、令牌轮换、owner 的日常配置修改项。**不是**缺陷、**不是**功能请求——那两类仍走协调会话派给 hub / waker / docs。
+- **做什么**：本机 DSH 部署态巡检（只看**本项目部署面**，见下）、令牌轮换、owner 的日常配置修改项。**不是**缺陷、**不是**功能请求——那两类仍走协调会话派给 hub / waker / docs。
+- **巡检范围（只看本项目部署面）**：hub `/health` 与版本一致性、waker `process/disk/stale`、8790/8795/3654 端口、三道门禁（roadmap / check-paths / defects）、未推送提交、hub 容器状态与项目日志、`hub/data` 与插件目录所在卷余量（**低于 1G 才报**）。**不巡检** NAS 全局容量与其他卷、SMB 映射、路由器等家庭网络面（那些归 `lan-ops` / 其他会话）。
+- **上报门槛**：以下情形**必须立即** `--wake` 协调会话——`roadmap --check` drift、`check-paths` / secrets 失败、版本不一致（`HUB_VERSION` ≠ `package.json`、`/health` ≠ 仓库、waker `stale=true`）、端口不通或 hub 不可达、任何 P0 / 安全发现；**只有全绿或纯观察项才只写文件不唤醒**。一句话：**会让别人的门禁变红或服务不可用，就叫人；只是记录就写文件。**
 - **边界**：只读仓库文件；可写 `.worklog/ops/**`、`.worklog/todo/ops.md`、本机 `~/.dsh/**`（改前备份、写回滚说明）；不改代码、不 push、不 publish、不部署、不重启（除 owner 批准）。
 - **怎么找它**：按标题 `mesh · ops` inject：`node scripts/mesh-dispatch.mjs --wake --title "mesh · ops" --file .worklog/dispatch/ops.txt`；精确 session id 见 `.worklog/ops/session.md`（机器本地，不入库）。
 
