@@ -48,7 +48,9 @@ node scripts/roadmap.mjs --check   # 只比对：一致 0 / 漂移 1 / 缺标记
 
 - `<!-- AUTO:TODO START -->` 与 `<!-- AUTO:TODO END -->` 之间整段由脚本生成，**手改会被覆盖**；标记外内容原样保留；
 - 产物位置：ROADMAP 在仓外（默认 `<仓根>/../ROADMAP.md`，可用 `--roadmap` 指定），HTML 在 `.worklog/roadmap.html`（已忽略，本地打开）；
-- `--check` 比较时忽略 `<!-- generated:` 时间行，因此刚 `--write` 完必须退出 0；它也是收尾检查的一部分。
+- `--check` 比较时忽略 `<!-- generated:` 时间行，因此刚 `--write` 完必须退出 0；它也是收尾检查的一部分；
+- **已完成条目只在「已完成」节单列**：P0/P1/P2 分组只列未完成，头部计数 `P0/P1/P2（未完成） + 已完成 = 总数`；
+- `--check` 还会核对 `.worklog/roadmap.html` 的 `src=` 源哈希：ROADMAP 一致但 HTML 缺失/过期时只打印 `WARN`，退出码仍为 0（HTML 是附属产物）。
 
 ## 汇总：协调会话 → `..\ROADMAP.md`
 

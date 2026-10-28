@@ -16,6 +16,7 @@
  * Options: --roadmap <path> (default <repo>/../ROADMAP.md), --repo <path> (default cwd).
  */
 
+import { createHash } from 'node:crypto'
 import { readFile, writeFile, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
@@ -90,10 +91,11 @@ function sortForDisplay(entries) {
 }
 
 function countEntries(entries) {
+  // P0/P1/P2 count unfinished items only; completed ones live in `done` (a+b+c+d = total).
   const counts = { total: entries.length, P0: 0, P1: 0, P2: 0, done: 0 }
   for (const entry of entries) {
-    counts[entry.priority] += 1
     if (entry.status === '已完成') counts.done += 1
+    else counts[entry.priority] += 1
   }
   return counts
 }
@@ -144,6 +146,7 @@ function parseEntry(line, sessionName, file, lineNumber, errors) {
   return {
     priority,
     title,
+    displayTitle: stripOwnerSuffix(title),
     description,
     acceptance: fields.acceptance,
     status: fields.status,
@@ -192,6 +195,30 @@ function normalizeTitle(title) {
     .toLowerCase()
 }
 
+/** The owner suffix ("（需 hub 会话）" etc.) is redundant now that items carry "；归属：<会话>". */
+function stripOwnerSuffix(title) {
+  return title
+    .replace(/（需[^）]*）/g, '')
+    .replace(/\(需[^)]*\)/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+/** Stable fingerprint of the parsed model (no timestamp): decides whether generated artifacts are stale. */
+function sourceHash(entries) {
+  const canonical = entries.map((entry) => ({
+    priority: entry.priority,
+    title: entry.title,
+    description: entry.description,
+    acceptance: entry.acceptance,
+    status: entry.status,
+    owner: entry.owner,
+    file: entry.file,
+    line: entry.line,
+  }))
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex').slice(0, 12)
+}
+
 function bigrams(text) {
   const counts = new Map()
   for (let index = 0; index < text.length - 1; index += 1) {
@@ -220,11 +247,11 @@ function dice(left, right) {
 function markDuplicates(entries) {
   for (let i = 0; i < entries.length; i += 1) {
     const left = entries[i]
-    const leftTitle = normalizeTitle(left.title)
+    const leftTitle = normalizeTitle(left.displayTitle)
     for (let j = i + 1; j < entries.length; j += 1) {
       const right = entries[j]
       if (left.file === right.file) continue
-      const score = dice(leftTitle, normalizeTitle(right.title))
+      const score = dice(leftTitle, normalizeTitle(right.displayTitle))
       if (score < 0.5) continue
       if (!left.duplicateOf) left.duplicateOf = right.owner
       if (!right.duplicateOf) right.duplicateOf = left.owner
@@ -234,21 +261,22 @@ function markDuplicates(entries) {
 
 function formatItem(entry) {
   const suffix = entry.duplicateOf ? ` ⚠ 疑似重复（${entry.duplicateOf}）` : ''
-  return `- [${entry.owner}] ${entry.title} — ${entry.status}${suffix}`
+  return `- [${entry.owner}] ${entry.displayTitle} — ${entry.status}${suffix}`
 }
 
-function buildSegment(entries, generatedAt) {
+function buildSegment(entries, generatedAt, hash) {
   const counts = countEntries(entries)
+  const unfinished = entries.filter((entry) => entry.status !== '已完成')
+  const done = entries.filter((entry) => entry.status === '已完成').sort(ownerCompare)
   const lines = [
-    `${GENERATED_PREFIX} ${generatedAt}; ${counts.total} items; src=.worklog/todo -->`,
-    `共 ${counts.total} 条（P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}，已完成 ${counts.done}）· 来源 .worklog/todo/*.md`,
+    `${GENERATED_PREFIX} ${generatedAt}; ${counts.total} items; src=${hash} -->`,
+    `共 ${counts.total} 条 · P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}（未完成）· 已完成 ${counts.done} · 来源 .worklog/todo/*.md`,
   ]
   for (const priority of PRIORITIES) {
-    const group = entries.filter((entry) => entry.priority === priority).sort(ownerCompare)
+    const group = unfinished.filter((entry) => entry.priority === priority).sort(ownerCompare)
     lines.push('', `### ${priority}（${group.length}）`)
     for (const entry of group) lines.push(formatItem(entry))
   }
-  const done = entries.filter((entry) => entry.status === '已完成').sort(ownerCompare)
   if (done.length) {
     lines.push('', `### 已完成（${done.length}）`)
     for (const entry of done) lines.push(formatItem(entry))
@@ -278,14 +306,28 @@ async function readRoadmap(roadmapPath) {
   }
 }
 
-async function checkRoadmap(roadmapPath, entries, generatedAt) {
+async function warnIfHtmlStale(htmlPath, hash) {
+  let problem = null
+  try {
+    const html = await readFile(htmlPath, 'utf8')
+    const match = /<!-- generated:[^>]*src=([0-9a-f]{12})/.exec(html)
+    if (!match) problem = 'no src hash in HTML'
+    else if (match[1] !== hash) problem = `src ${match[1]} != ${hash}`
+  } catch {
+    problem = 'missing file'
+  }
+  if (problem) console.log(`WARN: .worklog/roadmap.html 过期，跑 --write (${problem})`)
+}
+
+async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash) {
   const original = await readRoadmap(roadmapPath)
   const markers = locateMarkers(original)
   if (!markers.ok) fail(2, `missing marker ${markers.missing} in ${roadmapPath}`)
   const actual = stripGenerated(original.slice(markers.start + MARK_START.length, markers.end))
-  const expected = stripGenerated(buildSegment(entries, generatedAt))
+  const expected = stripGenerated(buildSegment(entries, generatedAt, hash))
   if (actual === expected) {
     console.log(`OK: ROADMAP auto section matches .worklog/todo (${entries.length} items)`)
+    await warnIfHtmlStale(htmlPath, hash)
     return
   }
   const actualLines = actual.split('\n')
@@ -308,12 +350,12 @@ async function checkRoadmap(roadmapPath, entries, generatedAt) {
   process.exit(1)
 }
 
-async function writeRoadmap(roadmapPath, entries, generatedAt) {
+async function writeRoadmap(roadmapPath, entries, generatedAt, hash) {
   const original = await readRoadmap(roadmapPath)
   const markers = locateMarkers(original)
   if (!markers.ok) fail(2, `missing marker ${markers.missing} in ${roadmapPath}`)
   const newline = original.includes('\r\n') ? '\r\n' : '\n'
-  const segment = buildSegment(entries, generatedAt).replace(/\n/g, newline)
+  const segment = buildSegment(entries, generatedAt, hash).replace(/\n/g, newline)
   const next =
     original.slice(0, markers.start + MARK_START.length) +
     newline +
@@ -342,12 +384,12 @@ function renderCard(entry) {
   const duplicate = entry.duplicateOf
     ? `      <span class="dup" title="与 ${escapeHtml(entry.duplicateOf)} 的条目疑似重复">⚠</span>\n`
     : ''
-  const search = escapeHtml(`${entry.title} ${entry.description} ${entry.acceptance}`.toLowerCase())
+  const search = escapeHtml(`${entry.displayTitle} ${entry.description} ${entry.acceptance}`.toLowerCase())
   return `    <details class="card" data-prio="${entry.priority}" data-owner="${escapeHtml(entry.owner)}" data-status="${escapeHtml(entry.status)}" data-search="${search}">
       <summary>
         <span class="prio ${entry.priority.toLowerCase()}">${entry.priority}</span>
         <span class="owner">${escapeHtml(entry.owner)}</span>
-        <span class="title">${escapeHtml(entry.title)}</span>
+        <span class="title">${escapeHtml(entry.displayTitle)}</span>
         <span class="badge ${statusClass(entry.status)}">${escapeHtml(entry.status)}</span>
 ${duplicate}      </summary>
       <div class="detail">
@@ -361,7 +403,7 @@ ${duplicate}      </summary>
     </details>`
 }
 
-function renderHtml(entries, generatedAt) {
+function renderHtml(entries, generatedAt, hash) {
   const counts = countEntries(entries)
   const sorted = sortForDisplay(entries)
   const owners = [...new Set(sorted.map((entry) => entry.owner))].sort()
@@ -374,6 +416,7 @@ function renderHtml(entries, generatedAt) {
     .join('\n')
   const cards = sorted.map(renderCard).join('\n')
   return `<!doctype html>
+<!-- generated: ${escapeHtml(generatedAt)}; ${counts.total} items; src=${hash} -->
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -507,8 +550,8 @@ ${cards}
 `
 }
 
-async function writeHtml(htmlPath, entries, generatedAt) {
-  await writeFile(htmlPath, renderHtml(entries, generatedAt), 'utf8')
+async function writeHtml(htmlPath, entries, generatedAt, hash) {
+  await writeFile(htmlPath, renderHtml(entries, generatedAt, hash), 'utf8')
 }
 
 async function assertRepo(repo) {
@@ -530,9 +573,20 @@ async function main() {
 
   const { entries, errors } = await parseTodos(todoDir)
   markDuplicates(entries)
+  const hash = sourceHash(entries)
+  const generatedAt = nowStamp()
 
   if (options.json) {
-    console.log(JSON.stringify({ repo, roadmap: roadmapPath, counts: countEntries(entries), errors, entries }, null, 2))
+    const model = {
+      repo,
+      roadmap: roadmapPath,
+      html: htmlPath,
+      hash,
+      counts: countEntries(entries),
+      errors,
+      entries: entries.map((entry) => ({ ...entry, completed: entry.status === '已完成' })),
+    }
+    console.log(JSON.stringify(model, null, 2))
     process.exit(errors.length ? 1 : 0)
   }
 
@@ -542,24 +596,22 @@ async function main() {
     process.exit(1)
   }
 
-  const generatedAt = nowStamp()
-
   if (options.htmlOnly) {
-    await writeHtml(htmlPath, entries, generatedAt)
+    await writeHtml(htmlPath, entries, generatedAt, hash)
     console.log(`wrote HTML -> ${htmlPath}`)
     return
   }
 
   if (options.mode === 'check') {
-    await checkRoadmap(roadmapPath, entries, generatedAt)
+    await checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash)
     return
   }
 
-  await writeRoadmap(roadmapPath, entries, generatedAt)
+  await writeRoadmap(roadmapPath, entries, generatedAt, hash)
   const counts = countEntries(entries)
   console.log(`wrote ROADMAP: ${counts.total} items (P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}, done ${counts.done}) -> ${roadmapPath}`)
   try {
-    await writeHtml(htmlPath, entries, generatedAt)
+    await writeHtml(htmlPath, entries, generatedAt, hash)
     console.log(`wrote HTML -> ${htmlPath}`)
   } catch (error) {
     console.warn(`warning: HTML render failed (ROADMAP was written): ${error.message}`)

@@ -91,4 +91,4 @@ git status                         # 应干净：产物都在忽略目录 / 仓�
 node scripts/roadmap.mjs --check   # 必须退出 0
 ```
 
-`--check` 退出 1 表示 todo 与 ROADMAP 自动段漂移，跑 `--write` 后复查；退出 2 表示 ROADMAP 缺 AUTO 标记，找协调会话。
+`--check` 退出 1 表示 todo 与 ROADMAP 自动段漂移，跑 `--write` 后复查；退出 2 表示 ROADMAP 缺 AUTO 标记，找协调会话。看到 `WARN: .worklog/roadmap.html 过期` 就补跑一次 `--write`（不阻塞收尾，但别把过期页面当现状）。
