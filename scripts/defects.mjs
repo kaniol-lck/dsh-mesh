@@ -162,10 +162,11 @@ function createCollector() {
     add(finding) {
       let bucket = buckets.get(finding.signature)
       if (!bucket) {
-        bucket = { signature: finding.signature, count: 0, first: null, last: null, domains: new Set(), evidence: [] }
+        bucket = { signature: finding.signature, count: 0, readyCount: 0, first: null, last: null, domains: new Set(), evidence: [] }
         buckets.set(finding.signature, bucket)
       }
       bucket.count += 1
+      if (finding.ready !== false) bucket.readyCount += 1
       for (const date of [finding.first, finding.last]) {
         if (!date || date === '?') continue
         if (!bucket.first || date < bucket.first) bucket.first = date
@@ -235,6 +236,17 @@ async function todoFileDate(repo, file) {
   }
 }
 
+function isSettledPair(left, right) {
+  // Settled = at least one side explicitly points 归属 at the other side, and the pair
+  // agrees on status. Priority mismatch is recorded but does not keep a pair "unsettled":
+  // the two entries describe the same work at different granularity.
+  if (!right) return false
+  if (left.status !== right.status) return false
+  const leftPointsToRight = left.explicitOwner && left.owner === right.owner
+  const rightPointsToLeft = right.explicitOwner && right.owner === left.owner
+  return leftPointsToRight || rightPointsToLeft
+}
+
 async function collectRoadmapDuplicates(repo, confirmed) {
   const roadmapScript = path.join(repo, 'scripts', 'roadmap.mjs')
   const exists = await stat(roadmapScript).then((info) => info.isFile()).catch(() => false)
@@ -271,8 +283,13 @@ async function collectRoadmapDuplicates(repo, confirmed) {
       pairs.push([marked[i], null])
     }
   }
+  let settled = 0
+  let unsettled = 0
   for (const pair of pairs) {
     const [left, right] = pair
+    const settledPair = isSettledPair(left, right)
+    if (settledPair) settled += 1
+    else unsettled += 1
     if (!right) {
       confirmed.add({
         signature: 'dup-todo',
@@ -281,22 +298,25 @@ async function collectRoadmapDuplicates(repo, confirmed) {
         snippet: left.displayTitle ?? left.title,
         first: await todoFileDate(repo, left.file),
         last: await todoFileDate(repo, left.file),
+        ready: false,
       })
       continue
     }
     const first = await todoFileDate(repo, left.file)
     const last = await todoFileDate(repo, right.file)
     const domain = left.owner === right.owner ? left.owner : `${left.owner}/${right.owner}`
+    const note = settledPair && left.priority !== right.priority ? `（优先级不一致 ${left.priority}/${right.priority}）` : ''
     confirmed.add({
       signature: 'dup-todo',
       domain,
       evidence: `${left.file}:${left.line} + ${right.file}:${right.line}`,
-      snippet: `${left.displayTitle ?? left.title} ↔ ${right.displayTitle ?? right.title}`,
+      snippet: `${left.displayTitle ?? left.title} ↔ ${right.displayTitle ?? right.title}${note}`,
       first,
       last,
+      ready: false,
     })
   }
-  return { available: true, marked: marked.length, pairs: pairs.length }
+  return { available: true, marked: marked.length, pairs: pairs.length, settled, unsettled }
 }
 
 // Coarse failure signatures: same kind of failure counts once, no matter which path/id it names.
@@ -410,25 +430,26 @@ async function collectFailLog() {
   return { files: files.length, records, signatureCount: rows.length, occurrences: rows.reduce((sum, row) => sum + row.occurrences, 0), rows }
 }
 
-function renderLedger(generatedAt, totals, options, confirmedRows, inferredRows, confirmedPending, inferredPending, failLog) {
+function renderLedger(generatedAt, totals, options, dupStats, confirmedRows, inferredRows, confirmedPending, inferredPending, failLog) {
   const lines = [
     `<!-- generated: ${generatedAt}; confirmed=${totals.confirmed}; inferred=${totals.inferred} -->`,
     '# 缺陷台账',
     '',
-    `共 ${totals.confirmed + totals.inferred} 条（确定 ${totals.confirmed} + 推断 ${totals.inferred}，推断不计入 READY）`,
+    `共 ${totals.confirmed + totals.inferred} 条（确定 ${totals.confirmed} + 推断 ${totals.inferred}，推断不计入 READY）· dup-todo 已归口 ${dupStats.settled} / 未归口 ${dupStats.unsettled}`,
     '',
-    `## READY FOR PATCH（≥${options.threshold}，只看确定源）`,
+    `## READY FOR PATCH（≥${options.threshold}，只看确定源；已归口的重复登记不计）`,
   ]
-  const ready = confirmedRows.filter((row) => row.count >= options.threshold)
+  const ready = confirmedRows.filter((row) => row.readyCount >= options.threshold)
   if (ready.length === 0) lines.push('（无）')
   for (const row of ready) {
     const evidence = row.evidence[0] ?? '?'
     lines.push(`- ${row.signature}（${row.count}）—— 证据：${evidence}；建议：${SUGGESTIONS[row.signature] ?? '人工判断'}`)
   }
-  lines.push('', '## 计数', '| 签名 | 次数 | 首见 | 末见 | 域 | 置信 |', '|---|---|---|---|---|---|')
+  lines.push('', '## 计数', '| 签名 | 次数 | 首见 | 末见 | 域 | 置信 | 归口 |', '|---|---|---|---|---|---|---|')
   for (const row of [...confirmedRows, ...inferredRows].sort((left, right) => right.count - left.count || (left.signature < right.signature ? -1 : 1))) {
     const confidence = confirmedRows.includes(row) ? '确定' : '推断?'
-    lines.push(`| ${row.signature} | ${row.count} | ${row.first ?? '?'} | ${row.last ?? '?'} | ${[...row.domains].join(' / ') || '?'} | ${confidence} |`)
+    const gate = row.signature === 'dup-todo' ? `已归口 ${dupStats.settled} / 未归口 ${dupStats.unsettled}` : '-'
+    lines.push(`| ${row.signature} | ${row.count} | ${row.first ?? '?'} | ${row.last ?? '?'} | ${[...row.domains].join(' / ') || '?'} | ${confidence} | ${gate} |`)
   }
   if (options.withFailLog) {
     lines.push('', '## 工具失败（参考，不计入 READY）')
@@ -463,11 +484,16 @@ async function main() {
   const failLog = options.withFailLog ? await collectFailLog() : null
   const confirmedRows = confirmed.rows()
   const inferredRows = inferred.rows()
+  const dupStats = { pairs: roadmap.pairs ?? 0, settled: roadmap.settled ?? 0, unsettled: roadmap.unsettled ?? 0 }
+  // Settled duplicate pairs are normal records: count them, never keep READY lit. An
+  // unsettled pair is a process gap, so it re-enables the dup-todo row for READY.
+  const dupRow = confirmedRows.find((row) => row.signature === 'dup-todo')
+  if (dupRow) dupRow.readyCount = dupStats.unsettled > 0 ? dupRow.count : 0
   const totals = { confirmed: confirmed.total(), inferred: inferred.total() }
   const generatedAt = nowStamp()
 
   if (options.json) {
-    const ready = confirmedRows.filter((row) => row.count >= options.threshold)
+    const readyRows = confirmedRows.filter((row) => row.readyCount >= options.threshold)
     console.log(
       JSON.stringify(
         {
@@ -480,10 +506,13 @@ async function main() {
             count: totals.confirmed,
             defectLines: worklog.defectLines,
             dupPairs: roadmap.pairs ?? 0,
-            ready: ready.map((row) => row.signature),
+            dupSettled: dupStats.settled,
+            dupUnsettled: dupStats.unsettled,
+            ready: readyRows.map((row) => row.signature),
             rows: confirmedRows.map((row) => ({
               signature: row.signature,
               count: row.count,
+              readyCount: row.readyCount,
               first: row.first ?? '?',
               last: row.last ?? '?',
               domains: [...row.domains],
@@ -502,7 +531,7 @@ async function main() {
             })),
             pending: inferred.pending,
           },
-          ready: ready.map((row) => row.signature),
+          ready: readyRows.map((row) => row.signature),
           pending: [...confirmed.pending, ...inferred.pending],
           toolFailures: failLog
             ? { signatureCount: failLog.signatureCount, occurrences: failLog.occurrences, rows: failLog.rows }
@@ -516,11 +545,11 @@ async function main() {
   }
 
   const ledgerPath = path.join(repo, '.worklog', 'defects.md')
-  const ledger = renderLedger(generatedAt, totals, options, confirmedRows, inferredRows, confirmed.pending, inferred.pending, failLog)
+  const ledger = renderLedger(generatedAt, totals, options, dupStats, confirmedRows, inferredRows, confirmed.pending, inferred.pending, failLog)
   await writeFile(ledgerPath, ledger, 'utf8')
-  const ready = confirmedRows.filter((row) => row.count >= options.threshold)
-  const readyText = ready.length ? ready.map((row) => `${row.signature}（${row.count}）`).join(' / ') : 'none'
-  console.log(`defects: confirmed=${totals.confirmed}（DEFECT ${worklog.defectLines} 条 + dup-todo ${roadmap.pairs ?? 0} 对）· inferred=${totals.inferred} · READY=${readyText}`)
+  const readyRows = confirmedRows.filter((row) => row.readyCount >= options.threshold)
+  const readyText = readyRows.length ? readyRows.map((row) => `${row.signature}（${row.count}）`).join(' / ') : 'none'
+  console.log(`defects: confirmed=${totals.confirmed}（DEFECT ${worklog.defectLines} 条 + dup-todo ${dupStats.pairs} 对，已归口 ${dupStats.settled} / 未归口 ${dupStats.unsettled}）· inferred=${totals.inferred} · READY=${readyText}`)
   if (failLog) console.log(`fail-log: signatures=${failLog.signatureCount}（occurrences=${failLog.occurrences}，参考，不进 READY）`)
   console.log(`ledger -> ${ledgerPath}`)
 }
