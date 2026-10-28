@@ -17,7 +17,7 @@
  *    normal session-start inbox check picks it up later.
  */
 import { createServer } from 'node:http'
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { statSync } from 'node:fs'
 import { tmpdir, networkInterfaces, homedir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
@@ -507,7 +507,11 @@ export function apply(ctx, config) {
   // ~/.dsh/sessions/<workspace>/<session-id>/session.v4.jsonl.zstd, so the waker can
   // enumerate them and prompt one directly. This never touches the hub, which keeps the
   // latency in the millisecond range and works offline.
-  const SESSIONS_ROOT = join(homedir(), '.dsh', 'sessions')
+  // MESH_WAKER_SESSIONS_ROOT exists so tests can point discovery at a temp directory and
+  // never list (or delete) the real sessions of the machine running them.
+  const SESSIONS_ROOT = process.env.MESH_WAKER_SESSIONS_ROOT
+    ? String(process.env.MESH_WAKER_SESSIONS_ROOT)
+    : join(homedir(), '.dsh', 'sessions')
   const SESSION_INDEX_PATH = c.tokenFile ? join(dirname(c.tokenFile), 'sessions-index.json') : join(tmpdir(), 'mesh-waker-sessions.json')
   const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 
@@ -669,6 +673,74 @@ export function apply(ctx, config) {
       }
     }
     throw new Error('找不到会话；可用 GET /mesh/sessions 查看本机会话列表')
+  }
+
+  const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
+
+  /**
+   * Drop every conversations.json binding that points at one session: the delivery target
+   * (`deliverTo`), the panel binding and a conversation's own session. Without this the
+   * next wake keeps targeting a session that no longer exists.
+   */
+  function dropConversationBindings(sessionId) {
+    let dropped = 0
+    for (const [conversation, entry] of Object.entries(conversations)) {
+      if (!entry || typeof entry !== 'object') continue
+      let touched = false
+      if (entry.deliverTo === sessionId) {
+        entry.deliverTo = null
+        touched = true
+      }
+      if (entry.panelSessionId === sessionId) {
+        entry.panelSessionId = null
+        touched = true
+      }
+      if (entry.sessionId === sessionId) {
+        entry.sessionId = null
+        entry.createdAt = 0
+        entry.wakes = 0
+        touched = true
+      }
+      if (!touched) continue
+      dropped += 1
+      fileLog(`unbound ${conversation} from deleted session ${sessionId}`)
+    }
+    if (dropped) {
+      saveConversations()
+      state.conversations = Object.keys(conversations).length
+    }
+    return dropped
+  }
+
+  /**
+   * Stop whatever a live session is doing before its log goes away. dsh exposes no public
+   * "close session" call, so this cancels the active turn (the documented stop), then tries
+   * any dispose-like hook the host happens to expose, then waits briefly for the agent to
+   * disappear. `stopped: false` means the session is still loaded: the caller must report a
+   * failure instead of deleting a log a running agent may still be writing to.
+   */
+  async function stopLiveSession(sessionId) {
+    if (!isLive(sessionId)) return { live: false, stopped: true, via: [] }
+    const via = []
+    const call = async (label, owner, methods, argument) => {
+      for (const method of methods) {
+        if (typeof owner?.[method] !== 'function') continue
+        try {
+          await owner[method](argument)
+          via.push(`${label}.${method}`)
+          return true
+        } catch (error) {
+          fileLog(`${label}.${method}(${sessionId}) failed: ${error.message}`)
+        }
+      }
+      return false
+    }
+    await call('sessionController', ctx.sessionController, ['cancel'], { sessionId })
+    await call('agent', ctx.agents?.get?.(sessionId), ['dispose', 'close', 'stop', 'abort'])
+    await call('sessionController', ctx.sessionController, ['close', 'dispose', 'unload'], { sessionId })
+    const deadline = Date.now() + 2000
+    while (Date.now() < deadline && isLive(sessionId)) await sleep(100)
+    return { live: isLive(sessionId), stopped: !isLive(sessionId), via }
   }
 
   function throttleSummary() {
@@ -1598,28 +1670,70 @@ export function apply(ctx, config) {
         res.end('{"error":"loopback only"}')
         return
       }
-      const chunks = []
-      for await (const chunk of req) chunks.push(chunk)
       try {
-        const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        const draft = await readJsonRequest(req)
         const id = String(draft.session ?? '').trim()
         if (!id) throw new Error('session is required')
-        let removed = 'unknown'
+        // Only sessions discovery can see are deletable: the id is matched against the
+        // scanned list, so a caller cannot aim the delete at an arbitrary path.
+        const entry = discoverSessions().find((session) => session.id === id)
+        // 1) stop the live session first; a log a running agent still writes must not vanish.
+        const stop = await stopLiveSession(id)
+        if (!stop.stopped) {
+          res.writeHead(409, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+          res.end(
+            JSON.stringify({
+              ok: false,
+              sessionId: id,
+              error: `session is still live (${stop.via.join(', ') || 'no stop hook available'}); stop it first`,
+              live: true,
+              stoppedVia: stop.via,
+            }),
+          )
+          return
+        }
+        // 2) drop the bindings before the session disappears, so mail falls back to the inbox.
+        const bindingsDropped = dropConversationBindings(id)
+        // 3) the workspace registry knows workspaces, not session logs; sweep it best effort
+        //    and never treat its return value as proof that a session was deleted.
+        let registry = null
         try {
           if (typeof ctx.workspaceRegistry?.deleteKnown === 'function') {
             await ctx.workspaceRegistry.deleteKnown(id)
-            removed = 'deleteKnown'
+            registry = 'deleteKnown'
+          } else if (typeof ctx.workspaceRegistry?.delete === 'function') {
+            await ctx.workspaceRegistry.delete(id)
+            registry = 'delete'
           }
         } catch (error) {
-          fileLog(`workspaceRegistry.deleteKnown failed for ${id}: ${error.message}`)
+          fileLog(`workspaceRegistry delete for ${id} failed: ${error.message}`)
         }
-        if (removed === 'unknown' && typeof ctx.workspaceRegistry?.delete === 'function') {
-          await ctx.workspaceRegistry.delete(id)
-          removed = 'delete'
+        if (!entry) {
+          res.writeHead(404, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+          res.end(JSON.stringify({ ok: false, sessionId: id, error: 'session not found in the local session list' }))
+          return
         }
-        fileLog(`deleted local session ${id} via ${removed}`)
+        // 4) hard delete: GET /mesh/sessions discovers these directories, so removing the
+        //    directory is what actually makes the session disappear.
+        const directory = dirname(entry.log)
+        rmSync(directory, { recursive: true, force: true })
+        if (existsSync(directory)) throw new Error(`removing ${directory} did not take effect`)
+        delete sessionIndex[id]
+        saveSessionIndex()
+        fileLog(`deleted local session ${id} dir=${directory} live=${stop.live} bindings=${bindingsDropped}`)
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-        res.end(JSON.stringify({ ok: true, sessionId: id, method: removed }))
+        res.end(
+          JSON.stringify({
+            ok: true,
+            sessionId: id,
+            method: 'session-directory',
+            directory,
+            live: false,
+            stoppedVia: stop.via,
+            bindingsDropped,
+            registry,
+          }),
+        )
       } catch (error) {
         res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: false, error: error.message }))
