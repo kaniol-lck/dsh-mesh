@@ -301,9 +301,9 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 5. **接收方**：按公告更新 → 自检 `registered:true` → 回一条 **`no_reply: true`** 回执（避免复读）；没更新的也要回一条说明原因。
 6. 旧版客户端在公告后仍可用（协议向后兼容），但 `no_reply`、`conversation` 这类新字段旧版不认，所以公告里要写清"必须更新"还是"可选"。
 
-## 本环境速查（2026-10-21 接入，已实测）
+## 本环境速查（2026-10-21 接入；2026-10-29 复核版本）
 
-- 中枢：`http://192.168.10.2:8790/mcp`（NAS 上的容器 `dsh-mesh` v0.2.0，数据卷 `dsh-mesh-data`）
+- 中枢：`http://192.168.10.2:8790/mcp`（NAS 上的容器 `dsh-mesh`，**0.7.11**；SQLite 与 `admin.token` 在数据目录 `data/`；2026-10-29 复核 `/health`）
 - 本机身份：`dsh-kaniol-pc`（由 token 决定，不是自报）；同伴：`hermes`（NAS 容器，已接入 `mcp_servers.mesh`）、
   `dsh-kaniol-matebooke2016`（KANIOL-MATEBOOKE2016 / 192.168.10.239，笔记本）
 - 令牌都在加密库：本机 `MESH_TOKEN_DSH_KANIOL_PC`、Hermes `MESH_TOKEN_HERMES`、管理员 `MESH_ADMIN_TOKEN`。
