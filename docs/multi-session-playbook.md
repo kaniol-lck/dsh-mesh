@@ -70,6 +70,8 @@ node scripts/mesh-dispatch.mjs --session session-… --file task.txt --mode stee
 | 注入没反应 | 目标会话忙/标题匹配歧义 | 用完整 session id；查 `live` 字段 |
 | `create` 返回 400 | 缺 `title`，或标题匹配不到目标 | 看响应里的 `error` |
 | 注入只收到 15 字符 `"[object Object]"` | PowerShell 5.1 `ConvertTo-Json` 把多行字符串包成 `{"value":…}` | 改用 `scripts/mesh-dispatch.mjs`（Node fetch）派活，不要用 `Invoke-RestMethod` |
+| 用 PS `Set-Content -Encoding utf8` 改 `package.json` 后 JSON 解析失败 | Windows PowerShell 5.1 的 `-Encoding utf8` 会写 UTF-8 **BOM**，`JSON.parse` 报 `Unexpected token '﻿'` | 改 JSON/JS 时用 `[IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))`，或直接用编辑工具；写完 `node -e "JSON.parse(...)"` 验一遍 |
+| 测试 version drift 后 `hub/package.json` 未还原 | 手工改完没 `git checkout`，测试值被提交进去 | 测完立即 `git checkout -- hub/package.json`（或改前先备份），提交前 `git diff hub/` 确认为空 |
 
 ## 5. 发版（仍需 owner 确认）
 
