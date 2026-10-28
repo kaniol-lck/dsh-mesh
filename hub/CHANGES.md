@@ -6,9 +6,18 @@ v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话
 
 复验方式：`node smoke-client.mjs`（57/57）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
-> **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；已在 0.7.11 线上补齐（受限 token 调越权 REST 端点返回 403 + `required_scope`），未另发版本。
+> **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；补丁进入 0.7.12（见下条）。
 
 ---
+
+## v0.7.12（2026-10-29，REST 面 scopes 越权修复）
+
+| 项 | 内容 |
+|---|---|
+| 修复 | `handleRest` 之前不检查 `id.scopes`，受限 token 仍能调 `/api/send`、`/api/inbox`、`/api/board` 等；现在按读写端点逐一判权：读端点要 `read`，发消息/改消息要 `send`，写黑板要 `board`，blob 传输要 `blob` |
+| 响应 | 越权返回 `403` + `{ok:false, error, required_scope}`；admin 端点仍只认 admin token |
+| 测试 | smoke 增加 7 例：send-only 读 inbox 403、read-only 写 board 403、read-only 上传 blob 403、read-only 列 blob 元数据 200、unrestricted 发送 201，另含 read-only 发消息 403、read-only 读 inbox 200 |
+| 验证 | `node smoke-client.mjs`：57/57 passed（临时端口 + 临时数据目录，未碰 NAS） |
 
 ## v0.7.11（2026-10-28，控制台可退出 / 切换令牌）
 
