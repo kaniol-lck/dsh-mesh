@@ -136,9 +136,12 @@ dsh plugin --profile web add dsh-mesh-waker
 - [架构说明](docs/mesh-architecture.md)
 - [鉴权与控制台](docs/auth-and-console.md)（token 生命周期、scopes、IP 白名单、注册码派发、控制台角色）
 - [本机会话协作](docs/local-sessions.md)（会话发现与定向注入，不经过中枢）
-- [多会话协作手册](docs/multi-session-playbook.md)（协调/执行分工、派活模板、故障清理）（token 生命周期、scopes、IP 白名单、注册码派发、控制台角色）
+- [多会话协作手册](docs/multi-session-playbook.md)（协调/执行分工、派活模板、故障清理）
+- [发布流程](docs/release.md)（插件预检、next/latest 两级、owner 确认门）
+- [工作日志约定](docs/worklog.md)（todo 格式、ROADMAP 生成、缺陷台账）
 - [客户端插件 mesh-waker](plugins/mesh-waker/README.md)
 - [给 agent 的协作约定](skills/mesh/SKILL.md)
+- [工作区交接工具](scripts/handoff/README.md)
 
 ## 工作区交接
 
@@ -154,8 +157,9 @@ hub/                    中枢本体（单文件服务、Dockerfile、冒烟测�
 plugins/mesh-waker/     DSH 客户端插件：唤醒端点 -> 会话回合
 plugins/mesh-approval/  审批转发插件（兼容 Hermes）
 skills/mesh/            给 agent 看的协作说明（发信/读信/黑板约定）
-docs/mesh-architecture.md
-scripts/                密钥扫描 + 几个小型 REST 客户端脚本
+docs/                   auth-and-console · local-sessions · multi-session-playbook · release · worklog · mesh-architecture
+scripts/                密钥扫描、REST 客户端、roadmap/defects/check-paths 等门禁
+scripts/handoff/        工作区交接：打包 / 校验 / 依赖回流
 ```
 
 ## License

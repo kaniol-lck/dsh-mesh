@@ -17,7 +17,7 @@
 | 方法 | 路径 | 作用 |
 |---|---|---|
 | GET | `/mesh/sessions` | 列出本机会话（id、标题、cwd、是否 live/archived） |
-| POST | `/mesh/sessions/create` | 新建会话：`{title, workspacePath, prompt?}` |
+| POST | `/mesh/sessions/create` | 新建会话：`{title, workspacePath 或 cwd, prompt?}` |
 | POST | `/mesh/inject` | 定向投递：`{session 或 title, text, mode?}` |
 | POST | `/mesh/sessions/archive` | 归档（侧栏隐藏，文件保留） |
 | POST | `/mesh/sessions/delete` | 尝试从注册表删除（文件可能仍在磁盘） |
@@ -25,7 +25,7 @@
 要点：
 
 - **cwd 必须是具体仓根**（`...\dsh-mesh\public`）。指到包含两个仓的上级目录会让 `hub/`、`plugins/` 全部找不到；
-- 新建会话若不绑定工作区（只传 `cwd`），侧栏不会显示——统一传 `workspacePath`；
+- 新建会话的 `workspacePath` 与 `cwd` **都会**被尝试解析/绑定工作区（`plugins/mesh-waker/index.js:1674-1695`）；只有解析/创建失败时才回退为「无工作区」会话、侧栏不显示。推荐显式传 `workspacePath`，便于排错；
 - 注入默认 `mode=queue`（等当前回合结束），`steer` 会打断，慎用；
 - 目标会话不在内存时会自动 resume，首次稍慢。
 
@@ -63,7 +63,7 @@ node scripts/mesh-dispatch.mjs --session session-… --file task.txt --mode stee
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 新建会话侧栏不显示 | 只传了 cwd，没绑工作区 | 传 `workspacePath`；旧会话可 archive |
+| 新建会话侧栏不显示 | 工作区解析/创建失败（路径不存在或无权限），或旧版 waker；0.4.59 下 `cwd` 也会尝试绑定 | 确认路径存在可读，显式传 `workspacePath`；旧会话可 archive |
 | 会话里 `hub/README.md` 找不到 | cwd 指向了上级总目录 | 用具体仓根重建会话 |
 | 重复会话 | 创建请求在成功后报错（历史 bug），或重复提交 | 按标题去重：保留最新，其余 `/mesh/sessions/archive` |
 | archive 后仍出现在 `/mesh/sessions` | 该列表扫磁盘，不看注册表 | 侧栏以注册表为准；要彻底清理需删目录并重启 DSH |

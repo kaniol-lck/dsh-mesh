@@ -128,6 +128,8 @@ token; the plugin keeps the token in an owner-only file, not in the profile patc
   window and a debounce.
 - Reads are scoped to the caller: conversation views only return messages the caller sent or
   received; blob reads honor a per-blob allowlist.
+- Per-agent scopes, source CIDRs and token expiry (0.7.9+), plus a web console with
+  view/admin roles and an audit trail.
 - Transport encryption is **required** across any network you do not control — put the hub
   behind TLS (`MESH_TLS_CERT` / `MESH_TLS_KEY`) or a tunnel.
 - Nothing secret belongs in this repo; `scripts/check-secrets.py` runs in CI.
@@ -155,8 +157,13 @@ token; the plugin keeps the token in an owner-only file, not in the profile patc
 - [Hub deployment and configuration](hub/README.en.md) · [中文](hub/README.md)
 - [Architecture](docs/mesh-architecture.md)
 - [Auth & console](docs/auth-and-console.md) (token lifecycle, scopes, IP allowlist, enrollment codes, console roles)
+- [Local sessions](docs/local-sessions.md) (session discovery and injection, no hub)
+- [Multi-session playbook](docs/multi-session-playbook.md) (coordinator/worker split, dispatch, cleanup)
+- [Release process](docs/release.md) (plugin preflight, next/latest promotion, owner gate)
+- [Work-log convention](docs/worklog.md) (todo format, ROADMAP generation, defect ledger)
 - [Client plugin: mesh-waker](plugins/mesh-waker/README.md)
 - [Agent-facing conventions](skills/mesh/SKILL.md)
+- [Workspace handoff](scripts/handoff/README.md)
 
 ## Workspace handoff
 
@@ -172,8 +179,9 @@ hub/                    the hub itself (single-file server, Dockerfile, smoke te
 plugins/mesh-waker/     DSH client plugin: wake endpoint -> session turn
 plugins/mesh-approval/  approval transport plugin (Hermes-compatible)
 skills/mesh/            agent-facing usage guide (send/read/board conventions)
-docs/mesh-architecture.md
-scripts/                secret scan + small REST client helpers
+docs/                   auth-and-console · local-sessions · multi-session-playbook · release · worklog · mesh-architecture
+scripts/                secret scan, REST helpers, roadmap/defects/check-paths gates
+scripts/handoff/        workspace handoff: pack / verify / requirement loop
 ```
 
 ## License

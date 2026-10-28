@@ -377,7 +377,7 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/create -H 'content-type:
 铁律：
 
 1. **cwd/workspacePath 必须指向具体仓库根**，不要指向包含多个仓的上级目录，否则相对路径找不到文件；
-2. 新建会话要传 `workspacePath`（只传 cwd 不绑工作区，侧栏不显示）；
+2. 新建会话传 `workspacePath` 或 `cwd` 都会尝试解析/绑定工作区（`plugins/mesh-waker/index.js:1674-1695`）；解析/创建失败才回退为不绑定、侧栏不显示；显式传 `workspacePath` 更好排错；
 3. 注入默认 `queue`，`steer` 会打断当前回合，慎用；
 4. 一个任务派一个会话，明确“只改哪里 / 什么算完成 / 怎么回报”；
 5. 清理重复会话用 `/mesh/sessions/archive`（侧栏隐藏）或 `/mesh/sessions/delete`（文件可能仍在磁盘）。
