@@ -29,7 +29,7 @@
 1. 只在有证据时触发：同类问题 ≥2 次 / 一次故障让既有约定失效 / 检查脚本反复卡同一处。
 2. 动作：记 WORKLOG 一行 → 若是约定缺口，产出 AGENTS.md 或 docs/worklog.md 的补丁（含证据行与收尾验证办法）。
 3. 约定变更必须先报 owner 批准，批准后由 docs 落盘、协调会话记 WORKLOG；禁止静默改约定。
-4. 统计口径固定为 `node scripts/defects.mjs --scan --threshold 3`；同类 ≥3 条标 READY FOR PATCH，才起草补丁。
+4. 统计口径固定为 `node scripts/defects.mjs --scan --threshold 3`；同类 ≥3 条标 READY FOR PATCH，才起草补丁。**READY 只看确定源**（`DEFECT:` 行 + 跨会话重复对）；工具失败归 fail-log-guide，`--with-fail-log` 只作参考，不计入 READY。
 
 ## 跨域发现（所有会话）
 1. 同域问题写自己 todo；跨域但只需改文件时，只写一条 `归属：<会话>` 的 todo，派活由协调会话统一做。

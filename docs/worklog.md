@@ -73,9 +73,11 @@ YYYY-MM-DD HH:mm · <会话> · <动作> · <产物或 commit>
 
 反复出现的问题先记账，够数才动约定；脚本**不会自动改约定**。
 
-- 确定源：在 `.worklog/WORKLOG.md` 写一行 `DEFECT: <签名> · <域> · <证据> · <blocking:yes|no>`（字段可缺，缺了记 `?`）；
+- 确定源（决定 READY）：`.worklog/WORKLOG.md` 里的 `DEFECT: <签名> · <域> · <证据> · <blocking:yes|no>` 行（字段可缺，缺了记 `?`），以及 roadmap 标出的跨会话疑似重复**对**（一对算 1 条）；
+- 推断源（只计数，不决定 READY）：WORKLOG 里命中 `修复|漂移|坑|失败|超时|不一致` 的行，台账里标 `?`；
 - 统计：`node scripts/defects.mjs --scan --threshold 3` 生成 `.worklog/defects.md`（本地文件，不入库）；`--json` 只打印不写文件，`--taxonomy` 打印词表；
-- 某签名次数 ≥ threshold 时台账标 `READY FOR PATCH`：到了才起草约定补丁 → owner 批准 → docs 落盘 → 协调会话记 WORKLOG 一行；
+- 某签名**确定性**次数 ≥ threshold 时才标 `READY FOR PATCH`（推断源永不触发）：到了才起草约定补丁 → owner 批准 → docs 落盘 → 协调会话记 WORKLOG 一行；
+- 工具失败归 fail-log-guide，默认**不纳入**台账；`--with-fail-log` 只把去重后的错误签名列进「工具失败（参考）」节，不计入 READY；
 - `DEFECT:` 进料目前是**建议不是强制**：先观察两轮真实进料量，再决定要不要升级为硬性要求。
 
 ## 收尾检查
