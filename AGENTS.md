@@ -22,7 +22,7 @@
 4. 不 `git push --force`；不提交凭据、token、`.npmrc`（`scripts/check-secrets.py` 是门禁）。
 5. 发版动作（`npm publish`、部署 hub 到 NAS）**必须先得到 owner 确认**。
 6. 待办写 `.worklog/todo/<自己>.md`，任务/故障/发版日志写 `.worklog/WORKLOG.md`，整套 `.worklog/` 不入库（明细只留在本地）。
-7. 工作日志的格式、目录与收尾检查见 `.worklog/README.md`。
+7. 工作日志的格式、目录与收尾检查见 `docs/worklog.md`。
 
 ## 多会话派活
 
@@ -32,10 +32,11 @@
 # 看本机会话
 curl.exe -s http://127.0.0.1:8795/mesh/sessions
 
-# 派给某个会话（按标题或 id）
-curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: application/json' `
-  -d '{"title":"mesh · hub","text":"核对 hub/README.md 与 docs/auth-and-console.md，列出不一致处，只列不改。"}'
+# 派给某个会话（Node fetch，正文从文件读）
+node scripts/mesh-dispatch.mjs --title "mesh · hub" --file .worklog/dispatch/hub.txt
 ```
+
+**不要用 `Invoke-RestMethod` / `ConvertTo-Json` 发任务正文**（会把多行字符串收成 `[object Object]`）。
 
 细节见 `docs/multi-session-playbook.md`。
 

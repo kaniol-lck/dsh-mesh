@@ -1,4 +1,4 @@
-﻿# Credentials and machine state never belong in this repository.
+# Credentials and machine state never belong in this repository.
 token
 wake-secret
 *.token
@@ -33,5 +33,5 @@ REFS.md
 __pycache__/
 *.pyc
 
-# Local work log (owner: not tracked)
+# Local work log data (never tracked; convention lives in docs/worklog.md)
 .worklog/
