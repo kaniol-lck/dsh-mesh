@@ -97,6 +97,8 @@ node scripts/roadmap.mjs --check   # 必须退出 0
 
 `--check` 退出 1 表示 todo 与 ROADMAP 自动段漂移，跑 `--write` 后复查；退出 2 表示 ROADMAP 缺 AUTO 标记，找协调会话。看到 `WARN: .worklog/roadmap.html 过期` 就补跑一次 `--write`（不阻塞收尾，但别把过期页面当现状）。
 
+决策怎么路由看 AGENTS「决策路由」：跨域、约定/流程变更、版本号、凭据与轮换、发版与部署的事别在会话里自己拍板；自决的决定在 `WORKLOG` 写一行 `DECISION:`。
+
 ## 7. 唤醒协调会话（本机）
 
 本机内**只用 inject**，不要为了叫醒本机会话去调 hub/mesh：
