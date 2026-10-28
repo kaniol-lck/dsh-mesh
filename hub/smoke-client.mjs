@@ -100,6 +100,11 @@ const bob = await connect('bob', bobToken)
     health.persisted_sessions >= 2,
     `persisted=${health.persisted_sessions}, version=${health.version}`,
   )
+  // The version is reported from HUB_VERSION in server.mjs; the npm package has its own
+  // field. They drifted once (server 0.7.11 vs package 0.7.6) and broke release hygiene,
+  // so the smoke suite now fails when they disagree.
+  const pkg = JSON.parse(readFileSync(join(HERE, 'package.json'), 'utf8'))
+  check('package.json version matches the running hub', pkg.version === health.version, `pkg ${pkg.version}, hub ${health.version}`)
 }
 
 try {

@@ -1,12 +1,84 @@
-# v0.2.x 加固记录
+# 变更记录
 
 v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审计 + 本机实跑，
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（26/26）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（50/50）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
 ---
+
+## v0.7.11（2026-10-28，控制台可退出 / 切换令牌）
+
+| 项 | 内容 |
+|---|---|
+| 控制台 | 页头加「退出 / 切换令牌」表单：POST /console/logout 清掉 cookie 回登录页；只读角色提示用管理员令牌重新登录以切换角色 |
+| 验证 | 控制台点「退出」后 cookie 失效并回到登录页；换另一个令牌登录后角色角标随之切换 |
+
+## v0.7.10（2026-10-28，修复控制台页面脚本）
+
+| 项 | 内容 |
+|---|---|
+| 修复 | 页面内联脚本里 `alert('…\n\n' + token)` 的 `\n` 被模板字符串展开成真实换行，浏览器报语法错误，刷新与所有按钮失效；改为转义后的 `\\n` |
+| 验证 | 打开 /console 后概览、成员、审计正常渲染，浏览器 console 无语法错误；轮换令牌弹窗正常显示 |
+
+## v0.7.9（2026-10-28，管理员控制台、per-agent scopes、IP 白名单、令牌过期）
+
+| 项 | 内容 |
+|---|---|
+| 控制台 | 双角色：view token 只读；admin token 可轮换/吊销、改 scopes、改 allowed_cidrs、生成注册码。cookie 会话的写操作要求 x-mesh-csrf，只读角色写操作 403 |
+| 权限 | agents.scopes（read / send / board / blob，空 = 全部）、allowed_cidrs、token_expires_at 列（自动迁移）；MCP 工具按 scope 拒绝并返回可读错误 |
+| 认证 | 令牌过期返回 401 token expired；来源不在 allowed_cidrs 返回 403；控制台来源由 MESH_CONSOLE_ALLOW 限制（默认 loopback + RFC1918） |
+| 验证 | 受限 scope 的 token 调 mesh_send 得到 scope 错误；CIDR 不符 403；过期 token 401；只读角色在控制台写操作 403 |
+
+## v0.7.8（2026-10-28，注册码 enroll）
+
+| 项 | 内容 |
+|---|---|
+| 注册码 | POST /api/admin/enroll-codes（admin）生成 8 位 code，10 分钟有效、单次使用；POST /api/enroll 用它换 agent token（201），同码重放 401 |
+| 防爆破 | enroll 按来源 IP 计数，超过 10 次返回 429；成功与失败都进 audit 表 |
+| 关联 | 同提交的「两轴版本自检」与「持久化限流账本」在 waker 0.4.55，详见插件 CHANGELOG |
+| 验证 | 生成注册码 → /api/enroll 换到 token → token 调 /api/status 200；重放同一 code 401；库中只存 token 的 sha256 |
+
+## v0.7.7（2026-10-27，按消息指定投递模式）
+
+| 项 | 内容 |
+|---|---|
+| 消息 | messages.delivery_mode 列（自动迁移）；mesh_send 接受 delivery: queue / steer / branch，POST /api/send 接受 body.delivery，非法值按未设置处理 |
+| 语义 | 只是发送方建议，接收方 waker 的本地策略与频率上限仍优先；inbox / conversation 返回该字段 |
+| 验证 | 发送 delivery=steer 后 /api/inbox 返回 delivery_mode=steer；不传该字段时为 null |
+
+## v0.7.6（2026-10-27，回信沿用发起会话）
+
+| 项 | 内容 |
+|---|---|
+| 消息 | messages.origin_session 列（自动迁移）；mesh_send 接受 session，POST /api/send 接受 body.session，随消息落库（≤80 字符） |
+| 唤醒 | wake ping 带上该 conversation 中发送方最近一条 origin_session，接收端 waker 可把对话绑回发起会话；仅是建议，接收端自行决定 |
+| 验证 | 带 session 发送后，对端 wake body 含 origin_session；/api/conversation 返回该字段 |
+
+## v0.7.5（2026-10-26，只读控制台）
+
+| 项 | 内容 |
+|---|---|
+| 控制台 | GET /console（需 MESH_VIEW_TOKEN，未设时回落到 MESH_ADMIN_TOKEN；两者都没有则 404）；登录换 HttpOnly + SameSite=Strict cookie（12 小时） |
+| 防护 | 来源由 MESH_CONSOLE_ALLOW 限制（默认 loopback + RFC1918）；连续 5 次错误令牌锁 60 秒；只读 API：overview / peers / audit |
+| 验证 | 设置 MESH_VIEW_TOKEN 后 /console 先返回登录页、登录后 200；非白名单来源 403；README 与 README.en 同步控制台说明 |
+
+## v0.7.4（2026-10-26，插件版本上报与漂移提示）
+
+| 项 | 内容 |
+|---|---|
+| 上报 | POST /api/register 接受 plugin {name, version, platform}，写入 agents.plugin_* 列（自动迁移）；仅作展示，不参与鉴权 |
+| 漂移 | 引入 HUB_VERSION 与 MESH_MIN_WAKER；/api/peers 返回 plugin 与 compat（ok / outdated），/api/status 返回 plugin_versions 与 outdated 列表 |
+| 验证 | 以 plugin.version=0.3.9 注册后 /api/peers 显示 outdated、0.4.0 显示 ok；/api/status 的 outdated 含旧节点 |
+
+## v0.7.3（2026-10-26，interrupt 提示与 relay 会话键）
+
+| 项 | 内容 |
+|---|---|
+| 消息 | messages.interrupt 列（自动迁移）；mesh_send 接受 interrupt:true，POST /api/send 接受 body.interrupt；inbox / conversation 返回该字段。是否插队仍由接收方 waker 决定 |
+| relay | 唤醒请求改用 X-Hermes-Session-Key: mesh:<conversation>，Hermes 的 api_server 按 header（而不是 OpenAI user 字段）区分会话 |
+| 验证 | 发送 interrupt:true 后 /api/inbox 与 /api/conversation 的 interrupt=1；relay 目标收到 x-hermes-session-key header |
 
 ## v0.7.2（2026-10-25，修复会话持久化被 idle sweep 抹掉）
 
