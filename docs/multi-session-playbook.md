@@ -94,3 +94,33 @@ node scripts/roadmap.mjs --check   # 必须退出 0
 ```
 
 `--check` 退出 1 表示 todo 与 ROADMAP 自动段漂移，跑 `--write` 后复查；退出 2 表示 ROADMAP 缺 AUTO 标记，找协调会话。看到 `WARN: .worklog/roadmap.html 过期` 就补跑一次 `--write`（不阻塞收尾，但别把过期页面当现状）。
+
+## 7. 唤醒协调会话（本机）
+
+本机内**只用 inject**，不要为了叫醒本机会话去调 hub/mesh：
+
+```powershell
+# P0 / 安全：立刻叫醒协调会话
+node scripts/mesh-dispatch.mjs --wake --title "mesh · 协调" --text "[WAKE] hub/README 的 TLS 示例仍指向明文 HTTP，涉及安全，需你决定是否先改文档"
+
+# 需要 owner 决策：一句话说清现状和选项，细节放第二段
+node scripts/mesh-dispatch.mjs --wake --title "mesh · 协调" --text "[WAKE] latest 发布前需要 owner 确认，两个候选版本已备好"
+```
+
+- 触发门槛（满足其一才叫）：P0 / 安全；需要 owner 决策；阻塞自己 ≥30 分钟；任务完成且结论会影响别人下一步；
+- **不唤醒**：普通进度、「我做完了」、todo 更新、例行问答 —— 写进 `.worklog/todo/<自己>.md` 和 `WORKLOG`，协调会话下一轮会扫到；
+- 正文首行必须是 `[WAKE] <一句话摘要>`，细节写后面；一次任务最多叫一次，等回执期间不要重复叫；
+- `--wake` 对「同一目标会话 + 同一正文」做 60 秒防抖，重复投递会打印 `deduped: same payload within 60s` 并退出 0。
+
+## 8. 跨机消息唤醒（绑定）
+
+跨机来件由 hub 落库后经 waker 唤醒；落到哪个本机会话由 binding 决定：
+
+```powershell
+curl.exe -s -X POST http://127.0.0.1:8795/mesh/bind -H 'content-type: application/json' `
+  -d '{"conversation":"conv/xxx","sessionId":"session-…","deliver":true}'
+```
+
+- 只有绑定过的 `conversation`，新消息才会注入指定会话；未绑定的落到「mesh 收件箱」会话；
+- `deliver:false` 只做展示绑定、不投递；
+- **本节待验证**：waker 会话正在做端到端验证，结论回来后更新本节（当前只按接口签名与实现描述，未做完整跨机实测）。
