@@ -60,4 +60,5 @@ CI（`.github/workflows/plugin-check.yml`）在 push / PR 时跑前两项，失�
 
 - 本机 link 安装：刷新 GUI，`web boot` 无报错，右侧 Mesh 信箱在；
 - 让对话收到一封信，确认唤醒/投递按预期工作；
+- npm 命名边界：确认只在 npm 发布 `dsh-mesh-waker`；`hub/package.json` 保持 `private: true`；不要把 hub 当成 `dsh-mesh` 发布（npm 上同名包属第三方）；
 - matebook 等远端的升级等到 `latest` 提升之后再统一做。

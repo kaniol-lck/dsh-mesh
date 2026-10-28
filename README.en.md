@@ -135,10 +135,20 @@ token; the plugin keeps the token in an owner-only file, not in the profile patc
 ## Updating
 
 - **Source**: `git pull` (or a GitHub Release tarball) → rebuild → `docker compose up -d`.
-- **Clients**: the plugins are ordinary npm packages; once published,
-  `dsh plugin add <package>` updates a machine without copying files by hand.
+- **Node client plugins** (currently only `mesh-waker`): regular npm packages;
+  `dsh plugin add dsh-mesh-waker` updates a machine without copying files by hand.
+  `mesh-approval` is a standalone Python plugin, not on npm — install it from source
+  (see `plugins/mesh-approval/README.md`).
 - **Between machines that cannot reach GitHub**: send a tarball through the blob channel; a
   `git bundle` works the same way when history matters.
+
+## npm namespace boundary (important)
+
+- This project publishes **only `dsh-mesh-waker`** to npm.
+- `hub/` keeps `"private": true` and is never published.
+- **Do not `npm i dsh-mesh`**: the `dsh-mesh` package on npm (Wang-Lin-Chang's file message
+  queue) and `@baixianger/dsh-mesh` (Iroh P2P) are third-party projects unrelated to this
+  repository.
 
 ## Documentation
 

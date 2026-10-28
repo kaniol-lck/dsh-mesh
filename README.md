@@ -121,8 +121,14 @@ dsh plugin --profile web add dsh-mesh-waker
 ## 更新方式
 
 - **源码**：`git pull`（或下载 GitHub Release 的 tar.gz）→ 重新构建 → `docker compose up -d`；
-- **客户端插件**：都是普通 npm 包，发布后 `dsh plugin add <包名>` 即可升级，不用手工拷文件；
+- **Node 客户端插件**（目前只有 `mesh-waker`）：是普通 npm 包，`dsh plugin add dsh-mesh-waker` 即可升级，不用手工拷文件；`mesh-approval` 是 Python 独立插件，不走 npm，需从源码安装（见 `plugins/mesh-approval/README.md`）；
 - **到不了 GitHub 的机器**：把 tar.gz 走 blob 通道传过去；需要保留历史时改用 `git bundle`，同样是单个文件。
+
+## npm 包名边界（重要）
+
+- 本项目在 npm **只发布 `dsh-mesh-waker`**；
+- `hub/` 的 `package.json` 是 `private: true`，**不上架**；
+- **不要 `npm i dsh-mesh`**：npm 上的 `dsh-mesh`（Wang-Lin-Chang 的文件消息队列）与 `@baixianger/dsh-mesh`（Iroh P2P）都是第三方项目，与本仓无关。
 
 ## 文档
 
