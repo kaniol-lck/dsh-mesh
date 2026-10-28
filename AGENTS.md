@@ -46,6 +46,19 @@
 - 正文首行必须是 `[WAKE] <一句话摘要>`，细节写后面；一次任务最多叫一次；等回执期间不要重复叫（`--wake` 对同一目标 + 同一正文 60 秒内自动去重）。
 - 跨机来件才走 mesh（由 waker 的 conversation 绑定决定落到哪个会话），本机会话之间不绕中枢。
 
+## 本机运维会话（mesh · ops）
+
+- **做什么**：本机 DSH 部署态巡检（hub `/health` 版本 vs 仓库、waker `process/disk` stale、8790/8795 端口、三道门禁、未推送提交、磁盘与日志）、令牌轮换、owner 的日常配置修改项。**不是**缺陷、**不是**功能请求——那两类仍走协调会话派给 hub / waker / docs。
+- **边界**：只读仓库文件；可写 `.worklog/ops/**`、`.worklog/todo/ops.md`、本机 `~/.dsh/**`（改前备份、写回滚说明）；不改代码、不 push、不 publish、不部署、不重启（除 owner 批准）。
+- **怎么找它**：按标题 `mesh · ops` inject：`node scripts/mesh-dispatch.mjs --wake --title "mesh · ops" --file .worklog/dispatch/ops.txt`；精确 session id 见 `.worklog/ops/session.md`（机器本地，不入库）。
+
+### 发现 token 泄露怎么办
+
+- **第一动作**：立刻 inject `mesh · ops`（`[WAKE]` 首行），只写「哪个键疑似泄露、怎么发现的、影响范围」；**不要在消息里重复 token 值**，也不要贴日志原文里的凭据片段。
+- ops 负责：确认范围 → 用 vault 里的 admin token 走中枢轮换 → 更新本机 vault 对应键 → 验证旧 token 401 / 新 token 可用 → 回报「键名 + 已更新 + 验证结果」。
+- 任何人不得自行把新 token 贴进对话；轮换后由 ops 在 `WORKLOG` 记一行（不含值）。
+- 若泄露源是提交进仓库的：同时 inject 协调会话，由协调会话决定是否 `git filter-repo`（历史改写需 owner 批准）。
+
 ## 多会话派活
 
 协调会话通过 waker 的本地接口派活（不需要中枢）：
