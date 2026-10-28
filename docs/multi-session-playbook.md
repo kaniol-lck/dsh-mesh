@@ -47,6 +47,18 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: applicat
 
 原则：**一个任务一个会话**；写清楚“只改哪里、什么算完成、怎么回报”。
 
+### 用 Node 发，不要用 PS 5.1 的 ConvertTo-Json
+
+PowerShell 5.1 的 `ConvertTo-Json` 会把多行字符串序列化成 `{"value":"…"}`，经 `/mesh/inject` 投递后对方只收到 15 字符的 `[object Object]`（`Invoke-RestMethod -Body` 同理）。把任务正文写成纯文本文件，用脚本发：
+
+```powershell
+node scripts/mesh-dispatch.mjs --title "mesh · hub" --file .worklog/dispatch/hub.txt
+node scripts/mesh-dispatch.mjs --title "mesh · docs" --file .worklog/dispatch/docs.txt --dry-run
+node scripts/mesh-dispatch.mjs --session session-… --file task.txt --mode steer
+```
+
+脚本按标题找目标时只考虑 `archived:false` 且 cwd 为仓根的会话，多条取 `last_active` 最新；打印选中的 session id 与 `chars=`，非 200 或 `ok:false` 时退出码 1。
+
 ## 4. 常踩的坑
 
 | 现象 | 原因 | 处理 |
@@ -57,6 +69,7 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: applicat
 | archive 后仍出现在 `/mesh/sessions` | 该列表扫磁盘，不看注册表 | 侧栏以注册表为准；要彻底清理需删目录并重启 DSH |
 | 注入没反应 | 目标会话忙/标题匹配歧义 | 用完整 session id；查 `live` 字段 |
 | `create` 返回 400 | 缺 `title`，或标题匹配不到目标 | 看响应里的 `error` |
+| 注入只收到 15 字符 `"[object Object]"` | PowerShell 5.1 `ConvertTo-Json` 把多行字符串包成 `{"value":…}` | 改用 `scripts/mesh-dispatch.mjs`（Node fetch）派活，不要用 `Invoke-RestMethod` |
 
 ## 5. 发版（仍需 owner 确认）
 

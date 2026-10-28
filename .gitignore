@@ -32,3 +32,6 @@ REFS.md
 # Python bytecode from local preflight runs
 __pycache__/
 *.pyc
+
+# Local work log (owner: not tracked)
+.worklog/

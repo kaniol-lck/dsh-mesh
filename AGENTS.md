@@ -21,6 +21,8 @@
 3. 提交只 `git add` 自己负责的路径；commit message 写**为什么**，不要只写“更新”。
 4. 不 `git push --force`；不提交凭据、token、`.npmrc`（`scripts/check-secrets.py` 是门禁）。
 5. 发版动作（`npm publish`、部署 hub 到 NAS）**必须先得到 owner 确认**。
+6. 待办写 `.worklog/todo/<自己>.md`，任务/故障/发版日志写 `.worklog/WORKLOG.md`，整套 `.worklog/` 不入库（明细只留在本地）。
+7. 工作日志的格式、目录与收尾检查见 `.worklog/README.md`。
 
 ## 多会话派活
 
