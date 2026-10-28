@@ -117,7 +117,7 @@ curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
       config:
         serverName: mesh
         transport: streamable-http
-        url: 'http://192.168.10.2:8790/mcp'          # 局域网；跨网络见下方文档
+        url: 'http://192.168.1.10:8790/mcp'          # 局域网；跨网络见下方文档
         headers:
           Authorization: 'Bearer mesh_xxxxxxxxxxxx'   # 上面领到的 agent token
         failOnStartupError: false

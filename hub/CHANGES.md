@@ -210,7 +210,7 @@ v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话
 | 问题 | 修法 |
 |---|---|
 | 会话命中后不校验归属，`Mcp-Session-Id` 泄漏即可冒充 | `sessionFor()` 比对 `agentName`，不符 403 |
-| `smoke-client.mjs` / `tls-check.mjs` 硬编码 `D:/dsh/mesh/data/admin.token`（作者机器残留） | 改为相对脚本目录的 `data/admin.token`，失败时给出可读提示 |
+| `smoke-client.mjs` / `tls-check.mjs` 硬编码 `<author-machine>/dsh/mesh/data/admin.token`（作者机器残留） | 改为相对脚本目录的 `data/admin.token`，失败时给出可读提示 |
 | 首次启动把 admin token 打进 stdout，长期留在 `docker logs` | 默认不打印，改用 `cat data/admin.token`；要打印设 `MESH_PRINT_ADMIN_TOKEN=1` |
 | compose 无条件挂载 `./certs`，目录不存在时被 Docker 建成 root 属主 | 默认注释该挂载，启用 TLS 前先建目录 |
 | `?limit=abc` 触发 `datatype mismatch` | `parseLimit()` 校验，返回可读 400 |

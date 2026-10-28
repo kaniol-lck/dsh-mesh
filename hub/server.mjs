@@ -1261,7 +1261,7 @@ async function refresh() {
         '<label style="margin-right:6px"><input type="checkbox" data-scope="' + scope + '" ' +
         ((a.scopes || ALL_SCOPES).includes(scope) ? 'checked' : '') + (isAdmin ? '' : ' disabled') + '> ' + scope + '</label>'
       ).join('');
-      const cidrs = '<input type="text" data-cidrs value="' + esc((a.allowed_cidrs || '')) + '" placeholder="192.168.10.0/24,10.0.0.0/8" size="22"' + (isAdmin ? '' : ' disabled') + '>';
+      const cidrs = '<input type="text" data-cidrs value="' + esc((a.allowed_cidrs || '')) + '" placeholder="192.168.1.0/24,10.0.0.0/8" size="22"' + (isAdmin ? '' : ' disabled') + '>';
       const expiry = a.token_expires_at ? new Date(a.token_expires_at).toLocaleDateString() : '不过期';
       const actions = isAdmin
         ? '<button data-act="save">保存</button> ' +
