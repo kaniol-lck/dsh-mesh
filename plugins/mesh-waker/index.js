@@ -1569,6 +1569,53 @@ export function apply(ctx, config) {
       return
     }
 
+    if (path === '/mesh/sessions/create' && req.method === 'POST') {
+      // Same mechanics the wake path uses (create + rename + prompt), exposed so a
+      // coordinator session can spawn project workers without touching the UI.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const chunks = []
+      let size = 0
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size > MAX_BODY) {
+          res.writeHead(413).end()
+          return
+        }
+        chunks.push(chunk)
+      }
+      try {
+        const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        const title = String(draft.title ?? '').trim().slice(0, 60)
+        if (!title) throw new Error('title is required')
+        const cwd = String(draft.cwd ?? c.sessionCwd ?? '').trim() || undefined
+        const created = await ctx.sessionController.create(cwd ? { cwd, agentPreset: c.agentPreset } : { agentPreset: c.agentPreset })
+        const sessionId = created?.sessionId
+        if (!sessionId) throw new Error('sessionController.create returned no sessionId')
+        try {
+          await ctx.sessionController.rename({ sessionId, title })
+        } catch (error) {
+          fileLog(`renaming created session failed: ${error.message}`)
+        }
+        const prompt = String(draft.prompt ?? '').trim()
+        let prompted = false
+        if (prompt) {
+          await promptWithResume(sessionId, prompt, draft.mode === 'steer' ? 'steer' : 'queue')
+          prompted = true
+        }
+        fileLog(`created local session ${sessionId} title="${title}" cwd=${cwd ?? '(default)'} prompted=${prompted}`)
+        res.writeHead(201, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: true, sessionId, title, cwd: cwd ?? null, prompted }))
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
+      return
+    }
+
     if (path === '/mesh/inject' && req.method === 'POST') {
       if (!fromLoopback(req)) {
         res.writeHead(403, { 'content-type': 'application/json' })

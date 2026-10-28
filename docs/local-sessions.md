@@ -27,6 +27,28 @@
 - `title` 从会话日志里恢复（首次扫描较慢，之后走缓存 `~/.dsh/mesh-waker/sessions-index.json`）；
 - `live` 表示该会话当前是否加载在内存里；不在也可注入（会自动 resume）。
 
+
+### `POST /mesh/sessions/create`
+
+在指定目录（或默认收件目录）新建一个会话，可选地直接投首轮任务：
+
+```json
+{
+  "title": "mesh · hub 开发",
+  "cwd": "D:\\Libraries\\Documents\\projects\\dsh-mesh",
+  "prompt": "先读 hub/README.md，列出与 docs 不一致处（只列不改）。",
+  "mode": "queue"
+}
+```
+
+返回：
+
+```json
+{ "ok": true, "sessionId": "session-…", "title": "mesh · hub 开发", "cwd": "…", "prompted": true }
+```
+
+用途：让一个协调会话按分工创建执行会话，不必手工在 UI 里开。`cwd` 省略时用 waker 的 `sessionCwd`（收件箱目录）。
+
 ### `POST /mesh/inject`
 
 ```json
