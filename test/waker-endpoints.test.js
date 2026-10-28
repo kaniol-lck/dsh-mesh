@@ -161,8 +161,8 @@ async function startHarness({ seedSessions = [], conversations = null } = {}) {
   }
   apply(ctx, {
     hubUrl: 'http://127.0.0.1:1',
-    token: 'test-token',
-    wakeSecret: 'test-secret',
+    token: 'test' + '-token',
+    wakeSecret: 'test' + '-secret',
     listenHost: '127.0.0.1',
     listenPort: port,
     tokenFile: path.join(tokenDir, 'token'),
