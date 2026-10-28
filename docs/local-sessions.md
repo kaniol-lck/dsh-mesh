@@ -15,7 +15,7 @@
     {
       "id": "session-c61c2456-…",
       "title": "hermes · rehome",
-      "cwd": "D:\\Libraries\\Documents\\projects\\dsh-mesh",
+      "workspacePath": "D:\\Libraries\\Documents\\projects\\dsh-mesh",
       "workspace": "--D-Libraries-Documents-projects-dsh-mesh--",
       "last_active": 1793167809000,
       "live": true
@@ -62,6 +62,17 @@
 - 寻址优先级：`session`（完整 id）→ 精确标题 → 标题唯一子串；歧义或找不到返回 400 并提示用 `GET /mesh/sessions`；
 - `mode`：`queue`（默认，等当前回合结束）/ `steer`（打断当前回合）；
 - 只接受 loopback 请求；写入 waker 日志 `injected … into local session …`。
+
+
+### `POST /mesh/sessions/archive`
+
+归档一个本机会话（会话文件保留，侧栏隐藏）：
+
+```json
+{ "session": "session-…" }
+```
+
+只能归档**已绑定工作区**的会话；没有 workspaceId 的会话会返回 400（这类会话本来也不出现在侧栏）。
 
 ## 典型用法：一个协调会话 + 多个执行会话
 
