@@ -151,6 +151,7 @@ function parseEntry(line, sessionName, file, lineNumber, errors) {
     acceptance: fields.acceptance,
     status: fields.status,
     owner: fields.owner ?? sessionName,
+    explicitOwner: fields.owner !== null,
     file,
     line: lineNumber,
     source: `${file}:${lineNumber}`,
@@ -319,6 +320,15 @@ async function warnIfHtmlStale(htmlPath, hash) {
   if (problem) console.log(`WARN: .worklog/roadmap.html 过期，跑 --write (${problem})`)
 }
 
+/** Cross-domain items should carry "；归属：<会话>"; missing it only warns, never blocks. */
+function warnIfMissingOwner(entries) {
+  for (const entry of entries) {
+    if (entry.explicitOwner) continue
+    if (!/[（(][^（）()]*会话[）)]/.test(entry.title)) continue
+    console.log(`WARN: ${entry.source} 跨域条目缺 归属，不阻塞（${entry.displayTitle}）`)
+  }
+}
+
 async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash) {
   const original = await readRoadmap(roadmapPath)
   const markers = locateMarkers(original)
@@ -328,6 +338,7 @@ async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash) {
   if (actual === expected) {
     console.log(`OK: ROADMAP auto section matches .worklog/todo (${entries.length} items)`)
     await warnIfHtmlStale(htmlPath, hash)
+    warnIfMissingOwner(entries)
     return
   }
   const actualLines = actual.split('\n')

@@ -21,9 +21,22 @@
 3. 提交只 `git add` 自己负责的路径；commit message 写**为什么**，不要只写“更新”。
 4. 不 `git push --force`；不提交凭据、token、`.npmrc`（`scripts/check-secrets.py` 是门禁）。
 5. 发版动作（`npm publish`、部署 hub 到 NAS）**必须先得到 owner 确认**。
-6. 待办写 `.worklog/todo/<自己>.md`，任务/故障/发版日志写 `.worklog/WORKLOG.md`，整套 `.worklog/` 不入库（明细只留在本地）。
+6. 待办写 `.worklog/todo/<自己>.md`，任务/故障/发版日志写 `.worklog/WORKLOG.md`，整套 `.worklog/` 不入库（明细只留在本地）。跨域条目**必须**写 `归属：<会话>`（缺了 `node scripts/roadmap.mjs --check` 只 WARN，不阻塞）。
 7. 工作日志的格式、目录与收尾检查见 `docs/worklog.md`。
 8. 改完自己的 todo 跑 `node scripts/roadmap.mjs --write`；收尾 `node scripts/roadmap.mjs --check` 必须退出 0。
+
+## 缺陷回流（协调会话）
+1. 只在有证据时触发：同类问题 ≥2 次 / 一次故障让既有约定失效 / 检查脚本反复卡同一处。
+2. 动作：记 WORKLOG 一行 → 若是约定缺口，产出 AGENTS.md 或 docs/worklog.md 的补丁（含证据行与收尾验证办法）。
+3. 约定变更必须先报 owner 批准，批准后由 docs 落盘、协调会话记 WORKLOG；禁止静默改约定。
+4. 统计口径固定为 `node scripts/defects.mjs --scan --threshold 3`；同类 ≥3 条标 READY FOR PATCH，才起草补丁。
+
+## 跨域发现（所有会话）
+1. 同域问题写自己 todo；跨域但只需改文件时，只写一条 `归属：<会话>` 的 todo，派活由协调会话统一做。
+2. 跨域只读核对可直接问对端，并在 todo 标「已直连确认」。
+3. P0 / 安全 / 阻塞自己：立即 inject（本机 8795）或 mesh（跨机）报协调会话。
+4. 例外：对方唯一能解且卡住你时可直连，但必须抄送协调会话一行（问了什么、对方怎么回）。
+5. 不跨机直接派活。
 
 ## 多会话派活
 
