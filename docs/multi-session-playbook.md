@@ -80,3 +80,15 @@ python scripts/release.py --promote       # 提 latest
 ```
 
 部署 hub 到 NAS 用 `sessions\<本机脚本>\ssh_deploy.py`，部署后必须验证 `/health` 版本。
+
+## 6. 收尾三连
+
+改完 `.worklog/todo/<自己>.md` 后固定跑三件：
+
+```powershell
+node scripts/roadmap.mjs --write   # 汇总进 ROADMAP 自动段 + 重渲染 .worklog/roadmap.html
+git status                         # 应干净：产物都在忽略目录 / 仓外
+node scripts/roadmap.mjs --check   # 必须退出 0
+```
+
+`--check` 退出 1 表示 todo 与 ROADMAP 自动段漂移，跑 `--write` 后复查；退出 2 表示 ROADMAP 缺 AUTO 标记，找协调会话。

@@ -23,11 +23,13 @@
 <!-- session: <名> · updated: YYYY-MM-DD -->
 ```
 
-条目一行一条，字段顺序固定：
+条目一行一条，字段顺序固定；`归属：<会话>` 可选，放在行尾（跨会话条目**必填**，说明这条该谁做；缺省=条目所在文件的会话）：
 
 ```
-- [P0|P1|P2] <标题> —— <一句话说明>；验收：<可验证标准>；状态：未开始|进行中|已完成
+- [P0|P1|P2] <标题> —— <一句话说明>；验收：<可验证标准>；状态：未开始|进行中|已完成；归属：<会话>
 ```
+
+解析按 `；` 拆段：只有段首是 `验收：` / `状态：` / `归属：` 的才算字段，其余拼回说明（说明里本身可能含 `；`）。
 
 规则：
 
@@ -35,10 +37,23 @@
 - 待办完成就改状态与验收结论，不要另起文件；过期的直接删或用 `.worklog/archive/` 归档；
 - 标题用一句话说清动作，说明写“为什么/影响面”，验收必须可被命令或肉眼逐条核对。
 
+## 自动汇总与渲染
+
+`scripts/roadmap.mjs` 把 todo 汇总进仓外 ROADMAP（只替换标记之间的自动段），并渲染本地 HTML：
+
+```powershell
+node scripts/roadmap.mjs --write   # 重写 ROADMAP 自动段 + .worklog/roadmap.html
+node scripts/roadmap.mjs --check   # 只比对：一致 0 / 漂移 1 / 缺标记 2
+```
+
+- `<!-- AUTO:TODO START -->` 与 `<!-- AUTO:TODO END -->` 之间整段由脚本生成，**手改会被覆盖**；标记外内容原样保留；
+- 产物位置：ROADMAP 在仓外（默认 `<仓根>/../ROADMAP.md`，可用 `--roadmap` 指定），HTML 在 `.worklog/roadmap.html`（已忽略，本地打开）；
+- `--check` 比较时忽略 `<!-- generated:` 时间行，因此刚 `--write` 完必须退出 0；它也是收尾检查的一部分。
+
 ## 汇总：协调会话 → `..\ROADMAP.md`
 
-- 协调会话把各 todo 的摘要汇总进仓外的 `..\ROADMAP.md`；
-- ROADMAP 只放**阶段目标与取舍**，明细（验收、状态、负责人）留在本地 todo 文件；
+- **不再手工抄写**：跑 `node scripts/roadmap.mjs --write`，脚本把 `.worklog/todo/*.md` 的明细写进 ROADMAP 的自动段；
+- ROADMAP 只放**阶段目标与取舍**（「本阶段焦点」「发布状态」等手写段由协调会话判断），明细（验收、状态、归属）留在本地 todo 文件；
 - 执行会话不直接改 ROADMAP。
 
 ## 滚动日志：`.worklog/WORKLOG.md`
@@ -55,5 +70,6 @@ YYYY-MM-DD HH:mm · <会话> · <动作> · <产物或 commit>
 ## 收尾检查
 
 - `git status` 必须干净：`.worklog/` 全部被忽略，不会出现在 status 里；`git ls-files .worklog` 应为空；
+- `node scripts/roadmap.mjs --check` 必须退出 0（1=漂移、2=缺标记），否则先 `--write` 再复查；
 - 不要把 `.worklog/` 下任何文件加入暂存区（不要用 `git add -A`，也不要 `git add -f`）；
 - 需要把日志带进交接包/镜像仓时，导出摘要到 `docs/`，不要整体拷贝本目录。

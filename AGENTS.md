@@ -23,6 +23,7 @@
 5. 发版动作（`npm publish`、部署 hub 到 NAS）**必须先得到 owner 确认**。
 6. 待办写 `.worklog/todo/<自己>.md`，任务/故障/发版日志写 `.worklog/WORKLOG.md`，整套 `.worklog/` 不入库（明细只留在本地）。
 7. 工作日志的格式、目录与收尾检查见 `docs/worklog.md`。
+8. 改完自己的 todo 跑 `node scripts/roadmap.mjs --write`；收尾 `node scripts/roadmap.mjs --check` 必须退出 0。
 
 ## 多会话派活
 
