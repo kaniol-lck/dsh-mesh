@@ -303,7 +303,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
 ## 本环境速查（2026-10-21 接入；2026-10-29 复核版本）
 
-- 中枢：`http://<NAS-IP>:8790/mcp`（NAS 上的容器 `dsh-mesh`，**0.7.11**；SQLite 与 `admin.token` 在数据目录 `data/`；2026-10-29 复核 `/health`）
+- 中枢：`http://<NAS-IP>:8790/mcp`（NAS 上的容器 `dsh-mesh`，版本以中枢 `/health` 为准（当前快照见 ROADMAP 自动段）；SQLite 与 `admin.token` 在数据目录 `data/`；2026-10-29 复核 `/health`）
 - 本机身份：`<this-node>`（由 token 决定，不是自报）；同伴：`hermes`（NAS 容器，已接入 `mcp_servers.mesh`）、
   `<peer-node>`（`<laptop-host>` / `<laptop-ip>`，笔记本）
 - 令牌都在加密库：本机 `MESH_TOKEN_<node>`、Hermes `MESH_TOKEN_HERMES`、管理员 `MESH_ADMIN_TOKEN`。

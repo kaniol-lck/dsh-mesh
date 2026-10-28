@@ -18,6 +18,16 @@ pm publish（含 --tag next 与 --promote） | **是** |
 申请确认时一次性给出：版本号、改了什么、预检结果、关键路径实测结果（真实收发的日志/响应），
 然后停下等 owner 回复；确认后再执行发布/部署。被拒绝就只保留代码提交与验证记录。
 
+## 版本递增纪律
+
+- **平时不改版本号**：bug 修复、文档、测试、重构都不动 `version`，版本号只在发版时跳；
+- 发版时一次性同步（漏一处就会出现 drift）：
+  - hub：`HUB_VERSION`（`hub/server.mjs`）+ `hub/package.json` + `hub/package-lock.json` + `CHANGES.md` 对应条目；
+  - waker：`plugins/mesh-waker/package.json` + `CHANGELOG.md`（新版本条目；还没有就先新建）；
+- 发版前必须全绿：`node scripts/roadmap.mjs --check`（含版本一致性硬校验）、`node scripts/check-paths.mjs`、
+  `python scripts/release.py --preflight`；
+- 文档里**不要抄当前版本号**：ROADMAP 自动段的「版本快照」是唯一展示位，其余文档只写「以中枢 `/health` / 自动段为准」。
+
 ## 三级
 
 | 级别 | 动作 | 时机 |

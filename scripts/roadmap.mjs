@@ -206,17 +206,20 @@ function stripOwnerSuffix(title) {
 }
 
 /** Stable fingerprint of the parsed model (no timestamp): decides whether generated artifacts are stale. */
-function sourceHash(entries) {
-  const canonical = entries.map((entry) => ({
-    priority: entry.priority,
-    title: entry.title,
-    description: entry.description,
-    acceptance: entry.acceptance,
-    status: entry.status,
-    owner: entry.owner,
-    file: entry.file,
-    line: entry.line,
-  }))
+function sourceHash(entries, versions) {
+  const canonical = {
+    versions: { hub: versions.hubVersion, waker: versions.wakerVersion },
+    entries: entries.map((entry) => ({
+      priority: entry.priority,
+      title: entry.title,
+      description: entry.description,
+      acceptance: entry.acceptance,
+      status: entry.status,
+      owner: entry.owner,
+      file: entry.file,
+      line: entry.line,
+    })),
+  }
   return createHash('sha256').update(JSON.stringify(canonical)).digest('hex').slice(0, 12)
 }
 
@@ -265,13 +268,14 @@ function formatItem(entry) {
   return `- [${entry.owner}] ${entry.displayTitle} — ${entry.status}${suffix}`
 }
 
-function buildSegment(entries, generatedAt, hash) {
+function buildSegment(entries, generatedAt, hash, versions) {
   const counts = countEntries(entries)
   const unfinished = entries.filter((entry) => entry.status !== '已完成')
   const done = entries.filter((entry) => entry.status === '已完成').sort(ownerCompare)
   const lines = [
     `${GENERATED_PREFIX} ${generatedAt}; ${counts.total} items; src=${hash} -->`,
     `共 ${counts.total} 条 · P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}（未完成）· 已完成 ${counts.done} · 来源 .worklog/todo/*.md`,
+    `版本快照：hub ${versions.hubVersion}（hub/server.mjs + hub/package.json）/ waker ${versions.wakerVersion}（plugins/mesh-waker/package.json）· 读取自代码，勿手改`,
   ]
   for (const priority of PRIORITIES) {
     const group = unfinished.filter((entry) => entry.priority === priority).sort(ownerCompare)
@@ -329,12 +333,19 @@ function warnIfMissingOwner(entries) {
   }
 }
 
-async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash) {
+async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, versions) {
+  if (versions.hubVersion !== versions.hubPackageVersion) {
+    console.error(
+      `ERROR: version drift: hub/server.mjs HUB_VERSION=${versions.hubVersion} vs hub/package.json=${versions.hubPackageVersion}`,
+    )
+    console.error('align HUB_VERSION and hub/package.json before checking the ROADMAP auto section')
+    process.exit(1)
+  }
   const original = await readRoadmap(roadmapPath)
   const markers = locateMarkers(original)
   if (!markers.ok) fail(2, `missing marker ${markers.missing} in ${roadmapPath}`)
   const actual = stripGenerated(original.slice(markers.start + MARK_START.length, markers.end))
-  const expected = stripGenerated(buildSegment(entries, generatedAt, hash))
+  const expected = stripGenerated(buildSegment(entries, generatedAt, hash, versions))
   if (actual === expected) {
     console.log(`OK: ROADMAP auto section matches .worklog/todo (${entries.length} items)`)
     await warnIfHtmlStale(htmlPath, hash)
@@ -361,12 +372,12 @@ async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash) {
   process.exit(1)
 }
 
-async function writeRoadmap(roadmapPath, entries, generatedAt, hash) {
+async function writeRoadmap(roadmapPath, entries, generatedAt, hash, versions) {
   const original = await readRoadmap(roadmapPath)
   const markers = locateMarkers(original)
   if (!markers.ok) fail(2, `missing marker ${markers.missing} in ${roadmapPath}`)
   const newline = original.includes('\r\n') ? '\r\n' : '\n'
-  const segment = buildSegment(entries, generatedAt, hash).replace(/\n/g, newline)
+  const segment = buildSegment(entries, generatedAt, hash, versions).replace(/\n/g, newline)
   const next =
     original.slice(0, markers.start + MARK_START.length) +
     newline +
@@ -574,6 +585,39 @@ async function assertRepo(repo) {
   if (!todoOk) fail(2, `missing .worklog/todo under ${repo}`)
 }
 
+async function readPackageVersion(file, label) {
+  let raw
+  try {
+    raw = await readFile(file, 'utf8')
+  } catch (error) {
+    fail(2, `cannot read ${label}: ${error.message}`)
+  }
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed.version) throw new Error('missing "version" field')
+    return String(parsed.version)
+  } catch (error) {
+    fail(2, `${label}: ${error.message}`)
+  }
+}
+
+/** Single source of truth for versions: hub/server.mjs HUB_VERSION + the two package.json files. */
+async function readVersions(repo) {
+  let source
+  try {
+    source = await readFile(path.join(repo, 'hub', 'server.mjs'), 'utf8')
+  } catch (error) {
+    fail(2, `cannot read hub/server.mjs: ${error.message}`)
+  }
+  const match = /HUB_VERSION\s*=\s*'([^']+)'/.exec(source)
+  if (!match) fail(2, "hub/server.mjs: cannot find HUB_VERSION = '...'")
+  return {
+    hubVersion: match[1],
+    hubPackageVersion: await readPackageVersion(path.join(repo, 'hub', 'package.json'), 'hub/package.json'),
+    wakerVersion: await readPackageVersion(path.join(repo, 'plugins', 'mesh-waker', 'package.json'), 'plugins/mesh-waker/package.json'),
+  }
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2))
   const repo = path.resolve(options.repo)
@@ -584,7 +628,8 @@ async function main() {
 
   const { entries, errors } = await parseTodos(todoDir)
   markDuplicates(entries)
-  const hash = sourceHash(entries)
+  const versions = await readVersions(repo)
+  const hash = sourceHash(entries, versions)
   const generatedAt = nowStamp()
 
   if (options.json) {
@@ -593,6 +638,7 @@ async function main() {
       roadmap: roadmapPath,
       html: htmlPath,
       hash,
+      versions: { ...versions, drift: versions.hubVersion !== versions.hubPackageVersion },
       counts: countEntries(entries),
       errors,
       entries: entries.map((entry) => ({ ...entry, completed: entry.status === '已完成' })),
@@ -614,11 +660,11 @@ async function main() {
   }
 
   if (options.mode === 'check') {
-    await checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash)
+    await checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, versions)
     return
   }
 
-  await writeRoadmap(roadmapPath, entries, generatedAt, hash)
+  await writeRoadmap(roadmapPath, entries, generatedAt, hash, versions)
   const counts = countEntries(entries)
   console.log(`wrote ROADMAP: ${counts.total} items (P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}, done ${counts.done}) -> ${roadmapPath}`)
   try {
