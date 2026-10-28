@@ -429,6 +429,75 @@ try {
   await alice.transport.close()
 }
 
+// --- REST scopes: a restricted token may not exceed its granted surface -------
+{
+  const readerToken = await mint('reader')
+  const senderToken = await mint('sender')
+  const setScopes = async (name, scopes) => {
+    const res = await admin('/console/agents/update', { method: 'POST', body: JSON.stringify({ name, scopes, allowed_cidrs: '' }) })
+    if (!res.ok) throw new Error(`set scopes for ${name} failed: HTTP ${res.status}`)
+  }
+  await setScopes('reader', ['read'])
+  await setScopes('sender', ['send'])
+
+  const readerSend = await fetch(`${BASE}/api/send`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${readerToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ to: 'alice', body: 'should be refused' }),
+  })
+  const readerSendBody = await readerSend.json().catch(() => ({}))
+  check(
+    'read-only token cannot send over REST',
+    readerSend.status === 403 && readerSendBody.ok === false && readerSendBody.required_scope === 'send',
+    `HTTP ${readerSend.status}`,
+  )
+
+  const senderInbox = await fetch(`${BASE}/api/inbox`, { headers: { authorization: `Bearer ${senderToken}` } })
+  const senderInboxBody = await senderInbox.json().catch(() => ({}))
+  check(
+    'send-only token cannot read the inbox',
+    senderInbox.status === 403 && senderInboxBody.required_scope === 'read',
+    `HTTP ${senderInbox.status}`,
+  )
+
+  const readerInbox = await fetch(`${BASE}/api/inbox`, { headers: { authorization: `Bearer ${readerToken}` } })
+  check('read-only token keeps read access', readerInbox.status === 200, `HTTP ${readerInbox.status}`)
+
+  const senderBoard = await fetch(`${BASE}/api/board`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${senderToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ key: 'scope/smoke', value: 'x' }),
+  })
+  const senderBoardBody = await senderBoard.json().catch(() => ({}))
+  check(
+    'send-only token cannot write the board',
+    senderBoard.status === 403 && senderBoardBody.required_scope === 'board',
+    `HTTP ${senderBoard.status}`,
+  )
+
+  const readerBlobPut = await fetch(`${BASE}/api/blob?name=denied.bin`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${readerToken}`, 'content-type': 'application/octet-stream' },
+    body: Buffer.from('should be refused'),
+  })
+  const readerBlobBody = await readerBlobPut.json().catch(() => ({}))
+  check(
+    'read-only token cannot upload a blob',
+    readerBlobPut.status === 403 && readerBlobBody.required_scope === 'blob',
+    `HTTP ${readerBlobPut.status}`,
+  )
+
+  const readerBlobs = await fetch(`${BASE}/api/blobs`, { headers: { authorization: `Bearer ${readerToken}` } })
+  check('read-only token can list blob metadata', readerBlobs.status === 200, `HTTP ${readerBlobs.status}`)
+
+  const unrestrictedSend = await fetch(`${BASE}/api/send`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ to: 'bob', body: 'unrestricted send still works' }),
+  })
+  check('unrestricted token still sends over REST', unrestrictedSend.status === 201, `HTTP ${unrestrictedSend.status}`)
+}
+
 // --- rotation and revocation ------------------------------------------------
 const rotated = await (await admin('/api/admin/rotate', { method: 'POST', body: JSON.stringify({ name: 'alice' }) })).json()
 const oldTokenAfterRotate = await fetch(`${BASE}/api/peers`, { headers: { authorization: `Bearer ${aliceToken}` } })

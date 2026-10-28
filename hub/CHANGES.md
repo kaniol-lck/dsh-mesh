@@ -4,7 +4,9 @@ v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审�
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（50/50）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（57/57）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+
+> **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；已在 0.7.11 线上补齐（受限 token 调越权 REST 端点返回 403 + `required_scope`），未另发版本。
 
 ---
 

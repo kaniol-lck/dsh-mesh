@@ -568,7 +568,8 @@ function resolveIdentity(req) {
 
   if (AUTH_MODE === 'open') {
     clearFailures(ip)
-    return { ok: true, name: headerValue(req, 'x-mesh-agent') || 'anonymous', host: headerValue(req, 'x-mesh-host'), ip }
+    // No token, no per-agent grant: the historical full surface is the only sane default.
+    return { ok: true, name: headerValue(req, 'x-mesh-agent') || 'anonymous', host: headerValue(req, 'x-mesh-host'), ip, scopes: ALL_SCOPES }
   }
 
   const token = bearerOf(req)
@@ -598,6 +599,33 @@ function resolveIdentity(req) {
     reason: overLimit ? 'too many failed auth attempts, retry later' : token ? 'invalid token' : 'missing bearer token',
     ip,
   }
+}
+
+/**
+ * Scope a REST route needs. Reads map to `read`, mailbox mutations to `send`, board
+ * writes to `board`, blob transfers to `blob`. `null` means "any authenticated agent".
+ *
+ * Admin routes never reach here: /api/admin/* is dispatched before handleRest. The mapping
+ * mirrors TOOL_SCOPE for MCP; both faces must agree or a restricted token can walk around
+ * the other one.
+ */
+function restScope(req, path) {
+  const method = req.method
+  if (path === '/api/send') return 'send'
+  // Registering a wake endpoint and acknowledging mail belong to the read side: they only
+  // affect messages this agent is already allowed to receive.
+  if (path === '/api/register' || path === '/api/read' || path === '/api/wake-secret') return 'read'
+  if (path === '/api/inbox' || path === '/api/peers' || path === '/api/status') return 'read'
+  if (path === '/api/board/log') return 'read'
+  if (path === '/api/board') return method === 'POST' ? 'board' : 'read'
+  if (path === '/api/conversations' || path === '/api/conversation' || path === '/api/message' || path === '/api/pinned') return 'read'
+  if (/^\/api\/message\/[0-9a-f-]{36}\/pin$/.test(path)) return 'send'
+  if (path === '/api/blob/init') return 'blob'
+  if (/^\/api\/blob\/[0-9a-f-]{36}\/(chunk|commit)$/.test(path)) return 'blob'
+  if (/^\/api\/blob\/[0-9a-f-]{36}(\/meta)?$/.test(path)) return method === 'GET' ? 'read' : 'blob'
+  if (path === '/api/blob') return 'blob'
+  if (path === '/api/blobs') return 'read'
+  return null
 }
 
 function isAdmin(req) {
@@ -1499,6 +1527,15 @@ async function handleRest(req, res, url) {
   const path = url.pathname
   const q = url.searchParams
   const ip = clientIp(req)
+
+  const requiredScope = restScope(req, path)
+  if (requiredScope && !(id.scopes ?? ALL_SCOPES).includes(requiredScope)) {
+    return sendJson(res, 403, {
+      ok: false,
+      error: `this endpoint requires scope "${requiredScope}"; this agent has: ${(id.scopes ?? []).join(', ') || 'none'}`,
+      required_scope: requiredScope,
+    })
+  }
 
   try {
     if (path === '/api/register' && req.method === 'POST') {
