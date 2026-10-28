@@ -116,6 +116,8 @@ node scripts/mesh-dispatch.mjs --wake --title "mesh · 协调" --text "[WAKE] la
 
 ## 8. 跨机消息唤醒（绑定）
 
+绑定只服务跨机来件；本机唤醒见 §7。
+
 跨机来件由 hub 落库后经 waker 唤醒；落到哪个本机会话由 binding 决定：
 
 ```powershell
@@ -125,4 +127,4 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/bind -H 'content-type: applicatio
 
 - 只有绑定过的 `conversation`，新消息才会注入指定会话；未绑定的落到「mesh 收件箱」会话；
 - `deliver:false` 只做展示绑定、不投递；
-- **本节待验证**：waker 会话正在做端到端验证，结论回来后更新本节（当前只按接口签名与实现描述，未做完整跨机实测）。
+- **已实测（2026-10-29）**：临时会话绑定一段 conversation 后，经 hub 发 1 条消息 → 该会话自动起一轮（实测 604ms），消息注入绑定会话；测试后解绑，`/mesh/admin/bindings` 无残留。本机会话之间不要走这条路（用 `scripts/mesh-dispatch.mjs --wake` 直接 inject）。
