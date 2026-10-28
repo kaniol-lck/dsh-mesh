@@ -20,6 +20,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Path/topology guard
+        working-directory: .
+        run: node scripts/check-paths.mjs
       - name: Install dependencies
         run: npm install --no-audit --no-fund
       - name: Start hub and run smoke suite

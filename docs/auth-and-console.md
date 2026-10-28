@@ -36,7 +36,7 @@
 
 ## 3. IP 白名单与过期
 
-- `allowed_cidrs`：逗号分隔 IPv4/CIDR，如 `192.168.10.0/24,10.8.0.0/16`；留空 = 不限来源。
+- `allowed_cidrs`：逗号分隔 IPv4/CIDR，如 `192.168.1.0/24,10.8.0.0/16`；留空 = 不限来源。
 - `token_expires_at`：毫秒时间戳；到期后该 token 返回 `401 token expired; rotate or re-enroll this agent`。
 - 反代/frp 场景需要在反代上透传真实来源地址，否则白名单看到的都是反代 IP。
 
@@ -74,7 +74,7 @@
 ```bash
 curl -s -X POST http://<hub>:8790/api/enroll \
   -H 'content-type: application/json' \
-  -d '{"code":"ABCD1234","name":"dsh-new-node","host":"192.168.10.50"}'
+  -d '{"code":"ABCD1234","name":"dsh-new-node","host":"192.168.1.50"}'
 # → {"name":"dsh-new-node","token":"mesh_…"}
 ```
 
@@ -86,7 +86,7 @@ curl -s -X POST http://<hub>:8790/api/enroll \
 ```bash
 curl -s -X POST http://<hub>:8790/api/admin/agents \
   -H "Authorization: Bearer $MESH_ADMIN_TOKEN" -H 'content-type: application/json' \
-  -d '{"name":"dsh-new-node","host":"192.168.10.50"}'
+  -d '{"name":"dsh-new-node","host":"192.168.1.50"}'
 ```
 
 token 只返回一次（同方式 A 第 4 步落地）。

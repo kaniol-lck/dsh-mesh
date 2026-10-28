@@ -81,14 +81,15 @@ python scripts/release.py --promote       # 提 latest
 
 部署 hub 到 NAS 用 `sessions\<本机脚本>\ssh_deploy.py`，部署后必须验证 `/health` 版本。
 
-## 6. 收尾四连
+## 6. 收尾五连
 
-改完 `.worklog/todo/<自己>.md` 后固定跑四步：
+改完 `.worklog/todo/<自己>.md` 后固定跑五步：
 
 ```powershell
 node scripts/roadmap.mjs --write   # 汇总进 ROADMAP 自动段 + 重渲染 .worklog/roadmap.html
 node scripts/defects.mjs --scan    # 复核缺陷台账（.worklog/defects.md）
 git status                         # 应干净：产物都在忽略目录 / 仓外
+node scripts/check-paths.mjs       # 路径/内网拓扑门禁：本机绝对路径、真实 LAN IP 一律不得入库
 node scripts/roadmap.mjs --check   # 必须退出 0
 ```
 

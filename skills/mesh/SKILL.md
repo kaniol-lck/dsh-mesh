@@ -253,7 +253,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
   ```
   mesh_board_set({ key: "task/mesh-waker-install", value: "...",
-                   owner: "dsh-kaniol-matebooke2016", status: "todo" })
+                   owner: "<peer-node>", status: "todo" })
   ```
 
   `get` / `list` 会返回这两个字段。约定 `status` ∈ `todo` / `doing` / `done`；谁认领谁改状态，完成时写 `done` + 时间。
@@ -265,7 +265,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
 ```
 /mesh hermes                          # 和 hermes 开一轮对话，conversation 自动生成并绑定到当前会话
-/mesh hermes,dsh-kaniol-matebooke2016 看一下 8790   # 点名多个对象，并立即把这句发出去
+/mesh hermes,<peer-node> 看一下 8790   # 点名多个对象，并立即把这句发出去
 ```
 
 - conversation id 自动生成（`conv/<8位>`），**不用自己起名字**；
@@ -284,7 +284,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
    ```
    mesh_send({ to: "*", subject: "插件更新 0.3.0 (f89073fb)",
-               body: "变更：… 取包：\\\\192.168.10.2\\Media\\_handoff\\mesh-waker-handoff.tar.gz
+               body: "变更：… 取包：\\\\<NAS-IP>\\Media\\_handoff\\mesh-waker-handoff.tar.gz
                      （sha256 6e2bdb3b…） 步骤：解包→覆盖 index.js/client.js/package.json→重启 dsh→自检
                      回执：更新完回一条 no_reply:true 的消息" })
    ```
@@ -295,7 +295,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
    ```json
    {"plugin":"@local/dsh-mesh-waker","version":"0.3.0",
     "index_sha256":"…","tar_sha256":"…","hub_version":"0.5.2",
-    "updated_at":"2026-10-23T02:20+08:00","updated_by":"dsh-kaniol-pc"}
+    "updated_at":"2026-10-23T02:20+08:00","updated_by":"<this-node>"}
    ```
 
 5. **接收方**：按公告更新 → 自检 `registered:true` → 回一条 **`no_reply: true`** 回执（避免复读）；没更新的也要回一条说明原因。
@@ -303,12 +303,12 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
 ## 本环境速查（2026-10-21 接入；2026-10-29 复核版本）
 
-- 中枢：`http://192.168.10.2:8790/mcp`（NAS 上的容器 `dsh-mesh`，**0.7.11**；SQLite 与 `admin.token` 在数据目录 `data/`；2026-10-29 复核 `/health`）
-- 本机身份：`dsh-kaniol-pc`（由 token 决定，不是自报）；同伴：`hermes`（NAS 容器，已接入 `mcp_servers.mesh`）、
-  `dsh-kaniol-matebooke2016`（KANIOL-MATEBOOKE2016 / 192.168.10.239，笔记本）
-- 令牌都在加密库：本机 `MESH_TOKEN_DSH_KANIOL_PC`、Hermes `MESH_TOKEN_HERMES`、管理员 `MESH_ADMIN_TOKEN`。
+- 中枢：`http://<NAS-IP>:8790/mcp`（NAS 上的容器 `dsh-mesh`，**0.7.11**；SQLite 与 `admin.token` 在数据目录 `data/`；2026-10-29 复核 `/health`）
+- 本机身份：`<this-node>`（由 token 决定，不是自报）；同伴：`hermes`（NAS 容器，已接入 `mcp_servers.mesh`）、
+  `<peer-node>`（`<laptop-host>` / `<laptop-ip>`，笔记本）
+- 令牌都在加密库：本机 `MESH_TOKEN_<node>`、Hermes `MESH_TOKEN_HERMES`、管理员 `MESH_ADMIN_TOKEN`。
   明文只出现在本机 profile 的 `mcp-mesh` 配置里——轮换令牌后要同步改那一处，否则会 401。
-- 自证：`mesh_whoami` 返回的 `agent` 应是 `dsh-kaniol-pc`；`mesh_status` 能看到中枢计数。
+- 自证：`mesh_whoami` 返回的 `agent` 应是 `<this-node>`；`mesh_status` 能看到中枢计数。
 - **`mesh_whoami` 的两个已知缺陷**（v0.2.1 修）：`hub` 回显监听地址 `http://0.0.0.0:8790/mcp`（不是可达地址）；
   `host` 取自请求头、名册里没有时恒为 `null`。**身份、host、描述一律以 `mesh_peers` 为准**，whoami 只用来确认"我是谁"。
 - 中枢没开 / 断网时 dsh 照常启动（`failOnStartupError: false`），连接恢复后自动重连；
@@ -371,7 +371,7 @@ curl.exe -s http://127.0.0.1:8795/mesh/sessions          # 列会话：id/标题
 curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: application/json' `
   -d '{"title":"mesh · hub","text":"核对 README 与文档，只列不改"}'
 curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/create -H 'content-type: application/json' `
-  -d '{"title":"mesh · docs","workspacePath":"D:/Libraries/Documents/projects/dsh-mesh/public","prompt":"先读 docs/ 列待办"}'
+  -d '{"title":"mesh · docs","workspacePath":"<repo>","prompt":"先读 docs/ 列待办"}'
 ```
 
 铁律：

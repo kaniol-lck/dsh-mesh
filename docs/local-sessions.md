@@ -15,8 +15,8 @@
     {
       "id": "session-c61c2456-…",
       "title": "hermes · rehome",
-      "workspacePath": "D:\\Libraries\\Documents\\projects\\dsh-mesh",
-      "workspace": "--D-Libraries-Documents-projects-dsh-mesh--",
+      "workspacePath": "<repo>",
+      "workspace": "--<repo-path-slug>--",
       "last_active": 1793167809000,
       "live": true
     }
@@ -35,7 +35,7 @@
 ```json
 {
   "title": "mesh · hub 开发",
-  "cwd": "D:\\Libraries\\Documents\\projects\\dsh-mesh",
+  "cwd": "<repo>",
   "prompt": "先读 hub/README.md，列出与 docs 不一致处（只列不改）。",
   "mode": "queue"
 }

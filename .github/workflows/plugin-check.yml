@@ -35,3 +35,6 @@ jobs:
 
       - name: Secret scan
         run: python3 scripts/check-secrets.py
+
+      - name: Path/topology guard
+        run: node scripts/check-paths.mjs

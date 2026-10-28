@@ -16,14 +16,14 @@
 
 ## 会话纪律
 
-1. **cwd 必须是本仓根**（`D:\Libraries\Documents\projects\dsh-mesh\public`）。不要用包含 `public/` 与 `transfer/` 的上级目录，否则相对路径找不到文件。
+1. **cwd 必须是本仓根**（`public/` 这一层，即 clone/检出目录）。不要用包含 `public/` 与 `transfer/` 的上级目录，否则相对路径找不到文件。
 2. 相对路径一律以本仓根为准：`hub/README.md`、`plugins/mesh-waker/index.js`。
 3. 提交只 `git add` 自己负责的路径；commit message 写**为什么**，不要只写“更新”。
 4. 不 `git push --force`；不提交凭据、token、`.npmrc`（`scripts/check-secrets.py` 是门禁）。
 5. 发版动作（`npm publish`、部署 hub 到 NAS）**必须先得到 owner 确认**。
 6. 待办写 `.worklog/todo/<自己>.md`，任务/故障/发版日志写 `.worklog/WORKLOG.md`，整套 `.worklog/` 不入库（明细只留在本地）。跨域条目**必须**写 `归属：<会话>`（缺了 `node scripts/roadmap.mjs --check` 只 WARN，不阻塞）。
 7. 工作日志的格式、目录与收尾检查见 `docs/worklog.md`。
-8. 改完自己的 todo 跑 `node scripts/roadmap.mjs --write`；收尾 `node scripts/roadmap.mjs --check` 必须退出 0。
+8. 改完自己的 todo 跑 `node scripts/roadmap.mjs --write`；收尾 `node scripts/roadmap.mjs --check` 必须退出 0，`node scripts/check-paths.mjs` 也必须退出 0。
 
 ## 缺陷回流（协调会话）
 1. 只在有证据时触发：同类问题 ≥2 次 / 一次故障让既有约定失效 / 检查脚本反复卡同一处。
