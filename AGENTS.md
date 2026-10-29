@@ -61,6 +61,19 @@
    没有这一行 = 没有决定；协调会话每轮收尾会 grep `DECISION:` 汇总。
 5. **冲突处理**：若直问得到的决定与既有约定/记录冲突，以「时间较晚 + 已记录」为准，并由该会话抄送协调会话回写 AGENTS/todo。
 
+## 派活账本（协调会话维护）
+
+协调会话每派一单，在 `.worklog/dispatch/queue.md` 记一行：编号 / 会话 / 任务 / 派出时间 / 期望产物 / 状态。
+
+状态机：`dispatched` → `started`（可选）→ `committed`（有 commit）→ `deployed`（需上生产才算完）→ `done`。
+
+三条核对规则：
+1. 超过 **30 分钟**仍停在 `dispatched`/`started`，且该会话 `last_active` 在动 → 协调会话直接问「卡在哪」，**不许靠猜**；
+2. `committed` ≠ 可用：需要部署的单必须等到 `deployed`，否则按「代码进了仓库、生产还是旧镜像」处理（本机已发生过一次：hub 新端点全部提交但生产仍是旧版）；
+3. `mesh · ops` 巡检第 10 项会列出超过 30 分钟未 `committed` 的条目，作为兜底告警。
+
+执行会话**不需要**维护这个文件；你们的 `todo/<自己>.md` 与 commit 就是账本的证据来源。派活正文里若写明「期望产物」，账本会照抄该列，便于对账。
+
 ## 唤醒协调会话（本机）
 
 - 本机唤醒**只用 inject**：`node scripts/mesh-dispatch.mjs --wake --title "mesh · 协调" --file .worklog/dispatch/<主题>.txt`；不要为本机唤醒去调 hub/mesh。
