@@ -26,6 +26,17 @@ const MESH_WAKER_ID = (() => {
   return fallback
 })()
 
+// Version drift notice for the settings page: the disk copy was updated but the running
+// process still serves the old code. Empty string means "render nothing", so a healthy
+// install stays quiet instead of showing a permanent banner.
+function staleVersionNotice(status) {
+  const versions = status && status.pluginVersions
+  if (!versions || versions.stale !== true) return ''
+  const disk = versions.disk || '?'
+  const process = versions.process || '?'
+  return `检测到磁盘版本 ${disk}，进程版本 ${process} —— 重启 DSH 后生效`
+}
+
 // Two copies of this plugin can coexist (a linked copy plus the npm package). The loader
 // throws on a duplicate module id, and that aborts the whole web boot, so degrade to a
 // warning instead of killing the app.
@@ -1015,6 +1026,24 @@ try {
       return h(
         'div',
         { style: { display: 'grid', gap: 0, padding: '8px 0 24px' } },
+        staleVersionNotice(status)
+          ? h(
+              'div',
+              {
+                style: {
+                  margin: '4px 0 12px',
+                  padding: '8px 12px',
+                  borderRadius: 6,
+                  background: 'rgba(217, 119, 6, 0.12)',
+                  border: '1px solid rgba(217, 119, 6, 0.45)',
+                  color: '#b45309',
+                  fontSize: 13,
+                  fontWeight: 600,
+                },
+              },
+              '⚠ ' + staleVersionNotice(status),
+            )
+          : null,
         h(
           Row,
           { title: '中枢登记', description: status && status.wakeUrl ? status.wakeUrl : '' },
@@ -2355,4 +2384,10 @@ try {
   });
 } catch (error) {
   console.warn('[mesh-waker] duplicate registration skipped:', error && error.message ? error.message : error);
+}
+
+// VM test hook: harnesses that evaluate this file without React (see the dynamic-id test)
+// opt in by defining the global, so runtime behaviour and globals stay unchanged.
+if (typeof globalThis !== 'undefined' && typeof globalThis.__meshWakerTestHook === 'function') {
+  globalThis.__meshWakerTestHook({ staleVersionNotice })
 }
