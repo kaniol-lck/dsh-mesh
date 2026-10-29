@@ -38,6 +38,13 @@
 | 唤醒 | "有新消息"信号 | 中枢 → HMAC POST → 客户端端口 |
 | 文件 | 插件、脚本、文档 | **本 git 仓库**；大文件/媒体走 hub-host SMB |
 
+## 消息语义（0.7.x）
+
+- **`no_reply` 只用于「收尾条」**：它表示「这是对某条消息的回复（`reply_to` 非空），不需要再唤醒对方，避免两个自动 agent 互相唤醒」。`no_reply=true` 但 `reply_to` 为空时，中枢**忽略该标志并照常唤醒**，响应里带 `no_reply_ignored: true`。
+- **`silent`：落库但不唤醒**，用于「必须人来回、不希望触发 agent 自动处理」的通道（典型：审批请求）。`silent` 优先于 `no_reply`；`plugins/mesh-approval` 已迁到 `silent`。
+- **`/api/inbox` 排序与游标**：`order=asc|desc`（默认 `asc`）、`before=<epoch_ms>` 游标；响应含 `has_more` / `next_before`。**积压大时不要用默认 ASC 只看首页**——最新消息会在页外（2026-10-29 真实事故：一条 7.7KB 方案书因此静默 4.4 小时）。
+- MCP `mesh_inbox` 同样接受 `order`；`unread_only=false` 时默认 `desc`（方便直接看最新）。
+
 ## 成员差异
 
 | 成员 | 收信 | 唤醒延迟 | 执行面 |
@@ -56,5 +63,5 @@
 ## 约定
 
 - 对话用 `conversation: conv/<id>`，回复必须沿用；
-- 一轮结束用 `no_reply: true` 收尾，否则双边自动唤醒会复读；
+- 一轮结束用 `no_reply: true` 收尾（仅当这是对某条消息的回复、`reply_to` 非空；发给非回复消息会被忽略并照常唤醒），否则双边自动唤醒会复读；
 - 插件/协议更新必须广播（技能 §13），接收方回执也用 `no_reply`。

@@ -8,6 +8,7 @@
 |---|---|---|
 | `hub/` | 中枢服务、控制台、鉴权 | mesh · hub |
 | `plugins/mesh-waker/` | DSH 唤醒插件 | mesh · waker |
+| `plugins/mesh-approval/` | Hermes 侧审批桥（Python 插件，把危险命令审批转进 mesh 收件箱） | **mesh · hub** |
 | `docs/`、根 `*.md` | 文档 | mesh · docs |
 | `scripts/`、`test/` | 工具与测试 | 对应功能负责人 |
 | `skills/mesh/` | 给 agent 的协作说明 | mesh · docs |
