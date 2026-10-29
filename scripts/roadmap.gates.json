@@ -7,8 +7,8 @@
       "requires": [
         { "match": "joinCode" },
         { "match": "自举" },
-        { "match": "pull 默认" },
-        { "match": "onboarding" }
+        { "match": "pull 循环" },
+        { "feature": "接入体验" }
       ]
     },
     {
@@ -18,8 +18,7 @@
       "requires": [
         { "match": "mesh_dispatch" },
         { "match": "批次屏障" },
-        { "match": "回执" },
-        { "match": "项目无关" }
+        { "match": "回执" }
       ]
     },
     {
@@ -28,7 +27,7 @@
       "question": "完成后能否把 hub 与 waker 安全地对公网发布？",
       "requires": [
         { "feature": "传输安全" },
-        { "match": "证书与 token 轮换" },
+        { "match": "令牌轮换" },
         { "match": "ops-check" },
         { "match": "GitHub Release" },
         { "match": "双轴版本自检" }
@@ -41,7 +40,7 @@
       "requires": [
         { "feature": "运维交付" },
         { "match": "transport-security" },
-        { "match": "onboarding" }
+        { "match": "release.md" }
       ]
     }
   ]
