@@ -3,7 +3,7 @@
 本文回答一个问题：**hub 要出内网时，用什么方式加密、怎么落地、怎么验证、会踩什么坑**。
 结论按 2026-10-29 的本机实测环境书写；换网络环境时先看 §2 的决策表，再看 §3 是否仍适用。
 
-> 本文用占位符；本环境实测的完整地址与设备型号记录在本地 .worklog/ops/transport-security.local.md（不入库，随 .worklog 忽略）。
+> 本文用占位符（`<EDGE-PORT>` = 你在云安全组放行的公网端口，本环境实测值见本地记录，不入库）；完整地址与设备型号记录在本地 .worklog/ops/transport-security.local.md（不入库，随 .worklog 忽略）。
 
 ---
 
@@ -43,7 +43,7 @@ hub 本体不动，仍然只监听本机回环。优点是改动最小、单入�
 公网 → <边缘路由>（<ISP 光猫/路由>，<home-public-ip>）        ← NAT #1
      → <软路由系统>（LAN <LAN-CIDR>）                          ← NAT #2
      → NAS <NAS-IP>（<NAS 系统>）：frpc → nginx(:8443, TLS 终止) → hub 127.0.0.1:8790
-公网 → 云 <CLOUD-IP>:18790（frps 0.71.1）→ 上面这条隧道
+公网 → 云 <CLOUD-IP>:<EDGE-PORT>（frps 0.71.1）→ 上面这条隧道
 ```
 
 - 路由器 `ipv6-address` / `ipv6-prefix` 为空 → **IPv6 不可用**，入口只能靠云主机。
@@ -138,16 +138,16 @@ openssl x509 -in server.crt -noout -enddate
 `server.crt` 是叶子证书、**不能当信任锚**。
 
 中枢侧已把 CA 挂在同一个 TLS 入口上（nginx `location = /ca.crt`，`application/x-x509-ca-cert`，
-经 frp 暴露在 `https://<CLOUD-IP>:18790/ca.crt`）。对端三步：
+经 frp 暴露在 `https://<CLOUD-IP>:<EDGE-PORT>/ca.crt`）。对端三步：
 
 ```bash
 # 1) 首次取 CA（-k 只用于这一次：此时还没有可信任的锚）
-curl -k https://<CLOUD-IP>:18790/ca.crt -o ca.crt
+curl -k https://<CLOUD-IP>:<EDGE-PORT>/ca.crt -o ca.crt
 # 2) 核对指纹（与中枢侧公布值比对，不一致就不要继续）
 openssl x509 -in ca.crt -noout -fingerprint -sha256
 # 3) 让 Node 信任它，再验证一次
 export NODE_EXTRA_CA_CERTS=$PWD/ca.crt      # Windows: setx NODE_EXTRA_CA_CERTS ... 后重启 DSH
-curl --cacert ca.crt https://<CLOUD-IP>:18790/health    # 期望 200
+curl --cacert ca.crt https://<CLOUD-IP>:<EDGE-PORT>/health    # 期望 200
 ```
 
 Windows 的 `curl.exe`（schannel）另需 `--ssl-no-revoke`（见下）。
@@ -166,17 +166,17 @@ Windows 的 `curl.exe`（schannel）另需 `--ssl-no-revoke`（见下）。
 
 ```bash
 NODE_EXTRA_CA_CERTS=<path>/ca.crt node -e "
-  fetch('https://<CLOUD-IP>:18790/health').then(r => r.json()).then(console.log)"
+  fetch('https://<CLOUD-IP>:<EDGE-PORT>/health').then(r => r.json()).then(console.log)"
 # 期望：{ ok: true, service: 'dsh-mesh', version: '0.7.12', ... }
 ```
 
-DSH 的 `mcp-mesh` 配置里把 `url` 换成 `https://<CLOUD-IP>:18790/mcp`，
+DSH 的 `mcp-mesh` 配置里把 `url` 换成 `https://<CLOUD-IP>:<EDGE-PORT>/mcp`，
 并保证**启动 DSH 的进程**能拿到 `NODE_EXTRA_CA_CERTS`（Windows 下是用户/系统环境变量，不是 profile 里的字段）。
 
 ### Windows `curl.exe`
 
 ```powershell
-curl.exe --cacert ca.crt --ssl-no-revoke https://<CLOUD-IP>:18790/health
+curl.exe --cacert ca.crt --ssl-no-revoke https://<CLOUD-IP>:<EDGE-PORT>/health
 ```
 
 `--ssl-no-revoke` 的原因：Windows `curl.exe` 用 schannel，自签 CA 没有 CRL/OCSP，
@@ -215,17 +215,17 @@ openssl x509 -in server.crt -noout -enddate
 
 | 检查 | 命令要点 | 期望结果 |
 |---|---|---|
-| 外网 HTTPS | `curl --cacert ca.crt --ssl-no-revoke https://<CLOUD-IP>:18790/health` | 200 |
+| 外网 HTTPS | `curl --cacert ca.crt --ssl-no-revoke https://<CLOUD-IP>:<EDGE-PORT>/health` | 200 |
 | Node 客户端 | `NODE_EXTRA_CA_CERTS=ca.crt node -e "fetch(...)"` | 200，`service=dsh-mesh version=0.7.12` |
-| 明文 HTTP | `curl http://<CLOUD-IP>:18790/health` | **400**（nginx 拒绝 "plain HTTP request sent to HTTPS port"） |
-| 无 token | `curl --cacert ca.crt --ssl-no-revoke https://<CLOUD-IP>:18790/api/inbox` | **401** |
+| 明文 HTTP | `curl http://<CLOUD-IP>:<EDGE-PORT>/health` | **400**（nginx 拒绝 "plain HTTP request sent to HTTPS port"） |
+| 无 token | `curl --cacert ca.crt --ssl-no-revoke https://<CLOUD-IP>:<EDGE-PORT>/api/inbox` | **401** |
 | 局域网明文 | `curl http://<NAS-IP>:8790/health` | 200（内网保持原样） |
 
 TLS 自动化检查（在 hub 目录）：
 
 ```bash
 NODE_EXTRA_CA_CERTS=<path>/ca.crt \
-MESH_BASE=https://<CLOUD-IP>:18790 \
+MESH_BASE=https://<CLOUD-IP>:<EDGE-PORT> \
 MESH_ADMIN_TOKEN=<vault 注入> \
 node scripts/tls-check.mjs
 ```

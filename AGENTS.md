@@ -41,7 +41,7 @@
 
 ## 自测与生产中枢
 
-允许直接对生产中枢（`https://<CLOUD-IP>:18790` 或内网 `http://<NAS-IP>:8790`）跑自测，但必须统一管理（真实地址见本地 `.worklog/ops/transport-security.local.md`，不入库）。测试口径：单元/集成测试默认用临时实例（临时端口 + 临时数据目录，不碰生产数据）；端到端验收允许打生产中枢，但按下面四条管理。
+允许直接对生产中枢（`https://<CLOUD-IP>:<EDGE-PORT>` 或内网 `http://<NAS-IP>:8790`）跑自测，但必须统一管理（真实地址见本地 `.worklog/ops/transport-security.local.md`，不入库）。测试口径：单元/集成测试默认用临时实例（临时端口 + 临时数据目录，不碰生产数据）；端到端验收允许打生产中枢，但按下面四条管理。
 
 1. **命名前缀**：自测创建的 agent 必须以 `selftest-` 或 `test-` 开头（例：`selftest-enroll-20261029`）；生产节点禁止使用这两个前缀。
 2. **当场清理**：测试结束立刻 `DELETE /api/admin/agents?name=<名>&purge=1` 连行删除；确实需要留证据时，在 WORKLOG 记 `SELFTEST: <名> · <用途> · <保留到何时>`。
