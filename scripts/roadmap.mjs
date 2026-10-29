@@ -23,6 +23,19 @@ import process from 'node:process'
 
 const PRIORITIES = ['P0', 'P1', 'P2']
 const STATUSES = ['未开始', '进行中', '已完成']
+/** Fixed vocabulary — do not invent labels; unknown values fall back to 未分类 with a WARN. */
+const FEATURES = ['接入体验', '收件箱', '协作编排', '传输安全', '运维交付', '控制台', '文档', '未分类']
+/** Keyword fallback, first match wins (checked in this order). */
+const FEATURE_RULES = [
+  ['传输安全', /TLS|证书|CA|token|scope|审计|白名单|凭据/i],
+  ['收件箱', /收件箱|inbox|消息|no_reply|silent|claim|排序|游标/i],
+  ['接入体验', /接入|新手|joinCode|bootstrap|pull|轮询|standalone|onboarding|注册码|设备码/i],
+  ['协作编排', /批量|batch|回执|receipt|liveness|派活|账本|todo|进度|屏障/i],
+  ['控制台', /控制台|console|面板|页面/i],
+  ['运维交付', /部署|发版|发布|巡检|门禁|脚本|CI|tag/i],
+  ['文档', /文档|README|docs|技能|示例/i],
+]
+const DONE_LIST_CAP = 60
 const MARK_START = '<!-- AUTO:TODO START -->'
 const MARK_END = '<!-- AUTO:TODO END -->'
 const GENERATED_PREFIX = '<!-- generated:'
@@ -108,7 +121,22 @@ function parseHeader(line) {
   return { session: match[1], updated: match[2] }
 }
 
-function parseEntry(line, sessionName, file, lineNumber, errors) {
+function inferFeature(text) {
+  for (const [name, pattern] of FEATURE_RULES) if (pattern.test(text)) return name
+  return '未分类'
+}
+
+/** Explicit 功能： wins; missing falls back to keywords; out-of-vocabulary is demoted with a WARN. */
+function resolveFeature(raw, entry, where, warnings) {
+  if (raw) {
+    if (FEATURES.includes(raw)) return raw
+    warnings.push({ ...where, message: `未知功能标签「${raw}」，已归未分类` })
+    return '未分类'
+  }
+  return inferFeature(`${entry.title} ${entry.description} ${entry.acceptance}`)
+}
+
+function parseEntry(line, sessionName, file, lineNumber, errors, warnings) {
   const match = /^- \[(P[0-2])\] (.+)$/.exec(line)
   if (!match) {
     errors.push({ file, line: lineNumber, message: 'not a todo line: expected "- [P0|P1|P2] <标题> —— <说明>；验收：…；状态：…"' })
@@ -116,10 +144,10 @@ function parseEntry(line, sessionName, file, lineNumber, errors) {
   }
   const [, priority, rest] = match
   const segments = rest.split('；')
-  const fields = { acceptance: null, status: null, owner: null, progress: null }
+  const fields = { acceptance: null, status: null, owner: null, progress: null, feature: null }
   const descriptionParts = [segments[0]]
   for (const segment of segments.slice(1)) {
-    const field = /^(验收|状态|归属|进展)：(.+)$/.exec(segment)
+    const field = /^(验收|状态|归属|进展|功能)：(.+)$/.exec(segment)
     if (!field) {
       // A "；" inside the description is not a field separator.
       descriptionParts.push(segment)
@@ -129,6 +157,7 @@ function parseEntry(line, sessionName, file, lineNumber, errors) {
     if (key === '验收') fields.acceptance = value.trim()
     else if (key === '状态') fields.status = value.trim()
     else if (key === '进展') fields.progress = value.trim()
+    else if (key === '功能') fields.feature = value.trim()
     else fields.owner = value.trim()
   }
   const head = descriptionParts.join('；')
@@ -156,6 +185,7 @@ function parseEntry(line, sessionName, file, lineNumber, errors) {
     owner: fields.owner ?? sessionName,
     explicitOwner: fields.owner !== null,
     progress: fields.progress ?? null,
+    feature: resolveFeature(fields.feature, { title, description, acceptance: fields.acceptance }, { file, line: lineNumber }, warnings),
     file,
     line: lineNumber,
     source: `${file}:${lineNumber}`,
@@ -196,6 +226,7 @@ async function parseTodos(todoDir) {
   }
   const entries = []
   const errors = []
+  const warnings = []
   for (const file of names) {
     const text = await readFile(path.join(todoDir, file), 'utf8')
     const lines = text.split(/\r?\n/)
@@ -207,11 +238,11 @@ async function parseTodos(todoDir) {
     for (let index = 1; index < lines.length; index += 1) {
       const line = lines[index].trimEnd()
       if (!line.startsWith('- ')) continue
-      const entry = parseEntry(line, sessionName, file, index + 1, errors)
+      const entry = parseEntry(line, sessionName, file, index + 1, errors, warnings)
       if (entry) entries.push(entry)
     }
   }
-  return { entries, errors }
+  return { entries, errors, warnings }
 }
 
 function normalizeTitle(title) {
@@ -245,6 +276,7 @@ function sourceHash(entries, versions) {
       status: entry.status,
       owner: entry.owner,
       progress: entry.progress,
+      feature: entry.feature,
       file: entry.file,
       line: entry.line,
     })),
@@ -306,23 +338,52 @@ function formatItem(entry, today = new Date()) {
   return `- [${entry.owner}] ${entry.displayTitle} — ${statusText}${demoted}${suffix}`
 }
 
+function featureStats(entries) {
+  return FEATURES.map((name) => {
+    const group = entries.filter((entry) => entry.feature === name)
+    const open = group.filter((entry) => entry.status !== '已完成')
+    const topPriority = PRIORITIES.find((priority) => open.some((entry) => entry.priority === priority)) ?? null
+    const owners = [...new Set(group.filter((entry) => entry.explicitOwner).map((entry) => entry.owner))].sort()
+    return { name, open: open.length, done: group.length - open.length, topPriority, owners }
+  })
+}
+
 function buildSegment(entries, generatedAt, hash, versions) {
   const counts = countEntries(entries)
   const unfinished = entries.filter((entry) => entry.status !== '已完成')
-  const done = entries.filter((entry) => entry.status === '已完成').sort(ownerCompare)
+  const done = entries.filter((entry) => entry.status === '已完成')
+  const openCount = counts.P0 + counts.P1 + counts.P2
   const lines = [
     `${GENERATED_PREFIX} ${generatedAt}; ${counts.total} items; src=${hash} -->`,
-    `共 ${counts.total} 条 · P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}（未完成）· 已完成 ${counts.done} · 进行中 ${counts.inProgress} · 来源 .worklog/todo/*.md`,
+    `共 ${counts.total} 条 · P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}（未完成 ${openCount}）· 进行中 ${counts.inProgress} · 已完成 ${counts.done} · 来源 .worklog/todo/*.md`,
     `版本快照：hub ${versions.hubVersion}（hub/server.mjs + hub/package.json）/ waker ${versions.wakerVersion}（plugins/mesh-waker/package.json）· 读取自代码，勿手改`,
+    '',
+    '### 按功能聚合',
+    '',
+    '| 功能 | 未完成 | 已完成 | 最高优先级 | 涉及会话 |',
+    '|---|---|---|---|---|',
   ]
+  for (const stats of featureStats(entries)) {
+    lines.push(`| ${stats.name} | ${stats.open} | ${stats.done} | ${stats.topPriority ?? '—'} | ${stats.owners.length ? stats.owners.join(', ') : '—'} |`)
+  }
   for (const priority of PRIORITIES) {
     const group = unfinished.filter((entry) => entry.priority === priority).sort(ownerCompare)
     lines.push('', `### ${priority}（${group.length}）`)
     for (const entry of group) lines.push(formatItem(entry))
   }
   if (done.length) {
-    lines.push('', `### 已完成（${done.length}）`)
-    for (const entry of done) lines.push(formatItem(entry))
+    const sortedDone = [...done].sort(
+      (left, right) =>
+        FEATURES.indexOf(left.feature) - FEATURES.indexOf(right.feature) || priorityCompare(left, right) || ownerCompare(left, right),
+    )
+    lines.push('', '<details>', `<summary>已完成（${done.length}）—— 点击展开</summary>`, '')
+    for (const entry of sortedDone.slice(0, DONE_LIST_CAP)) {
+      lines.push(`- ${entry.feature} · [${entry.priority}] ${entry.displayTitle}（${entry.owner}）`)
+    }
+    if (sortedDone.length > DONE_LIST_CAP) {
+      lines.push('', `- 其余 ${sortedDone.length - DONE_LIST_CAP} 条见 .worklog/roadmap.html`)
+    }
+    lines.push('', '</details>')
   }
   return lines.join('\n')
 }
@@ -526,17 +587,19 @@ function renderCard(entry) {
     ? `      <span class="dup" title="进行中但${escapeHtml(live.reason)}，按待办处理">⚠</span>\n`
     : ''
   const search = escapeHtml(
-    `${entry.displayTitle} ${entry.description} ${entry.acceptance} ${demoted ? live.reason : ''}`.toLowerCase(),
+    `${entry.displayTitle} ${entry.description} ${entry.acceptance} ${entry.feature} ${demoted ? live.reason : ''}`.toLowerCase(),
   )
-  return `    <details class="card" data-prio="${entry.priority}" data-owner="${escapeHtml(entry.owner)}" data-status="${escapeHtml(statusShown)}" data-search="${search}">
+  return `    <details class="card" data-prio="${entry.priority}" data-owner="${escapeHtml(entry.owner)}" data-feature="${escapeHtml(entry.feature)}" data-status="${escapeHtml(statusShown)}" data-search="${search}">
       <summary>
         <span class="prio ${entry.priority.toLowerCase()}">${entry.priority}</span>
         <span class="owner">${escapeHtml(entry.owner)}</span>
+        <span class="feature">${escapeHtml(entry.feature)}</span>
         <span class="title">${escapeHtml(entry.displayTitle)}</span>
         <span class="badge ${statusClass(statusShown)}">${escapeHtml(statusShown)}</span>
 ${duplicate}${demotion}      </summary>
       <div class="detail">
         <dl>
+          <dt>功能</dt><dd>${escapeHtml(entry.feature)}</dd>
           <dt>说明</dt><dd>${escapeHtml(entry.description)}</dd>
           <dt>验收</dt><dd>${escapeHtml(entry.acceptance)}</dd>
           <dt>归属</dt><dd>${escapeHtml(entry.owner)}</dd>
@@ -558,7 +621,12 @@ function renderHtml(entries, generatedAt, hash) {
   const ownerChips = owners
     .map((owner) => `        <button type="button" class="chip" data-owner-filter="${escapeHtml(owner)}">${escapeHtml(owner)}</button>`)
     .join('\n')
-  const cards = sorted.map(renderCard).join('\n')
+  const openCards = sorted.filter((entry) => entry.status !== '已完成')
+  const doneCards = sorted.filter((entry) => entry.status === '已完成')
+  const cards = openCards.map(renderCard).join('\n')
+  const doneBlock = doneCards.length
+    ? `<details class="done-block">\n<summary>已完成（${doneCards.length}）—— 点击展开</summary>\n${doneCards.map(renderCard).join('\n')}\n</details>`
+    : ''
   return `<!doctype html>
 <!-- generated: ${escapeHtml(generatedAt)}; ${counts.total} items; src=${hash} -->
 <html lang="zh-CN">
@@ -600,6 +668,9 @@ function renderHtml(entries, generatedAt, hash) {
   .badge.doing { background: #fff4dd; color: #8a5a00; border-color: #f0d9a8; }
   .badge.done { background: #e7f6ec; color: #1d6b3a; border-color: #bfe4cb; }
   .dup { color: #c62828; cursor: help; }
+  .feature { padding: 1px 8px; border-radius: 999px; background: #eef1f6; color: #556; font-size: 12px; }
+  .done-block { margin-top: 18px; border: 1px dashed #ccd; border-radius: 10px; padding: 8px 12px; }
+  .done-block > summary { cursor: pointer; color: #667; padding: 4px 2px; }
   .detail { padding: 0 14px 12px; border-top: 1px dashed #e2e4ea; }
   dl { display: grid; grid-template-columns: 64px 1fr; gap: 6px 12px; margin: 10px 0 0; }
   dt { color: #667; }
@@ -637,6 +708,7 @@ ${ownerChips}
 </section>
 <main id="list">
 ${cards}
+${doneBlock}
 </main>
 <script>
 (function () {
@@ -748,7 +820,12 @@ async function main() {
   const roadmapPath = options.roadmap ? path.resolve(options.roadmap) : path.resolve(repo, '..', 'ROADMAP.md')
   const htmlPath = path.join(repo, '.worklog', 'roadmap.html')
 
-  const { entries, errors } = await parseTodos(todoDir)
+  const { entries, errors, warnings } = await parseTodos(todoDir)
+  for (const warning of warnings) {
+    const text = `WARN: ${warning.file} 行 ${warning.line} ${warning.message}`
+    if (options.json) console.error(text)
+    else console.log(text)
+  }
   markDuplicates(entries)
   const versions = await readVersions(repo)
   const hash = sourceHash(entries, versions)
@@ -762,6 +839,7 @@ async function main() {
       hash,
       versions: { ...versions, drift: versions.hubVersion !== versions.hubPackageVersion },
       counts: countEntries(entries),
+      features: featureStats(entries),
       errors,
       entries: entries.map((entry) => {
         const live = isLiveInProgress(entry)
