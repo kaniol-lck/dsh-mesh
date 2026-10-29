@@ -90,12 +90,14 @@ function sortForDisplay(entries) {
   return [...entries].sort((left, right) => priorityCompare(left, right) || ownerCompare(left, right))
 }
 
-function countEntries(entries) {
+function countEntries(entries, today = new Date()) {
   // P0/P1/P2 count unfinished items only; completed ones live in `done` (a+b+c+d = total).
-  const counts = { total: entries.length, P0: 0, P1: 0, P2: 0, done: 0 }
+  // inProgress additionally requires a live claim (owner + fresh progress date).
+  const counts = { total: entries.length, P0: 0, P1: 0, P2: 0, done: 0, inProgress: 0 }
   for (const entry of entries) {
     if (entry.status === '已完成') counts.done += 1
     else counts[entry.priority] += 1
+    if (isLiveInProgress(entry, today).ok) counts.inProgress += 1
   }
   return counts
 }
@@ -114,10 +116,10 @@ function parseEntry(line, sessionName, file, lineNumber, errors) {
   }
   const [, priority, rest] = match
   const segments = rest.split('；')
-  const fields = { acceptance: null, status: null, owner: null }
+  const fields = { acceptance: null, status: null, owner: null, progress: null }
   const descriptionParts = [segments[0]]
   for (const segment of segments.slice(1)) {
-    const field = /^(验收|状态|归属)：(.+)$/.exec(segment)
+    const field = /^(验收|状态|归属|进展)：(.+)$/.exec(segment)
     if (!field) {
       // A "；" inside the description is not a field separator.
       descriptionParts.push(segment)
@@ -126,6 +128,7 @@ function parseEntry(line, sessionName, file, lineNumber, errors) {
     const [, key, value] = field
     if (key === '验收') fields.acceptance = value.trim()
     else if (key === '状态') fields.status = value.trim()
+    else if (key === '进展') fields.progress = value.trim()
     else fields.owner = value.trim()
   }
   const head = descriptionParts.join('；')
@@ -152,11 +155,36 @@ function parseEntry(line, sessionName, file, lineNumber, errors) {
     status: fields.status,
     owner: fields.owner ?? sessionName,
     explicitOwner: fields.owner !== null,
+    progress: fields.progress ?? null,
     file,
     line: lineNumber,
     source: `${file}:${lineNumber}`,
     duplicateOf: null,
   }
+}
+
+/**
+ * "进行中" only counts when the item names its owner and carries a fresh progress date.
+ * Missing/old progress would otherwise leave zombie in-progress rows on the board forever.
+ */
+function isLiveInProgress(entry, today = new Date()) {
+  if (entry.status !== '进行中') return { ok: false, reason: null }
+  if (!entry.explicitOwner) return { ok: false, reason: '缺归属' }
+  if (!entry.progress) return { ok: false, reason: '缺进展' }
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(entry.progress)
+  if (!match) return { ok: false, reason: '进展日期无效' }
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const stamp = Date.UTC(year, month - 1, day)
+  const probe = new Date(stamp)
+  if (probe.getUTCFullYear() !== year || probe.getUTCMonth() !== month - 1 || probe.getUTCDate() !== day) {
+    return { ok: false, reason: '进展日期无效' }
+  }
+  const todayStamp = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate())
+  const ageDays = Math.floor((todayStamp - stamp) / 86_400_000)
+  if (ageDays > 14) return { ok: false, reason: `进展已过期 ${ageDays} 天` }
+  return { ok: true }
 }
 
 async function parseTodos(todoDir) {
@@ -216,6 +244,7 @@ function sourceHash(entries, versions) {
       acceptance: entry.acceptance,
       status: entry.status,
       owner: entry.owner,
+      progress: entry.progress,
       file: entry.file,
       line: entry.line,
     })),
@@ -263,9 +292,18 @@ function markDuplicates(entries) {
   }
 }
 
-function formatItem(entry) {
+function formatItem(entry, today = new Date()) {
   const suffix = entry.duplicateOf ? ` ⚠ 疑似重复（${entry.duplicateOf}）` : ''
-  return `- [${entry.owner}] ${entry.displayTitle} — ${entry.status}${suffix}`
+  let statusText = entry.status
+  let demoted = ''
+  if (entry.status === '进行中') {
+    const live = isLiveInProgress(entry, today)
+    if (!live.ok) {
+      statusText = '待办'
+      demoted = `（进行中·${live.reason}，按待办处理）`
+    }
+  }
+  return `- [${entry.owner}] ${entry.displayTitle} — ${statusText}${demoted}${suffix}`
 }
 
 function buildSegment(entries, generatedAt, hash, versions) {
@@ -274,7 +312,7 @@ function buildSegment(entries, generatedAt, hash, versions) {
   const done = entries.filter((entry) => entry.status === '已完成').sort(ownerCompare)
   const lines = [
     `${GENERATED_PREFIX} ${generatedAt}; ${counts.total} items; src=${hash} -->`,
-    `共 ${counts.total} 条 · P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}（未完成）· 已完成 ${counts.done} · 来源 .worklog/todo/*.md`,
+    `共 ${counts.total} 条 · P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}（未完成）· 已完成 ${counts.done} · 进行中 ${counts.inProgress} · 来源 .worklog/todo/*.md`,
     `版本快照：hub ${versions.hubVersion}（hub/server.mjs + hub/package.json）/ waker ${versions.wakerVersion}（plugins/mesh-waker/package.json）· 读取自代码，勿手改`,
   ]
   for (const priority of PRIORITIES) {
@@ -333,6 +371,16 @@ function warnIfMissingOwner(entries) {
   }
 }
 
+/** An in-progress row without a live claim (owner + fresh progress) is demoted to todo; warn only. */
+function warnIfDemotedInProgress(entries, today = new Date()) {
+  for (const entry of entries) {
+    if (entry.status !== '进行中') continue
+    const live = isLiveInProgress(entry, today)
+    if (live.ok) continue
+    console.log(`WARN: ${entry.file} 行 ${entry.line} 「进行中」但${live.reason}，按待办处理`)
+  }
+}
+
 async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, versions) {
   if (versions.hubVersion !== versions.hubPackageVersion) {
     console.error(
@@ -350,6 +398,7 @@ async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, v
     console.log(`OK: ROADMAP auto section matches .worklog/todo (${entries.length} items)`)
     await warnIfHtmlStale(htmlPath, hash)
     warnIfMissingOwner(entries)
+    warnIfDemotedInProgress(entries)
     return
   }
   const actualLines = actual.split('\n')
@@ -467,22 +516,31 @@ function statusClass(status) {
 }
 
 function renderCard(entry) {
+  const live = isLiveInProgress(entry)
+  const demoted = entry.status === '进行中' && !live.ok
+  const statusShown = demoted ? '待办' : entry.status
   const duplicate = entry.duplicateOf
     ? `      <span class="dup" title="与 ${escapeHtml(entry.duplicateOf)} 的条目疑似重复">⚠</span>\n`
     : ''
-  const search = escapeHtml(`${entry.displayTitle} ${entry.description} ${entry.acceptance}`.toLowerCase())
-  return `    <details class="card" data-prio="${entry.priority}" data-owner="${escapeHtml(entry.owner)}" data-status="${escapeHtml(entry.status)}" data-search="${search}">
+  const demotion = demoted
+    ? `      <span class="dup" title="进行中但${escapeHtml(live.reason)}，按待办处理">⚠</span>\n`
+    : ''
+  const search = escapeHtml(
+    `${entry.displayTitle} ${entry.description} ${entry.acceptance} ${demoted ? live.reason : ''}`.toLowerCase(),
+  )
+  return `    <details class="card" data-prio="${entry.priority}" data-owner="${escapeHtml(entry.owner)}" data-status="${escapeHtml(statusShown)}" data-search="${search}">
       <summary>
         <span class="prio ${entry.priority.toLowerCase()}">${entry.priority}</span>
         <span class="owner">${escapeHtml(entry.owner)}</span>
         <span class="title">${escapeHtml(entry.displayTitle)}</span>
-        <span class="badge ${statusClass(entry.status)}">${escapeHtml(entry.status)}</span>
-${duplicate}      </summary>
+        <span class="badge ${statusClass(statusShown)}">${escapeHtml(statusShown)}</span>
+${duplicate}${demotion}      </summary>
       <div class="detail">
         <dl>
           <dt>说明</dt><dd>${escapeHtml(entry.description)}</dd>
           <dt>验收</dt><dd>${escapeHtml(entry.acceptance)}</dd>
           <dt>归属</dt><dd>${escapeHtml(entry.owner)}</dd>
+          ${entry.progress ? `<dt>进展</dt><dd>${escapeHtml(entry.progress)}</dd>` : ''}
           <dt>源文件</dt><dd>${escapeHtml(entry.source)}</dd>
         </dl>
       </div>
@@ -705,7 +763,10 @@ async function main() {
       versions: { ...versions, drift: versions.hubVersion !== versions.hubPackageVersion },
       counts: countEntries(entries),
       errors,
-      entries: entries.map((entry) => ({ ...entry, completed: entry.status === '已完成' })),
+      entries: entries.map((entry) => {
+        const live = isLiveInProgress(entry)
+        return { ...entry, completed: entry.status === '已完成', liveInProgress: live.ok, demoteReason: live.ok ? null : live.reason }
+      }),
     }
     console.log(JSON.stringify(model, null, 2))
     process.exit(errors.length ? 1 : 0)
