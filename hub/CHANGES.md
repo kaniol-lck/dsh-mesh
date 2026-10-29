@@ -4,7 +4,7 @@ v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审�
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（66/66）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（70/70）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
 > **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；补丁进入 0.7.12（见下条）。
 
@@ -17,7 +17,9 @@ v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话
 | 注册码入口 | 控制台「新节点配对」区块：管理员点按钮调 `POST /console/enroll-code` 生成 8 位码（10 分钟、单次），页内显示大字号码、剩余时间、复制按钮，并直接给出三条接入命令（换 token / 落盘 0600 / 验证） |
 | 设备码 | 新增 `POST /api/enroll/request`（返回 `user_code` + `device_code`，10 分钟、单次、按 IP 限速）与 `POST /api/enroll/token`（`202 pending` / `201 {name,token}` / `403 denied` / `410 expired`）；控制台新增待批准列表与批准/拒绝，管理面另有 `/api/admin/enroll/approve|deny` |
 | 安全 | `device_code` 不出现在控制台页面；批准需管理员控制台会话或 admin token；轮询 10 次/分钟/IP，失败进 audit；原 `/api/enroll` 八位码保持不变 |
-| 验证 | `node smoke-client.mjs`：66/66 passed（新增注册码单次、设备码 pending→approve→token→410、deny→403、轮询限速 429）；本地控制台手测 10/10：登录、生成码、待批准列表、批准后消失、页面脚本 `node --check` 通过 |
+| 时间字段 | `/api/admin/agents`、`/api/peers`（REST 与 MCP）新增 `last_seen_at`（UTC ISO 8601，保留 `last_seen_seconds_ago` 兼容）；控制台「最后活动」渲染为「刚刚 / N 分钟前 / N 小时前 / N 天前」，`title` 放本地绝对时间 |
+| 彻底删除 | `DELETE /api/admin/agents?name=&purge=1` 连行删除（含 wake_url/wake_secret）并审计 `admin.purge`；不带 `purge` 仍是吊销；控制台对已吊销节点显示「清理」，经会话鉴权的 `/console/agents/purge` 执行并二次确认 |
+| 验证 | `node smoke-client.mjs`：70/70 passed（注册码单次、设备码 pending→approve→token→410、deny→403、轮询限速 429、`last_seen_at` 可解析、`purge=1` 删行）；本地控制台手测 12/12（人类可读渲染 + 清理按钮）；页面脚本 `node --check` 通过 |
 
 ## v0.7.12（2026-10-29，REST 面 scopes 越权修复）
 

@@ -725,6 +725,7 @@ function buildServer(agentName, agentHost, publicUrl) {
           description: r.description,
           online: ts - r.last_seen <= ONLINE_TTL_MS,
           last_seen_seconds_ago: Math.round((ts - r.last_seen) / 1000),
+          last_seen_at: new Date(r.last_seen).toISOString(),
           unread_for_them: db.prepare('SELECT COUNT(*) AS n FROM messages WHERE recipient = ? AND read_at IS NULL').get(r.name).n,
         }))
         .filter((p) => include_offline || p.online)
@@ -1236,7 +1237,7 @@ ${auth.role === 'admin' ? '' : '<p class="muted">只读会话：需要轮换令�
 
 <h2>节点权限与令牌</h2>
 <p class="muted">scope：read（读消息/黑板）· send（发消息）· board（写黑板）· blob（文件）。IP 白名单留空=不限；填 CIDR 用逗号分隔。</p>
-<table><thead><tr><th>agent</th><th>scopes</th><th>IP 白名单</th><th>令牌过期</th><th>操作</th></tr></thead>
+<table><thead><tr><th>agent</th><th>scopes</th><th>IP 白名单</th><th>令牌过期</th><th>最后活动</th><th>操作</th></tr></thead>
 <tbody id="agents"></tbody></table>
 <p class="muted" id="adminNote"></p>
 
@@ -1270,6 +1271,22 @@ let enrollExpires = 0;
 function fmtClock(seconds) {
   const safe = Math.max(0, Math.round(seconds));
   return Math.floor(safe / 60) + ' 分 ' + String(safe % 60).padStart(2, '0') + ' 秒';
+}
+function humanAgo(ms) {
+  if (!Number.isFinite(ms)) return '未知';
+  const minutes = Math.floor(Math.max(0, Date.now() - ms) / 60000);
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return minutes + ' 分钟前';
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + ' 小时前';
+  return Math.floor(hours / 24) + ' 天前';
+}
+function absTime(ms) {
+  const value = new Date(ms);
+  if (Number.isNaN(value.getTime())) return '未知';
+  const pad = (n) => String(n).padStart(2, '0');
+  return value.getFullYear() + '-' + pad(value.getMonth() + 1) + '-' + pad(value.getDate()) + ' ' +
+    pad(value.getHours()) + ':' + pad(value.getMinutes()) + ':' + pad(value.getSeconds());
 }
 function copyText(text) {
   const area = document.createElement('textarea');
@@ -1308,13 +1325,14 @@ async function refresh() {
     ].join('');
     document.getElementById('peers').innerHTML = (peers.peers || []).map((p) => {
       const plugin = p.plugin || {};
+      const seen = p.last_seen_at ? Date.parse(p.last_seen_at) : Date.now() - (p.last_seen_seconds_ago ?? 0) * 1000;
       const compat = plugin.compat === 'ok' ? '<span class="badge ok">ok</span>'
         : plugin.compat === 'outdated' ? '<span class="badge warn">outdated</span>'
         : '<span class="badge off">未上报</span>';
       return '<tr><td>' + esc(p.name) + '</td>' +
         '<td>' + (p.online ? '<span class="badge ok">在线</span>' : '<span class="badge off">离线</span>') + '</td>' +
         '<td>' + esc(plugin.name || '—') + '</td><td>' + esc(plugin.version || '—') + '</td>' +
-        '<td>' + compat + '</td><td>' + esc((p.last_seen_seconds_ago ?? 0) + 's 前') + '</td></tr>';
+        '<td>' + compat + '</td><td title="' + esc(absTime(seen)) + '">' + esc(humanAgo(seen)) + '</td></tr>';
     }).join('');
     const isAdmin = ROLE === 'admin';
     document.getElementById('agents').innerHTML = (agents.agents || []).map((a) => {
@@ -1324,13 +1342,16 @@ async function refresh() {
       ).join('');
       const cidrs = '<input type="text" data-cidrs value="' + esc((a.allowed_cidrs || '')) + '" placeholder="192.168.1.0/24,10.0.0.0/8" size="22"' + (isAdmin ? '' : ' disabled') + '>';
       const expiry = a.token_expires_at ? new Date(a.token_expires_at).toLocaleDateString() : '不过期';
+      const seen = a.last_seen_at ? Date.parse(a.last_seen_at) : a.last_seen;
       const actions = isAdmin
         ? '<button data-act="save">保存</button> ' +
           '<button data-act="rotate" class="danger">轮换</button> ' +
-          '<button data-act="revoke" class="danger">吊销</button>'
+          '<button data-act="revoke" class="danger">吊销</button>' +
+          (!a.has_token && !a.online ? ' <button data-act="purge" class="danger">清理</button>' : '')
         : '<span class="muted">只读</span>';
       return '<tr data-name="' + esc(a.name) + '"><td>' + esc(a.name) + '</td><td>' + scopeBoxes + '</td>' +
-        '<td>' + cidrs + '</td><td>' + esc(expiry) + '</td><td>' + actions + '</td></tr>';
+        '<td>' + cidrs + '</td><td>' + esc(expiry) + '</td>' +
+        '<td title="' + esc(absTime(seen)) + '">' + esc(humanAgo(seen)) + '</td><td>' + actions + '</td></tr>';
     }).join('');
     document.getElementById('adminNote').textContent = isAdmin
       ? '管理员会话：可直接改权限；轮换/吊销会立即影响对应节点。'
@@ -1364,6 +1385,11 @@ document.addEventListener('click', async (event) => {
   if (act === 'revoke') {
     if (!confirm('吊销 ' + name + '？该节点将无法认证，需重新注册。')) return;
     const result = await post('/console/agents/revoke', { name });
+    if (result) refresh();
+  }
+  if (act === 'purge') {
+    if (!confirm('清理 ' + name + '？会连记录一起删除，不可恢复。')) return;
+    const result = await post('/console/agents/purge', { name });
     if (result) refresh();
   }
 });
@@ -1517,6 +1543,7 @@ async function handleConsole(req, res, url) {
           host: r.host,
           online: ts - r.last_seen <= ONLINE_TTL_MS,
           last_seen_seconds_ago: Math.round((ts - r.last_seen) / 1000),
+          last_seen_at: new Date(r.last_seen).toISOString(),
           plugin: r.plugin_version
             ? { name: r.plugin_name, version: r.plugin_version, platform: r.plugin_platform,
                 compat: compareVersion(r.plugin_version, MIN_WAKER) >= 0 ? 'ok' : 'outdated' }
@@ -1536,6 +1563,8 @@ async function handleConsole(req, res, url) {
           token_issued_at: r.token_issued_at ?? null,
           has_token: Boolean(r.token_hash),
           last_seen: r.last_seen,
+          last_seen_at: new Date(r.last_seen).toISOString(),
+          online: Date.now() - r.last_seen <= ONLINE_TTL_MS,
         })),
       })
     }
@@ -1582,6 +1611,14 @@ async function handleConsole(req, res, url) {
       db.prepare('UPDATE agents SET token_hash = NULL WHERE name = ?').run(name)
       audit('console.revoke', name, ip, true)
       return sendJson(res, 200, { ok: true, name, revoked: true })
+    }
+    if (action === 'purge') {
+      const row = db.prepare('SELECT name, last_seen, token_hash FROM agents WHERE name = ?').get(name)
+      if (!row) return sendJson(res, 404, { error: 'unknown agent' })
+      if (row.token_hash) return sendJson(res, 409, { error: 'revoke the token before purging' })
+      db.prepare('DELETE FROM agents WHERE name = ?').run(name)
+      audit('admin.purge', name, ip, true)
+      return sendJson(res, 200, { ok: true, name, purged: true })
     }
     return sendJson(res, 404, { error: 'unknown action' })
   }
@@ -1679,6 +1716,7 @@ async function handleRest(req, res, url) {
           description: r.description,
           online: ts - r.last_seen <= ONLINE_TTL_MS,
           last_seen_seconds_ago: Math.round((ts - r.last_seen) / 1000),
+          last_seen_at: new Date(r.last_seen).toISOString(),
           plugin: r.plugin_version
             ? { name: r.plugin_name, version: r.plugin_version, platform: r.plugin_platform, reported_at: r.plugin_reported_at,
                 compat: compareVersion(r.plugin_version, MIN_WAKER) >= 0 ? 'ok' : 'outdated' }
@@ -2341,6 +2379,7 @@ async function handleDeviceEnroll(req, res, url) {
  *   POST   /api/admin/rotate   {name}                       -> {name, token}
  *   GET    /api/admin/agents                                -> roster (no tokens)
  *   DELETE /api/admin/agents?name=...                       -> revoke
+ *   DELETE /api/admin/agents?name=...&purge=1               -> delete the row entirely
  *   GET    /api/admin/audit?limit=50                        -> recent auth/ops
  */
 async function handleAdmin(req, res, url) {
@@ -2410,6 +2449,7 @@ async function handleAdmin(req, res, url) {
           description: r.description,
           online: ts - r.last_seen <= ONLINE_TTL_MS,
           last_seen_seconds_ago: Math.round((ts - r.last_seen) / 1000),
+          last_seen_at: new Date(r.last_seen).toISOString(),
           has_token: Boolean(r.token_hash),
         })),
       })
@@ -2418,6 +2458,12 @@ async function handleAdmin(req, res, url) {
     if (path === '/api/admin/agents' && req.method === 'DELETE') {
       const name = String(url.searchParams.get('name') ?? '').trim()
       if (!name) return sendJson(res, 400, { error: 'name is required' })
+      if (url.searchParams.get('purge') === '1') {
+        // Full removal: the row (and with it wake_url/wake_secret) is gone, not just revoked.
+        const result = db.prepare('DELETE FROM agents WHERE name = ?').run(name)
+        audit('admin.purge', name, ip, true)
+        return sendJson(res, 200, { name, purged: Number(result.changes ?? 0) > 0 })
+      }
       const result = db.prepare('UPDATE agents SET token_hash = NULL WHERE name = ?').run(name)
       audit('admin.revoke', name, ip, true)
       return sendJson(res, 200, { name, revoked: Number(result.changes ?? 0) > 0 })

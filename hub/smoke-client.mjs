@@ -591,6 +591,36 @@ await admin('/api/admin/agents?name=bob', { method: 'DELETE' })
 const revoked = await fetch(`${BASE}/api/peers`, { headers: { authorization: `Bearer ${bobToken}` } })
 check('revocation blocks the agent', revoked.status === 401, `HTTP ${revoked.status}`)
 
+// --- human-readable timestamps + full removal --------------------------------
+{
+  const roster = await (await admin('/api/admin/agents')).json()
+  check(
+    'admin roster exposes a parseable last_seen_at',
+    roster.agents.length > 0 && roster.agents.every((row) => Number.isFinite(Date.parse(row.last_seen_at))),
+    String(roster.agents[0]?.last_seen_at ?? 'missing'),
+  )
+  const peers = await (await fetch(`${BASE}/api/peers?offline=1`, { headers: { authorization: `Bearer ${rotated.token}` } })).json()
+  check(
+    '/api/peers exposes a parseable last_seen_at',
+    peers.peers.length > 0 && peers.peers.every((row) => Number.isFinite(Date.parse(row.last_seen_at))),
+    `${peers.peers.length} peers`,
+  )
+
+  await mint('purge-me')
+  const revokedOnly = await (await admin('/api/admin/agents?name=purge-me', { method: 'DELETE' })).json()
+  const afterRevoke = await (await admin('/api/admin/agents')).json()
+  check(
+    'DELETE without purge only revokes the token',
+    revokedOnly.revoked === true && revokedOnly.purged === undefined && afterRevoke.agents.some((row) => row.name === 'purge-me'),
+  )
+  const purged = await (await admin('/api/admin/agents?name=purge-me&purge=1', { method: 'DELETE' })).json()
+  const afterPurge = await (await admin('/api/admin/agents')).json()
+  check(
+    'purge=1 deletes the agent row',
+    purged.purged === true && !afterPurge.agents.some((row) => row.name === 'purge-me'),
+  )
+}
+
 // --- audit trail ------------------------------------------------------------
 const auditTrail = await (await admin('/api/admin/audit?limit=200')).json()
 check('failed auth attempts are audited', auditTrail.entries.some((e) => e.action === 'auth' && e.ok === 0), `${auditTrail.count} entries`)
