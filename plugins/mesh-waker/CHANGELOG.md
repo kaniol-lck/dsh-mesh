@@ -2,12 +2,24 @@
 
 本文件记录 `dsh-mesh-waker` 的变更。格式仿 `hub/CHANGES.md`：每节写清改了什么、怎么复验。
 
-> **发版状态**：`0.4.56`–`0.4.60` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
-> `next` 是 0.4.55）；owner 已批准发布 0.4.60，`npm publish` 由协调会话执行。
+> **发版状态**：`0.4.56`–`0.5.0` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
+> `next` 是 0.4.55）；0.4.60 与 0.5.0 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 0.5.0 激活矩阵）。
 
 ---
+
+## v0.5.0（2026-10-29，pull 默认 + 自举接入 + standalone）
+
+| 项 | 内容 |
+|---|---|
+| pull 默认 | 新增 pull 循环：`GET /api/inbox?unread=1&order=desc&limit=20&claim=1&claim_ttl_ms=…` → 按 conversation 分组 → **复用现有唤醒路径**（冷却、去重、`mark_read`）→ 间隔自适应（有信 `pollBusyIntervalMs` / 连续 3 次空 `pollIdleIntervalMs` / 其余 `pollIntervalMs`），失败按 `5s × 2^n` 退避、上限 5 分钟；push 与 pull 并存时共用同一套去重，不重复开 turn |
+| 自举接入 | `hubUrl` + `joinCode` 且无 token 时：`GET /api/bootstrap`（含可选 CA）→ `POST /api/enroll {code,name,host}` → token 写 `tokenFile`（0600）→ 继续启动；没配 `tokenFile` 直接报错要求配置 |
+| standalone | 无 `hubUrl` 只监听本机（默认 `127.0.0.1`），`/mesh/status.mode="standalone"`，**不发任何网络请求**；有 `hubUrl` 但 token 与 joinCode 都缺时同样降级，`lastError` 写明 `missing token (provide joinCode or tokenFile)`，不静默退出 |
+| CA 信任 | `caFile` 走 `tls.setDefaultCACertificates`（不依赖 `NODE_EXTRA_CA_CERTS`）；bootstrap 返回 `tls.ca_pem` 且未配 `caFile` 时自动采用（仅内存）；`caSha256` 指纹钉扎，不符即拒绝联网；日志只记 sha256 前 16 位 |
+| 状态与面板 | `/mesh/status` 增 `mode`、`lastPullAt`、`pollIntervalMs`、`nextPollIn`、`caFingerprint`、`hubConnected`；面板状态区显示「同步方式」「上次拉取」，standalone 时提示填 `hubUrl` + `joinCode` |
+| wakeSecret | 从「必需」降为**仅 push 需要**；pull 模式缺它不报错、不阻塞 |
+| 验证 | `node test/waker-endpoints.test.js` 11/11（含 standalone 零网络请求、缺凭据 lastError、`caSha256` 不匹配、joinCode 自举 + pull 真拉信、间隔自适应）；手工 bootstrap 实测：token 落盘且与签发值一致，日志只有 `fp=tok-ma… len=24`，未出现完整 token |
 
 ## v0.4.60（2026-10-29，设置面板「打开中枢控制台」）
 

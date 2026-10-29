@@ -19,10 +19,11 @@
 import { createServer } from 'node:http'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { statSync } from 'node:fs'
-import { tmpdir, networkInterfaces, homedir } from 'node:os'
+import { tmpdir, networkInterfaces, homedir, hostname } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { getCACertificates, setDefaultCACertificates } from 'node:tls'
 import { zstdDecompressSync } from 'node:zlib'
 
 // Self-reported identity: the hub surfaces it so an operator can spot a stale install.
@@ -138,6 +139,45 @@ function normalize(config) {
   return built
 }
 
+/** Fingerprints may arrive with colons, spaces or upper case; compare them normalised. */
+function normalizeSha(value) {
+  return String(value ?? '')
+    .replace(/[\s:]/g, '')
+    .toLowerCase()
+}
+
+function clampInterval(value, fallback, min, max) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
+  return Math.min(max, Math.max(min, Math.round(parsed)))
+}
+
+function sha256Hex(value) {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+/**
+ * Next pull delay (contract section 4, items 4 and 5). Pure so tests can pin the
+ * transitions: mail moved -> busy cadence, three empty polls -> idle cadence, otherwise
+ * the normal cadence; consecutive failures back off 5s * 2^(n-1), capped at 5 minutes.
+ */
+export function nextPollDelayMs({ moved = 0, emptyPolls = 0, failures = 0, config = {} } = {}) {
+  if (failures > 0) return Math.min(300000, 5000 * 2 ** (failures - 1))
+  if (moved > 0) return clampInterval(config.pollBusyIntervalMs, 5000, 1000, 600000)
+  if (emptyPolls >= 3) return clampInterval(config.pollIdleIntervalMs, 60000, 5000, 600000)
+  return clampInterval(config.pollIntervalMs, 30000, 5000, 600000)
+}
+
+/** Agent name for POST /api/enroll: must match [A-Za-z0-9_-]{1,32}. */
+function enrollAgentName(config) {
+  if (config.agentName && /^[A-Za-z0-9_-]{1,32}$/.test(config.agentName)) return config.agentName
+  const host = hostname()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return `dsh-${host || 'node'}`.slice(0, 32)
+}
+
 function normalizeBase(config) {
   const c = config ?? {}
   // Secrets may be inlined (older configs) or, preferably, read from owner-only files so
@@ -155,10 +195,22 @@ function normalizeBase(config) {
     token: String(c.token ?? '') || fromFile(c.tokenFile),
     tokenFile: c.tokenFile ? String(c.tokenFile) : undefined,
     wakeSecret: String(c.wakeSecret ?? '') || fromFile(c.wakeSecretFile),
-    listenHost: String(c.listenHost ?? '0.0.0.0'),
+    // Loopback by default: a box that only pulls mail has no reason to listen on the LAN.
+    // Push setups set listenHost (0.0.0.0 / the LAN address) plus advertiseHost explicitly.
+    listenHost: String(c.listenHost ?? '127.0.0.1'),
     listenPort: Number(c.listenPort ?? 8795),
     wakePath: String(c.wakePath ?? '/mesh/wake'),
     advertiseHost: c.advertiseHost ? String(c.advertiseHost) : undefined,
+    // --- pull / bootstrap (contract 2026-10-29, section 3) ---------------------------
+    mode: ['auto', 'pull', 'push'].includes(String(c.mode)) ? String(c.mode) : 'auto',
+    joinCode: c.joinCode ? String(c.joinCode).trim() : undefined,
+    caFile: c.caFile ? String(c.caFile) : undefined,
+    caSha256: c.caSha256 ? normalizeSha(c.caSha256) : undefined,
+    pollIntervalMs: clampInterval(c.pollIntervalMs, 30000, 5000, 600000),
+    pollBusyIntervalMs: clampInterval(c.pollBusyIntervalMs, 5000, 1000, 600000),
+    pollIdleIntervalMs: clampInterval(c.pollIdleIntervalMs, 60000, 5000, 600000),
+    claimTtlMs: clampInterval(c.claimTtlMs, 300000, 10000, 3_600_000),
+    agentName: c.agentName ? String(c.agentName).trim().slice(0, 32) : undefined,
     sessionCwd: c.sessionCwd ? String(c.sessionCwd) : undefined,
     workspacePath: c.workspacePath ? String(c.workspacePath) : undefined,
     workspaceTitle: String(c.workspaceTitle ?? 'Mesh 收件箱'),
@@ -233,10 +285,19 @@ export function apply(ctx, config) {
   let c = normalize(config)
   const log = ctx.logger ?? console
 
-  if (!c.hubUrl || !c.token || !c.wakeSecret) {
-    log.error('[mesh-waker] hubUrl, token and wakeSecret are required; plugin inactive')
-    return
+  // Activation matrix (contract 2026-10-29, section 3). The local endpoints never need the
+  // hub, so "no credentials" degrades to standalone instead of making the whole plugin
+  // inactive: the listener still comes up and /mesh/sessions + /mesh/inject keep working.
+  let hubReady = Boolean(c.hubUrl && c.token)
+  let effectiveMode = hubReady ? c.mode : 'standalone'
+  let activationError = null
+  if (!c.hubUrl) {
+    effectiveMode = 'standalone'
+  } else if (!c.token && !c.joinCode) {
+    effectiveMode = 'standalone'
+    activationError = 'missing token (provide joinCode or tokenFile)'
   }
+  let bootstrapPending = Boolean(c.hubUrl && !c.token && c.joinCode)
 
   const advertisedHost = c.advertiseHost ?? lanAddress()
   const wakeUrl = `http://${advertisedHost}:${c.listenPort}${c.wakePath}`
@@ -251,18 +312,33 @@ export function apply(ctx, config) {
   const state = {
     registered: false,
     plugin: PLUGIN_INFO,
+    mode: effectiveMode,
     sessionId: null,
     conversations: 0,
     wakes: 0,
     lastWakeAt: 0,
-    lastError: null,
+    lastError: activationError,
     firstError: null,
     lastDurationMs: null,
     workspacePath: c.workspacePath ?? null,
     trust: c.trust,
     lastCatchUpAt: null,
     lastCatchUpCount: null,
+    // Pull mode (contract section 4): when the last poll finished, how long the current
+    // cadence is, and when the next one fires (the status route reports the countdown).
+    lastPullAt: null,
+    pollIntervalMs: c.pollIntervalMs,
   }
+
+  // Pull loop bookkeeping.
+  let pullTimer = null
+  let pullRunning = false
+  let pullFailures = 0
+  let emptyPolls = 0
+  let nextPullAt = 0
+  let pullCadenceMs = c.pollIntervalMs
+  let hubFeaturesStarted = false
+  let caFingerprint = null
 
   // conversation -> { sessionId, createdAt, wakes, title }, persisted next to the token so
   // the mapping survives a dsh restart.
@@ -400,8 +476,9 @@ export function apply(ctx, config) {
 
   /** Pull the hub's conversations + threads into the local cache. */
   async function syncHistory() {
+    if (!hubReady) return
     try {
-      const listRes = await fetch(`${c.hubUrl}/api/conversations?limit=50`, {
+      const listRes = await hubFetch(`/api/conversations?limit=50`, {
         headers: { authorization: `Bearer ${c.token}` },
         signal: AbortSignal.timeout(8000),
       })
@@ -411,7 +488,7 @@ export function apply(ctx, config) {
       for (const row of (list.conversations ?? []).slice(0, 30)) {
         const isDefault = !row.conversation || row.conversation === 'default'
         const query = `conversation=${encodeURIComponent(isDefault ? 'default' : row.conversation)}&full=1&limit=200`
-        const res = await fetch(`${c.hubUrl}/api/conversation?${query}`, {
+        const res = await hubFetch(`/api/conversation?${query}`, {
           headers: { authorization: `Bearer ${c.token}` },
           signal: AbortSignal.timeout(8000),
         })
@@ -429,7 +506,7 @@ export function apply(ctx, config) {
   }
 
   async function pinHistoryMessage(id, pinned) {
-    const res = await fetch(`${c.hubUrl}/api/message/${id}/pin`, {
+    const res = await hubFetch(`/api/message/${id}/pin`, {
       method: 'POST',
       headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ pinned }),
@@ -441,7 +518,7 @@ export function apply(ctx, config) {
   }
 
   async function markHistoryRead(ids) {
-    const res = await fetch(`${c.hubUrl}/api/read`, {
+    const res = await hubFetch(`/api/read`, {
       method: 'POST',
       headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ ids }),
@@ -814,7 +891,7 @@ export function apply(ctx, config) {
    *  a shared secret to per-agent secrets must not silently break every installed client. */
   async function refreshWakeSecret() {
     try {
-      const res = await fetch(`${c.hubUrl}/api/wake-secret`, {
+      const res = await hubFetch(`/api/wake-secret`, {
         headers: { authorization: `Bearer ${c.token}` },
         signal: AbortSignal.timeout(5000),
       })
@@ -840,7 +917,7 @@ export function apply(ctx, config) {
 
   async function registerWakeUrl() {
     try {
-      const res = await fetch(`${c.hubUrl}/api/register`, {
+      const res = await hubFetch(`/api/register`, {
         method: 'POST',
         headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
         body: JSON.stringify({ wake_url: wakeUrl, plugin: PLUGIN_INFO }),
@@ -877,7 +954,7 @@ export function apply(ctx, config) {
   /** Raw unread list from the hub. */
   async function fetchInbox() {
     try {
-      const res = await fetch(`${c.hubUrl}/api/inbox?unread=1&limit=50`, {
+      const res = await hubFetch(`/api/inbox?unread=1&limit=50`, {
         headers: { authorization: `Bearer ${c.token}` },
         signal: AbortSignal.timeout(5000),
       })
@@ -922,7 +999,7 @@ export function apply(ctx, config) {
   async function buildPromptText(meta, messages, trust) {
     let peers = ''
     try {
-      const res = await fetch(`${c.hubUrl}/api/peers?offline=0`, {
+      const res = await hubFetch(`/api/peers?offline=0`, {
         headers: { authorization: `Bearer ${c.token}` },
         signal: AbortSignal.timeout(3000),
       })
@@ -1043,7 +1120,7 @@ export function apply(ctx, config) {
     const ids = messages.map((m) => m.id).filter(Boolean)
     if (!ids.length) return
     try {
-      const res = await fetch(`${c.hubUrl}/api/read`, {
+      const res = await hubFetch(`/api/read`, {
         method: 'POST',
         headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
         body: JSON.stringify({ ids }),
@@ -1232,7 +1309,7 @@ export function apply(ctx, config) {
    * that just bound the conversation still sees what was said.
    */
   async function backfillConversation(conversation, sessionId, limit = 12) {
-    const res = await fetch(`${c.hubUrl}/api/conversation?conversation=${encodeURIComponent(conversation)}`, {
+    const res = await hubFetch(`/api/conversation?conversation=${encodeURIComponent(conversation)}`, {
       headers: { authorization: `Bearer ${c.token}` },
       signal: AbortSignal.timeout(8000),
     })
@@ -1448,7 +1525,7 @@ export function apply(ctx, config) {
 
   /** On start, drain whatever arrived while dsh was closed (the hub cannot push then). */
   async function catchUp() {
-    if (!c.catchUpOnStart) return
+    if (!c.catchUpOnStart || !hubReady) return
     try {
       const messages = (await fetchInbox()).filter((m) => !m.no_reply)
       if (!messages.length) return
@@ -1644,7 +1721,216 @@ export function apply(ctx, config) {
     return JSON.parse(Buffer.concat(parts).toString('utf8') || '{}')
   }
 
+  // ---------------------------------------------------------------- hub transport
+  //
+  // Every outbound hub call goes through hubFetch: standalone (or "no credentials yet")
+  // fails fast with a readable error and never touches the network (contract section 3).
+  async function hubFetch(pathOrUrl, init) {
+    if (!hubReady) throw new Error('standalone: no hub configured (set hubUrl plus token, or hubUrl plus joinCode)')
+    const url = /^https?:\/\//i.test(pathOrUrl) ? pathOrUrl : `${c.hubUrl}${pathOrUrl}`
+    return fetch(url, init)
+  }
+
+  /** Add one PEM bundle to this process's default trust anchors (Node >= 24.2). */
+  function adoptCaPem(pem, source) {
+    const text = String(pem ?? '').trim()
+    if (!text) throw new Error('empty CA bundle')
+    const sha = sha256Hex(text)
+    if (c.caSha256 && sha !== c.caSha256) {
+      throw new Error(`CA fingerprint mismatch for ${source}: pinned ${c.caSha256.slice(0, 16)}…, got ${sha.slice(0, 16)}…`)
+    }
+    if (typeof setDefaultCACertificates !== 'function' || typeof getCACertificates !== 'function') {
+      throw new Error('this Node cannot add trust anchors (needs tls.setDefaultCACertificates, Node >= 24.2)')
+    }
+    setDefaultCACertificates([...getCACertificates('default'), text])
+    caFingerprint = sha
+    fileLog(`trusted CA from ${source} sha256=${sha.slice(0, 16)}…`)
+    return sha
+  }
+
+  /** caFile is applied before the first request; a bad file or pin disables hub features. */
+  function adoptConfiguredCa() {
+    if (!c.caFile) return true
+    try {
+      adoptCaPem(readFileSync(c.caFile, 'utf8'), `caFile ${c.caFile}`)
+      return true
+    } catch (error) {
+      activationError = `CA rejected: ${error.message}`
+      state.lastError = activationError
+      hubReady = false
+      bootstrapPending = false
+      effectiveMode = 'standalone'
+      state.mode = effectiveMode
+      fileLog(`CA setup failed: ${error.message}`)
+      log.warn(`[mesh-waker] ${activationError}`)
+      return false
+    }
+  }
+
+  const hubTimers = []
+  const hubLater = (fn, ms) => {
+    const timer = setTimeout(fn, Math.max(0, ms))
+    timer.unref?.()
+    hubTimers.push(timer)
+    return timer
+  }
+  const hubEvery = (fn, ms) => {
+    const timer = setInterval(fn, Math.max(1000, ms))
+    timer.unref?.()
+    hubTimers.push(timer)
+    return timer
+  }
+
+  /** One-time bootstrap: joinCode -> GET /api/bootstrap (CA) -> POST /api/enroll -> token. */
+  async function bootstrapWithJoinCode() {
+    try {
+      // Bootstrap runs before hubReady: use raw fetch, not hubFetch.
+      const bootRes = await fetch(`${c.hubUrl}/api/bootstrap`, { signal: AbortSignal.timeout(8000) })
+      if (!bootRes.ok) throw new Error(`bootstrap HTTP ${bootRes.status}`)
+      const boot = await bootRes.json()
+      if (boot?.service !== 'dsh-mesh') throw new Error('this URL is not a dsh-mesh hub')
+      const tlsInfo = boot.tls && typeof boot.tls === 'object' ? boot.tls : null
+      if (tlsInfo?.ca_pem) {
+        const offered = sha256Hex(String(tlsInfo.ca_pem))
+        if (tlsInfo.ca_sha256 && normalizeSha(tlsInfo.ca_sha256) !== offered) {
+          throw new Error(`hub advertised a CA whose sha256 does not match (${offered.slice(0, 16)}…)`)
+        }
+        // Only adopt when the user did not pin their own CA; a pinned caFile wins.
+        if (!c.caFile) adoptCaPem(tlsInfo.ca_pem, `bootstrap ${c.hubUrl}`)
+      }
+      if (!c.tokenFile) throw new Error('joinCode requires tokenFile: the issued token must be stored with mode 0600')
+      const enrollRes = await fetch(`${c.hubUrl}/api/enroll`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          code: c.joinCode,
+          name: enrollAgentName(c),
+          host: c.advertiseHost ?? lanAddress(),
+        }),
+        signal: AbortSignal.timeout(8000),
+      })
+      const enrolled = await enrollRes.json().catch(() => ({}))
+      if (!enrollRes.ok || !enrolled?.token) {
+        throw new Error(`enroll HTTP ${enrollRes.status}: ${enrolled?.error ?? 'no token in the reply'}`)
+      }
+      mkdirSync(dirname(c.tokenFile), { recursive: true })
+      writeFileSync(c.tokenFile, String(enrolled.token), { mode: 0o600 })
+      c = { ...c, token: String(enrolled.token), joinCode: undefined }
+      bootstrapPending = false
+      hubReady = true
+      effectiveMode = c.mode
+      state.mode = effectiveMode
+      state.registered = false
+      fileLog(
+        `bootstrap: enrolled as ${enrolled.name ?? '(unnamed)'} token fp=${String(enrolled.token).slice(0, 6)}… len=${String(enrolled.token).length} mode=${effectiveMode}`,
+      )
+      log.info(`[mesh-waker] enrolled via joinCode as ${enrolled.name ?? 'agent'}; mode=${effectiveMode}`)
+      startHubFeatures()
+    } catch (error) {
+      bootstrapPending = false
+      activationError = `bootstrap failed: ${error.message}`
+      state.lastError = activationError
+      hubReady = false
+      effectiveMode = 'standalone'
+      state.mode = effectiveMode
+      fileLog(`bootstrap failed: ${error.message}`)
+      log.warn(`[mesh-waker] ${activationError}`)
+    }
+  }
+
+  function schedulePull(delay) {
+    if (pullTimer) clearTimeout(pullTimer)
+    pullTimer = null
+    if (!hubReady || effectiveMode === 'push') return
+    pullCadenceMs = delay
+    state.pollIntervalMs = delay
+    nextPullAt = Date.now() + delay
+    pullTimer = setTimeout(() => {
+      pullTimer = null
+      void pullOnce()
+    }, Math.max(0, delay))
+    pullTimer.unref?.()
+  }
+
+  /**
+   * One pull round (contract section 4): claim -> group by conversation -> the existing
+   * wake path (which keeps its cooldowns, dedupe and mark_read) -> adaptive cadence.
+   * Sharing wake() with push is what keeps a push/pull race from opening two turns.
+   */
+  async function pullOnce() {
+    if (!hubReady || pullRunning) return
+    pullRunning = true
+    let moved = 0
+    try {
+      const res = await hubFetch(`/api/inbox?unread=1&order=desc&limit=20&claim=1&claim_ttl_ms=${c.claimTtlMs}`, {
+        headers: { authorization: `Bearer ${c.token}` },
+        signal: AbortSignal.timeout(15000),
+      })
+      if (!res.ok) throw new Error(`hub HTTP ${res.status}`)
+      const data = await res.json()
+      const messages = data.messages ?? []
+      moved = messages.length
+      if (moved) {
+        mergeHistory(messages)
+        emptyPolls = 0
+        const groups = new Map()
+        for (const message of messages) {
+          const key = message.conversation || ''
+          if (!groups.has(key)) groups.set(key, [])
+          groups.get(key).push(message)
+        }
+        for (const [key, group] of groups) {
+          const first = group[0] ?? {}
+          await wake(key ? { conversation: key, sender: first.sender, subject: first.subject } : {})
+        }
+      } else {
+        emptyPolls += 1
+      }
+      pullFailures = 0
+      if (typeof state.lastError === 'string' && state.lastError.startsWith('pull failed:')) state.lastError = null
+    } catch (error) {
+      pullFailures += 1
+      state.lastError = `pull failed: ${error.message}`
+      fileLog(`pull failed (${pullFailures}): ${error.message}`)
+    } finally {
+      pullRunning = false
+      state.lastPullAt = Date.now()
+      schedulePull(nextPollDelayMs({ moved, emptyPolls, failures: pullFailures, config: c }))
+    }
+  }
+
+  /** Start hub-dependent work once a usable credential exists (token or bootstrap result). */
+  function startHubFeatures() {
+    if (!hubReady || hubFeaturesStarted) return
+    hubFeaturesStarted = true
+    const wantsPush = effectiveMode !== 'pull'
+    if (wantsPush) {
+      void registerWakeUrl()
+      // Push pings are HMAC-signed; pull-only installs never need a wake secret.
+      if (c.wakeSecret) void refreshWakeSecret()
+      hubEvery(() => void registerWakeUrl(), c.registerIntervalMs)
+      if (c.catchUpOnStart) hubLater(() => void catchUp(), Math.max(1000, c.catchUpDelayMs))
+    }
+    hubLater(() => void syncHistory(), Math.max(1000, c.catchUpDelayMs) + 2000)
+    hubEvery(() => void syncHistory(), Math.max(60_000, c.historySyncIntervalMs ?? 600_000))
+    if (effectiveMode !== 'push') schedulePull(1200)
+  }
+
+  function disposeHubWork() {
+    for (const timer of hubTimers) {
+      clearTimeout(timer)
+      clearInterval(timer)
+    }
+    hubTimers.length = 0
+    if (pullTimer) clearTimeout(pullTimer)
+    pullTimer = null
+    hubFeaturesStarted = false
+  }
+
   ctx.effect(() => {
+    // Trust anchors must be in place before any request; a bad caFile leaves the plugin
+    // local-only instead of failing to start.
+    adoptConfiguredCa()
     const server = createServer((req, res) => {
       void (async () => {
         const path = (req.url ?? '').split('?')[0]
@@ -1891,6 +2177,14 @@ export function apply(ctx, config) {
                 disk: diskVersion,
                 stale: diskVersion !== null && diskVersion !== PLUGIN_INFO.version,
               },
+              // Pull/standalone surface (contract sections 3 and 4): the panel shows the
+              // sync mode and the last pull, and the countdown is handy when debugging.
+              mode: state.mode,
+              lastPullAt: state.lastPullAt,
+              pollIntervalMs: state.pollIntervalMs,
+              nextPollIn: nextPullAt ? Math.max(0, Math.round((nextPullAt - Date.now()) / 1000)) : null,
+              caFingerprint: caFingerprint ? `${caFingerprint.slice(0, 16)}…` : null,
+              hubConnected: hubReady,
               ...state,
               throttled: throttleSummary(),
               historyCached: history.size,
@@ -1964,7 +2258,7 @@ export function apply(ctx, config) {
             try {
               const isDefault = !conversation || conversation === 'default'
               const query = `conversation=${encodeURIComponent(isDefault ? 'default' : conversation)}&full=1&limit=200`
-              const upstream = await fetch(`${c.hubUrl}/api/conversation?${query}`, {
+              const upstream = await hubFetch(`/api/conversation?${query}`, {
                 headers: { authorization: `Bearer ${c.token}` },
                 signal: AbortSignal.timeout(6000),
               })
@@ -2029,7 +2323,7 @@ export function apply(ctx, config) {
           }
           res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
           try {
-            const upstream = await fetch(`${c.hubUrl}/api/peers?offline=1`, {
+            const upstream = await hubFetch(`/api/peers?offline=1`, {
               headers: { authorization: `Bearer ${c.token}` },
               signal: AbortSignal.timeout(4000),
             })
@@ -2117,7 +2411,7 @@ export function apply(ctx, config) {
             if (!draft.to || typeof draft.body !== 'string' || !draft.body.trim()) {
               throw new Error('to and body are required')
             }
-            const upstream = await fetch(`${c.hubUrl}/api/send`, {
+            const upstream = await hubFetch(`/api/send`, {
               method: 'POST',
               headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
               body: JSON.stringify({
@@ -2333,7 +2627,7 @@ export function apply(ctx, config) {
               }
               if (!admin) throw new Error('admin token file is empty')
               if (!c.tokenFile) throw new Error('tokenFile is not configured, cannot store a new token')
-              const response = await fetch(`${c.hubUrl}/api/admin/rotate`, {
+              const response = await hubFetch(`/api/admin/rotate`, {
                 method: 'POST',
                 headers: { authorization: `Bearer ${admin}`, 'content-type': 'application/json' },
                 body: JSON.stringify({ name: selfName || undefined }),
@@ -2415,32 +2709,13 @@ export function apply(ctx, config) {
     server.on('error', (error) => log.error(`[mesh-waker] listener error: ${error.message}`))
     server.listen(c.listenPort, c.listenHost, () => {
       log.info(`[mesh-waker] listening on ${c.listenHost}:${c.listenPort}${c.wakePath}`)
-      void registerWakeUrl()
-      // Pick up this agent's own wake secret at startup (per-agent keys, hub >= 0.5.4).
-      void refreshWakeSecret()
+      // Activation matrix: bootstrap first (joinCode), otherwise start when a token exists.
+      if (bootstrapPending) void bootstrapWithJoinCode()
+      else if (hubReady) startHubFeatures()
     })
 
-    const timer = setInterval(() => void registerWakeUrl(), c.registerIntervalMs)
-    timer.unref?.()
-
-    // While dsh was closed the hub could not push, so drain the backlog once on start.
-    const catchUpTimer = c.catchUpOnStart
-      ? setTimeout(() => void catchUp(), Math.max(1000, c.catchUpDelayMs))
-      : null
-    catchUpTimer?.unref?.()
-
-    // Mirror the hub's conversations into the local cache at start and every 10 minutes;
-    // the hub only keeps 7 days, the cache keeps what we already saw.
-    const historyTimer = setInterval(() => void syncHistory(), Math.max(60_000, c.historySyncIntervalMs ?? 600_000))
-    historyTimer.unref?.()
-    const historyStartup = setTimeout(() => void syncHistory(), Math.max(1000, c.catchUpDelayMs) + 2000)
-    historyStartup.unref?.()
-
     return () => {
-      clearInterval(timer)
-      clearInterval(historyTimer)
-      clearTimeout(historyStartup)
-      if (catchUpTimer) clearTimeout(catchUpTimer)
+      disposeHubWork()
       try {
         server.close()
       } catch {
@@ -2495,7 +2770,7 @@ export function apply(ctx, config) {
         if (rest) {
           for (const target of targets) {
             try {
-              const res = await fetch(`${c.hubUrl}/api/send`, {
+              const res = await hubFetch(`/api/send`, {
                 method: 'POST',
                 headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
                 body: JSON.stringify({ to: target, body: rest, conversation }),

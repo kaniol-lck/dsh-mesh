@@ -205,6 +205,29 @@ try {
           h('button', { type: 'button', style: styles.button, onClick: load }, '刷新'),
         ),
         h(Field, { label: '已向中枢登记' }, h('span', null, status.registered ? '是' : '否')),
+        h(
+          Field,
+          { label: '同步方式' },
+          h(
+            'span',
+            { style: status.mode === 'standalone' ? styles.hint : null },
+            status.mode === 'standalone'
+              ? 'standalone（未连接中枢）'
+              : String(status.mode ?? 'auto') + (status.hubConnected === false ? '（中枢不可用）' : ''),
+          ),
+        ),
+        h(
+          Field,
+          { label: '上次拉取' },
+          h('span', { style: styles.value }, status.lastPullAt ? new Date(status.lastPullAt).toLocaleString() : '—'),
+        ),
+        status.mode === 'standalone'
+          ? h(
+              'div',
+              { style: { ...styles.hint, marginLeft: 0 } },
+              '未连接中枢：填写 hubUrl + joinCode（或在 tokenFile 指向的位置放好 token）。本机会话与 inject 不受影响。',
+            )
+          : null,
         h(Field, { label: '监听地址' }, h('span', { style: styles.value }, status.wakeUrl)),
         h(Field, { label: '当前会话' }, h('span', { style: styles.value }, status.sessionId || '（尚未创建）')),
         h(Field, { label: '累计唤醒' }, h('span', null, String(status.wakes ?? 0) + (status.lastWakeAt ? '，最近 ' + new Date(status.lastWakeAt).toLocaleString() : ''))),

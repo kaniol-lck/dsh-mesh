@@ -1,8 +1,8 @@
 # dsh-mesh-waker
 
-DSH 客户端插件：[dsh-mesh](https://github.com/kaniol-lck/dsh-mesh) 局域网 agent 中枢的唤醒端。
+DSH 客户端插件：[dsh-mesh](https://github.com/kaniol-lck/dsh-mesh) 局域网 agent 中枢的接入端。
 
-中枢在收到消息后会向本机端点发一个**不含正文、带 HMAC 签名**的 ping；本插件把这个 ping 变成一次真正的会话回合（创建或复用会话 → 注入"去读收件箱"的提示），于是即使没人在看窗口，agent 也会自己处理来信。
+默认是 **pull 模式**：本机按间隔向中枢 `GET /api/inbox?claim=1` 拉信，所以**不需要公网 IP、不需要入站端口、不需要 `NODE_EXTRA_CA_CERTS`**。有入站能力时再叠加 push（中枢发 HMAC 签名的 `/mesh/wake` ping），把延迟从「一个轮询间隔」压到「一次 HTTP」；两条路径共用同一套 conversation 冷却与去重，不会重复开 turn。
 
 ## 安装
 
@@ -11,7 +11,14 @@ dsh plugin add dsh-mesh-waker
 dsh plugin --profile web add dsh-mesh-waker
 ```
 
-装完打开 **设置 → Mesh**，填中枢地址与这台机器的 agent token（token 由插件存到仅本人可读的文件，不写进 profile patch）。
+装完打开 **设置 → Mesh**，填两样就能接入：
+
+1. `hubUrl`，例如 `http://<NAS-IP>:8790` 或 `https://mesh.example.com`；
+2. `joinCode`（中枢控制台/管理员发的 8 位一次性注册码）。
+
+启动时插件 `GET /api/bootstrap` 取服务信息（以及可选 CA），再 `POST /api/enroll` 换回自己的 agent token，按 `0600` 写进 `tokenFile`；日志里只出现 `token fp=<前6位>… len=<n>`，重启后不再需要 `joinCode`。
+
+> 不用中枢也能跑：**不填 `hubUrl` 就是 standalone**，只起本机 `127.0.0.1:8795` 的五个本地端点，供同一 DSH 里的会话互相 inject。
 
 ## 它提供什么
 
@@ -19,7 +26,43 @@ dsh plugin --profile web add dsh-mesh-waker
 - **设置页**：中枢地址、信任级别（strict / normal / full）、按设备信任、收件箱目录、投递方式、启动补收；
 - **收件箱**：右栏「开始」里的「Mesh 信箱」卡片 + 左侧侧边栏整页视图，按会话聚合、悬停预览、点击跳转、按收发着色；
 - **本地历史缓存**：中枢只保留 7 天消息，插件把见过的消息镜像到本地 `history.json`，不过期；
-- **会话绑定**：会话 ↔ mesh conversation 的映射分「唤醒路由」与「面板显示」两个字段，互不干扰。
+- **会话绑定**：会话 ↔ mesh conversation 的映射分「唤醒路由」与「面板显示」两个字段，互不干扰；
+- **pull 循环**（默认）：`claim=1` → 按 conversation 分组 → 走现有唤醒路径 → `mark_read`；间隔自适应（有信 5s / 常态 30s / 连续 3 次空 60s），失败按 `5s × 2^n` 退避（上限 5 分钟）；
+- **自举接入**：`hubUrl` + `joinCode` → 取 CA → 换 token → 写 `tokenFile`（0600），全程不打印密钥；
+- **standalone**：没有 `hubUrl` 时只起本机监听，`/mesh/status.mode="standalone"`，不发任何网络请求。
+
+## 配置
+
+全部可选；写在 profile 的 cordis patch 里（或 `~/.dsh/mesh-waker/config.json`）：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `hubUrl` | — | 中枢地址；留空 = standalone |
+| `token` / `tokenFile` | — | agent token；优先读 `tokenFile`（自举会把换到的 token 写进去） |
+| `joinCode` | — | 一次性注册码；有它且没有 token 时自动换 token |
+| `wakeSecret` / `wakeSecretFile` | — | **只有 push 需要**；pull 模式缺它不报错、不阻塞 |
+| `mode` | `auto` | `auto`（pull 常开，push 叠加）/ `pull` / `push` |
+| `listenHost` | `127.0.0.1` | 只有 push 才需要改 `0.0.0.0` 或 LAN 地址 |
+| `listenPort` | `8795` | 本地面板与会话端口 |
+| `advertiseHost` | — | push 时告诉中枢的可达地址（决定 `wakeUrl`） |
+| `caFile` | — | 额外 CA PEM，用于出站 TLS（替代 `NODE_EXTRA_CA_CERTS`） |
+| `caSha256` | — | 可选指纹钉扎；与 `caFile` 或 bootstrap 返回的 `tls.ca_sha256` 比对，不符即拒绝连接 |
+| `pollIntervalMs` | `30000` | 常态轮询间隔（下限 5000，上限 600000） |
+| `pollBusyIntervalMs` | `5000` | 拉到消息后的快档间隔 |
+| `pollIdleIntervalMs` | `60000` | 连续 3 次空轮询后的慢档间隔 |
+| `claimTtlMs` | `300000` | claim 租约；puller 崩溃后由中枢自动回收 |
+
+**激活矩阵**：
+
+| hubUrl | token | joinCode | 行为 |
+|---|---|---|---|
+| 无 | 任意 | 任意 | **standalone**：只绑 `listenHost:listenPort`，不发任何网络请求 |
+| 有 | 有 | 任意 | 正常启动，`mode` 决定 pull / push / auto |
+| 有 | 无 | 有 | **自举**：`/api/bootstrap` → `/api/enroll` → token 写 `tokenFile`(0600) → 继续启动 |
+| 有 | 无 | 无 | standalone，且 `lastError="missing token (provide joinCode or tokenFile)"`（不静默退出） |
+
+CA 只记 sha256 前 16 位，token 只记 `fp=<前6位>… len=<n>`；任何日志都不打印密钥。
+
 
 ## 本机会话协作（不经过中枢）
 

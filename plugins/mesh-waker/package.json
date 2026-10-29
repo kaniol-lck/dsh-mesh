@@ -1,7 +1,7 @@
 {
   "name": "dsh-mesh-waker",
-  "version": "0.4.60",
-  "description": "DSH client plugin for dsh-mesh: turns a signed, content-free wake ping from the hub into a real session turn, with a settings page, inbox card and history cache.",
+  "version": "0.5.0",
+  "description": "DSH client for dsh-mesh: pulls the hub inbox with claims (no inbound port needed), turns mail into real session turns, bootstraps itself from hubUrl + joinCode, and still works standalone for local multi-session coordination.",
   "type": "module",
   "exports": {
     ".": "./index.js",
