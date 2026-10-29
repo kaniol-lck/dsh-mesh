@@ -25,15 +25,15 @@ const PRIORITIES = ['P0', 'P1', 'P2']
 const STATUSES = ['未开始', '进行中', '已完成']
 /** Fixed vocabulary — do not invent labels; unknown values fall back to 未分类 with a WARN. */
 const FEATURES = ['接入体验', '收件箱', '协作编排', '传输安全', '运维交付', '控制台', '文档', '未分类']
-/** Keyword fallback, first match wins (checked in this order). */
+/** Keyword fallback, first match wins (checked in this order). Title first, description second only. */
 const FEATURE_RULES = [
-  ['传输安全', /TLS|证书|CA|token|scope|审计|白名单|凭据/i],
-  ['收件箱', /收件箱|inbox|消息|no_reply|silent|claim|排序|游标/i],
-  ['接入体验', /接入|新手|joinCode|bootstrap|pull|轮询|standalone|onboarding|注册码|设备码/i],
-  ['协作编排', /批量|batch|回执|receipt|liveness|派活|账本|todo|进度|屏障/i],
-  ['控制台', /控制台|console|面板|页面/i],
-  ['运维交付', /部署|发版|发布|巡检|门禁|脚本|CI|tag/i],
-  ['文档', /文档|README|docs|技能|示例/i],
+  ['接入体验', /接入|新手|onboard|joinCode|bootstrap|自举|pull|轮询|standalone|注册码|设备码|配对/i],
+  ['收件箱', /收件箱|inbox|消息|no_reply|silent|claim|排序|游标|已读|静默/i],
+  ['协作编排', /批量|batch|回执|receipt|liveness|活力|派活|账本|屏障|里程碑|进度/i],
+  ['控制台', /控制台|console|面板|页面|按钮/i],
+  ['运维交付', /部署|发版|发布|巡检|门禁|脚本化|CI|tag|镜像|容器/i],
+  ['文档', /文档|README|docs|技能|示例|注释/i],
+  ['传输安全', /TLS|证书|自签|scopes|allowed_cidrs|F-?orwarded|明文传输|轮换/i],
 ]
 const DONE_LIST_CAP = 60
 const MARK_START = '<!-- AUTO:TODO START -->'
@@ -121,8 +121,11 @@ function parseHeader(line) {
   return { session: match[1], updated: match[2] }
 }
 
-function inferFeature(text) {
-  for (const [name, pattern] of FEATURE_RULES) if (pattern.test(text)) return name
+function inferFeature(title, description) {
+  // Only the title decides by default: 说明/验收 almost always mention token/CA/审计,
+  // which used to suck unrelated items into 传输安全.
+  for (const [name, pattern] of FEATURE_RULES) if (pattern.test(title)) return name
+  for (const [name, pattern] of FEATURE_RULES) if (pattern.test(description)) return name
   return '未分类'
 }
 
@@ -133,7 +136,7 @@ function resolveFeature(raw, entry, where, warnings) {
     warnings.push({ ...where, message: `未知功能标签「${raw}」，已归未分类` })
     return '未分类'
   }
-  return inferFeature(`${entry.title} ${entry.description} ${entry.acceptance}`)
+  return inferFeature(entry.title, entry.description)
 }
 
 function parseEntry(line, sessionName, file, lineNumber, errors, warnings) {
@@ -185,7 +188,7 @@ function parseEntry(line, sessionName, file, lineNumber, errors, warnings) {
     owner: fields.owner ?? sessionName,
     explicitOwner: fields.owner !== null,
     progress: fields.progress ?? null,
-    feature: resolveFeature(fields.feature, { title, description, acceptance: fields.acceptance }, { file, line: lineNumber }, warnings),
+    feature: resolveFeature(fields.feature, { title, description }, { file, line: lineNumber }, warnings),
     file,
     line: lineNumber,
     source: `${file}:${lineNumber}`,
@@ -840,6 +843,7 @@ async function main() {
       versions: { ...versions, drift: versions.hubVersion !== versions.hubPackageVersion },
       counts: countEntries(entries),
       features: featureStats(entries),
+      unclassified: entries.filter((entry) => entry.feature === '未分类').slice(0, 50).map((entry) => entry.displayTitle),
       errors,
       entries: entries.map((entry) => {
         const live = isLiveInProgress(entry)
@@ -892,6 +896,8 @@ async function main() {
     } catch (error) {
       console.warn(`warning: HTML render failed (ROADMAP was written): ${error.message}`)
     }
+    const unclassified = entries.filter((entry) => entry.feature === '未分类').length
+    console.log(`未分类 ${unclassified} 条（如需归口请在 todo 里加「功能：…」）`)
   } finally {
     await lock.release()
   }
