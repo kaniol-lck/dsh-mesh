@@ -27,6 +27,25 @@ const MARKER_ALLOWLIST = new Set(['LICENSE', 'plugins/mesh-waker/package.json'])
 // Fake-but-consistent example ranges (docs examples and the hub default allowlist).
 const ALLOWED_LAN = new Set(['192.168.0.0/16', '192.168.1.0/24', '192.168.1.50', '192.168.1.10'])
 
+// Anything outside these ranges is treated as a real public address (RFC 5737 / 2606 examples included).
+function isPublicIpv4(match) {
+  const octets = match.split('.').map(Number)
+  if (octets.length !== 4 || octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return false
+  const [a, b, c, d] = octets
+  if (a === 10) return false // 10/8
+  if (a === 172 && b >= 16 && b <= 31) return false // 172.16/12
+  if (a === 192 && b === 168) return false // 192.168/16
+  if (a === 127) return false // loopback
+  if (a === 169 && b === 254) return false // link-local
+  if (a === 0 && b === 0 && c === 0 && d === 0) return false
+  if (a === 255 && b === 255 && c === 255 && d === 255) return false
+  if (a === 192 && b === 0 && c === 2) return false // 192.0.2/24 (docs)
+  if (a === 198 && b === 51 && c === 100) return false // 198.51.100/24 (docs)
+  if (a === 203 && b === 0 && c === 113) return false // 203.0.113/24 (docs)
+  if (a === 198 && (b === 18 || b === 19)) return false // 198.18/15 (benchmark)
+  return true
+}
+
 const BINARY_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp', '.avif',
   '.pdf', '.zip', '.gz', '.tgz', '.tar', '.7z',
@@ -51,6 +70,19 @@ const RULES = [
     regex: /192\.168\.\d{1,3}\.\d{1,3}(?:\/\d{1,2})?/g,
     reason: '内网 IP',
     allow: (match) => ALLOWED_LAN.has(match),
+  },
+  {
+    name: 'public-ipv4',
+    regex: /(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])/g,
+    reason: '公网 IP（疑似真实服务器地址）；示例请用 203.0.113.x / 198.51.100.x',
+    allow: (match) => !isPublicIpv4(match),
+  },
+  {
+    name: 'local-topology',
+    // Written with escapes so this gate itself does not carry the literal fingerprints.
+    regex: /\u534E\u6570|FAC1(?:)200R|fn(?:)OS/g,
+    reason: '本环境拓扑指纹（设备/运营商特征）',
+    allow: () => false,
   },
   {
     name: 'local-marker',

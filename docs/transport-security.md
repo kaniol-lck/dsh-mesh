@@ -3,8 +3,7 @@
 本文回答一个问题：**hub 要出内网时，用什么方式加密、怎么落地、怎么验证、会踩什么坑**。
 结论按 2026-10-29 的本机实测环境书写；换网络环境时先看 §2 的决策表，再看 §3 是否仍适用。
 
-> 本文不写任何口令 / token / 私钥；LAN 侧地址用占位符（`<NAS-IP>`、`<home-public-ip>`），
-> 公网入口地址与端口是部署事实，直接写出。
+> 本文用占位符；本环境实测的完整地址与设备型号记录在本地 .worklog/ops/transport-security.local.md（不入库，随 .worklog 忽略）。
 
 ---
 
@@ -41,9 +40,9 @@ hub 本体不动，仍然只监听本机回环。优点是改动最小、单入�
 ### 3.1 拓扑（双层 NAT，无 IPv6）
 
 ```
-公网 → <EDGE-ROUTER>（<ISP>定制光猫/路由，<home-public-ip>）        ← NAT #1
-     → Kwrt/OpenWrt（LAN <LAN-CIDR>）                          ← NAT #2
-     → NAS <NAS-IP>（<NAS-OS>）：frpc → nginx(:8443, TLS 终止) → hub 127.0.0.1:8790
+公网 → <边缘路由>（<ISP 光猫/路由>，<home-public-ip>）        ← NAT #1
+     → <软路由系统>（LAN <LAN-CIDR>）                          ← NAT #2
+     → NAS <NAS-IP>（<NAS 系统>）：frpc → nginx(:8443, TLS 终止) → hub 127.0.0.1:8790
 公网 → 云 <CLOUD-IP>:18790（frps 0.71.1）→ 上面这条隧道
 ```
 
