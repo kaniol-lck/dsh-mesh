@@ -18,6 +18,7 @@ v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话
 | silent | `POST /api/send` 与 `mesh_send` 新增 `silent:true`：落库但不唤醒，供「必须人来回」的通道；与 `no_reply` 同时出现时 silent 优先并在响应注明 |
 | inbox 分页 | `GET /api/inbox` 新增 `order=asc|desc`（默认 asc）与 `before=<epoch_ms>` 游标，响应带 `has_more` / `next_before`；`mark_read=1` 仍只标记本次页；MCP `mesh_inbox` 新增 `order`，`unread_only:false` 时默认 `desc` |
 | 审批桥 | `plugins/mesh-approval` 发送改 `silent:true`（否则新语义下会唤醒 agent、可自审自批），轮询改 `order=desc`；新增 `test_transport_contract.py` 回归用例 |
+| 构建 | `Dockerfile` 新增 `ARG NPM_REGISTRY`（默认 `https://registry.npmmirror.com`），`npm install` 按该源执行；构建时可用 `--build-arg NPM_REGISTRY=https://registry.npmjs.org` 覆盖。只影响构建，版本号不变 |
 | 验证 | `node smoke-client.mjs`：77/77 passed（30 条积压下 desc 取最新、before 覆盖全量、no_reply 无 reply_to 唤醒、silent 不唤醒、reply_to 收尾不唤醒、MCP desc）；审批单测 2/2；live 审批 decision=once、wake_hits=0 |
 
 ## v0.7.13（2026-10-29，控制台配对：注册码入口 + 设备码）

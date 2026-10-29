@@ -6,10 +6,16 @@
 # (the original handoff image shipped node_modules inside the build context).
 FROM node:22-alpine
 
+# Registry for the dependency layer. A version bump invalidates this layer (package.json
+# changes), so every release re-downloads; hosts that cannot reach npmjs (the NAS times
+# out after 20s while npmmirror answers in <1s) would stall on every build. Override with
+#   docker build --build-arg NPM_REGISTRY=https://registry.npmjs.org .
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
 WORKDIR /app
 
 COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+RUN npm install --omit=dev --no-audit --no-fund --registry=${NPM_REGISTRY}
 
 COPY . .
 

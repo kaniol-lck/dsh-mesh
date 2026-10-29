@@ -43,6 +43,9 @@ docker compose up -d
 docker logs dsh-mesh | head -20
 ```
 
+构建默认从 `https://registry.npmmirror.com` 装依赖（NAS 访问 npmjs 会超时）；要用官方源可覆盖：
+`docker build --build-arg NPM_REGISTRY=https://registry.npmjs.org .`。
+
 只想先跑局域网（不加密）就这样够了。要跨网络访问，再加 TLS：
 
 ```bash
