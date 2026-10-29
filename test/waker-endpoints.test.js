@@ -70,7 +70,7 @@ function seedSession(sessionsRoot, { id, title, workspace = 'ws-test' }) {
  * and standalone boots must not touch the network. Pass `config` to boot a hub-mode
  * install (bootstrap / pull) and `writeToken: false` to start with no stored token.
  */
-async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true } = {}) {
+async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-endpoints-'))
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
@@ -87,6 +87,8 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   if (writeToken) fs.writeFileSync(tokenFile, 'test' + '-token')
   const conversationsPath = path.join(tokenDir, 'conversations.json')
   if (conversations) fs.writeFileSync(conversationsPath, JSON.stringify(conversations, null, 2))
+  const batchesPath = path.join(tmp, 'batches.json')
+  if (batches) fs.writeFileSync(batchesPath, JSON.stringify({ savedAt: Date.now(), batches }, null, 2))
 
   const state = {
     prompts: [],
@@ -194,6 +196,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
     workspacePath: path.join(tmp, 'inbox'),
     sessionCwd: path.join(tmp, 'inbox'),
     receiptFile: path.join(tmp, 'receipts.jsonl'),
+    batchFile: batchesPath,
     catchUpOnStart: false,
     catchUpDelayMs: 600000,
     historySyncIntervalMs: 3600000,
@@ -233,6 +236,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
     tokenFile,
     conversationsPath,
     receiptsPath: path.join(tmp, 'receipts.jsonl'),
+    batchesPath,
     external,
     emit(name, ...args) {
       for (const fn of listeners.get(name) ?? []) fn(...args)
@@ -641,6 +645,186 @@ async function main() {
     const status = await request(h.base, '/mesh/status')
     const ok = Boolean(receipt) && receipt.status === 'not-started' && receipt.reasonKind === 'not-started' && /receiptStallMs|1000ms/.test(receipt.reasonDetail ?? '') && status.json?.pendingTasks === 0
     report('receipt: stalled task becomes not-started', ok, `status=${receipt?.status ?? '-'} detail=${receipt?.reasonDetail ?? '-'} pending=${status.json?.pendingTasks}`)
+  })
+
+  // 19-22. liveness derivation is a pure function: approval > job > tool > stalled.
+  await runCase('liveness: waiting-approval names the tool and minutes', async () => {
+    const { deriveLivenessState } = await import(pathToFileURL(ENTRY).href)
+    const now = Date.now()
+    const derived = deriveLivenessState(
+      {
+        openTurn: 3,
+        lastEventAt: now,
+        lastTurnStartAt: now,
+        openCalls: new Map(),
+        openJobs: new Map(),
+        openApprovals: new Map([['a1', { toolName: 'bash', askedAt: now - 120000 }]]),
+      },
+      { hasPending: true, now, stallQuietMs: 300000 },
+    )
+    const ok = derived.state === 'waiting-approval' && /bash/.test(derived.detail) && /2m/.test(derived.detail)
+    report('liveness: waiting-approval names the tool and minutes', ok, `${derived.state} · ${derived.detail}`)
+  })
+
+  await runCase('liveness: waiting-job names the job and minutes', async () => {
+    const { deriveLivenessState } = await import(pathToFileURL(ENTRY).href)
+    const now = Date.now()
+    const derived = deriveLivenessState(
+      {
+        openTurn: 2,
+        lastEventAt: now,
+        lastTurnStartAt: now,
+        openCalls: new Map(),
+        openJobs: new Map([['job-7', { startedAt: now - 60000 }]]),
+        openApprovals: new Map(),
+      },
+      { hasPending: true, now, stallQuietMs: 300000 },
+    )
+    const ok = derived.state === 'waiting-job' && /job-7/.test(derived.detail) && /1m/.test(derived.detail)
+    report('liveness: waiting-job names the job and minutes', ok, `${derived.state} · ${derived.detail}`)
+  })
+
+  await runCase('liveness: waiting-tool names the tool and minutes', async () => {
+    const { deriveLivenessState } = await import(pathToFileURL(ENTRY).href)
+    const now = Date.now()
+    const derived = deriveLivenessState(
+      {
+        openTurn: 2,
+        lastEventAt: now,
+        lastTurnStartAt: now,
+        openCalls: new Map([['c1', { name: 'read_file', startedAt: now - 180000 }]]),
+        openJobs: new Map(),
+        openApprovals: new Map(),
+      },
+      { hasPending: true, now, stallQuietMs: 300000 },
+    )
+    const ok = derived.state === 'waiting-tool' && /read_file/.test(derived.detail) && /3m/.test(derived.detail)
+    report('liveness: waiting-tool names the tool and minutes', ok, `${derived.state} · ${derived.detail}`)
+  })
+
+  await runCase('liveness: quiet open turn becomes stalled', async () => {
+    const { deriveLivenessState } = await import(pathToFileURL(ENTRY).href)
+    const now = Date.now()
+    const derived = deriveLivenessState(
+      {
+        openTurn: 4,
+        lastEventAt: now - 400000,
+        lastTurnStartAt: now - 500000,
+        openCalls: new Map(),
+        openJobs: new Map(),
+        openApprovals: new Map(),
+      },
+      { hasPending: true, now, stallQuietMs: 300000 },
+    )
+    const ok = derived.state === 'stalled' && /quiet/.test(derived.detail)
+    report('liveness: quiet open turn becomes stalled', ok, `${derived.state} · ${derived.detail}`)
+  })
+
+  // 23. batch: every task settles -> exactly one aggregate receipt.
+  await runCase('batch: all tasks settle into one aggregate receipt', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-batch', title: 'batch target' }] })
+    const injectA = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'batch target', text: 'task a', meta: { taskId: 'T-a', batchId: 'B-1' } },
+    })
+    h.emit('session/event', { id: 'session-batch' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-batch' }, { type: 'assistant/message', turn: 1, message: { content: [{ type: 'text', text: 'a done' }] } })
+    h.emit('session/event', { id: 'session-batch' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const injectB = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'batch target', text: 'task b', meta: { taskId: 'T-b', batchId: 'B-1' } },
+    })
+    h.emit('session/event', { id: 'session-batch' }, { type: 'turn/start', turn: 2 })
+    h.emit('session/event', { id: 'session-batch' }, { type: 'turn/end', turn: 2, reason: { kind: 'completed' } })
+    const aggregate = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.kind === 'batch' && row.batchId === 'B-1'), 5000)
+    const perTask = readReceipts(h.receiptsPath).filter((row) => !row.kind && ['T-a', 'T-b'].includes(row.taskId))
+    const after = await request(h.base, '/mesh/batches')
+    const ok =
+      injectA.json?.batchId === 'B-1' &&
+      injectB.json?.batchId === 'B-1' &&
+      Boolean(aggregate) &&
+      aggregate.done === 2 &&
+      aggregate.total === 2 &&
+      perTask.length === 2 &&
+      (after.json?.batches ?? []).length === 0 &&
+      h.state.prompts.length === 2
+    report('batch: all tasks settle into one aggregate receipt', ok, `done=${aggregate?.done}/${aggregate?.total} perTask=${perTask.length} batchesLeft=${(after.json?.batches ?? []).length} prompts=${h.state.prompts.length}`)
+  })
+
+  // 24. deadline with an unfinished task -> partial aggregate carrying its liveness.
+  await runCase('batch: deadline produces a partial aggregate', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-deadline', title: 'deadline target' }], config: { batchDeadlineMs: 1000 } })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'deadline target', text: 'slow task', meta: { taskId: 'T-slow', batchId: 'B-dl' } },
+    })
+    const aggregate = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.kind === 'batch' && row.batchId === 'B-dl'), 6000)
+    const task = aggregate?.tasks?.[0]
+    const ok = Boolean(aggregate) && aggregate.done === 0 && aggregate.total === 1 && task?.status === 'not-started' && /no turn\/start/.test(task?.detail ?? '')
+    report('batch: deadline produces a partial aggregate', ok, `done=${aggregate?.done}/${aggregate?.total} taskStatus=${task?.status ?? '-'} detail=${task?.detail ?? '-'}`)
+  })
+
+  // 25. stalled member raises exactly one alert, without settling the task.
+  await runCase('batch: stalled member alerts once and is not settled', async (boot) => {
+    const h = await boot({
+      seedSessions: [{ id: 'session-hang', title: 'hang target' }],
+      config: { waitLongMs: 500, stallQuietMs: 300, alertMode: 'file', batchDeadlineMs: 60000 },
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'hang target', text: 'hang task', meta: { taskId: 'T-hang', batchId: 'B-hang' } },
+    })
+    h.emit('session/event', { id: 'session-hang' }, { type: 'turn/start', turn: 1 })
+    const first = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.kind === 'batch-alert' && row.taskId === 'T-hang'), 6000)
+    await sleep(1800)
+    const alerts = readReceipts(h.receiptsPath).filter((row) => row.kind === 'batch-alert' && row.taskId === 'T-hang')
+    const stillOpen = (await request(h.base, '/mesh/batches')).json?.batches ?? []
+    const ok = Boolean(first) && first.state === 'stalled' && alerts.length === 1 && stillOpen.length === 1
+    report('batch: stalled member alerts once and is not settled', ok, `alerts=${alerts.length} state=${first?.state ?? '-'} openBatches=${stillOpen.length}`)
+  })
+
+  // 26. restored batch with an open task is reported as lost (the restart killed the turn).
+  await runCase('batch: restored open task settles as lost', async (boot) => {
+    const started = Date.now() - 5000
+    const seededBatches = {
+      'B-lost': {
+        createdAt: started,
+        deadlineAt: started + 3600000,
+        barrierMode: 'file',
+        alertMode: 'file',
+        alerted: [],
+        tasks: { 'T-lost': { sessionId: 'session-lost', status: 'pending', settledAt: null, durationMs: null, summary: '' } },
+      },
+    }
+    const h = await boot({ seedSessions: [{ id: 'session-lost', title: 'lost target' }], batches: seededBatches })
+    const aggregate = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.kind === 'batch' && row.batchId === 'B-lost'), 6000)
+    const task = aggregate?.tasks?.[0]
+    const ok = Boolean(aggregate) && aggregate.done === 1 && aggregate.total === 1 && task?.status === 'lost'
+    report('batch: restored open task settles as lost', ok, `done=${aggregate?.done}/${aggregate?.total} taskStatus=${task?.status ?? '-'}`)
+  })
+
+  // 27. DELETE /mesh/batches/<id> cancels: no aggregate after the turn ends.
+  await runCase('batch: DELETE cancels and suppresses the aggregate', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-cancel', title: 'cancel target' }] })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'cancel target', text: 'cancel task', meta: { taskId: 'T-cancel', batchId: 'B-cancel' } },
+    })
+    const list = await request(h.base, '/mesh/batches')
+    const detail = await request(h.base, '/mesh/batches/B-cancel')
+    const cancelled = await request(h.base, '/mesh/batches/B-cancel', { method: 'DELETE' })
+    h.emit('session/event', { id: 'session-cancel' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-cancel' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    await sleep(300)
+    const aggregates = readReceipts(h.receiptsPath).filter((row) => row.kind === 'batch' && row.batchId === 'B-cancel')
+    const ok =
+      (list.json?.batches ?? []).length === 1 &&
+      detail.json?.ok === true &&
+      detail.json?.total === 1 &&
+      cancelled.status === 200 &&
+      cancelled.json?.cancelled === true &&
+      aggregates.length === 0
+    report('batch: DELETE cancels and suppresses the aggregate', ok, `listed=${(list.json?.batches ?? []).length} detailTotal=${detail.json?.total ?? '-'} delete=${cancelled.status} aggregates=${aggregates.length}`)
   })
 
   const failed = results.filter((result) => !result.ok)

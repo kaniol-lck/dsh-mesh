@@ -258,6 +258,118 @@ export function messageText(message) {
     .trim()
 }
 
+function minutesSince(at, now) {
+  if (!Number.isFinite(at) || at <= 0) return 0
+  return Math.max(0, Math.floor((now - at) / 60000))
+}
+
+function oldestOf(mapLike) {
+  const entries =
+    mapLike instanceof Map ? [...mapLike.entries()] : mapLike && typeof mapLike === 'object' ? Object.entries(mapLike) : []
+  let best = null
+  for (const [id, value] of entries) {
+    const at = Number(value?.startedAt ?? value?.askedAt ?? value?.at ?? 0)
+    if (!best || at < best.at) best = { id, value: value ?? {}, at }
+  }
+  return best
+}
+
+/**
+ * Derive the liveness of one session from its event ledger (contract 2026-10-29).
+ * Pure: the caller passes the ledger and the clock. Order matters:
+ * not-started -> lost -> waiting-approval -> waiting-job -> waiting-tool -> stalled -> idle -> working.
+ * `since` is the timestamp the current blocking state began, used for the waitLongMs alert.
+ */
+export function deriveLivenessState(ledger, { hasPending = false, lost = false, now = Date.now(), stallQuietMs = 300000 } = {}) {
+  const state = {
+    openTurn: ledger?.openTurn ?? null,
+    lastEventAt: Number(ledger?.lastEventAt ?? 0),
+    lastTurnStartAt: Number(ledger?.lastTurnStartAt ?? 0),
+    openCalls: ledger?.openCalls ?? new Map(),
+    openJobs: ledger?.openJobs ?? new Map(),
+    openApprovals: ledger?.openApprovals ?? new Map(),
+  }
+  if (hasPending && !state.lastTurnStartAt) return { state: 'not-started', detail: 'no turn/start since injection', since: state.lastEventAt || now }
+  if (lost) return { state: 'lost', detail: 'plugin restarted while the turn was open', since: state.lastEventAt || now }
+  const approvals = oldestOf(state.openApprovals)
+  if (approvals) {
+    const toolName = approvals.value.toolName ?? 'unknown'
+    return { state: 'waiting-approval', detail: `${toolName} ${minutesSince(approvals.at, now)}m`, since: approvals.at }
+  }
+  const job = oldestOf(state.openJobs)
+  if (job) return { state: 'waiting-job', detail: `${job.id} ${minutesSince(job.at, now)}m`, since: job.at }
+  const call = oldestOf(state.openCalls)
+  if (call) {
+    const name = call.value.name ?? 'unknown'
+    return { state: 'waiting-tool', detail: `${name} ${minutesSince(call.at, now)}m`, since: call.at }
+  }
+  if (state.openTurn !== null && now - state.lastEventAt > stallQuietMs) {
+    return { state: 'stalled', detail: `quiet ${minutesSince(state.lastEventAt, now)}m (turn ${state.openTurn})`, since: state.lastEventAt }
+  }
+  if (state.openTurn === null) return { state: 'idle', detail: '', since: now }
+  return { state: 'working', detail: `turn ${state.openTurn}`, since: now }
+}
+
+/** Human duration for the aggregate receipt: 42m, 2h05m, 8m30s. */
+export function humanDuration(ms) {
+  const total = Math.max(0, Math.round(Number(ms) || 0) / 1000)
+  const seconds = Math.round(total)
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+  return rest ? `${hours}h${String(rest).padStart(2, '0')}m` : `${hours}h`
+}
+
+const BATCH_STATUS_ICON = {
+  completed: '✅',
+  error: '❌',
+  aborted: '❌',
+  blocked: '❌',
+  interrupted: '❌',
+  'max-tokens': '❌',
+  forked: '✅',
+  lost: '❌',
+}
+
+/**
+ * Build the aggregate batch receipt: the JSONL record and the chat body share the tasks.
+ * `tasks` entries carry {taskId, status, durationMs, summary, detail}.
+ */
+export function buildBatchReceipt({ batchId, tasks = [], startedAt = 0, endedAt = Date.now(), summaryChars = 300 } = {}) {
+  const normalized = tasks.map((task) => ({
+    taskId: task.taskId,
+    status: task.status ?? 'pending',
+    durationMs: task.durationMs ?? null,
+    summary: truncateText(task.summary ?? '', summaryChars),
+    detail: task.detail ?? null,
+    settled: task.settled !== false,
+  }))
+  const pendingStates = ['pending', 'not-started', 'stalled', 'working', 'waiting-approval', 'waiting-job', 'waiting-tool']
+  // done counts settled tasks (a failed turn still finished); open ones stay out.
+  const done = normalized.filter((task) => task.settled && !pendingStates.includes(task.status)).length
+  const record = {
+    kind: 'batch',
+    batchId,
+    tasks: normalized.map(({ settled, ...rest }) => rest),
+    startedAt: startedAt || null,
+    endedAt,
+    done,
+    total: normalized.length,
+  }
+  const header = `[BATCH] ${batchId} ${done}/${normalized.length} done in ${humanDuration(endedAt - (startedAt || endedAt))}`
+  const width = normalized.reduce((max, task) => Math.max(max, Array.from(task.taskId ?? '').length), 0)
+  const lines = normalized.map((task) => {
+    const icon = BATCH_STATUS_ICON[task.status] ?? '⏳'
+    const id = String(task.taskId ?? '').padEnd(width, ' ')
+    const took = task.durationMs === null ? '' : humanDuration(task.durationMs)
+    const status = task.detail ? `${task.status}(${task.detail})` : task.status
+    return `${icon} ${id}  ${took}  ${status}`.replace(/\s+$/, '')
+  })
+  return { record, body: [header, ...lines].join('\n') }
+}
+
 function normalizeBase(config) {
   const c = config ?? {}
   // Secrets may be inlined (older configs) or, preferably, read from owner-only files so
@@ -343,6 +455,14 @@ function normalizeBase(config) {
     receiptTo: c.receiptTo ? String(c.receiptTo).trim() : '',
     receiptSummaryChars: clampInterval(c.receiptSummaryChars, 300, 20, 4000),
     receiptStallMs: clampInterval(c.receiptStallMs, 600000, 1000, 86_400_000),
+    // Batch barriers + liveness alerts (contract 2026-10-29): a batch is one notification
+    // when everything finished; stalled work is reported early instead of waiting an hour.
+    stallQuietMs: clampInterval(c.stallQuietMs, 300000, 1000, 86_400_000),
+    waitLongMs: clampInterval(c.waitLongMs, 1800000, 1000, 86_400_000),
+    batchDeadlineMs: clampInterval(c.batchDeadlineMs, 7200000, 1000, 86_400_000),
+    barrierMode: ['file', 'queue', 'wake'].includes(String(c.barrierMode)) ? String(c.barrierMode) : 'wake',
+    alertMode: ['file', 'queue', 'wake'].includes(String(c.alertMode)) ? String(c.alertMode) : 'queue',
+    batchFile: c.batchFile ? String(c.batchFile) : join(homedir(), '.dsh', 'mesh-waker', 'batches.json'),
     permissionPresetByTrust: {
       strict: 'read-only',
       normal: 'workspace-write',
@@ -420,6 +540,7 @@ export function apply(ctx, config) {
     // Task receipts: how many are waiting for their turn to end, and the latest one written.
     pendingTasks: 0,
     lastReceipt: null,
+    pendingBatches: 0,
   }
 
   // Pull loop bookkeeping.
@@ -2031,6 +2152,29 @@ export function apply(ctx, config) {
   const assistantText = new Map()
   const receiptTimers = new Set()
   let lastReceipt = null
+  // Liveness ledger: one row per session, updated from session/event.
+  const liveness = new Map()
+  // Batches: one aggregate receipt when every task settled (or the deadline hits).
+  const batches = new Map()
+  let batchSweepTimer = null
+
+  function livenessFor(sessionId) {
+    let ledger = liveness.get(sessionId)
+    if (!ledger) {
+      ledger = {
+        openTurn: null,
+        lastEventAt: 0,
+        lastTurnStartAt: 0,
+        openCalls: new Map(),
+        openJobs: new Map(),
+        openApprovals: new Map(),
+        lastLlmAt: 0,
+        lastReason: null,
+      }
+      liveness.set(sessionId, ledger)
+    }
+    return ledger
+  }
 
   function maxTurnFor(sessionId) {
     const known = turnStartedAt.get(sessionId)
@@ -2054,33 +2198,41 @@ export function apply(ctx, config) {
     return receipt.summary ? `${first}\n${receipt.summary}` : first
   }
 
-  async function deliverReceipt(receipt) {
-    if (receipt.receiptMode === 'file') return
+  /** Deliver one notice (receipt or batch text) to receiptTo; file mode never injects. */
+  async function deliverNotice(mode, text, label) {
+    if (mode === 'file') return false
     if (!c.receiptTo) {
-      state.lastError = 'receiptTo is empty; receipt written to file only'
-      fileLog('receipt delivery skipped: receiptTo is empty')
-      return
+      state.lastError = 'receiptTo is empty; notice written to file only'
+      fileLog(`${label} delivery skipped: receiptTo is empty`)
+      return false
     }
     let target
     try {
       target = resolveLocalSession({ session: c.receiptTo, title: c.receiptTo })
     } catch (error) {
       state.lastError = `receiptTo not resolved: ${error.message}`
-      fileLog(`receipt delivery skipped: ${error.message}`)
-      return
+      fileLog(`${label} delivery skipped: ${error.message}`)
+      return false
     }
-    let mode = 'queue'
-    if (receipt.receiptMode === 'wake') {
-      if (c.wakeSecret) mode = 'steer'
-      else log.warn('[mesh-waker] receiptMode=wake needs wakeSecret; delivering as queue')
+    let turnMode = 'queue'
+    if (mode === 'wake') {
+      if (c.wakeSecret) turnMode = 'steer'
+      else log.warn('[mesh-waker] wake delivery needs wakeSecret; delivering as queue')
     }
     try {
-      await promptWithResume(target.id, receiptBody(receipt), mode)
-      fileLog(`receipt ${receipt.taskId} delivered to ${target.id} (${receipt.receiptMode}, mode=${mode})`)
+      await promptWithResume(target.id, text, turnMode)
+      fileLog(`${label} delivered to ${target.id} (${mode}, mode=${turnMode})`)
+      return true
     } catch (error) {
-      state.lastError = `receipt delivery failed: ${error.message}`
-      fileLog(`receipt delivery failed: ${error.message}`)
+      state.lastError = `${label} delivery failed: ${error.message}`
+      fileLog(`${label} delivery failed: ${error.message}`)
+      return false
     }
+  }
+
+  async function deliverReceipt(receipt) {
+    if (receipt.receiptMode === 'file') return
+    await deliverNotice(receipt.receiptMode, receiptBody(receipt), `receipt ${receipt.taskId}`)
   }
 
   function clearPending(task) {
@@ -2121,6 +2273,7 @@ export function apply(ctx, config) {
     state.pendingTasks = pendingTasks.size
     fileLog(`receipt ${taskId} ${receipt.status} turn=${receipt.turn ?? '-'} duration=${receipt.durationMs}ms`)
     void deliverReceipt(receipt)
+    updateBatchTask(taskId, receipt)
     return receipt
   }
 
@@ -2128,7 +2281,9 @@ export function apply(ctx, config) {
     const taskId = String(meta?.taskId ?? '').trim()
     if (!/^[A-Za-z0-9._:-]{1,80}$/.test(taskId)) throw new Error('meta.taskId must match [A-Za-z0-9._:-]{1,80}')
     const requested = String(meta?.receipt ?? '')
-    const receiptMode = ['file', 'queue', 'wake'].includes(requested) ? requested : c.receiptMode
+    const batchId = meta?.batchId ? String(meta.batchId).trim() : null
+    // Batch members never disturb the coordinator one by one: only the aggregate goes out.
+    const receiptMode = batchId ? 'file' : ['file', 'queue', 'wake'].includes(requested) ? requested : c.receiptMode
     const previous = pendingTasks.get(taskId)
     if (previous) clearPending(previous)
     const task = {
@@ -2136,11 +2291,13 @@ export function apply(ctx, config) {
       injectedAt: Date.now(),
       baselineTurn: maxTurnFor(target.id),
       receiptMode,
+      batchId,
       settled: false,
       stallTimer: null,
     }
     pendingTasks.set(taskId, task)
     state.pendingTasks = pendingTasks.size
+    if (batchId) registerBatchTask(taskId, task, meta)
     const timer = setTimeout(() => {
       receiptTimers.delete(timer)
       if (task.settled) return
@@ -2154,7 +2311,7 @@ export function apply(ctx, config) {
     timer.unref?.()
     task.stallTimer = timer
     receiptTimers.add(timer)
-    fileLog(`task ${taskId} pending on ${target.id} baselineTurn=${task.baselineTurn ?? 'unknown'} receipt=${receiptMode}`)
+    fileLog(`task ${taskId} pending on ${target.id} baselineTurn=${task.baselineTurn ?? 'unknown'} receipt=${receiptMode}${batchId ? ` batch=${batchId}` : ''}`)
     return taskId
   }
 
@@ -2166,13 +2323,72 @@ export function apply(ctx, config) {
     state.pendingTasks = pendingTasks.size
   }
 
-  /** turn/start arms/stops the stall timer, assistant/message keeps the last text, turn/end settles. */
+  /** Feed the liveness ledger, then settle tasks on turn/end. */
   function handleSessionEvent(session, event) {
     try {
       const sessionId = typeof session === 'string' ? session : session?.id ?? session?.sessionId
       if (!sessionId || !event || typeof event !== 'object') return
       const type = String(event.type ?? '')
       const turn = Number.isFinite(Number(event.turn)) ? Number(event.turn) : null
+      const ledger = livenessFor(sessionId)
+      const now = Date.now()
+      ledger.lastEventAt = now
+      switch (type) {
+        case 'turn/start':
+          ledger.openTurn = turn
+          ledger.lastTurnStartAt = now
+          ledger.openCalls.clear()
+          ledger.openJobs.clear()
+          ledger.openApprovals.clear()
+          break
+        case 'turn/end':
+          ledger.openTurn = null
+          ledger.lastReason = event.reason ?? null
+          ledger.openCalls.clear()
+          ledger.openJobs.clear()
+          ledger.openApprovals.clear()
+          break
+        case 'tool/call':
+          ledger.openCalls.set(String(event.callId ?? randomUUID()), {
+            name: String(event.name ?? 'tool'),
+            startedAt: now,
+          })
+          break
+        case 'tool/result': {
+          const callId = event.callId ?? event.message?.callId
+          if (callId !== undefined) ledger.openCalls.delete(String(callId))
+          else {
+            const first = ledger.openCalls.keys().next()
+            if (!first.done) ledger.openCalls.delete(first.value)
+          }
+          break
+        }
+        case 'job/registered': {
+          const jobId = event.jobId ?? event.id ?? event.job?.id ?? randomUUID()
+          ledger.openJobs.set(String(jobId), { startedAt: now })
+          break
+        }
+        case 'job/settled': {
+          const jobId = event.jobId ?? event.id ?? event.job?.id
+          if (jobId !== undefined) ledger.openJobs.delete(String(jobId))
+          break
+        }
+        case 'approval/asked':
+          ledger.openApprovals.set(String(event.id ?? randomUUID()), {
+            toolName: String(event.toolName ?? event.name ?? 'tool'),
+            askedAt: now,
+          })
+          break
+        case 'approval/decided':
+          if (event.id !== undefined) ledger.openApprovals.delete(String(event.id))
+          break
+        case 'llm/retry':
+        case 'llm/retry-started':
+          ledger.lastLlmAt = now
+          break
+        default:
+          break
+      }
       if (type === 'turn/start') {
         if (turn !== null) turnStartedAt.set(sessionId, Math.max(turn, turnStartedAt.get(sessionId) ?? 0))
         for (const task of pendingTasks.values()) {
@@ -2199,10 +2415,304 @@ export function apply(ctx, config) {
     }
   }
 
+  // ---------------------------------------------------------------- batches
+  //
+  // A batch is a barrier: every task still writes its own JSONL line, but only one
+  // aggregate notice goes to receiptTo, once everything settled (or the deadline hit).
+
+  function saveBatches() {
+    try {
+      const data = { savedAt: Date.now(), batches: {} }
+      for (const [batchId, batch] of batches) {
+        data.batches[batchId] = {
+          createdAt: batch.createdAt,
+          deadlineAt: batch.deadlineAt,
+          barrierMode: batch.barrierMode,
+          alertMode: batch.alertMode,
+          alerted: [...batch.alerted],
+          tasks: Object.fromEntries(
+            [...batch.tasks].map(([taskId, row]) => [
+              taskId,
+              { sessionId: row.sessionId, status: row.status, settledAt: row.settledAt, durationMs: row.durationMs, summary: row.summary },
+            ]),
+          ),
+        }
+      }
+      mkdirSync(dirname(c.batchFile), { recursive: true })
+      writeFileSync(c.batchFile, JSON.stringify(data, null, 2), { mode: 0o600 })
+    } catch (error) {
+      fileLog(`saving batches failed: ${error.message}`)
+    }
+  }
+
+  function loadBatches() {
+    try {
+      const raw = JSON.parse(readFileSync(c.batchFile, 'utf8'))
+      const now = Date.now()
+      for (const [batchId, saved] of Object.entries(raw?.batches ?? {})) {
+        if (!saved) continue
+        if (now - Number(saved.createdAt ?? 0) > 24 * 3600_000) {
+          fileLog(`dropping stale batch ${batchId} (older than 24h)`)
+          continue
+        }
+        const tasks = new Map()
+        for (const [taskId, row] of Object.entries(saved.tasks ?? {})) {
+          tasks.set(taskId, {
+            sessionId: row.sessionId,
+            status: row.status ?? 'pending',
+            settledAt: row.settledAt ?? null,
+            durationMs: row.durationMs ?? null,
+            summary: row.summary ?? '',
+          })
+        }
+        batches.set(batchId, {
+          createdAt: saved.createdAt ?? now,
+          deadlineAt: saved.deadlineAt ?? now + c.batchDeadlineMs,
+          barrierMode: saved.barrierMode ?? c.barrierMode,
+          alertMode: saved.alertMode ?? c.alertMode,
+          alerted: new Set(saved.alerted ?? []),
+          tasks,
+          finalized: false,
+          deadlineTimer: null,
+        })
+      }
+    } catch {
+      /* first run: no batch file yet */
+    }
+  }
+
+  function batchOfTask(taskId) {
+    for (const [batchId, batch] of batches) if (batch.tasks.has(taskId)) return [batchId, batch]
+    return [null, null]
+  }
+
+  function armBatchDeadline(batchId, batch) {
+    if (batch.deadlineTimer) clearTimeout(batch.deadlineTimer)
+    batch.deadlineTimer = setTimeout(() => finalizeBatch(batchId, { partial: true }), Math.max(0, batch.deadlineAt - Date.now()))
+    batch.deadlineTimer.unref?.()
+  }
+
+  function taskLiveness(sessionId, taskId) {
+    return deriveLivenessState(liveness.get(sessionId), {
+      hasPending: pendingTasks.has(taskId),
+      now: Date.now(),
+      stallQuietMs: c.stallQuietMs,
+    })
+  }
+
+  function finalizeBatch(batchId, { partial = false } = {}) {
+    const batch = batches.get(batchId)
+    if (!batch || batch.finalized) return null
+    batch.finalized = true
+    if (batch.deadlineTimer) {
+      clearTimeout(batch.deadlineTimer)
+      batch.deadlineTimer = null
+    }
+    if (batch.completeTimer) {
+      clearTimeout(batch.completeTimer)
+      batch.completeTimer = null
+    }
+    const now = Date.now()
+    const rows = []
+    for (const [taskId, row] of batch.tasks) {
+      if (row.settledAt !== null) {
+        rows.push({ taskId, status: row.status, durationMs: row.durationMs, summary: row.summary, settled: true })
+      } else {
+        const derived = taskLiveness(row.sessionId, taskId)
+        rows.push({ taskId, status: derived.state, durationMs: null, summary: '', detail: derived.detail || null, settled: false })
+      }
+    }
+    const { record, body } = buildBatchReceipt({
+      batchId,
+      tasks: rows,
+      startedAt: batch.createdAt,
+      endedAt: now,
+      summaryChars: c.receiptSummaryChars,
+    })
+    writeReceiptFile(record)
+    lastReceipt = { taskId: batchId, status: partial ? 'partial' : 'completed', at: now }
+    state.lastReceipt = lastReceipt
+    state.pendingBatches = batches.size
+    fileLog(`batch ${batchId} finalized partial=${partial} ${record.done}/${record.total}`)
+    void deliverNotice(batch.barrierMode, body, `batch ${batchId}`)
+    // A closed batch stops waiting: unsettled members must not emit their own receipts later.
+    for (const taskId of batch.tasks.keys()) if (pendingTasks.has(taskId)) cancelPendingTask(taskId)
+    batches.delete(batchId)
+    state.pendingBatches = batches.size
+    saveBatches()
+    return record
+  }
+
+  function cancelBatch(batchId) {
+    const batch = batches.get(batchId)
+    if (!batch) return false
+    batch.finalized = true
+    if (batch.deadlineTimer) clearTimeout(batch.deadlineTimer)
+    if (batch.completeTimer) clearTimeout(batch.completeTimer)
+    for (const taskId of batch.tasks.keys()) if (pendingTasks.has(taskId)) cancelPendingTask(taskId)
+    batches.delete(batchId)
+    state.pendingBatches = batches.size
+    saveBatches()
+    fileLog(`batch ${batchId} cancelled; no aggregate receipt will be sent`)
+    return true
+  }
+
+  function registerBatchTask(taskId, task, meta) {
+    const batchId = String(meta?.batchId ?? '').trim()
+    if (!batchId) return null
+    if (!/^[A-Za-z0-9._:-]{1,80}$/.test(batchId)) throw new Error('meta.batchId must match [A-Za-z0-9._:-]{1,80}')
+    const now = Date.now()
+    let batch = batches.get(batchId)
+    if (!batch) {
+      const requestedDeadline = Number(meta?.deadlineMs)
+      const deadlineMs =
+        Number.isFinite(requestedDeadline) && requestedDeadline > 0
+          ? Math.min(86_400_000, Math.max(1000, requestedDeadline))
+          : c.batchDeadlineMs
+      batch = {
+        createdAt: now,
+        deadlineAt: now + deadlineMs,
+        barrierMode: c.barrierMode,
+        alertMode: c.alertMode,
+        alerted: new Set(),
+        tasks: new Map(),
+        finalized: false,
+        deadlineTimer: null,
+        completeTimer: null,
+      }
+      batches.set(batchId, batch)
+      armBatchDeadline(batchId, batch)
+    }
+    // A late member must be able to join a batch that just looked complete.
+    if (batch.completeTimer) {
+      clearTimeout(batch.completeTimer)
+      batch.completeTimer = null
+    }
+    batch.tasks.set(taskId, { sessionId: task.sessionId, status: 'pending', settledAt: null, durationMs: null, summary: '' })
+    state.pendingBatches = batches.size
+    saveBatches()
+    fileLog(`batch ${batchId} +${taskId} (${batch.tasks.size} tasks)`)
+    return batchId
+  }
+
+  function updateBatchTask(taskId, receipt) {
+    const [batchId, batch] = batchOfTask(taskId)
+    if (!batchId || !batch) return
+    const row = batch.tasks.get(taskId)
+    if (row) {
+      row.status = receipt.status
+      row.settledAt = receipt.endedAt
+      row.durationMs = receipt.durationMs
+      row.summary = receipt.summary
+    }
+    saveBatches()
+    if ([...batch.tasks.values()].some((entry) => entry.settledAt === null)) return
+    // Completion grace: dispatch runs one command per process, so the next member may be
+    // injected a moment after the previous one finished.
+    if (batch.completeTimer) return
+    batch.completeTimer = setTimeout(() => finalizeBatch(batchId), 300)
+    batch.completeTimer.unref?.()
+  }
+
+  /** One alert per (batch, task, state) when something has been hanging for waitLongMs. */
+  function sweepBatches() {
+    const now = Date.now()
+    for (const [batchId, batch] of [...batches]) {
+      for (const [taskId, row] of batch.tasks) {
+        if (row.settledAt !== null) continue
+        const derived = taskLiveness(row.sessionId, taskId)
+        if (!['stalled', 'waiting-approval', 'waiting-job'].includes(derived.state)) continue
+        if (now - derived.since < c.waitLongMs) continue
+        const key = `${taskId}|${derived.state}`
+        if (batch.alerted.has(key)) continue
+        batch.alerted.add(key)
+        const at = Date.now()
+        writeReceiptFile({
+          kind: 'batch-alert',
+          batchId,
+          taskId,
+          sessionId: row.sessionId,
+          state: derived.state,
+          detail: derived.detail,
+          at,
+        })
+        saveBatches()
+        void deliverNotice(batch.alertMode, `[BATCH-ALERT] ${batchId} ${taskId} ${derived.state} ${derived.detail}`, `batch alert ${batchId}/${taskId}`)
+        fileLog(`batch ${batchId} alert task=${taskId} state=${derived.state}`)
+      }
+    }
+  }
+
+  /** GET /mesh/batches shape: settled tasks report their status, open ones their liveness. */
+  function describeBatch(batchId, batch) {
+    const tasks = [...batch.tasks.entries()].map(([taskId, row]) => {
+      const live = row.settledAt === null ? taskLiveness(row.sessionId, taskId) : null
+      return {
+        taskId,
+        sessionId: row.sessionId,
+        status: row.settledAt === null ? live.state : row.status,
+        settledAt: row.settledAt,
+        durationMs: row.durationMs,
+        liveness: live?.state ?? null,
+        detail: live?.detail ?? null,
+        summary: row.summary ?? '',
+      }
+    })
+    return {
+      batchId,
+      done: tasks.filter((task) => task.settledAt !== null).length,
+      total: tasks.length,
+      createdAt: batch.createdAt,
+      deadlineAt: batch.deadlineAt,
+      barrierMode: batch.barrierMode,
+      tasks,
+    }
+  }
+
+  /** Restore batches from disk; a restored open task lost its turn with the restart. */
+  function restoreBatches() {
+    loadBatches()
+    for (const [batchId, batch] of batches) {
+      armBatchDeadline(batchId, batch)
+      for (const [taskId, row] of batch.tasks) {
+        if (row.settledAt !== null) continue
+        const task = {
+          sessionId: row.sessionId,
+          injectedAt: batch.createdAt,
+          baselineTurn: maxTurnFor(row.sessionId),
+          receiptMode: 'file',
+          batchId,
+          settled: false,
+          stallTimer: null,
+        }
+        pendingTasks.set(taskId, task)
+        const timer = setTimeout(() => {
+          receiptTimers.delete(timer)
+          settleTask(taskId, task, {
+            turn: null,
+            status: 'lost',
+            reasonKind: 'lost',
+            reasonDetail: 'plugin restarted while the turn was open',
+          })
+        }, 100)
+        timer.unref?.()
+        receiptTimers.add(timer)
+      }
+    }
+    state.pendingTasks = pendingTasks.size
+    state.pendingBatches = batches.size
+  }
+
   function disposeReceipts() {
     for (const task of pendingTasks.values()) clearPending(task)
     pendingTasks.clear()
     receiptTimers.clear()
+    for (const batch of batches.values()) {
+      if (batch.deadlineTimer) clearTimeout(batch.deadlineTimer)
+      if (batch.completeTimer) clearTimeout(batch.completeTimer)
+    }
+    if (batchSweepTimer) clearInterval(batchSweepTimer)
+    batchSweepTimer = null
     state.pendingTasks = 0
   }
 
@@ -2212,6 +2722,11 @@ export function apply(ctx, config) {
       return typeof off === 'function' ? off : undefined
     })
   }
+
+  // Restore batches before the listener comes up, then poll liveness for early alerts.
+  restoreBatches()
+  batchSweepTimer = setInterval(sweepBatches, Math.max(1000, Math.min(30000, Math.floor(c.waitLongMs / 2))))
+  batchSweepTimer.unref?.()
 
   ctx.effect(() => {
     // Trust anchors must be in place before any request; a bad caFile leaves the plugin
@@ -2243,6 +2758,40 @@ export function apply(ctx, config) {
         res.writeHead(500, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: error.message }))
       }
+      return
+    }
+
+    if (path === '/mesh/batches' && req.method === 'GET') {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(JSON.stringify({ ok: true, batches: [...batches.entries()].map(([batchId, batch]) => describeBatch(batchId, batch)) }))
+      return
+    }
+    if (path.startsWith('/mesh/batches/')) {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const batchId = decodeURIComponent(path.slice('/mesh/batches/'.length))
+      if (req.method === 'DELETE') {
+        const cancelled = cancelBatch(batchId)
+        res.writeHead(cancelled ? 200 : 404, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify(cancelled ? { ok: true, batchId, cancelled: true } : { ok: false, error: 'unknown batch' }))
+        return
+      }
+      if (req.method === 'GET') {
+        const batch = batches.get(batchId)
+        res.writeHead(batch ? 200 : 404, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify(batch ? { ok: true, ...describeBatch(batchId, batch) } : { ok: false, error: 'unknown batch' }))
+        return
+      }
+      res.writeHead(405, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end('{"error":"method not allowed"}')
       return
     }
 
@@ -2449,6 +2998,7 @@ export function apply(ctx, config) {
         const target = resolveLocalSession(draft)
         const mode = draft.mode === 'steer' ? 'steer' : 'queue'
         const meta = draft.meta && typeof draft.meta === 'object' ? draft.meta : {}
+        const batchId = meta.batchId ? String(meta.batchId).trim() : null
         // Register before prompting: a very fast turn can end before this request returns.
         let taskId = null
         try {
@@ -2458,9 +3008,9 @@ export function apply(ctx, config) {
           if (taskId) cancelPendingTask(taskId)
           throw error
         }
-        fileLog(`injected ${text.length} chars into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}${taskId ? ` task=${taskId}` : ''}`)
+        fileLog(`injected ${text.length} chars into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}`)
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-        res.end(JSON.stringify({ ok: true, sessionId: target.id, title: target.title, mode, taskId }))
+        res.end(JSON.stringify({ ok: true, sessionId: target.id, title: target.title, mode, taskId, batchId: taskId ? batchId : null }))
       } catch (error) {
         res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: false, error: error.message }))
@@ -2496,9 +3046,12 @@ export function apply(ctx, config) {
               // Task receipts: count waiting for turn/end, the latest settled one, and where
               // they go. The file path is a local path, never a credential.
               pendingTasks: pendingTasks.size,
+              pendingBatches: batches.size,
               lastReceipt,
               receiptMode: c.receiptMode,
               receiptFile: c.receiptFile,
+              batchFile: c.batchFile,
+              barrierMode: c.barrierMode,
               ...state,
               throttled: throttleSummary(),
               historyCached: history.size,

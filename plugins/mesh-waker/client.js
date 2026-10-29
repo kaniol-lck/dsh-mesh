@@ -1051,7 +1051,8 @@ try {
               (status.lastReceipt
                 ? ` · 最近 ${status.lastReceipt.taskId} ${status.lastReceipt.status} ${new Date(status.lastReceipt.at).toLocaleTimeString()}`
                 : ' · 暂无回执') +
-              (status.pendingTasks ? ` · 等待结算 ${status.pendingTasks}` : ''),
+              (status.pendingTasks ? ` · 等待结算 ${status.pendingTasks}` : '') +
+              (status.pendingBatches ? ` · 批次 ${status.pendingBatches}` : ''),
           ),
         ),
         h(

@@ -2,12 +2,24 @@
 
 本文件记录 `dsh-mesh-waker` 的变更。格式仿 `hub/CHANGES.md`：每节写清改了什么、怎么复验。
 
-> **发版状态**：`0.4.56`–`0.5.1` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
-> `next` 是 0.4.55）；0.4.60、0.5.0 与 0.5.1 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
+> **发版状态**：`0.4.56`–`0.5.2` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
+> `next` 是 0.4.55）；0.4.60、0.5.0–0.5.2 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 0.5.0 激活矩阵 + 0.5.1 回执）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness）。
 
 ---
+
+## v0.5.2（2026-10-29，批次屏障 + 事件驱动 liveness）
+
+| 项 | 内容 |
+|---|---|
+| 批次屏障 | `/mesh/inject` 的 `meta` 增 `batchId` / `deadlineMs`（响应回显 `batchId`）；`scripts/mesh-dispatch.mjs` 增 `--batch [id]`（缺省 `B-<base36>`，同 id 复用）与 `--deadline 2h\|90m\|600s`；全部任务结算 → **一条**聚合回执（文本 + JSONL `{kind:"batch",…, done, total}`），deadline 到点仍有关键未结 → 部分完成聚合，未结项带 liveness；批次内单任务只写自己的 JSONL、不 queue/wake；完成判定有 300ms grace，允许连续派发的下一单加入 |
+| liveness | 每会话账本（openTurn / lastEventAt / openCalls / openJobs / openApprovals / lastLlmAt），事件面覆盖 `turn/start|end`、`step/*`、`assistant/message`、`tool/call|result`、`job/registered|settled`、`approval/asked|decided`、`llm/retry*`、`agent/error`；`deriveLivenessState` 纯函数按 `not-started → lost → waiting-approval → waiting-job → waiting-tool → stalled → idle → working` 判定 |
+| 卡住先报 | 批次内任务处于 stalled / waiting-approval / waiting-job 且超过 `waitLongMs` → 发一次 `[BATCH-ALERT]`（同批次+任务+状态只发一次），不结算，继续等 `turn/end` 或 deadline |
+| 持久化与端点 | 批次写入 `batchFile`（0600，启动恢复、>24h 清理；恢复时 open 任务按 `lost` 结算）；`GET /mesh/batches`、`GET /mesh/batches/<id>`（含逐任务 liveness）、`DELETE /mesh/batches/<id>`（取消且不再回执） |
+| 配置 | `stallQuietMs` 300000 / `waitLongMs` 1800000 / `batchDeadlineMs` 7200000 / `barrierMode` wake / `alertMode` queue / `batchFile` `~/.dsh/mesh-waker/batches.json` |
+| 状态 | `/mesh/status` 增 `pendingBatches`、`batchFile`、`barrierMode`；面板「任务回执」行追加批次数 |
+| 验证 | `node test/waker-endpoints.test.js` 26/26：新增 4 例 liveness 派生（approval/job/tool/stalled）、batch 单次聚合（done=2/2、只剩一条 batch 行、批次清空）、deadline 部分完成（未结项 `not-started`）、stalled 告警只发一次且不结算、重启恢复按 `lost` 结算、`DELETE` 后无聚合；`node --check` 三文件 exit 0 |
 
 ## v0.5.1（2026-10-29，插件级任务回执）
 

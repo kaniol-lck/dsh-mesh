@@ -86,6 +86,51 @@ node scripts/mesh-dispatch.mjs --title "mesh · hub" --file task.txt --task --re
 
 > 回执只走**本机** inject，绝不推到 hub；`receiptTo` 解析不到时只写文件并置 `lastError`，不会去打扰别的会话。日志与回执里没有 token、密钥。
 
+## 批次与进度判定（0.5.2）
+
+**batch**：一次派 N 单，全部结束才通知一次。`scripts/mesh-dispatch.mjs` 加 `--batch [id]`（同 id 的多次调用归同一批，不带值自动生成 `B-<base36>`）与 `--deadline 2h|90m|600s`：
+
+```bash
+node scripts/mesh-dispatch.mjs --title "mesh · hub"  --file t1.txt --batch B-20261029 --deadline 90m
+node scripts/mesh-dispatch.mjs --title "mesh · docs" --file t2.txt --batch B-20261029
+```
+
+批次内单任务**不单独打扰**（回执按 `file` 处理），只有聚合回执走 `barrierMode`：
+
+```
+[BATCH] B-20261029 3/3 done in 42m
+✅ T-114 hub bootstrap        8m  completed
+❌ T-115 waker pull          12m  error(provider_error)
+⏳ T-116 docs onboarding         not-started
+```
+
+JSONL：`{kind:"batch", batchId, tasks:[{taskId,status,durationMs,summary}], startedAt, endedAt, done, total}`。deadline 到点仍有未结 → 发一次「部分完成」聚合，未结项带**当前 liveness**；随后清批次。
+
+**liveness**：每个会话从事件流派生状态（`session/event`），判定顺序固定：
+
+| state | 判据 | detail 示例 |
+|---|---|---|
+| `not-started` | 有 pending 任务但从未收到 `turn/start` | `no turn/start since injection` |
+| `lost` | 插件重启时 pending 仍开着（多半打断了回合） | `plugin restarted while the turn was open` |
+| `waiting-approval` | 有未决 `approval/asked` | `bash 2m` |
+| `waiting-job` | 有未结算 `job/registered` | `job-7 1m` |
+| `waiting-tool` | 有未返回 `tool/call` | `read_file 3m` |
+| `stalled` | turn 开着、无 job/approval/tool 且静默超过 `stallQuietMs` | `quiet 6m (turn 4)` |
+| `idle` | `openTurn === null` | — |
+| `working` | 其余（turn 开着且有近期事件） | `turn 4` |
+
+批次进行中，某任务处于 `stalled`/`waiting-approval`/`waiting-job` 且已挂起超过 `waitLongMs` → 发**一次** `[BATCH-ALERT]`（同批次同任务同状态只发一次），**不结算**该任务，批次继续等 `turn/end` 或 deadline。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `stallQuietMs` | `300000` | 静默多久判 `stalled` |
+| `waitLongMs` | `1800000` | 挂起多久发「挂了很久」提醒 |
+| `batchDeadlineMs` | `7200000` | 批次兜底 deadline |
+| `barrierMode` | `wake` | 聚合回执投递方式 `file|queue|wake` |
+| `alertMode` | `queue` | 中途告警方式 |
+| `batchFile` | `~/.dsh/mesh-waker/batches.json` | 批次持久化（0600，启动恢复，>24h 清理） |
+
+HTTP（loopback）：`GET /mesh/batches`、`GET /mesh/batches/<id>`（含每个任务的 liveness）、`DELETE /mesh/batches/<id>`（取消，不再回执）。
 
 ## 本机会话协作（不经过中枢）
 

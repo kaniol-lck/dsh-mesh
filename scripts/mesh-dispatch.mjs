@@ -50,6 +50,9 @@ Options:
   --task [id]        attach a task id so the waker writes a receipt when the turn
                      ends; "--task" alone generates T-<base36 timestamp>
   --receipt <mode>   file | queue | wake (waker default when omitted); implies --task
+  --batch [id]       join a batch barrier: one aggregate receipt when every task ends;
+                     "--batch" alone generates B-<base36 timestamp>
+  --deadline <dur>   batch deadline like 2h / 90m / 600s (waker default when omitted)
   --repo <path>      repo root used to filter by cwd (default: process.cwd())
   --dry-run          resolve and print the target, send nothing
   -h, --help         show this help
@@ -61,7 +64,7 @@ function fail(message, code = 1) {
 }
 
 function parseArgs(argv) {
-  const options = { mode: 'queue', dryRun: false, wake: false, task: undefined, receipt: undefined }
+  const options = { mode: 'queue', dryRun: false, wake: false, task: undefined, receipt: undefined, batch: undefined, deadline: undefined }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     const takeValue = () => {
@@ -85,6 +88,14 @@ function parseArgs(argv) {
         break
       }
       case '--receipt': options.receipt = takeValue(); break
+      // Same optional-value shape as --task: bare flag generates an id.
+      case '--batch': {
+        const next = argv[index + 1]
+        options.batch = next !== undefined && !String(next).startsWith('--') ? String(next) : ''
+        if (options.batch) index += 1
+        break
+      }
+      case '--deadline': options.deadline = takeValue(); break
       case '--wake': options.wake = true; break
       case '--dry-run': options.dryRun = true; break
       case '-h':
@@ -105,9 +116,19 @@ function parseArgs(argv) {
   if (options.receipt !== undefined && !['file', 'queue', 'wake'].includes(options.receipt)) {
     fail('--receipt must be file, queue or wake', 2)
   }
-  // Asking for a receipt destination implies task tracking.
+  // Asking for a receipt destination or a batch implies task tracking.
   if (options.receipt !== undefined && options.task === undefined) options.task = ''
+  if (options.batch !== undefined && options.task === undefined) options.task = ''
+  if (options.deadline !== undefined) parseDuration(options.deadline)
   return options
+}
+
+/** "2h" / "90m" / "600s" -> milliseconds (fails the process on a malformed value). */
+function parseDuration(value) {
+  const match = /^(\d+)(ms|s|m|h)$/i.exec(String(value).trim())
+  if (!match) fail(`--deadline must look like 600s, 90m or 2h (got ${value})`, 2)
+  const unit = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[match[2].toLowerCase()]
+  return Number(match[1]) * unit
 }
 
 function normalizePath(value) {
@@ -193,10 +214,20 @@ async function main() {
   // --task without a value generates one; --receipt implies task tracking (parseArgs).
   const taskId =
     options.task === undefined ? null : options.task || `T-${Date.now().toString(36)}`
-  const meta = taskId ? { taskId, ...(options.receipt ? { receipt: options.receipt } : {}) } : undefined
+  const batchId = options.batch === undefined ? null : options.batch || `B-${Date.now().toString(36)}`
+  const deadlineMs = options.deadline !== undefined ? parseDuration(options.deadline) : undefined
+  const meta = taskId
+    ? {
+        taskId,
+        ...(options.receipt ? { receipt: options.receipt } : {}),
+        ...(batchId ? { batchId, ...(deadlineMs ? { deadlineMs } : {}) } : {}),
+      }
+    : undefined
 
   if (options.dryRun) {
-    console.log(`dry-run: session=${target.id} chars=${chars} wake=${wakeFlag}${taskId ? ` task=${taskId}` : ''} (not sent)`)
+    console.log(
+      `dry-run: session=${target.id} chars=${chars} wake=${wakeFlag}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}${deadlineMs ? ` deadline=${deadlineMs}ms` : ''} (not sent)`,
+    )
     return
   }
 
@@ -240,7 +271,9 @@ async function main() {
     await saveDedupe(dedupeFile, dedupeEntries)
   }
 
-  console.log(`sent session=${target.id} chars=${chars} mode=${options.mode} wake=${wakeFlag}${taskId ? ` task=${taskId}` : ''}`)
+  console.log(
+    `sent session=${target.id} chars=${chars} mode=${options.mode} wake=${wakeFlag}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}`,
+  )
 }
 
 main().catch((error) => fail(error?.message ?? String(error)))
