@@ -181,6 +181,21 @@ curl 'http://NAS:8790/api/board?key=env/nas' -H "Authorization: Bearer $TOKEN"
 
 ---
 
+---
+
+## 四·补、控制台（/console）
+
+浏览器打开 `http://<host>:8790/console`（需先把 `MESH_VIEW_TOKEN` 或 `MESH_ADMIN_TOKEN` 配好；两者都没有时页面 404）。**来源默认只允许 loopback 与内网段（RFC1918）**，可用 `MESH_CONSOLE_ALLOW` 调整；跨任何不可信网络必须先做传输加密，见 [docs/transport-security.md](../docs/transport-security.md)。登录换取 HttpOnly + SameSite=Strict cookie（12 小时）；view token 只读，admin token 可管理。
+
+**配对新节点（两条路）**
+
+1. **注册码**：控制台「新节点配对 → 生成注册码」拿到 8 位码（10 分钟、单次），新节点执行 `POST /api/enroll {"code":"…","name":"…"}` 换 token；页面同时给出落盘/验证命令。
+2. **设备码**：新节点 `POST /api/enroll/request {"name":…,"host":…}` 得到 `user_code` 与 `device_code` → 管理员在控制台「待批准设备」点批准（或 `POST /api/admin/enroll/approve {"user_code":…}`）→ 节点轮询 `POST /api/enroll/token {"device_code":…}`：`202 pending` / `201 {name,token}` / `403 denied` / `410 expired`。`device_code` 只给节点，控制台页面从不显示。
+
+**scopes**：默认全权（`scopes` 留空 = `read,send,board,blob`）。控制台「节点权限与令牌」可按 agent 勾选收紧；收紧后越权 REST 调用返回 `403` + `required_scope`。对应关系：`read` 管收件箱、会话、黑板读、成员列表、blob 读，缺它这些 GET 全部 403；`send` 管 `/api/send` 与标重要；`board` 管黑板写；`blob` 管上传/chunk/commit/删除。
+
+**轮换与审计**：控制台每行「轮换」「吊销」；admin API 为 `POST /api/admin/rotate {name}` 与 `DELETE /api/admin/agents?name=…`（加 `&purge=1` 连行删除）。控制台底部「审计」显示最近操作，完整记录用 `GET /api/admin/audit?limit=50`；轮换、吊销、权限变更都会写 audit。
+
 ## 五、REST 接口一览
 
 | 方法 | 路径 | 鉴权 | 说明 |
@@ -308,6 +323,7 @@ agent 就能把内存或 NAS 磁盘耗尽：
 - `Mcp-Session-Id` 与会话归属绑定：拿着别的 agent 的 session id 调用会得到 403，
   id 泄漏本身不足以冒充身份。
 - `data/` 里有 `admin.token` 和 SQLite（消息正文明文），分发/备份这个目录等于分发凭据。
+- TLS 冒烟：在 `hub/` 下跑 `node scripts/tls-smoke.mjs`——临时自签实例断言 HTTPS 200、明文 HTTP 被拒、无 token 401，全程 loopback，不访问外网。
 
 ---
 
@@ -318,3 +334,4 @@ agent 就能把内存或 NAS 磁盘耗尽：
 - 没有端到端加密（TLS 保护传输层）；库内明文存储，依赖 NAS 的磁盘权限。
 - 单进程 SQLite，写并发在几十次/秒级，家庭规模足够。
 - 自签证书需要客户端 `NODE_EXTRA_CA_CERTS` 信任，详见传输文档。
+- 令牌轮换入口：控制台单行「轮换」或 admin API `POST /api/admin/rotate {name}`；旧 token 立即失效，动作进 audit（`console.rotate` / `admin.rotate`），节点侧不再需要本地 admin-token 文件。
