@@ -157,11 +157,21 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   const { apply } = await import(pathToFileURL(ENTRY).href)
   const port = await freePort()
   const disposers = []
+  const listeners = new Map()
   const ctx = {
     logger: { info() {}, warn() {}, error() {} },
     effect: (fn) => {
       const dispose = fn()
       if (typeof dispose === 'function') disposers.push(dispose)
+    },
+    on: (name, fn) => {
+      if (!listeners.has(name)) listeners.set(name, [])
+      listeners.get(name).push(fn)
+      return () => {
+        const list = listeners.get(name) ?? []
+        const at = list.indexOf(fn)
+        if (at >= 0) list.splice(at, 1)
+      }
     },
     commands: { register: () => () => {} },
     sessionController,
@@ -183,6 +193,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
     tokenFile,
     workspacePath: path.join(tmp, 'inbox'),
     sessionCwd: path.join(tmp, 'inbox'),
+    receiptFile: path.join(tmp, 'receipts.jsonl'),
     catchUpOnStart: false,
     catchUpDelayMs: 600000,
     historySyncIntervalMs: 3600000,
@@ -221,7 +232,11 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
     tokenDir,
     tokenFile,
     conversationsPath,
+    receiptsPath: path.join(tmp, 'receipts.jsonl'),
     external,
+    emit(name, ...args) {
+      for (const fn of listeners.get(name) ?? []) fn(...args)
+    },
     close() {
       if (globalThis.fetch !== realFetch) globalThis.fetch = realFetch
       for (const dispose of disposers) {
@@ -314,6 +329,20 @@ async function waitFor(check, timeoutMs = 10000, stepMs = 100) {
     await new Promise((resolveWait) => setTimeout(resolveWait, stepMs))
   }
   return null
+}
+
+const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms))
+
+function readReceipts(file) {
+  try {
+    return fs
+      .readFileSync(file, 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+  } catch {
+    return []
+  }
 }
 
 async function runCase(name, fn) {
@@ -546,6 +575,72 @@ async function main() {
       backoffCap: nextPollDelayMs({ failures: 20, config }) === 300000,
     }
     report('pull cadence adapts and backs off', Object.values(checked).every(Boolean), JSON.stringify(checked))
+  })
+
+  // 15. task receipts: a completed turn settles once with a code-point-safe summary.
+  await runCase('receipt: completed turn writes one truncated receipt', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-receipt', title: 'receipt target' }], config: { receiptSummaryChars: 20 } })
+    const injected = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'receipt target', text: 'do the thing', meta: { taskId: 'T-completed' } },
+    })
+    const pendingStatus = await request(h.base, '/mesh/status')
+    h.emit('session/event', { id: 'session-receipt' }, { type: 'turn/start', turn: 7 })
+    h.emit('session/event', { id: 'session-receipt' }, { type: 'assistant/message', turn: 7, message: { content: [{ type: 'text', text: 'x'.repeat(40) }] } })
+    h.emit('session/event', { id: 'session-receipt' }, { type: 'turn/end', turn: 7, reason: { kind: 'completed' } })
+    const settled = await waitFor(() => readReceipts(h.receiptsPath).find((receipt) => receipt.taskId === 'T-completed'), 4000)
+    const receipt = settled
+    const ok =
+      injected.json?.taskId === 'T-completed' &&
+      pendingStatus.json?.pendingTasks === 1 &&
+      Boolean(receipt) &&
+      receipt.status === 'completed' &&
+      receipt.reasonKind === 'completed' &&
+      receipt.turn === 7 &&
+      receipt.summary === 'x'.repeat(20) + '…' &&
+      receipt.receiptMode === 'file' &&
+      receipt.durationMs >= 0
+    report(
+      'receipt: completed turn writes one truncated receipt',
+      ok,
+      `taskId=${injected.json?.taskId ?? '-'} pending=${pendingStatus.json?.pendingTasks ?? '-'} status=${receipt?.status ?? '-'} summaryLen=${Array.from(receipt?.summary ?? '').length} turn=${receipt?.turn ?? '-'}`,
+    )
+  })
+
+  // 16. a taskId settles exactly once; later turn/end events in the same session add nothing.
+  await runCase('receipt: one taskId settles once', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-once', title: 'once target' }] })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'once target', text: 'settle me', meta: { taskId: 'T-once' } } })
+    h.emit('session/event', { id: 'session-once' }, { type: 'turn/start', turn: 3 })
+    h.emit('session/event', { id: 'session-once' }, { type: 'turn/end', turn: 3, reason: { kind: 'completed' } })
+    await waitFor(() => readReceipts(h.receiptsPath).filter((receipt) => receipt.taskId === 'T-once').length === 1, 4000)
+    h.emit('session/event', { id: 'session-once' }, { type: 'turn/end', turn: 4, reason: { kind: 'completed' } })
+    await sleep(250)
+    const rows = readReceipts(h.receiptsPath).filter((receipt) => receipt.taskId === 'T-once')
+    const status = await request(h.base, '/mesh/status')
+    const ok = rows.length === 1 && status.json?.pendingTasks === 0 && status.json?.lastReceipt?.taskId === 'T-once'
+    report('receipt: one taskId settles once', ok, `rows=${rows.length} pending=${status.json?.pendingTasks} last=${status.json?.lastReceipt?.status ?? '-'}`)
+  })
+
+  // 17. error turns keep the LLM failure code in reasonDetail.
+  await runCase('receipt: error turn records the failure code', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-error', title: 'error target' }] })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'error target', text: 'fail me', meta: { taskId: 'T-error' } } })
+    h.emit('session/event', { id: 'session-error' }, { type: 'turn/start', turn: 2 })
+    h.emit('session/event', { id: 'session-error' }, { type: 'turn/end', turn: 2, reason: { kind: 'error', error: { code: 'provider_error' } } })
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-error'), 4000)
+    const ok = Boolean(receipt) && receipt.status === 'error' && receipt.reasonDetail === 'provider_error' && receipt.turn === 2
+    report('receipt: error turn records the failure code', ok, `status=${receipt?.status ?? '-'} detail=${receipt?.reasonDetail ?? '-'} turn=${receipt?.turn ?? '-'}`)
+  })
+
+  // 18. no turn/start inside receiptStallMs -> not-started receipt, pending cleared.
+  await runCase('receipt: stalled task becomes not-started', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-stall', title: 'stall target' }], config: { receiptStallMs: 1000 } })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'stall target', text: 'never starts', meta: { taskId: 'T-stall' } } })
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-stall'), 4000)
+    const status = await request(h.base, '/mesh/status')
+    const ok = Boolean(receipt) && receipt.status === 'not-started' && receipt.reasonKind === 'not-started' && /receiptStallMs|1000ms/.test(receipt.reasonDetail ?? '') && status.json?.pendingTasks === 0
+    report('receipt: stalled task becomes not-started', ok, `status=${receipt?.status ?? '-'} detail=${receipt?.reasonDetail ?? '-'} pending=${status.json?.pendingTasks}`)
   })
 
   const failed = results.filter((result) => !result.ok)

@@ -178,6 +178,86 @@ function enrollAgentName(config) {
   return `dsh-${host || 'node'}`.slice(0, 32)
 }
 
+/**
+ * TurnEndReason -> the receipt's `status` / `reasonKind` / `reasonDetail`.
+ * Kept pure (no closure state) so the mapping is testable without a host.
+ */
+export function classifyTurnEnd(reason) {
+  const kind = typeof reason === 'string' ? reason : String(reason?.kind ?? 'completed')
+  const detailOf = (value) => {
+    if (!value) return null
+    if (typeof value === 'string') return value
+    const nested = value.code ?? value.name ?? value.kind ?? value.reason ?? value.message
+    return nested ? String(nested) : null
+  }
+  switch (kind) {
+    case 'error':
+      return { status: 'error', reasonKind: 'error', reasonDetail: detailOf(reason?.error) }
+    case 'aborted':
+      return { status: 'aborted', reasonKind: 'aborted', reasonDetail: detailOf(reason?.reason ?? reason?.cause) }
+    case 'blocked':
+      return { status: 'blocked', reasonKind: 'blocked', reasonDetail: detailOf(reason?.reason ?? reason?.cause) }
+    case 'completed':
+    case 'max-tokens':
+    case 'interrupted':
+    case 'forked':
+      return { status: kind, reasonKind: kind, reasonDetail: null }
+    default:
+      return { status: kind, reasonKind: kind, reasonDetail: null }
+  }
+}
+
+/** Truncate by code points: a cut never splits a surrogate pair. */
+export function truncateText(text, maxChars) {
+  const chars = Array.from(String(text ?? ''))
+  const limit = Math.max(0, Math.trunc(Number(maxChars) || 0))
+  if (chars.length <= limit) return chars.join('')
+  return chars.slice(0, limit).join('') + '…'
+}
+
+/** The one receipt record: the JSONL line and the [RECEIPT] body share these fields. */
+export function buildReceipt({
+  taskId,
+  sessionId,
+  turn = null,
+  status,
+  reasonKind = status,
+  reasonDetail = null,
+  injectedAt = null,
+  endedAt = null,
+  summary = '',
+  receiptMode = 'file',
+  summaryChars = 300,
+} = {}) {
+  const at = endedAt ?? Date.now()
+  return {
+    taskId: taskId ?? null,
+    sessionId: sessionId ?? null,
+    turn: turn ?? null,
+    status: status ?? 'completed',
+    reasonKind: reasonKind ?? status ?? null,
+    reasonDetail: reasonDetail ?? null,
+    injectedAt: injectedAt ?? null,
+    endedAt: at,
+    durationMs: injectedAt ? Math.max(0, at - injectedAt) : null,
+    summary: truncateText(summary, summaryChars),
+    receiptMode,
+  }
+}
+
+/** Plain text of one assistant message: string, {text}, or content/parts parts. */
+export function messageText(message) {
+  if (!message) return ''
+  if (typeof message === 'string') return message.trim()
+  if (typeof message.text === 'string') return message.text.trim()
+  const parts = Array.isArray(message.content) ? message.content : Array.isArray(message.parts) ? message.parts : []
+  return parts
+    .filter((part) => part && (part.type === 'text' || typeof part.text === 'string'))
+    .map((part) => String(part.text ?? ''))
+    .join('\n')
+    .trim()
+}
+
 function normalizeBase(config) {
   const c = config ?? {}
   // Secrets may be inlined (older configs) or, preferably, read from owner-only files so
@@ -254,6 +334,15 @@ function normalizeBase(config) {
     catchUpOnStart: c.catchUpOnStart !== false,
     catchUpDelayMs: Number(c.catchUpDelayMs ?? 12000),
     catchUpMaxConversations: Number(c.catchUpMaxConversations ?? 3),
+    // --- task receipts (0.5.1) -------------------------------------------------------
+    // A task injected with meta.taskId gets exactly one receipt when its turn ends (or
+    // when it never starts). file = JSONL only (quiet default); queue/wake also notify
+    // receiptTo. Nothing here ever carries a token or a secret.
+    receiptMode: ['file', 'queue', 'wake'].includes(String(c.receiptMode)) ? String(c.receiptMode) : 'file',
+    receiptFile: c.receiptFile ? String(c.receiptFile) : join(homedir(), '.dsh', 'mesh-waker', 'receipts.jsonl'),
+    receiptTo: c.receiptTo ? String(c.receiptTo).trim() : '',
+    receiptSummaryChars: clampInterval(c.receiptSummaryChars, 300, 20, 4000),
+    receiptStallMs: clampInterval(c.receiptStallMs, 600000, 1000, 86_400_000),
     permissionPresetByTrust: {
       strict: 'read-only',
       normal: 'workspace-write',
@@ -328,6 +417,9 @@ export function apply(ctx, config) {
     // cadence is, and when the next one fires (the status route reports the countdown).
     lastPullAt: null,
     pollIntervalMs: c.pollIntervalMs,
+    // Task receipts: how many are waiting for their turn to end, and the latest one written.
+    pendingTasks: 0,
+    lastReceipt: null,
   }
 
   // Pull loop bookkeeping.
@@ -1927,6 +2019,200 @@ export function apply(ctx, config) {
     hubFeaturesStarted = false
   }
 
+  // ---------------------------------------------------------------- task receipts
+  //
+  // /mesh/inject may carry meta.taskId; when that session's turn ends we write exactly one
+  // receipt (classification and record shape are the pure functions above). file = JSONL
+  // only; queue/wake additionally inject a short [RECEIPT] message into receiptTo. Nothing
+  // in this path logs a token or a secret.
+
+  const pendingTasks = new Map()
+  const turnStartedAt = new Map()
+  const assistantText = new Map()
+  const receiptTimers = new Set()
+  let lastReceipt = null
+
+  function maxTurnFor(sessionId) {
+    const known = turnStartedAt.get(sessionId)
+    return Number.isFinite(known) ? known : null
+  }
+
+  function writeReceiptFile(receipt) {
+    try {
+      mkdirSync(dirname(c.receiptFile), { recursive: true })
+      appendFileSync(c.receiptFile, `${JSON.stringify(receipt)}\n`, { mode: 0o600 })
+      return true
+    } catch (error) {
+      fileLog(`writing receipt failed: ${error.message}`)
+      state.lastError = `writing receipt failed: ${error.message}`
+      return false
+    }
+  }
+
+  function receiptBody(receipt) {
+    const first = `[RECEIPT] ${receipt.taskId} ${receipt.status} ${receipt.durationMs ?? 0}ms`
+    return receipt.summary ? `${first}\n${receipt.summary}` : first
+  }
+
+  async function deliverReceipt(receipt) {
+    if (receipt.receiptMode === 'file') return
+    if (!c.receiptTo) {
+      state.lastError = 'receiptTo is empty; receipt written to file only'
+      fileLog('receipt delivery skipped: receiptTo is empty')
+      return
+    }
+    let target
+    try {
+      target = resolveLocalSession({ session: c.receiptTo, title: c.receiptTo })
+    } catch (error) {
+      state.lastError = `receiptTo not resolved: ${error.message}`
+      fileLog(`receipt delivery skipped: ${error.message}`)
+      return
+    }
+    let mode = 'queue'
+    if (receipt.receiptMode === 'wake') {
+      if (c.wakeSecret) mode = 'steer'
+      else log.warn('[mesh-waker] receiptMode=wake needs wakeSecret; delivering as queue')
+    }
+    try {
+      await promptWithResume(target.id, receiptBody(receipt), mode)
+      fileLog(`receipt ${receipt.taskId} delivered to ${target.id} (${receipt.receiptMode}, mode=${mode})`)
+    } catch (error) {
+      state.lastError = `receipt delivery failed: ${error.message}`
+      fileLog(`receipt delivery failed: ${error.message}`)
+    }
+  }
+
+  function clearPending(task) {
+    if (!task) return
+    if (task.stallTimer) {
+      clearTimeout(task.stallTimer)
+      receiptTimers.delete(task.stallTimer)
+      task.stallTimer = null
+    }
+  }
+
+  function settleTask(taskId, task, details) {
+    if (!task || task.settled) return null
+    task.settled = true
+    clearPending(task)
+    pendingTasks.delete(taskId)
+    const shot = assistantText.get(task.sessionId)
+    const summary =
+      shot && (details.turn === null || details.turn === undefined || shot.turn === null || shot.turn === details.turn)
+        ? shot.text
+        : ''
+    const receipt = buildReceipt({
+      taskId,
+      sessionId: task.sessionId,
+      turn: details.turn ?? null,
+      status: details.status,
+      reasonKind: details.reasonKind ?? details.status,
+      reasonDetail: details.reasonDetail ?? null,
+      injectedAt: task.injectedAt,
+      endedAt: details.endedAt ?? Date.now(),
+      summary,
+      receiptMode: task.receiptMode,
+      summaryChars: c.receiptSummaryChars,
+    })
+    writeReceiptFile(receipt)
+    lastReceipt = { taskId: receipt.taskId, status: receipt.status, at: receipt.endedAt }
+    state.lastReceipt = lastReceipt
+    state.pendingTasks = pendingTasks.size
+    fileLog(`receipt ${taskId} ${receipt.status} turn=${receipt.turn ?? '-'} duration=${receipt.durationMs}ms`)
+    void deliverReceipt(receipt)
+    return receipt
+  }
+
+  function registerPendingTask(target, meta) {
+    const taskId = String(meta?.taskId ?? '').trim()
+    if (!/^[A-Za-z0-9._:-]{1,80}$/.test(taskId)) throw new Error('meta.taskId must match [A-Za-z0-9._:-]{1,80}')
+    const requested = String(meta?.receipt ?? '')
+    const receiptMode = ['file', 'queue', 'wake'].includes(requested) ? requested : c.receiptMode
+    const previous = pendingTasks.get(taskId)
+    if (previous) clearPending(previous)
+    const task = {
+      sessionId: target.id,
+      injectedAt: Date.now(),
+      baselineTurn: maxTurnFor(target.id),
+      receiptMode,
+      settled: false,
+      stallTimer: null,
+    }
+    pendingTasks.set(taskId, task)
+    state.pendingTasks = pendingTasks.size
+    const timer = setTimeout(() => {
+      receiptTimers.delete(timer)
+      if (task.settled) return
+      settleTask(taskId, task, {
+        turn: null,
+        status: 'not-started',
+        reasonKind: 'not-started',
+        reasonDetail: `no turn/start within ${c.receiptStallMs}ms`,
+      })
+    }, c.receiptStallMs)
+    timer.unref?.()
+    task.stallTimer = timer
+    receiptTimers.add(timer)
+    fileLog(`task ${taskId} pending on ${target.id} baselineTurn=${task.baselineTurn ?? 'unknown'} receipt=${receiptMode}`)
+    return taskId
+  }
+
+  function cancelPendingTask(taskId) {
+    const task = pendingTasks.get(taskId)
+    if (!task) return
+    clearPending(task)
+    pendingTasks.delete(taskId)
+    state.pendingTasks = pendingTasks.size
+  }
+
+  /** turn/start arms/stops the stall timer, assistant/message keeps the last text, turn/end settles. */
+  function handleSessionEvent(session, event) {
+    try {
+      const sessionId = typeof session === 'string' ? session : session?.id ?? session?.sessionId
+      if (!sessionId || !event || typeof event !== 'object') return
+      const type = String(event.type ?? '')
+      const turn = Number.isFinite(Number(event.turn)) ? Number(event.turn) : null
+      if (type === 'turn/start') {
+        if (turn !== null) turnStartedAt.set(sessionId, Math.max(turn, turnStartedAt.get(sessionId) ?? 0))
+        for (const task of pendingTasks.values()) {
+          if (task.sessionId !== sessionId || task.settled) continue
+          if (task.baselineTurn === null || (turn !== null && turn > task.baselineTurn)) clearPending(task)
+        }
+        return
+      }
+      if (type === 'assistant/message') {
+        const text = messageText(event.message)
+        if (text) assistantText.set(sessionId, { turn, text })
+        return
+      }
+      if (type === 'turn/end') {
+        const classified = classifyTurnEnd(event.reason)
+        for (const [taskId, task] of [...pendingTasks]) {
+          if (task.sessionId !== sessionId || task.settled) continue
+          if (task.baselineTurn !== null && turn !== null && turn < task.baselineTurn) continue
+          settleTask(taskId, task, { turn, ...classified })
+        }
+      }
+    } catch (error) {
+      fileLog(`session/event handling failed: ${error.message}`)
+    }
+  }
+
+  function disposeReceipts() {
+    for (const task of pendingTasks.values()) clearPending(task)
+    pendingTasks.clear()
+    receiptTimers.clear()
+    state.pendingTasks = 0
+  }
+
+  if (typeof ctx.on === 'function') {
+    ctx.effect(() => {
+      const off = ctx.on('session/event', handleSessionEvent)
+      return typeof off === 'function' ? off : undefined
+    })
+  }
+
   ctx.effect(() => {
     // Trust anchors must be in place before any request; a bad caFile leaves the plugin
     // local-only instead of failing to start.
@@ -2162,10 +2448,19 @@ export function apply(ctx, config) {
         if (!text) throw new Error('text is required')
         const target = resolveLocalSession(draft)
         const mode = draft.mode === 'steer' ? 'steer' : 'queue'
-        await promptWithResume(target.id, text, mode)
-        fileLog(`injected ${text.length} chars into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}`)
+        const meta = draft.meta && typeof draft.meta === 'object' ? draft.meta : {}
+        // Register before prompting: a very fast turn can end before this request returns.
+        let taskId = null
+        try {
+          if (meta.taskId) taskId = registerPendingTask(target, meta)
+          await promptWithResume(target.id, text, mode)
+        } catch (error) {
+          if (taskId) cancelPendingTask(taskId)
+          throw error
+        }
+        fileLog(`injected ${text.length} chars into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}${taskId ? ` task=${taskId}` : ''}`)
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-        res.end(JSON.stringify({ ok: true, sessionId: target.id, title: target.title, mode }))
+        res.end(JSON.stringify({ ok: true, sessionId: target.id, title: target.title, mode, taskId }))
       } catch (error) {
         res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: false, error: error.message }))
@@ -2198,6 +2493,12 @@ export function apply(ctx, config) {
               nextPollIn: nextPullAt ? Math.max(0, Math.round((nextPullAt - Date.now()) / 1000)) : null,
               caFingerprint: caFingerprint ? `${caFingerprint.slice(0, 16)}…` : null,
               hubConnected: hubReady,
+              // Task receipts: count waiting for turn/end, the latest settled one, and where
+              // they go. The file path is a local path, never a credential.
+              pendingTasks: pendingTasks.size,
+              lastReceipt,
+              receiptMode: c.receiptMode,
+              receiptFile: c.receiptFile,
               ...state,
               throttled: throttleSummary(),
               historyCached: history.size,
@@ -2729,6 +3030,7 @@ export function apply(ctx, config) {
 
     return () => {
       disposeHubWork()
+      disposeReceipts()
       try {
         server.close()
       } catch {

@@ -2,12 +2,24 @@
 
 本文件记录 `dsh-mesh-waker` 的变更。格式仿 `hub/CHANGES.md`：每节写清改了什么、怎么复验。
 
-> **发版状态**：`0.4.56`–`0.5.0` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
-> `next` 是 0.4.55）；0.4.60 与 0.5.0 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
+> **发版状态**：`0.4.56`–`0.5.1` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
+> `next` 是 0.4.55）；0.4.60、0.5.0 与 0.5.1 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 0.5.0 激活矩阵）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 0.5.0 激活矩阵 + 0.5.1 回执）。
 
 ---
+
+## v0.5.1（2026-10-29，插件级任务回执）
+
+| 项 | 内容 |
+|---|---|
+| meta 透传 | `/mesh/inject` 支持可选 `meta { taskId, receipt }`（不污染正文），响应回显 `taskId`；`scripts/mesh-dispatch.mjs` 新增 `--task [id]`（缺省自动 `T-<base36 时间戳>`，`--receipt` 隐含开启）与 `--receipt file\|queue\|wake`，成功输出打印 `task=<id>` |
+| 结算 | 订阅 `ctx.on('session/event')`：`turn/start` 维护每个会话的最大 turn 并解除「未开工」判定，`assistant/message` 记住本 turn 最后一条文本，`turn/end` 按 `turn >= baselineTurn` 结算 pending 任务；一个 taskId 只结算一次 |
+| 回执字段 | `taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode`；`status` 覆盖 `completed / aborted / blocked / error / max-tokens / interrupted / forked / not-started`；摘要按码点截断 |
+| 三档去向 | `receiptMode=file`（默认，只追加 `receiptFile`）→ `queue`（再把 `[RECEIPT]` 注入 `receiptTo`）→ `wake`（再唤醒；无 `wakeSecret` 时降级 queue 并 WARN）；`receiptTo` 解析不到只写文件 + `lastError`，绝不打扰其他会话 |
+| 未开工检测 | 注入后 `receiptStallMs`（默认 600000）内无 `turn/start` → `status:"not-started"` 并清理 pending；插件 dispose 时清理全部 pending 与计时器 |
+| 可见性 | `/mesh/status` 增 `pendingTasks`、`lastReceipt`、`receiptMode`、`receiptFile`；面板设置区显示只读「任务回执」行（方式 + 最近一条 + 等待数） |
+| 验证 | `node test/waker-endpoints.test.js` 17/17：新增 4 例（completed + 摘要截断、单次结算、error 带 `provider_error`、stall 1s → not-started）；另一轮手工实例写出 `receipts.jsonl` 且默认 file 模式未打扰任何会话 |
 
 ## v0.5.0（2026-10-29，pull 默认 + 自举接入 + standalone）
 

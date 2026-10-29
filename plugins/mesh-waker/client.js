@@ -1040,6 +1040,22 @@ try {
           : null,
         h(
           Row,
+          {
+            title: '任务回执',
+            description: '带 taskId 的 inject 在回合结束时写一条 JSONL；queue/wake 会再通知回执会话。只读。',
+          },
+          h(
+            'span',
+            { style: { fontSize: 12, opacity: 0.8 } },
+            (status.receiptMode ?? 'file') +
+              (status.lastReceipt
+                ? ` · 最近 ${status.lastReceipt.taskId} ${status.lastReceipt.status} ${new Date(status.lastReceipt.at).toLocaleTimeString()}`
+                : ' · 暂无回执') +
+              (status.pendingTasks ? ` · 等待结算 ${status.pendingTasks}` : ''),
+          ),
+        ),
+        h(
+          Row,
           { title: '信任级别（默认）', description: '自动唤醒会话的执行口径与权限：strict 只读 / normal 需批准 / full 直接执行。只在本机生效。' },
           h(
             MiniSelect,

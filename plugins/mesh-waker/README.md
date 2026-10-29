@@ -63,6 +63,29 @@ dsh plugin --profile web add dsh-mesh-waker
 
 CA 只记 sha256 前 16 位，token 只记 `fp=<前6位>… len=<n>`；任何日志都不打印密钥。
 
+## 任务回执（0.5.1）
+
+`/mesh/inject` 可以带 `meta.taskId`（不污染正文）：插件在该会话的回合结束时写**恰好一条**回执，一个 taskId 只结算一次；配合 `scripts/mesh-dispatch.mjs` 使用：
+
+```bash
+node scripts/mesh-dispatch.mjs --title "mesh · hub" --file task.txt --task T-20261029-hub
+node scripts/mesh-dispatch.mjs --title "mesh · hub" --file task.txt --task --receipt queue
+```
+
+`--task` 不带值时自动生成 `T-<base36 时间戳>`；`--receipt` 可覆盖全局默认（并隐含开启 task）。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `receiptMode` | `file` | `file` 只写 JSONL；`queue` 再把 `[RECEIPT]` 注入 `receiptTo`（mode=queue）；`wake` 额外唤醒（需 `wakeSecret`，否则降级 queue 并记 WARN） |
+| `receiptFile` | `~/.dsh/mesh-waker/receipts.jsonl` | 追加写，一行一条 JSON（0600） |
+| `receiptTo` | 空 | 接收回执的会话：标题（如 `mesh · 协调`）或 `session-…`；为空则只写文件 |
+| `receiptSummaryChars` | `300` | 摘要按**码点**截断，不会切出半个字符 |
+| `receiptStallMs` | `600000` | 注入后这么久仍无 `turn/start`，判 `not-started` |
+
+回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode`。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。注入给 `receiptTo` 的正文首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`，第二行是摘要。
+
+> 回执只走**本机** inject，绝不推到 hub；`receiptTo` 解析不到时只写文件并置 `lastError`，不会去打扰别的会话。日志与回执里没有 token、密钥。
+
 
 ## 本机会话协作（不经过中枢）
 

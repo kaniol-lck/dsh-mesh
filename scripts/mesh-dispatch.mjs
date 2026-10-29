@@ -47,6 +47,9 @@ Options:
   --wake             coordinator wake-up: require the "[WAKE]" first line and
                      dedupe the same target+payload for 60s
   --mode <mode>      queue (default) or steer
+  --task [id]        attach a task id so the waker writes a receipt when the turn
+                     ends; "--task" alone generates T-<base36 timestamp>
+  --receipt <mode>   file | queue | wake (waker default when omitted); implies --task
   --repo <path>      repo root used to filter by cwd (default: process.cwd())
   --dry-run          resolve and print the target, send nothing
   -h, --help         show this help
@@ -58,7 +61,7 @@ function fail(message, code = 1) {
 }
 
 function parseArgs(argv) {
-  const options = { mode: 'queue', dryRun: false, wake: false }
+  const options = { mode: 'queue', dryRun: false, wake: false, task: undefined, receipt: undefined }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     const takeValue = () => {
@@ -74,6 +77,14 @@ function parseArgs(argv) {
       case '--text': options.text = takeValue(); break
       case '--repo': options.repo = takeValue(); break
       case '--mode': options.mode = takeValue(); break
+      // Optional value: "--task" alone means "generate one", "--task T-1" uses T-1.
+      case '--task': {
+        const next = argv[index + 1]
+        options.task = next !== undefined && !String(next).startsWith('--') ? String(next) : ''
+        if (options.task) index += 1
+        break
+      }
+      case '--receipt': options.receipt = takeValue(); break
       case '--wake': options.wake = true; break
       case '--dry-run': options.dryRun = true; break
       case '-h':
@@ -91,6 +102,11 @@ function parseArgs(argv) {
   if (!options.title && !options.session) fail('pass --title or --session', 2)
   if (options.title && options.session) fail('--title and --session are mutually exclusive', 2)
   if (!['queue', 'steer'].includes(options.mode)) fail('--mode must be queue or steer', 2)
+  if (options.receipt !== undefined && !['file', 'queue', 'wake'].includes(options.receipt)) {
+    fail('--receipt must be file, queue or wake', 2)
+  }
+  // Asking for a receipt destination implies task tracking.
+  if (options.receipt !== undefined && options.task === undefined) options.task = ''
   return options
 }
 
@@ -174,9 +190,13 @@ async function main() {
 
   const chars = text.length
   const wakeFlag = options.wake ? 'yes' : 'no'
+  // --task without a value generates one; --receipt implies task tracking (parseArgs).
+  const taskId =
+    options.task === undefined ? null : options.task || `T-${Date.now().toString(36)}`
+  const meta = taskId ? { taskId, ...(options.receipt ? { receipt: options.receipt } : {}) } : undefined
 
   if (options.dryRun) {
-    console.log(`dry-run: session=${target.id} chars=${chars} wake=${wakeFlag} (not sent)`)
+    console.log(`dry-run: session=${target.id} chars=${chars} wake=${wakeFlag}${taskId ? ` task=${taskId}` : ''} (not sent)`)
     return
   }
 
@@ -198,7 +218,7 @@ async function main() {
   const sent = await fetch(`${BASE}/mesh/inject`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ session: target.id, text, mode: options.mode }),
+    body: JSON.stringify({ session: target.id, text, mode: options.mode, ...(meta ? { meta } : {}) }),
   })
   const raw = await sent.text()
   let result
@@ -220,7 +240,7 @@ async function main() {
     await saveDedupe(dedupeFile, dedupeEntries)
   }
 
-  console.log(`sent session=${target.id} chars=${chars} mode=${options.mode} wake=${wakeFlag}`)
+  console.log(`sent session=${target.id} chars=${chars} mode=${options.mode} wake=${wakeFlag}${taskId ? ` task=${taskId}` : ''}`)
 }
 
 main().catch((error) => fail(error?.message ?? String(error)))
