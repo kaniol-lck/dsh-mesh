@@ -133,6 +133,36 @@ openssl x509 -in server.crt -noout -enddate
 
 ## 4. 客户端接入
 
+### 怎么把 CA 发给对端
+
+对端只需要 **`ca.crt`**（CA 信任锚）；`ca.key` 与 `server.key` 永不外发，
+`server.crt` 是叶子证书、**不能当信任锚**。
+
+中枢侧已把 CA 挂在同一个 TLS 入口上（nginx `location = /ca.crt`，`application/x-x509-ca-cert`，
+经 frp 暴露在 `https://<CLOUD-IP>:18790/ca.crt`）。对端三步：
+
+```bash
+# 1) 首次取 CA（-k 只用于这一次：此时还没有可信任的锚）
+curl -k https://<CLOUD-IP>:18790/ca.crt -o ca.crt
+# 2) 核对指纹（与中枢侧公布值比对，不一致就不要继续）
+openssl x509 -in ca.crt -noout -fingerprint -sha256
+# 3) 让 Node 信任它，再验证一次
+export NODE_EXTRA_CA_CERTS=$PWD/ca.crt      # Windows: setx NODE_EXTRA_CA_CERTS ... 后重启 DSH
+curl --cacert ca.crt https://<CLOUD-IP>:18790/health    # 期望 200
+```
+
+Windows 的 `curl.exe`（schannel）另需 `--ssl-no-revoke`（见下）。
+
+- 本环境实测（2026-10-29）：`/ca.crt` 返回 200 / 1053 bytes；sha256 与中枢侧一致
+  `dc0efcd20925f286d052a0edfc330ec968aba81d43cbbb9f2ae77d3a7e5e3105`；
+  用取回的 CA 再请求 `/health` → 200。CA 主体 `CN=dsh-mesh local CA`，到期 **2036-10-26**。
+- **常见错误**：把 `server.crt`（叶子）当信任锚 → `UNABLE_TO_VERIFY_LEAF_SIGNATURE` /
+  `SELF_SIGNED_CERT_IN_CHAIN`；用 `NODE_TLS_REJECT_UNAUTHORIZED=0` 绕过 → **等于关掉校验，禁止**。
+- **为什么保留 CA + 叶子两段式**：轮换时只换叶子、客户端 CA 不动；
+  单文件自签叶子方案每次轮换都要重新分发到每台机器。
+- `/ca.crt` 是公开文件，不含私钥；`ca.key` 只留在中枢侧（本机 `.worklog/dispatch/certs/`
+  与 NAS 证书目录），永不进仓库。
+
 ### Node / DSH 主机
 
 ```bash
@@ -170,6 +200,9 @@ curl.exe --cacert ca.crt --ssl-no-revoke https://<CLOUD-IP>:18790/health
   2. 重启 `dsh-mesh-tls` 容器加载新证书；
   3. 若 CA 未变：只更新服务端，客户端不动；若已重建 CA：重新分发 `ca.crt` 并重配 `NODE_EXTRA_CA_CERTS`；
   4. 按 §6 全量复验，确认旧证书不再可用。
+
+一句话：**只换叶子 → 重启容器、客户端不动；换 CA → 所有客户端重新走 §4 的 `/ca.crt` 三步**
+（这也是把 CA 挂在 TLS 入口上的最大价值）。
 
 检查：
 
