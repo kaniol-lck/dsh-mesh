@@ -47,6 +47,8 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: applicat
 
 原则：**一个任务一个会话**；写清楚“只改哪里、什么算完成、怎么回报”。
 
+测试口径：单元/集成测试默认用临时实例（临时端口 + 临时数据目录）；端到端验收允许打生产中枢，但按 AGENTS「自测与生产中枢」四条管理（`selftest-`/`test-` 前缀、当场 purge、WORKLOG 登记、巡检兜底）。
+
 ### 用 Node 发，不要用 PS 5.1 的 ConvertTo-Json
 
 PowerShell 5.1 的 `ConvertTo-Json` 会把多行字符串序列化成 `{"value":"…"}`，经 `/mesh/inject` 投递后对方只收到 15 字符的 `[object Object]`（`Invoke-RestMethod -Body` 同理）。把任务正文写成纯文本文件，用脚本发：
