@@ -17,7 +17,8 @@
 
 - `token` 模式下 `X-Mesh-Agent` 头**一律忽略**，身份只由 token 决定，防止冒充；
 - 每次认证成/败都进 `audit` 表；失败按来源 IP 限流（只慢失败请求，不锁整网）；
-- wake secret 由中枢懒生成，节点用自己的 agent token 调 `GET /api/wake-secret` 取回并落盘（0600）。
+- wake secret 由中枢懒生成，节点用自己的 agent token 调 `GET /api/wake-secret` 取回并落盘（0600）；
+- `GET /api/bootstrap` 是**唯一**免鉴权端点：只返回端点信息与（可选）CA 公钥，按来源 IP 限速 60 次/分钟（超限 429）；**不含**任何 token / wake_secret / 内部路径，可安全公开。
 
 ---
 

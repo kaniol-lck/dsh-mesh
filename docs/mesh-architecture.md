@@ -45,6 +45,28 @@
 - **`/api/inbox` 排序与游标**：`order=asc|desc`（默认 `asc`）、`before=<epoch_ms>` 游标；响应含 `has_more` / `next_before`。**积压大时不要用默认 ASC 只看首页**——最新消息会在页外（2026-10-29 真实事故：一条 7.7KB 方案书因此静默 4.4 小时）。
 - MCP `mesh_inbox` 同样接受 `order`；`unread_only=false` 时默认 `desc`（方便直接看最新）。
 
+## 同步模型（pull 基线，push 加速）
+
+三种模式，链路不同但**处理路径是同一条**（group by conversation → 冷却/合并 → 建或复用 turn）：
+
+| 模式 | 链路 | 前提 |
+|---|---|---|
+| **pull**（默认） | 客户端定时 `GET /api/inbox?unread=1&order=desc&limit=20&claim=1` → 处理 → `mark_read=1` | 只要**出站** HTTPS 可达 |
+| **push**（可选加速） | 中枢 `POST` HMAC ping 到 `advertiseHost:port` → 客户端被叫醒 → 拉收件箱 | 中枢能**入站**连到你 |
+| **auto**（默认值） | pull 常开；有 `advertiseHost` 且注册成功时叠加 push，不可达静默回落 | 同上 |
+
+**设计原则：pull 是基线，push 是加速。** 理由：多数用户处在双 NAT、无公网 IP、公司防火墙环境，
+「零入站」才能装完即用；push 只用来省掉轮询间隔，不能成为接入前提。
+
+延迟对照：pull 常态 30s、有消息后 5s、连续空轮询退到 60s；push 通常十几秒内（本机实测 604ms 起一轮）。
+
+**claim 两阶段为什么必要**（`claimed_at` 租约 + `read_at` 已读）：
+
+1. `claim=1` 给返回行打 `claimed_at`（默认 5 分钟租约），表示「某个 puller 正在处理」，**不等于已读**；
+2. 处理完才 `mark_read=1` 写 `read_at`，之后不再返回；
+3. 进程崩溃/超时：租约过期后消息会被重新 claim → **至少一次投递**，不丢消息；
+4. 代价是可能重复处理，靠 conversation 冷却与去重保证「不重复开 turn」。
+
 ## 成员差异
 
 | 成员 | 收信 | 唤醒延迟 | 执行面 |
