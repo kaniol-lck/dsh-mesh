@@ -74,7 +74,7 @@ CA 只记 sha256 前 16 位，token 只记 `fp=<前6位>… len=<n>`；任何日
 | `POST /mesh/inject` | 向已有会话投一轮任务：按 `session`（完整 id）→ 精确标题 → 标题唯一子串寻址；歧义或找不到返回 400。`mode` 为 `queue`（默认，等当前回合）或 `steer`（打断当前回合） |
 | `POST /mesh/sessions/create` | 新建会话并绑定工作区，可选首轮 `prompt`；返回 `sessionId` / `workspaceId` / `workspacePath` / `prompted` |
 | `POST /mesh/sessions/archive` | 归档会话：日志保留、侧栏隐藏；存活的会话会被宿主拒绝（`workspace/session-active`） |
-| `POST /mesh/sessions/delete` | 删除会话：先停掉在跑的 agent（`sessionController.cancel` + 宿主 dispose 钩子），摘掉 `conversations.json` 里指向它的绑定，再删会话目录；停不下来的返回 **409**，不会假报成功 |
+| `POST /mesh/sessions/delete` | 删除会话：支持 `session`（id，可省略 `session-` 前缀）或 `title`（精确/唯一子串）寻址，标题歧义返回 400 并列出候选；先停掉在跑的 agent（`sessionController.cancel` + 宿主 dispose 钩子），摘掉 `conversations.json` 里指向它的绑定，再删会话目录；停不下来的返回 **409**，不会假报成功 |
 
 可直接复制：
 
@@ -93,7 +93,7 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/archive -H 'content-type
 curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/delete -H 'content-type: application/json' -d '{"session":"session-…"}'
 ```
 
-`delete` 只删 waker 能发现的会话（id 必须出现在 `GET /mesh/sessions` 里），不接受路径；`archive` 与 `inject` 支持标题寻址，`delete` 目前只认完整 id。
+`delete` 只删 waker 能发现的会话（目标必须出现在 `GET /mesh/sessions` 里），不接受路径；`inject`、`archive`、`delete` 都支持 `session`（id）或 `title`（精确 / 唯一子串）寻址，歧义时返回 400 并列出候选。
 
 细节与约定见 [docs/local-sessions.md](https://github.com/kaniol-lck/dsh-mesh/blob/main/docs/local-sessions.md)；端点验收：`node test/waker-endpoints.test.js`。
 

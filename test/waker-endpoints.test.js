@@ -375,7 +375,7 @@ async function main() {
   await runCase('delete of an unknown session is 4xx', async (boot) => {
     const h = await boot()
     const res = await request(h.base, '/mesh/sessions/delete', { method: 'POST', body: { session: 'session-does-not-exist' } })
-    const ok = res.status === 404 && res.json?.ok === false && /not found/.test(res.json?.error ?? '')
+    const ok = res.status === 404 && res.json?.ok === false && /找不到会话|not found/.test(res.json?.error ?? '')
     report('delete of an unknown session is 4xx', ok, `status=${res.status} ok=${res.json?.ok} error=${res.json?.error ?? '-'}`)
   })
 
@@ -419,7 +419,34 @@ async function main() {
     report('delete refuses a live session it cannot stop', ok, `status=${res.status} stillListed=${ids.includes('session-stuck')} error=${res.json?.error ?? '-'}`)
   })
 
-  // 7. standalone: no hubUrl still listens on loopback and makes zero network requests.
+  // 7. delete addresses a session by its exact title (same lookup as inject/archive).
+  await runCase('delete accepts an exact title', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-titled', title: 'exact title' }] })
+    const deleted = await request(h.base, '/mesh/sessions/delete', { method: 'POST', body: { title: 'exact title' } })
+    const listed = await request(h.base, '/mesh/sessions')
+    const ids = (listed.json?.sessions ?? []).map((session) => session.id)
+    const ok = deleted.status === 200 && deleted.json?.ok === true && deleted.json?.sessionId === 'session-titled' && !ids.includes('session-titled')
+    report('delete accepts an exact title', ok, `status=${deleted.status} sessionId=${deleted.json?.sessionId ?? '-'} stillListed=${ids.includes('session-titled')}`)
+  })
+
+  // 8. An ambiguous title is refused (400 + candidates) and nothing is deleted.
+  await runCase('delete refuses an ambiguous title without deleting', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-dup-x', title: 'dup title' },
+        { id: 'session-dup-y', title: 'dup title' },
+      ],
+    })
+    const res = await request(h.base, '/mesh/sessions/delete', { method: 'POST', body: { title: 'dup title' } })
+    const listed = await request(h.base, '/mesh/sessions')
+    const ids = (listed.json?.sessions ?? []).map((session) => session.id)
+    const candidates = /多个/.test(res.json?.error ?? '')
+    const survivors = ids.filter((id) => id === 'session-dup-x' || id === 'session-dup-y').length
+    const ok = res.status === 400 && res.json?.ok === false && candidates && survivors === 2
+    report('delete refuses an ambiguous title without deleting', ok, `status=${res.status} candidates=${candidates} survivors=${survivors}`)
+  })
+
+
   await runCase('standalone boots without a hub and stays offline', async (boot) => {
     const h = await boot()
     const status = await request(h.base, '/mesh/status')

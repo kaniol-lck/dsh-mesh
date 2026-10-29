@@ -1968,10 +1968,23 @@ export function apply(ctx, config) {
       }
       try {
         const draft = await readJsonRequest(req)
-        const id = String(draft.session ?? '').trim()
-        if (!id) throw new Error('session is required')
-        // Only sessions discovery can see are deletable: the id is matched against the
-        // scanned list, so a caller cannot aim the delete at an arbitrary path.
+        if (!draft.session && !draft.title) throw new Error('session or title is required')
+        // Same addressing as /mesh/inject: exact id (the `session-` prefix may be omitted),
+        // exact title, then a unique title substring. An ambiguous title fails instead of
+        // guessing, and the lookup stays inside discovery's list so a caller can never aim
+        // the delete at an arbitrary path.
+        let target
+        try {
+          target = resolveLocalSession(draft)
+        } catch (error) {
+          // Keep the old error semantics: an unknown session is 404, a bad/ambiguous
+          // selector is 400; the message (with the candidate list) is relayed verbatim.
+          const status = /找不到会话/.test(error.message) ? 404 : 400
+          res.writeHead(status, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+          res.end(JSON.stringify({ ok: false, error: error.message }))
+          return
+        }
+        const id = target.id
         const entry = discoverSessions().find((session) => session.id === id)
         // 1) stop the live session first; a log a running agent still writes must not vanish.
         const stop = await stopLiveSession(id)
