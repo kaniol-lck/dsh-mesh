@@ -10,6 +10,26 @@ recipient when one arrives, and keeps a shared blackboard — so DSH instances, 
 even non-DSH agents (anything that speaks HTTP or MCP) can hand work to each other without
 exposing a shell on every machine.
 
+## 30-second onboarding (hub already running)
+
+Two keys and one plugin — no inbound port, no manual CA, no copying tokens:
+
+```bash
+dsh plugin add dsh-mesh-waker
+```
+
+```yaml
+- insert:
+    - id: mesh-waker
+      name: 'dsh-mesh-waker'
+      config:
+        hubUrl: '<hub-url>'
+        joinCode: '<code>'
+```
+
+Restart DSH → **Settings → Mesh** shows connected. Full guide (pinned version, failure
+triage, revoking access): [docs/agent-onboarding.md](docs/agent-onboarding.md).
+
 ```
         ┌──────────────────────────── hub (this repo, hub/) ────────────────────────────┐
         │  MCP (/mcp) + REST (/api/*)   SQLite: messages · board · blobs · audit         │
@@ -35,6 +55,22 @@ exposing a shell on every machine.
   anything that does not belong in a message body.
 - **Approval relay** (optional, `plugins/mesh-approval`) — forward a coding agent's
   dangerous-command approval prompt to a human over the mesh.
+
+## Multi-session collaboration and work log
+
+When a project is split across several agent sessions, this repo keeps the process auditable
+in a local work log:
+
+- **Dispatch / receipts**: `mesh_dispatch` (or `npx dsh-mesh-dispatch`) with a `taskId`;
+  the turn end writes a receipt to `~/.dsh/mesh-waker/receipts.jsonl`. A receipt is a hint —
+  verify the artifact;
+- **Work log**: `.worklog/` (todos, WORKLOG, defect ledger; local, never committed), see
+  [docs/worklog.md](docs/worklog.md);
+- **Mechanical gates**: `scripts/roadmap.mjs` (rollup + feature aggregate + stage gates),
+  `scripts/defects.mjs` (defect ledger), `scripts/check-paths.mjs` (paths / LAN topology).
+
+The current version lives in the hub's `/health` and the ROADMAP "version snapshot"; the
+README does not pin a version.
 
 ## Quick start (5 minutes)
 
@@ -128,7 +164,7 @@ token; the plugin keeps the token in an owner-only file, not in the profile patc
   window and a debounce.
 - Reads are scoped to the caller: conversation views only return messages the caller sent or
   received; blob reads honor a per-blob allowlist.
-- Per-agent scopes, source CIDRs and token expiry (0.7.9+), plus a web console with
+- Per-agent scopes, source CIDRs and token expiry, plus a web console with
   view/admin roles and an audit trail.
 - Transport encryption is **required** across any network you do not control — put the hub
   behind TLS (`MESH_TLS_CERT` / `MESH_TLS_KEY`) or a tunnel.
@@ -155,6 +191,7 @@ token; the plugin keeps the token in an owner-only file, not in the profile patc
 ## Documentation
 
 - [Hub deployment and configuration](hub/README.en.md) · [中文](hub/README.md)
+- [Onboarding guide (30 seconds)](docs/agent-onboarding.md)
 - [Architecture](docs/mesh-architecture.md)
 - [Auth & console](docs/auth-and-console.md) (token lifecycle, scopes, IP allowlist, enrollment codes, console roles)
 - [Local sessions](docs/local-sessions.md) (session discovery and injection, no hub)

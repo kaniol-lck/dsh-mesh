@@ -1,4 +1,4 @@
-# 发布流程（插件）
+# 发布流程（插件与 hub）
 
 目标：**坏版本不进 `latest`**。我们踩过的两次事故都不是"推得早"，而是"没验证客户端
 bundle 能否被 loader 认领"——`node --check` 通过、宿主接口也正常，但页面一刷新就 web boot
@@ -11,8 +11,7 @@ bundle 能否被 loader 认领"——`node --check` 通过、宿主接口也正�
 | 动作 | 是否需确认 |
 |---|---|
 | 改代码、同步、git commit、git push | 否，改完即做 |
-| 
-pm publish（含 --tag next 与 --promote） | **是** |
+| npm publish（含 `--tag next` 与 `--promote`，统一由 `scripts/release.py` 执行） | **是** |
 | 部署 hub 到 NAS（docker 重建/重启） | **是** |
 
 申请确认时一次性给出：版本号、改了什么、预检结果、关键路径实测结果（真实收发的日志/响应），
@@ -33,8 +32,8 @@ pm publish（含 --tag next 与 --promote） | **是** |
 | 级别 | 动作 | 时机 |
 |---|---|---|
 | 1. 源码 | `git push` | 改完即推，当作备份与审计 |
-| 2. 预发布 | `npm publish --tag next` | 预检通过后 |
-| 3. 稳定 | `npm dist-tag add <pkg>@<ver> latest` | 本机 link 装过一次、GUI 刷新无 boot 错、跑过一个回合 |
+| 2. 预发布 | `python scripts/release.py`（发到 `next`） | 预检通过后 |
+| 3. 稳定 | `python scripts/release.py --promote` | 本机 link 装过一次、GUI 刷新无 boot 错、跑过一个回合 |
 
 `next` 标签不改 `latest`，别人 `dsh plugin add dsh-mesh-waker` 拿不到；想让某台机器先试，用
 `dsh plugin add dsh-mesh-waker@next`。
@@ -54,6 +53,22 @@ python scripts/release.py --promote
 
 凭据只从环境变量 `NPM_TOKEN` 读（vault 注入），脚本把临时 `.npmrc` 写到系统临时目录并用
 `--userconfig` 指过去，**不会在仓库里留下任何凭据文件**。
+
+## hub 发版流程（镜像 + NAS 部署）
+
+hub 不走 npm，走镜像 + NAS 部署，同样要过 owner 确认门（命令细节见 `docs/multi-session-playbook.md` §5）。
+
+1. **bump 三处**（一次改齐，否则 `roadmap --check` 会报 version drift）：`HUB_VERSION`（`hub/server.mjs`）、
+   `hub/package.json`、`hub/package-lock.json`；同时补 `hub/CHANGES.md` 对应条目。
+2. **预检**：`python scripts/release.py --preflight`（语法、版本一致性、密钥扫描、无 stray `.npmrc`）。
+3. **部署**：用 `sessions\<本机脚本>\ssh_deploy_*.py` 在 NAS 上重建/重启容器（脚本名以实际为准）。
+   NAS 构建**必须**走 `registry.npmmirror.com`——直连 `registry.npmjs.org` 会 20 秒超时卡住安装（0.7.14 的真实事故）。
+   镜像 tag 用版本号（如 `dsh-mesh:<版本>`），不要只留 `latest`，回滚才有抓手。
+4. **部署后验证**：`/health` 返回的版本等于新版本；公网入口 `https://<hub>` 返回 200
+   （自签 CA 与 `curl --ssl-no-revoke` 见 `docs/transport-security.md`）。
+5. **打 tag 并推送**：`git tag v<版本> && git push origin v<版本>`；GitHub Release 页用 `gh release create`，
+   摘要与 `hub/CHANGES.md` 口径一致。
+6. **回滚**：把容器镜像换回上一个版本 tag 并重启；数据在 `hub/data`，镜像回滚不动数据。
 
 ## 预检做什么
 

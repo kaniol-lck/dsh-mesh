@@ -7,6 +7,26 @@
 
 **一个局域网内的 agent 中枢**：一个 Node 服务负责在 agent 之间存消息、在来信时唤醒收件方，并维护一块共享黑板。DSH 实例、脚本、以及任何会讲 HTTP / MCP 的非 DSH agent，都能借此互相派活，而不必在每台机器上开放 shell。
 
+## 30 秒接入（中枢已部署）
+
+已有中枢？装插件、填两个键即可——不需要开端口、不需要手工 CA、不需要手抄 token：
+
+```bash
+dsh plugin add dsh-mesh-waker
+```
+
+```yaml
+- insert:
+    - id: mesh-waker
+      name: 'dsh-mesh-waker'
+      config:
+        hubUrl: '<hub-url>'
+        joinCode: '<code>'
+```
+
+重启 DSH → **设置 → Mesh** 显示已连接。完整步骤（含精确版本、失败排查与撤销接入）见
+[docs/agent-onboarding.md](docs/agent-onboarding.md)。
+
 ```
         ┌──────────────────────── hub（本仓库 hub/） ─────────────────────────┐
         │  MCP (/mcp) + REST (/api/*)   SQLite：消息 · 黑板 · blob · 审计       │
@@ -26,6 +46,16 @@
 - **共享黑板**：小体积 JSON / 文本 KV，外加一条只追加的日志，适合存整个团队都该看到的任务状态；
 - **blob 通道**：单文件最大 64 MiB，支持断点续传、sha256 校验、按 blob 的 ACL，放不适合塞进消息体的东西；
 - **审批转发**（可选，`plugins/mesh-approval`）：把编码 agent 的"危险命令待批准"提示转发给人，经 mesh 回复 approve / deny。
+
+## 多会话协作与工作日志
+
+把项目拆给多个 agent 会话并行做时，本仓把过程落成可审计的本地工作日志：
+
+- **派活 / 回执**：`mesh_dispatch`（或 `npx dsh-mesh-dispatch`）带 `taskId`，回合结束写回执到 `~/.dsh/mesh-waker/receipts.jsonl`；回执只是线索，验收要看产物；
+- **工作日志**：`.worklog/`（todo、WORKLOG、缺陷台账；本地不入库），约定见 [docs/worklog.md](docs/worklog.md)；
+- **机械门禁**：`scripts/roadmap.mjs`（汇总 + 功能聚合 + 关口）、`scripts/defects.mjs`（缺陷台账）、`scripts/check-paths.mjs`（路径 / 内网拓扑）。
+
+当前版本以中枢 `/health` 与 ROADMAP 自动段的「版本快照」为准，README 不写死具体版本号。
 
 ## 快速开始（5 分钟）
 
@@ -114,7 +144,7 @@ dsh plugin --profile web add dsh-mesh-waker
 - 唤醒 ping 用**逐 agent** 的密钥做 HMAC-SHA256 签名，带 120 秒时间窗与去抖；
 - 读取按调用者隔离：会话视图只返回自己发过或收到的消息；blob 读取受 per-blob 白名单约束；
 - **任何不受你控制的网络都必须加密**：给中枢配 TLS（`MESH_TLS_CERT` / `MESH_TLS_KEY`）或走隧道；
-- 每节点可限制 `read / send / board / blob` scopes、来源 IP 段与令牌有效期（0.7.9+）；
+- 每节点可限制 `read / send / board / blob` scopes、来源 IP 段与令牌有效期；
 - 网页控制台分只读/管理员两种角色，管理面受 `MESH_CONSOLE_ALLOW` 来源限制并有 CSRF 防护；
 - 仓库里不放任何凭据，`scripts/check-secrets.py` 已在 CI 中运行。
 
@@ -133,6 +163,7 @@ dsh plugin --profile web add dsh-mesh-waker
 ## 文档
 
 - [中枢部署与配置](hub/README.md) · [English](hub/README.en.md)
+- [接入指南（30 秒接入）](docs/agent-onboarding.md)
 - [架构说明](docs/mesh-architecture.md)
 - [鉴权与控制台](docs/auth-and-console.md)（token 生命周期、scopes、IP 白名单、注册码派发、控制台角色）
 - [本机会话协作](docs/local-sessions.md)（会话发现与定向注入，不经过中枢）
