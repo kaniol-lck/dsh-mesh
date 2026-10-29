@@ -4,11 +4,20 @@ v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审�
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（77/77）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（84/84）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
 > **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；补丁进入 0.7.12（见下条）。
 
 ---
+
+## v0.7.15（2026-10-29，pull 自举与收件箱 claim）
+
+| 项 | 内容 |
+|---|---|
+| bootstrap | 新增无需鉴权的 `GET /api/bootstrap`（按 IP 60 次/分钟限速，超限 429）：返回 `service/version/protocol/tls/endpoints/enroll/wake`；`tls` 由可选 `MESH_TLS_CA_FILE`（PEM）填充 `{ca_pem, ca_sha256}`，未设或不可读为 `null`（不可读只 WARN）；不含 token/wake_secret/文件路径 |
+| claim | `GET /api/inbox` 新增 `claim=1` 与 `claim_ttl_ms`（默认 300000）：只对本次返回行且在 `claimed_at` 为空或租约过期时写入；响应行带 `claimed_at`；claim 不等于已读，`mark_read=1` 行为不变 |
+| 迁移 | `messages.claimed_at INTEGER`（幂等 ALTER） |
+| 验证 | `node smoke-client.mjs`：84/84（bootstrap 字段与 60/min 限速、claim 租约保持/过期重取、claim 不影响未读、mark_read 生效）；手测 TLS：`ca_sha256` 与文件 SHA-256 一致，不可读路径 `tls:null` 且 WARN |
 
 ## v0.7.14（2026-10-29，静默消息与收件箱可达性修复）
 

@@ -241,6 +241,9 @@ CREATE TABLE IF NOT EXISTS blobs (
   // delivery_mode: what the sender would like the receiver's waker to do with this message
   // (queue | steer | branch). Advisory: the receiver's local policy and rate caps still win.
   if (!messageColumns.some((c) => c.name === 'delivery_mode')) db.exec('ALTER TABLE messages ADD COLUMN delivery_mode TEXT')
+  // claimed_at: a puller took these rows for processing. Not read; expires on its own so
+  // a crashed puller's messages become claimable again (see the claim=1 inbox parameter).
+  if (!messageColumns.some((c) => c.name === 'claimed_at')) db.exec('ALTER TABLE messages ADD COLUMN claimed_at INTEGER')
   // Console P1: least privilege per agent. Empty scopes means the historical full set, so
   // existing nodes keep working after the upgrade.
   if (!agentColumns.some((c) => c.name === 'scopes')) db.exec('ALTER TABLE agents ADD COLUMN scopes TEXT')
@@ -657,6 +660,8 @@ function parseLimit(raw, fallback, max) {
   return Math.min(parsed, max)
 }
 
+const DEFAULT_CLAIM_TTL_MS = 300_000
+
 /**
  * One page of an agent's inbox. `order` asc (default) keeps the historical oldest-first
  * behaviour; desc is what a "anything new?" poll needs. `before` is an epoch-ms cursor
@@ -676,7 +681,7 @@ function fetchInboxPage(agentName, { unreadOnly = true, limit = 20, order = 'asc
   params.push(limit + 1)
   const rows = db
     .prepare(
-      `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned, interrupt, delivery_mode FROM messages
+      `SELECT id, sender, subject, body, created_at, read_at, claimed_at, reply_to, conversation, no_reply, pinned, interrupt, delivery_mode FROM messages
         WHERE ${clauses.join(' AND ')}
         ORDER BY created_at ${descending ? 'DESC' : 'ASC'} LIMIT ?`,
     )
@@ -1849,7 +1854,21 @@ async function handleRest(req, res, url) {
       const beforeRaw = q.get('before')
       const before = beforeRaw === null || beforeRaw === '' ? null : Number(beforeRaw)
       if (before !== null && !Number.isFinite(before)) throw new BadRequest('before must be epoch milliseconds')
+      const claim = q.get('claim') === '1'
+      const claimTtlRaw = q.get('claim_ttl_ms')
+      const claimTtl = claimTtlRaw === null || claimTtlRaw === '' ? DEFAULT_CLAIM_TTL_MS : Number(claimTtlRaw)
+      if (!Number.isFinite(claimTtl) || claimTtl < 0) throw new BadRequest('claim_ttl_ms must be a non-negative number')
       const page = fetchInboxPage(id.name, { unreadOnly, limit, order, before })
+      if (claim && page.rows.length) {
+        // Only take rows nobody holds (or whose lease expired); a second claim inside the
+        // lease must not extend it. Claim is visibility, not read: mark_read stays separate.
+        const ts = now()
+        const stmt = db.prepare('UPDATE messages SET claimed_at = ? WHERE id = ? AND recipient = ? AND (claimed_at IS NULL OR claimed_at < ?)')
+        for (const row of page.rows) {
+          const changed = Number(stmt.run(ts, row.id, id.name, ts - claimTtl).changes ?? 0)
+          if (changed) row.claimed_at = ts
+        }
+      }
       if (q.get('mark_read') === '1' && page.rows.length) {
         const stmt = db.prepare('UPDATE messages SET read_at = ? WHERE id = ?')
         for (const row of page.rows) stmt.run(now(), row.id)
@@ -2317,7 +2336,7 @@ function pruneDeviceCodes() {
 
 function sweepEnrollState() {
   pruneDeviceCodes()
-  for (const map of [deviceRequestRate, devicePollRate]) {
+  for (const map of [deviceRequestRate, devicePollRate, bootstrapRate]) {
     for (const [ip, entry] of map) if (now() >= entry.resetAt) map.delete(ip)
   }
 }
@@ -2454,6 +2473,55 @@ async function handleDeviceEnroll(req, res, url) {
 }
 
 /**
+ * Public bootstrap: enough for a fresh client to join without out-of-band CA/token
+ * handling. No secrets and no filesystem paths leave this endpoint.
+ */
+const BOOTSTRAP_LIMIT_PER_MINUTE = 60
+const WAKE_MIN_POLL_INTERVAL_MS = 5_000
+const bootstrapRate = new Map()
+let tlsCaWarned = false
+
+function bootstrapTls() {
+  const file = process.env.MESH_TLS_CA_FILE || ''
+  if (!file) return null
+  try {
+    const raw = readFileSync(file)
+    return { ca_pem: raw.toString('utf8'), ca_sha256: createHash('sha256').update(raw).digest('hex') }
+  } catch (error) {
+    if (!tlsCaWarned) {
+      tlsCaWarned = true
+      console.warn(`[mesh] MESH_TLS_CA_FILE is not readable (${error.code ?? error.message}); /api/bootstrap reports tls:null`)
+    }
+    return null
+  }
+}
+
+async function handleBootstrap(req, res) {
+  const ip = clientIp(req)
+  if (overRate(bootstrapRate, ip, BOOTSTRAP_LIMIT_PER_MINUTE)) {
+    return sendJson(res, 429, { error: 'too many bootstrap requests, retry later' })
+  }
+  // High-frequency public endpoint: deliberately not written to the bounded audit table,
+  // which is the low-rate auth/ops trail (60 calls/min would push real events out).
+  return sendJson(res, 200, {
+    service: 'dsh-mesh',
+    version: HUB_VERSION,
+    protocol: 1,
+    tls: bootstrapTls(),
+    endpoints: {
+      mcp: '/mcp',
+      api: '/api',
+      inbox: '/api/inbox',
+      enroll: '/api/enroll',
+      device_request: '/api/enroll/request',
+      device_token: '/api/enroll/token',
+    },
+    enroll: { code_ttl_ms: ENROLL_CODE_TTL_MS, device_flow: true },
+    wake: { modes: ['pull', 'push'], min_poll_interval_ms: WAKE_MIN_POLL_INTERVAL_MS },
+  })
+}
+
+/**
  * Admin face: mint, rotate and revoke agent tokens.
  * Requires `Authorization: Bearer <MESH_ADMIN_TOKEN>` (or the generated
  * data/admin.token on first boot). A minted token is returned exactly once 鈥? * the hub only keeps its SHA-256.
@@ -2586,6 +2654,11 @@ const httpServer = makeServer(async (req, res) => {
 
   if (url.pathname.startsWith('/api/admin/')) {
     await handleAdmin(req, res, url)
+    return
+  }
+
+  if (url.pathname === '/api/bootstrap' && req.method === 'GET') {
+    await handleBootstrap(req, res)
     return
   }
 

@@ -446,6 +446,65 @@ try {
     await orderedClient.transport.close()
   }
 
+  // --- bootstrap + claim: pull onboarding and two-phase delivery -----------------
+  {
+    const boot = await (await fetch(`${BASE}/api/bootstrap`)).json()
+    const health = await (await fetch(`${BASE}/health`)).json()
+    check(
+      'bootstrap advertises the frozen contract',
+      boot.service === 'dsh-mesh' && boot.version === health.version && boot.protocol === 1 && boot.tls === null &&
+        boot.endpoints?.inbox === '/api/inbox' && boot.endpoints?.device_token === '/api/enroll/token' &&
+        boot.enroll?.code_ttl_ms === 600000 && boot.enroll?.device_flow === true &&
+        Array.isArray(boot.wake?.modes) && boot.wake.modes.includes('pull') && boot.wake.min_poll_interval_ms === 5000,
+      Object.keys(boot).join(','),
+    )
+
+    let bootstrapLimited = false
+    for (let attempt = 0; attempt < 70; attempt += 1) {
+      const response = await fetch(`${BASE}/api/bootstrap`)
+      if (response.status === 429) { bootstrapLimited = true; break }
+    }
+    check('bootstrap is rate-limited per IP', bootstrapLimited, bootstrapLimited ? '429 seen' : 'no 429')
+
+    const claimToken = await mint('claim-test')
+    for (let index = 0; index < 3; index += 1) {
+      await fetch(`${BASE}/api/send`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ to: 'claim-test', subject: `claim ${index}`, body: `claim body ${index}` }),
+      })
+    }
+    const inbox = (extra) => fetch(`${BASE}/api/inbox?unread=1&order=desc&limit=10&${extra}`, {
+      headers: { authorization: `Bearer ${claimToken}` },
+    }).then((response) => response.json())
+
+    const firstClaim = await inbox('claim=1')
+    check(
+      'claim=1 stamps claimed_at on the returned page',
+      firstClaim.messages.length === 3 && firstClaim.messages.every((message) => Number.isFinite(message.claimed_at)),
+      `${firstClaim.messages.length} rows`,
+    )
+    const firstStamps = new Map(firstClaim.messages.map((message) => [message.id, message.claimed_at]))
+    const secondClaim = await inbox('claim=1')
+    check(
+      'a second claim inside the lease does not renew claimed_at',
+      secondClaim.messages.length === 3 && secondClaim.messages.every((message) => firstStamps.get(message.id) === message.claimed_at),
+      'lease held',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const reclaimed = await inbox('claim=1&claim_ttl_ms=1')
+    check(
+      'an expired lease can be claimed again',
+      reclaimed.messages.length === 3 && reclaimed.messages.every((message) => message.claimed_at > firstStamps.get(message.id)),
+      'lease renewed',
+    )
+    const afterClaim = await inbox('')
+    check('claim does not mark messages read', afterClaim.messages.length === 3, `${afterClaim.messages.length} unread`)
+    const marked = await inbox('mark_read=1')
+    const afterRead = await inbox('')
+    check('mark_read removes rows from unread', marked.messages.length === 3 && afterRead.messages.length === 0, `marked=${marked.messages.length}, left=${afterRead.messages.length}`)
+  }
+
   // --- relay wake: only the deployment's configured target may be registered -----
   const badRelay = await fetch(`${BASE}/api/register`, {
     method: 'POST',
