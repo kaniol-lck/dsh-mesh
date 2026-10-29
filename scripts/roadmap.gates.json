@@ -1,0 +1,48 @@
+{
+  "gates": [
+    {
+      "id": "G1",
+      "name": "接入闭环",
+      "question": "陌生机器能否只靠 hubUrl + joinCode 接入，无需 setenv / curl / 手工 CA？",
+      "requires": [
+        { "match": "joinCode" },
+        { "match": "自举" },
+        { "match": "pull 默认" },
+        { "match": "onboarding" }
+      ]
+    },
+    {
+      "id": "G2",
+      "name": "协作闭环",
+      "question": "多会话派活能否无人值守跑通（派活 → 回执 → 批次收账）？",
+      "requires": [
+        { "match": "mesh_dispatch" },
+        { "match": "批次屏障" },
+        { "match": "回执" },
+        { "match": "项目无关" }
+      ]
+    },
+    {
+      "id": "G3",
+      "name": "公网发布就绪",
+      "question": "完成后能否把 hub 与 waker 安全地对公网发布？",
+      "requires": [
+        { "feature": "传输安全" },
+        { "match": "证书与 token 轮换" },
+        { "match": "ops-check" },
+        { "match": "GitHub Release" },
+        { "match": "双轴版本自检" }
+      ]
+    },
+    {
+      "id": "G4",
+      "name": "运维可交付",
+      "question": "别人接手能否按文档自行部署、巡检、轮换凭据？",
+      "requires": [
+        { "feature": "运维交付" },
+        { "match": "transport-security" },
+        { "match": "onboarding" }
+      ]
+    }
+  ]
+}

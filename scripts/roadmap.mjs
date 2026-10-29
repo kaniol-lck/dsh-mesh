@@ -354,7 +354,63 @@ function featureStats(entries) {
   })
 }
 
-function buildSegment(entries, generatedAt, hash, versions) {
+/** Stage gates live in scripts/roadmap.gates.json — declarative, no per-todo gate ids. */
+async function loadGates(repo) {
+  const file = path.join(repo, 'scripts', 'roadmap.gates.json')
+  let raw
+  try {
+    raw = await readFile(file, 'utf8')
+  } catch (error) {
+    console.warn(`WARN: cannot read gates config (${file}): ${error.message}`)
+    return []
+  }
+  try {
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed.gates) ? parsed.gates : []
+  } catch (error) {
+    console.warn(`WARN: bad gates config (${file}): ${error.message}`)
+    return []
+  }
+}
+
+function gateRequireLabel(require) {
+  return require?.match ?? require?.feature ?? '(empty)'
+}
+
+function gateRequireEntries(require, entries) {
+  if (require?.feature) return entries.filter((entry) => entry.feature === require.feature)
+  const needle = String(require?.match ?? '').toLowerCase()
+  return entries.filter((entry) => `${entry.title} ${entry.displayTitle}`.toLowerCase().includes(needle))
+}
+
+function evaluateGate(gate, entries) {
+  const met = []
+  const blocking = []
+  for (const require of gate.requires ?? []) {
+    const matched = gateRequireEntries(require, entries)
+    const open = matched.filter((entry) => entry.status !== '已完成')
+    if (matched.length > 0 && open.length === 0) {
+      met.push(require)
+      continue
+    }
+    blocking.push(matched.length === 0 ? `「${gateRequireLabel(require)}」无匹配` : open[0].displayTitle)
+  }
+  return {
+    id: gate.id,
+    name: gate.name,
+    question: gate.question,
+    satisfied: blocking.length === 0,
+    met: met.length,
+    total: (gate.requires ?? []).length,
+    blocking,
+  }
+}
+
+function gateRows(gates, entries) {
+  return gates.map((gate) => evaluateGate(gate, entries))
+}
+
+function buildSegment(entries, generatedAt, hash, versions, gates = []) {
   const counts = countEntries(entries)
   const unfinished = entries.filter((entry) => entry.status !== '已完成')
   const done = entries.filter((entry) => entry.status === '已完成')
@@ -371,6 +427,26 @@ function buildSegment(entries, generatedAt, hash, versions) {
   ]
   for (const stats of featureStats(entries)) {
     lines.push(`| ${stats.name} | ${stats.open} | ${stats.done} | ${stats.topPriority ?? '—'} | ${stats.owners.length ? stats.owners.join(', ') : '—'} |`)
+  }
+  if (gates.length) {
+    lines.push('', '### 关口（阶段性验收）', '', '| 关口 | 问题 | 状态 | 还差什么 |', '|---|---|---|---|')
+    const rows = gateRows(gates, entries)
+    for (const row of rows) {
+      const status = row.satisfied ? '✅ 达成' : `⏳ ${row.met}/${row.total}`
+      let remain = '—'
+      if (!row.satisfied) {
+        const circled = ['①', '②', '③']
+        remain = row.blocking
+          .slice(0, 3)
+          .map((title, index) => `${circled[index]}${title}`)
+          .join(' ')
+        if (row.blocking.length > 3) remain += ` 等 ${row.blocking.length} 条`
+      }
+      lines.push(`| ${row.id} ${row.name} | ${row.question} | ${status} | ${remain} |`)
+    }
+    if (rows.length && rows.every((row) => row.satisfied)) {
+      lines.push('', '> 全部关口已达成：可以对外发布。')
+    }
   }
   for (const priority of PRIORITIES) {
     const group = unfinished.filter((entry) => entry.priority === priority).sort(ownerCompare)
@@ -448,7 +524,17 @@ function warnIfDemotedInProgress(entries, today = new Date()) {
   }
 }
 
-async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, versions) {
+/** A gate require that matches no todo usually means a renamed title — warn, never block. */
+function warnIfGateMisses(entries, gates) {
+  for (const gate of gates) {
+    for (const require of gate.requires ?? []) {
+      if (gateRequireEntries(require, entries).length > 0) continue
+      console.log(`WARN: 关口 ${gate.id} 的 require「${gateRequireLabel(require)}」没有匹配到任何 todo（标题改过？）`)
+    }
+  }
+}
+
+async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, versions, gates = []) {
   if (versions.hubVersion !== versions.hubPackageVersion) {
     console.error(
       `ERROR: version drift: hub/server.mjs HUB_VERSION=${versions.hubVersion} vs hub/package.json=${versions.hubPackageVersion}`,
@@ -460,12 +546,13 @@ async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, v
   const markers = locateMarkers(original)
   if (!markers.ok) fail(2, `missing marker ${markers.missing} in ${roadmapPath}`)
   const actual = stripGenerated(original.slice(markers.start + MARK_START.length, markers.end))
-  const expected = stripGenerated(buildSegment(entries, generatedAt, hash, versions))
+  const expected = stripGenerated(buildSegment(entries, generatedAt, hash, versions, gates))
   if (actual === expected) {
     console.log(`OK: ROADMAP auto section matches .worklog/todo (${entries.length} items)`)
     await warnIfHtmlStale(htmlPath, hash)
     warnIfMissingOwner(entries)
     warnIfDemotedInProgress(entries)
+    warnIfGateMisses(entries, gates)
     return
   }
   const actualLines = actual.split('\n')
@@ -488,12 +575,12 @@ async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, v
   process.exit(1)
 }
 
-async function writeRoadmap(roadmapPath, entries, generatedAt, hash, versions) {
+async function writeRoadmap(roadmapPath, entries, generatedAt, hash, versions, gates = []) {
   const original = await readRoadmap(roadmapPath)
   const markers = locateMarkers(original)
   if (!markers.ok) fail(2, `missing marker ${markers.missing} in ${roadmapPath}`)
   const newline = original.includes('\r\n') ? '\r\n' : '\n'
-  const segment = buildSegment(entries, generatedAt, hash, versions).replace(/\n/g, newline)
+  const segment = buildSegment(entries, generatedAt, hash, versions, gates).replace(/\n/g, newline)
   const next =
     original.slice(0, markers.start + MARK_START.length) +
     newline +
@@ -616,10 +703,37 @@ ${duplicate}${demotion}      </summary>
     </details>`
 }
 
-function renderHtml(entries, generatedAt, hash) {
+function renderGatesHtml(gates, entries) {
+  const rows = gateRows(gates, entries)
+  const body = rows
+    .map((row) => {
+      const status = row.satisfied
+        ? '<span class="badge done">✅ 达成</span>'
+        : `<span class="badge doing">⏳ ${row.met}/${row.total}</span>`
+      const remain = row.satisfied
+        ? '—'
+        : `${escapeHtml(row.blocking.slice(0, 3).join('；'))}${row.blocking.length > 3 ? ` 等 ${row.blocking.length} 条` : ''}`
+      return `<tr><td><b>${escapeHtml(row.id)}</b> ${escapeHtml(row.name)}</td><td>${escapeHtml(row.question)}</td><td>${status}</td><td>${remain}</td></tr>`
+    })
+    .join('\n')
+  const note = rows.length > 0 && rows.every((row) => row.satisfied) ? '<p class="gate-note">全部关口已达成：可以对外发布。</p>' : ''
+  return `<section class="gates">
+<h2>关口（阶段性验收）</h2>
+<table>
+<thead><tr><th>关口</th><th>问题</th><th>状态</th><th>还差什么</th></tr></thead>
+<tbody>
+${body}
+</tbody>
+</table>
+${note}
+</section>`
+}
+
+function renderHtml(entries, generatedAt, hash, gates = []) {
   const counts = countEntries(entries)
   const sorted = sortForDisplay(entries)
   const owners = [...new Set(sorted.map((entry) => entry.owner))].sort()
+  const gatesHtml = gates.length ? renderGatesHtml(gates, entries) : ''
   const priorityChips = PRIORITIES.map(
     (priority) =>
       `        <button type="button" class="chip" data-prio-filter="${priority}">${priority}（${counts[priority]}）</button>`,
@@ -675,6 +789,12 @@ function renderHtml(entries, generatedAt, hash) {
   .badge.done { background: #e7f6ec; color: #1d6b3a; border-color: #bfe4cb; }
   .dup { color: #c62828; cursor: help; }
   .feature { padding: 1px 8px; border-radius: 999px; background: #eef1f6; color: #556; font-size: 12px; }
+  .gates { margin-bottom: 18px; }
+  .gates h2 { margin: 0 0 8px; font-size: 16px; }
+  .gates table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e2e4ea; border-radius: 10px; overflow: hidden; }
+  .gates th, .gates td { padding: 8px 12px; border-bottom: 1px solid #eef0f2; text-align: left; vertical-align: top; font-size: 13px; }
+  .gates tr:last-child td { border-bottom: none; }
+  .gate-note { margin: 8px 0 0; color: #1d6b3a; font-weight: 600; }
   .done-block { margin-top: 18px; border: 1px dashed #ccd; border-radius: 10px; padding: 8px 12px; }
   .done-block > summary { cursor: pointer; color: #667; padding: 4px 2px; }
   .detail { padding: 0 14px 12px; border-top: 1px dashed #e2e4ea; }
@@ -696,6 +816,7 @@ function renderHtml(entries, generatedAt, hash) {
     <div class="stat"><span>已完成</span><b>${counts.done}</b></div>
   </div>
 </header>
+${gatesHtml}
 <section class="filters">
   <div class="chips">
 ${priorityChips}
@@ -772,8 +893,8 @@ ${doneBlock}
 `
 }
 
-async function writeHtml(htmlPath, entries, generatedAt, hash) {
-  await atomicWrite(htmlPath, renderHtml(entries, generatedAt, hash))
+async function writeHtml(htmlPath, entries, generatedAt, hash, gates = []) {
+  await atomicWrite(htmlPath, renderHtml(entries, generatedAt, hash, gates))
 }
 
 async function assertRepo(repo) {
@@ -833,6 +954,7 @@ async function main() {
     else console.log(text)
   }
   markDuplicates(entries)
+  const gates = await loadGates(repo)
   const versions = await readVersions(repo)
   const hash = sourceHash(entries, versions)
   const generatedAt = nowStamp()
@@ -846,6 +968,7 @@ async function main() {
       versions: { ...versions, drift: versions.hubVersion !== versions.hubPackageVersion },
       counts: countEntries(entries),
       features: featureStats(entries),
+      gates: gateRows(gates, entries),
       unclassified: entries.filter((entry) => entry.feature === '未分类').slice(0, 50).map((entry) => entry.displayTitle),
       errors,
       entries: entries.map((entry) => {
@@ -874,7 +997,7 @@ async function main() {
     const lock = await acquireLock(repo)
     if (!lock) return
     try {
-      await writeHtml(htmlPath, entries, generatedAt, hash)
+      await writeHtml(htmlPath, entries, generatedAt, hash, gates)
       console.log(`wrote HTML -> ${htmlPath}`)
     } finally {
       await lock.release()
@@ -883,18 +1006,18 @@ async function main() {
   }
 
   if (options.mode === 'check') {
-    await checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, versions)
+    await checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, versions, gates)
     return
   }
 
   const lock = await acquireLock(repo)
   if (!lock) return
   try {
-    await writeRoadmap(roadmapPath, entries, generatedAt, hash, versions)
+    await writeRoadmap(roadmapPath, entries, generatedAt, hash, versions, gates)
     const counts = countEntries(entries)
     console.log(`wrote ROADMAP: ${counts.total} items (P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}, done ${counts.done}) -> ${roadmapPath}`)
     try {
-      await writeHtml(htmlPath, entries, generatedAt, hash)
+      await writeHtml(htmlPath, entries, generatedAt, hash, gates)
       console.log(`wrote HTML -> ${htmlPath}`)
     } catch (error) {
       console.warn(`warning: HTML render failed (ROADMAP was written): ${error.message}`)
