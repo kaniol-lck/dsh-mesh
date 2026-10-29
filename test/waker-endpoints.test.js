@@ -1017,6 +1017,55 @@ async function main() {
     report('CLI: parses deadline/task flags and refuses unknown args', ok, `deadline=${parsed.deadlineMs} task=${JSON.stringify(parsed.task)} usage=${/Usage/.test(unknown)}`)
   })
 
+  // 42-44. Regression: injection during a running turn must not settle on that turn's end.
+  await runCase('task receipt: queue injection during a running turn waits for the next turn', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-running', title: 'running target' }] })
+    h.emit('session/event', { id: 'session-running' }, { type: 'turn/start', data: { turn: 5 } })
+    const injected = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'running target', text: 'T-130 work', meta: { taskId: 'T-queue' } },
+    })
+    h.emit('session/event', { id: 'session-running' }, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
+    await sleep(400)
+    const premature = readReceipts(h.receiptsPath).filter((row) => row.taskId === 'T-queue')
+    h.emit('session/event', { id: 'session-running' }, { type: 'turn/start', data: { turn: 6 } })
+    h.emit('session/event', { id: 'session-running' }, { type: 'turn/end', data: { turn: 6, reason: { kind: 'completed' } } })
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-queue'), 4000)
+    const ok =
+      injected.status === 200 &&
+      premature.length === 0 &&
+      receipt?.turn === 6 &&
+      receipt?.settledTurn === 6 &&
+      receipt?.baselineTurn === 5 &&
+      receipt?.injectedDuringTurn === true
+    report('task receipt: queue injection during a running turn waits for the next turn', ok, `premature=${premature.length} turn=${receipt?.turn ?? '-'} baseline=${receipt?.baselineTurn ?? '-'} during=${receipt?.injectedDuringTurn ?? '-'}`)
+  })
+
+  await runCase('task receipt: steer injection settles on the running turn', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-steer', title: 'steer target' }] })
+    h.emit('session/event', { id: 'session-steer' }, { type: 'turn/start', data: { turn: 5 } })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'steer target', text: 'inserted into turn 5', mode: 'steer', meta: { taskId: 'T-steer' } },
+    })
+    h.emit('session/event', { id: 'session-steer' }, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-steer'), 4000)
+    const ok = receipt?.turn === 5 && receipt?.baselineTurn === 5 && receipt?.injectedDuringTurn === true
+    report('task receipt: steer injection settles on the running turn', ok, `turn=${receipt?.turn ?? '-'} baseline=${receipt?.baselineTurn ?? '-'} during=${receipt?.injectedDuringTurn ?? '-'}`)
+  })
+
+  await runCase('task receipt: no turn history still settles on the first turn/end', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-fresh', title: 'fresh target' }] })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'fresh target', text: 'fresh work', meta: { taskId: 'T-fresh' } },
+    })
+    h.emit('session/event', { id: 'session-fresh' }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-fresh'), 4000)
+    const ok = receipt?.turn === 1 && receipt?.baselineTurn === null && receipt?.injectedDuringTurn === false
+    report('task receipt: no turn history still settles on the first turn/end', ok, `turn=${receipt?.turn ?? '-'} baseline=${receipt?.baselineTurn ?? '-'} during=${receipt?.injectedDuringTurn ?? '-'}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

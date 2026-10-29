@@ -228,6 +228,9 @@ export function buildReceipt({
   summary = '',
   receiptMode = 'file',
   summaryChars = 300,
+  baselineTurn = null,
+  settledTurn = null,
+  injectedDuringTurn = false,
 } = {}) {
   const at = endedAt ?? Date.now()
   return {
@@ -242,6 +245,11 @@ export function buildReceipt({
     durationMs: injectedAt ? Math.max(0, at - injectedAt) : null,
     summary: truncateText(summary, summaryChars),
     receiptMode,
+    // Diagnostics: a receipt whose settledTurn equals baselineTurn (queue mode) means the
+    // task was injected while that turn was already running — useful when auditing.
+    baselineTurn: baselineTurn ?? null,
+    settledTurn: settledTurn ?? turn ?? null,
+    injectedDuringTurn: injectedDuringTurn === true,
   }
 }
 
@@ -2332,6 +2340,9 @@ export function apply(ctx, config) {
       summary,
       receiptMode: task.receiptMode,
       summaryChars: c.receiptSummaryChars,
+      baselineTurn: task.baselineTurn ?? null,
+      settledTurn: details.turn ?? null,
+      injectedDuringTurn: task.injectedDuringTurn === true,
     })
     writeReceiptFile(receipt)
     lastReceipt = { taskId: receipt.taskId, status: receipt.status, at: receipt.endedAt }
@@ -2343,7 +2354,7 @@ export function apply(ctx, config) {
     return receipt
   }
 
-  function registerPendingTask(target, meta) {
+  function registerPendingTask(target, meta, mode = 'queue') {
     const taskId = String(meta?.taskId ?? '').trim()
     if (!/^[A-Za-z0-9._:-]{1,80}$/.test(taskId)) throw new Error('meta.taskId must match [A-Za-z0-9._:-]{1,80}')
     const requested = String(meta?.receipt ?? '')
@@ -2352,10 +2363,17 @@ export function apply(ctx, config) {
     const receiptMode = batchId ? 'file' : ['file', 'queue', 'wake'].includes(requested) ? requested : c.receiptMode
     const previous = pendingTasks.get(taskId)
     if (previous) clearPending(previous)
+    // If the session is mid-turn, that turn was already running before this task existed:
+    // a queue delivery must wait for a strictly later turn, otherwise its turn/end would be
+    // mistaken for the task finishing (the T-130 false receipt).
+    const openTurn = liveness.get(target.id)?.openTurn ?? null
+    const injectedDuringTurn = openTurn !== null
     const task = {
       sessionId: target.id,
       injectedAt: Date.now(),
-      baselineTurn: maxTurnFor(target.id),
+      baselineTurn: injectedDuringTurn ? openTurn : maxTurnFor(target.id),
+      injectedDuringTurn,
+      mode: mode === 'steer' ? 'steer' : 'queue',
       receiptMode,
       batchId,
       settled: false,
@@ -2377,7 +2395,9 @@ export function apply(ctx, config) {
     timer.unref?.()
     task.stallTimer = timer
     receiptTimers.add(timer)
-    fileLog(`task ${taskId} pending on ${target.id} baselineTurn=${task.baselineTurn ?? 'unknown'} receipt=${receiptMode}${batchId ? ` batch=${batchId}` : ''}`)
+    fileLog(
+      `task ${taskId} pending on ${target.id} baselineTurn=${task.baselineTurn ?? 'unknown'} duringTurn=${injectedDuringTurn} mode=${task.mode} receipt=${receiptMode}${batchId ? ` batch=${batchId}` : ''}`,
+    )
     return taskId
   }
 
@@ -2476,7 +2496,12 @@ export function apply(ctx, config) {
         const classified = classifyTurnEnd(d.reason)
         for (const [taskId, task] of [...pendingTasks]) {
           if (task.sessionId !== sessionId || task.settled) continue
-          if (task.baselineTurn !== null && turn !== null && turn < task.baselineTurn) continue
+          if (task.baselineTurn !== null && turn !== null) {
+            // queue: the task only started in a strictly later turn; steer was inserted into
+            // the running turn, so that turn's end already covers it.
+            const settled = task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn
+            if (!settled) continue
+          }
           settleTask(taskId, task, { turn, ...classified })
         }
       }
@@ -2750,6 +2775,8 @@ export function apply(ctx, config) {
           sessionId: row.sessionId,
           injectedAt: batch.createdAt,
           baselineTurn: maxTurnFor(row.sessionId),
+          injectedDuringTurn: false,
+          mode: 'queue',
           receiptMode: 'file',
           batchId,
           settled: false,
@@ -2868,7 +2895,7 @@ export function apply(ctx, config) {
     }
     let taskId = null
     try {
-      taskId = registerPendingTask(session, meta)
+      taskId = registerPendingTask(session, meta, args.mode === 'steer' ? 'steer' : 'queue')
       await promptWithResume(session.id, text, args.mode === 'steer' ? 'steer' : 'queue')
     } catch (error) {
       if (taskId) cancelPendingTask(taskId)
@@ -3206,7 +3233,7 @@ export function apply(ctx, config) {
         // Register before prompting: a very fast turn can end before this request returns.
         let taskId = null
         try {
-          if (meta.taskId) taskId = registerPendingTask(target, meta)
+          if (meta.taskId) taskId = registerPendingTask(target, meta, mode)
           await promptWithResume(target.id, text, mode)
         } catch (error) {
           if (taskId) cancelPendingTask(taskId)

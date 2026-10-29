@@ -82,7 +82,7 @@ node scripts/mesh-dispatch.mjs --title "mesh · hub" --file task.txt --task --re
 | `receiptSummaryChars` | `300` | 摘要按**码点**截断，不会切出半个字符 |
 | `receiptStallMs` | `600000` | 注入后这么久仍无 `turn/start`，判 `not-started` |
 
-回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode`。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。注入给 `receiptTo` 的正文首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`，第二行是摘要。
+回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode / baselineTurn / settledTurn / injectedDuringTurn`。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。`baselineTurn`/`settledTurn` 是结算诊断：`queue` 注入发生在回合进行中时 `baselineTurn` 等于该回合，只有更晚回合的 `turn/end` 才会结算（`settledTurn > baselineTurn`），`steer` 则同一回合即可。注入给 `receiptTo` 的正文首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`，第二行是摘要。
 
 > 回执只走**本机** inject，绝不推到 hub；`receiptTo` 解析不到时只写文件并置 `lastError`，不会去打扰别的会话。日志与回执里没有 token、密钥。
 

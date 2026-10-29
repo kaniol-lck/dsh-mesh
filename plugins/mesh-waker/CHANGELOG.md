@@ -2,12 +2,22 @@
 
 本文件记录 `dsh-mesh-waker` 的变更。格式仿 `hub/CHANGES.md`：每节写清改了什么、怎么复验。
 
-> **发版状态**：`0.4.56`–`0.5.5` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
-> `next` 是 0.4.55）；0.4.60、0.5.0–0.5.5 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
+> **发版状态**：`0.4.56`–`0.5.6` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
+> `next` 是 0.4.55）；0.4.60、0.5.0–0.5.6 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线）。
 
 ---
+
+## v0.5.6（2026-10-30，修复「注入发生在回合进行中时被上一轮 turn/end 提前结算」）
+
+| 项 | 内容 |
+|---|---|
+| 事故 | 真机 17:15:05 把 T-130 注给正在跑 turn 36 的会话；17:15:59 turn 36 结束，插件就给 T-130 写了 `status=completed`，summary 是上一单 T-129 的内容，T-130 一行没做（`scripts/roadmap.gates.json` 不存在） |
+| 根因 | `baselineTurn = maxTurnFor()` 取的是「已开始的最大 turn」，正在跑的回合也在内；结算条件用 `turn < baselineTurn`，于是 `36 < 36 === false` → 同一轮 turn/end 直接结算 |
+| 修法 | ① 注入时看 liveness 的 `openTurn`：进行中 → `baselineTurn = openTurn` 且 `injectedDuringTurn=true`；空闲 → 沿用 `maxTurnFor`，`injectedDuringTurn=false`。② 结算改严格：`queue` 仅 `turn > baselineTurn`；`steer`（插进当前轮）`turn >= baselineTurn`；`baselineTurn === null` 保持任意 `turn/end` 可结算。③ 回执新增诊断字段 `baselineTurn / settledTurn / injectedDuringTurn`（不打印正文） |
+| 测试 | 新增 3 例（真实信封 `{type,data}`，共 43/43）：**回归**——`turn/start{turn:5}` → queue 注入 → `turn/end{turn:5}` 不产生回执（`premature=0`）→ `turn/start{6}`+`turn/end{6}` 才结算且 `turn=6/baselineTurn=5/injectedDuringTurn=true`；steer 同轮结算（`turn=5`）；无回合历史仍第一次 `turn/end` 即结算（`baselineTurn=null`） |
+| 版本 | 0.5.6；README 回执字段与说明同步；未 publish、未部署 |
 
 ## v0.5.5（2026-10-30，派活能力进插件：`mesh_dispatch` 工具 + `dsh-mesh-dispatch` CLI）
 
