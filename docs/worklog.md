@@ -61,6 +61,13 @@
 `status` 取值：`completed | error | aborted | blocked | max-tokens | interrupted | forked | not-started | lost`；
 `summary` 是该回合最后一条助手消息的截断，可能是思考片段，只作线索。
 
+## 内部文档与私有镜像
+
+- 内部文档（决策过程、本地实况、事故复盘、作业纪律、实验结论）只住 `.worklog/docs-internal/`（本地，不入库）；
+- 同步到私有镜像仓：`python scripts/sync-internal-docs.py`（默认 dry-run；`--apply` 才写并提交推送；`--no-push`、`--prune` 见脚本 help）；
+- 每轮收尾一条命令：`python scripts/round-close.py` —— `roadmap --write/--check` → `check-paths` → `check-secrets` → 同步内部文档，任一步失败即停，全绿打印 `ROUND CLOSE OK`；
+- 公开/私有的判据见 `.worklog/docs-internal/README.md`。
+
 ## 关口（阶段性验收）
 
 `scripts/roadmap.gates.json` 定义阶段验收：每个关口是一组 `requires`，`--write` 时机械判定是否达成，写进 ROADMAP 自动段的「### 关口（阶段性验收）」。
