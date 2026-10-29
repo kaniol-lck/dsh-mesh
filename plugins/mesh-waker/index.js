@@ -45,6 +45,16 @@ const PLUGIN_INFO = {
  * process) and "half-loaded" (handled by scripts/check-loadable.mjs before a restart).
  * Capability/plugin fields are hot and can never prove which code is running.
  */
+/**
+ * Where the hub's own console lives, for the settings panel's "open console" link.
+ * Display value only: it carries no token and the plugin never proxies admin calls.
+ * null when this install has no hub configured.
+ */
+export function hubConsoleUrlFor(hubUrl) {
+  const base = String(hubUrl ?? '').trim().replace(/\/+$/, '')
+  return base ? `${base}/console` : null
+}
+
 function readDiskVersion() {
   try {
     return String(JSON.parse(readFileSync(join(SELF_DIR, 'package.json'), 'utf8')).version ?? '0.0.0')
@@ -1874,6 +1884,7 @@ export function apply(ctx, config) {
             JSON.stringify({
               ok: true,
               wakeUrl,
+              hubConsoleUrl: hubConsoleUrlFor(c.hubUrl),
               config: editable(),
               pluginVersions: {
                 process: PLUGIN_INFO.version,

@@ -997,6 +997,24 @@ try {
           { title: '中枢登记', description: status && status.wakeUrl ? status.wakeUrl : '' },
           h('span', { style: { fontSize: 13, opacity: 0.8 } }, status && status.registered ? '已登记' : '未登记'),
         ),
+        status && status.hubConsoleUrl
+          ? h(
+              Row,
+              {
+                title: '中枢控制台',
+                description: '管理动作（发注册码 / 批准新节点 / 轮换令牌 / 改 scopes）在中枢控制台完成。',
+              },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  style: styles.button,
+                  onClick: () => window.open(status.hubConsoleUrl, '_blank', 'noopener,noreferrer'),
+                },
+                '打开',
+              ),
+            )
+          : null,
         h(
           Row,
           { title: '信任级别（默认）', description: '自动唤醒会话的执行口径与权限：strict 只读 / normal 需批准 / full 直接执行。只在本机生效。' },
