@@ -106,7 +106,10 @@ def present(request) -> ApprovalDecision:
                 "subject": "⚠️ 审批请求：" + (request.description or request.pattern_key or "危险命令")[:40],
                 "body": body,
                 "conversation": conversation,
-                "no_reply": True,
+                # silent, not no_reply: the approval must be stored without waking the
+                # agent (otherwise it could approve itself), and no_reply without a
+                # reply_to is now ignored by the hub.
+                "silent": True,
             },
         )
     except Exception:
@@ -116,7 +119,7 @@ def present(request) -> ApprovalDecision:
     while time.time() < deadline:
         time.sleep(POLL_SECONDS)
         try:
-            inbox = _call("GET", "/api/inbox?unread=1&limit=20", token)
+            inbox = _call("GET", "/api/inbox?unread=1&limit=20&order=desc", token)
         except Exception:
             continue
         for message in inbox.get("messages", []):

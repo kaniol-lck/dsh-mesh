@@ -4,11 +4,21 @@ v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审�
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（70/70）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（77/77）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
 > **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；补丁进入 0.7.12（见下条）。
 
 ---
+
+## v0.7.14（2026-10-29，静默消息与收件箱可达性修复）
+
+| 项 | 内容 |
+|---|---|
+| no_reply 收紧 | `no_reply:true` 只在带 `reply_to`（对话收尾）时生效；没有 `reply_to` 时忽略该标志、照常唤醒，响应带 `no_reply_ignored:true` 与 reason；广播路径同样适用 |
+| silent | `POST /api/send` 与 `mesh_send` 新增 `silent:true`：落库但不唤醒，供「必须人来回」的通道；与 `no_reply` 同时出现时 silent 优先并在响应注明 |
+| inbox 分页 | `GET /api/inbox` 新增 `order=asc|desc`（默认 asc）与 `before=<epoch_ms>` 游标，响应带 `has_more` / `next_before`；`mark_read=1` 仍只标记本次页；MCP `mesh_inbox` 新增 `order`，`unread_only:false` 时默认 `desc` |
+| 审批桥 | `plugins/mesh-approval` 发送改 `silent:true`（否则新语义下会唤醒 agent、可自审自批），轮询改 `order=desc`；新增 `test_transport_contract.py` 回归用例 |
+| 验证 | `node smoke-client.mjs`：77/77 passed（30 条积压下 desc 取最新、before 覆盖全量、no_reply 无 reply_to 唤醒、silent 不唤醒、reply_to 收尾不唤醒、MCP desc）；审批单测 2/2；live 审批 decision=once、wake_hits=0 |
 
 ## v0.7.13（2026-10-29，控制台配对：注册码入口 + 设备码）
 

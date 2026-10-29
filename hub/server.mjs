@@ -657,6 +657,36 @@ function parseLimit(raw, fallback, max) {
   return Math.min(parsed, max)
 }
 
+/**
+ * One page of an agent's inbox. `order` asc (default) keeps the historical oldest-first
+ * behaviour; desc is what a "anything new?" poll needs. `before` is an epoch-ms cursor
+ * that only takes older rows, so a desc caller can walk backwards page by page.
+ * Fetches limit+1 to answer has_more without a second COUNT query; nextBefore is the
+ * cursor for the next older page (desc only — asc callers grow the limit instead).
+ */
+function fetchInboxPage(agentName, { unreadOnly = true, limit = 20, order = 'asc', before = null } = {}) {
+  const descending = order === 'desc'
+  const clauses = ['recipient = ?']
+  const params = [agentName]
+  if (unreadOnly) clauses.push('read_at IS NULL')
+  if (Number.isFinite(before)) {
+    clauses.push('created_at < ?')
+    params.push(before)
+  }
+  params.push(limit + 1)
+  const rows = db
+    .prepare(
+      `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned, interrupt, delivery_mode FROM messages
+        WHERE ${clauses.join(' AND ')}
+        ORDER BY created_at ${descending ? 'DESC' : 'ASC'} LIMIT ?`,
+    )
+    .all(...params)
+  const hasMore = rows.length > limit
+  const page = hasMore ? rows.slice(0, limit) : rows
+  const nextBefore = hasMore && descending ? page[page.length - 1].created_at : null
+  return { rows: page, hasMore, nextBefore }
+}
+
 /** Build one MCP server bound to one agent identity. */
 function buildServer(agentName, agentHost, publicUrl) {
   const server = new McpServer({ name: 'dsh-mesh', version: HUB_VERSION })
@@ -735,7 +765,7 @@ function buildServer(agentName, agentHost, publicUrl) {
 
   tool(
     'mesh_send',
-    'Send a durable message to another agent. It is stored on the hub and delivered when that agent next checks its inbox, even if the target machine is switched off. Pass `conversation` (a short id you keep for the whole dialogue) so the receiver can keep this dialogue in one session, and so replies can be grouped with it. Pass `important: true` to keep a message exempt from the 7-day message TTL (pin). Pass `no_reply: true` for the closing message of a dialogue: it is delivered and readable but does NOT wake the recipient, so two auto-waking agents cannot answer each other forever. Pass `interrupt: true` only for a correction, cancellation or blocker: it asks the receiver to steer its running turn with this message instead of queueing it for later. Routine messages should leave it off.',
+    'Send a durable message to another agent. It is stored on the hub and delivered when that agent next checks its inbox, even if the target machine is switched off. Pass `conversation` (a short id you keep for the whole dialogue) so the receiver can keep this dialogue in one session, and so replies can be grouped with it. Pass `important: true` to keep a message exempt from the 7-day message TTL (pin). Pass `no_reply: true` only for the closing message of a dialogue and only together with `reply_to`: without a reply_to the flag is ignored and the recipient is woken normally. Pass `silent: true` to store the message without waking anyone, for channels that need a human reply but must not start an agent turn (silent wins over no_reply). Pass `interrupt: true` only for a correction, cancellation or blocker: it asks the receiver to steer its running turn with this message instead of queueing it for later. Routine messages should leave it off.',
     {
       to: z.string(),
       body: z.string(),
@@ -743,66 +773,99 @@ function buildServer(agentName, agentHost, publicUrl) {
       reply_to: z.string().optional(),
       conversation: z.string().optional(),
       no_reply: z.boolean().optional(),
+      silent: z.boolean().optional(),
       important: z.boolean().optional(),
       interrupt: z.boolean().optional(),
       session: z.string().optional(),
       delivery: z.enum(['queue', 'steer', 'branch']).optional(),
     },
-    ({ to, body, subject, reply_to, conversation, no_reply, important, interrupt, session, delivery }) => {
+    ({ to, body, subject, reply_to, conversation, no_reply, silent, important, interrupt, session, delivery }) => {
       assertText('to', to, MAX_RECIPIENT_BYTES)
       assertText('body', body, MAX_MESSAGE_BYTES)
       if (subject !== undefined) assertText('subject', subject, MAX_SUBJECT_BYTES)
       if (conversation !== undefined) assertText('conversation', conversation, MAX_CONVERSATION_BYTES)
-      const closing = no_reply === true ? 1 : 0
+      const replyTo = typeof reply_to === 'string' && reply_to.trim() ? reply_to : null
+      const wantsSilent = silent === true
+      let closing = no_reply === true ? 1 : 0
+      let noReplyIgnored = false
+      if (closing && !replyTo) {
+        // no_reply only makes sense as "closing message of a dialogue"; without a reply_to
+        // there is no dialogue to close, and dropping the wake silently loses real answers.
+        closing = 0
+        noReplyIgnored = true
+      }
+      const noWake = wantsSilent || closing === 1
       const flagged = important === true ? 1 : 0
       const urgent = interrupt === true ? 1 : 0
       const originSession = typeof session === 'string' && session.trim() ? session.trim().slice(0, 80) : null
+      const extras = {}
+      if (wantsSilent) extras.silent = true
+      if (noReplyIgnored) {
+        extras.no_reply_ignored = true
+        extras.reason = 'no_reply requires reply_to (closing message only)'
+      }
+      if (wantsSilent && no_reply === true) extras.note = 'silent takes precedence over no_reply'
       if (to === '*') {
         // Broadcast: one durable copy per other registered agent (still per-recipient, so
         // each side reads/marks its own inbox and the wake ping stays per agent).
         const recipients = db.prepare('SELECT name FROM agents WHERE name != ?').all(agentName).map((row) => row.name)
         const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session, delivery_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         for (const name of recipients) {
-          insert.run(randomUUID(), agentName, name, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent, originSession, delivery ?? null)
-          if (!closing) wakeAgent(name, conversation, { sender: agentName, subject })
+          insert.run(randomUUID(), agentName, name, subject ?? null, body, now(), replyTo, conversation ?? null, closing, flagged, urgent, originSession, delivery ?? null)
+          if (!noWake) wakeAgent(name, conversation, { sender: agentName, subject })
         }
-        return { to: '*', recipients: recipients.length, conversation: conversation ?? null, no_reply: Boolean(closing), note: 'broadcast to every other registered agent' }
+        return {
+          to: '*',
+          recipients: recipients.length,
+          conversation: conversation ?? null,
+          no_reply: Boolean(closing),
+          ...extras,
+          note: extras.note ?? 'broadcast to every other registered agent',
+        }
       }
       if (to === agentName) throw new Error('refusing to send a message to yourself')
       const target = db.prepare('SELECT name FROM agents WHERE name = ?').get(to)
       const id = randomUUID()
       db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session, delivery_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(id, agentName, to, subject ?? null, body, now(), reply_to ?? null, conversation ?? null, closing, flagged, urgent, originSession, delivery ?? null)
-      if (!closing) wakeAgent(to, conversation, { sender: agentName, subject })
+        .run(id, agentName, to, subject ?? null, body, now(), replyTo, conversation ?? null, closing, flagged, urgent, originSession, delivery ?? null)
+      if (!noWake) wakeAgent(to, conversation, { sender: agentName, subject })
       return {
         id,
         to,
         conversation: conversation ?? null,
         no_reply: Boolean(closing),
+        ...extras,
         known_recipient: Boolean(target),
-        note: closing ? 'queued as a closing message (no wake)' : target ? 'queued' : 'queued for an agent not yet registered',
+        note: extras.note ?? (closing ? 'queued as a closing message (no wake)' : target ? 'queued' : 'queued for an agent not yet registered'),
       }
     },
   )
 
   tool(
     'mesh_inbox',
-    'Read messages addressed to this agent, oldest first. Unread by default. Set mark_read to acknowledge in the same call.',
-    { limit: z.number().int().min(1).max(100).optional(), unread_only: z.boolean().optional(), mark_read: z.boolean().optional() },
-    ({ limit, unread_only, mark_read }) => {
+    'Read messages addressed to this agent. Unread by default, oldest first; pass order:"desc" to read newest first. With unread_only:false the default order is desc. Set mark_read to acknowledge the returned page in the same call.',
+    {
+      limit: z.number().int().min(1).max(100).optional(),
+      unread_only: z.boolean().optional(),
+      mark_read: z.boolean().optional(),
+      order: z.enum(['asc', 'desc']).optional(),
+    },
+    ({ limit, unread_only, mark_read, order }) => {
       const onlyUnread = unread_only ?? true
-      const rows = db
-        .prepare(
-          `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned, interrupt, delivery_mode FROM messages
-           WHERE recipient = ? ${onlyUnread ? 'AND read_at IS NULL' : ''}
-           ORDER BY created_at ASC LIMIT ?`,
-        )
-        .all(agentName, limit ?? 20)
-      if (mark_read && rows.length) {
+      const sortOrder = order ?? (onlyUnread ? 'asc' : 'desc')
+      const page = fetchInboxPage(agentName, { unreadOnly: onlyUnread, limit: limit ?? 20, order: sortOrder })
+      if (mark_read && page.rows.length) {
         const stmt = db.prepare('UPDATE messages SET read_at = ? WHERE id = ?')
-        for (const r of rows) stmt.run(now(), r.id)
+        for (const row of page.rows) stmt.run(now(), row.id)
       }
-      return { agent: agentName, count: rows.length, messages: rows }
+      return {
+        agent: agentName,
+        count: page.rows.length,
+        order: sortOrder,
+        has_more: page.hasMore,
+        next_before: page.nextBefore,
+        messages: page.rows,
+      }
     },
   )
 
@@ -1744,41 +1807,61 @@ async function handleRest(req, res, url) {
       const messageId = randomUUID()
       const conversation = body.conversation === undefined || body.conversation === null ? null : String(body.conversation)
       if (conversation !== null) assertText('conversation', conversation, MAX_CONVERSATION_BYTES)
-      const closing = body.no_reply === true ? 1 : 0
+      const replyTo = typeof body.reply_to === 'string' && body.reply_to.trim() ? body.reply_to : null
+      const wantsSilent = body.silent === true
+      let closing = body.no_reply === true ? 1 : 0
+      let noReplyIgnored = false
+      if (closing && !replyTo) {
+        closing = 0
+        noReplyIgnored = true
+      }
+      const noWake = wantsSilent || closing === 1
       const important = body.important === true || body.pinned === true
       const urgent = body.interrupt === true ? 1 : 0
       const originSession = typeof body.session === 'string' && body.session.trim() ? body.session.trim().slice(0, 80) : null
       const deliverMode = ['queue', 'steer', 'branch'].includes(String(body.delivery)) ? String(body.delivery) : null
+      const extras = {}
+      if (wantsSilent) extras.silent = true
+      if (noReplyIgnored) {
+        extras.no_reply_ignored = true
+        extras.reason = 'no_reply requires reply_to (closing message only)'
+      }
+      if (wantsSilent && body.no_reply === true) extras.note = 'silent takes precedence over no_reply'
       if (body.to === '*') {
         const recipients = db.prepare('SELECT name FROM agents WHERE name != ?').all(id.name).map((row) => row.name)
         const insert = db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session, delivery_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         for (const name of recipients) {
-          insert.run(randomUUID(), id.name, name, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent, originSession, deliverMode)
-          if (!closing) wakeAgent(name, conversation, { sender: id.name, subject: body.subject })
+          insert.run(randomUUID(), id.name, name, body.subject ?? null, body.body, now(), replyTo, conversation, closing, important ? 1 : 0, urgent, originSession, deliverMode)
+          if (!noWake) wakeAgent(name, conversation, { sender: id.name, subject: body.subject })
         }
-        return sendJson(res, 201, { to: '*', recipients: recipients.length, conversation, no_reply: Boolean(closing) })
+        return sendJson(res, 201, { to: '*', recipients: recipients.length, conversation, no_reply: Boolean(closing), ...extras })
       }
       db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session, delivery_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(messageId, id.name, body.to, body.subject ?? null, body.body, now(), body.reply_to ?? null, conversation, closing, important ? 1 : 0, urgent, originSession, deliverMode)
-      if (!closing) wakeAgent(body.to, conversation, { sender: id.name, subject: body.subject })
-      return sendJson(res, 201, { id: messageId, to: body.to, conversation, no_reply: Boolean(closing) })
+        .run(messageId, id.name, body.to, body.subject ?? null, body.body, now(), replyTo, conversation, closing, important ? 1 : 0, urgent, originSession, deliverMode)
+      if (!noWake) wakeAgent(body.to, conversation, { sender: id.name, subject: body.subject })
+      return sendJson(res, 201, { id: messageId, to: body.to, conversation, no_reply: Boolean(closing), ...extras })
     }
 
     if (path === '/api/inbox' && req.method === 'GET') {
       const unreadOnly = q.get('unread') !== '0'
       const limit = parseLimit(q.get('limit'), 20, 100)
-      const rows = db
-        .prepare(
-          `SELECT id, sender, subject, body, created_at, read_at, reply_to, conversation, no_reply, pinned, interrupt, delivery_mode FROM messages
-           WHERE recipient = ? ${unreadOnly ? 'AND read_at IS NULL' : ''}
-           ORDER BY created_at ASC LIMIT ?`,
-        )
-        .all(id.name, limit)
-      if (q.get('mark_read') === '1' && rows.length) {
+      const order = q.get('order') === 'desc' ? 'desc' : 'asc'
+      const beforeRaw = q.get('before')
+      const before = beforeRaw === null || beforeRaw === '' ? null : Number(beforeRaw)
+      if (before !== null && !Number.isFinite(before)) throw new BadRequest('before must be epoch milliseconds')
+      const page = fetchInboxPage(id.name, { unreadOnly, limit, order, before })
+      if (q.get('mark_read') === '1' && page.rows.length) {
         const stmt = db.prepare('UPDATE messages SET read_at = ? WHERE id = ?')
-        for (const r of rows) stmt.run(now(), r.id)
+        for (const row of page.rows) stmt.run(now(), row.id)
       }
-      return sendJson(res, 200, { agent: id.name, count: rows.length, messages: rows })
+      return sendJson(res, 200, {
+        agent: id.name,
+        count: page.rows.length,
+        order,
+        has_more: page.hasMore,
+        next_before: page.nextBefore,
+        messages: page.rows,
+      })
     }
 
     // A client that inlines message content into its own prompt needs to acknowledge

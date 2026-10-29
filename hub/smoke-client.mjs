@@ -155,6 +155,7 @@ try {
     subject: '收尾',
     body: '本轮结束，无需回复。',
     conversation: 'conv/smoke-1',
+    reply_to: 'conv-smoke-parent',
     no_reply: true,
   })
   const closingInbox = await call(bob.client, 'mesh_inbox', { mark_read: true })
@@ -207,7 +208,6 @@ try {
     )
     await call(alice.client, 'mesh_send', { to: 'bob', subject: 'wake 测试', body: '有人在吗' })
     await new Promise((resolve) => setTimeout(resolve, 1000))
-    wakeServer.close()
     check('hub pings the recipient wake endpoint', wakeHits.length >= 1, `${wakeHits.length} hit(s)`)
     check('wake ping is signed and carries no message body', Boolean(wakeHits[0]?.signature) && !String(wakeHits[0]?.body).includes('有人在吗'), String(wakeHits[0]?.signature ?? '').slice(0, 14))
     const expected = createHmac('sha256', bobSecret).update(wakeHits[0]?.body ?? '').digest('hex')
@@ -216,6 +216,47 @@ try {
       wakeHits[0]?.signature === `sha256=${expected}`,
       wakeHits[0]?.signature === `sha256=${expected}` ? 'verified' : 'mismatch',
     )
+
+    // no_reply is only the closing marker of a dialogue: without reply_to it must wake;
+    // silent must store the message without waking anyone.
+    const plainToken = await mint('wake-plain')
+    const silentToken = await mint('wake-silent')
+    const closingToken = await mint('wake-closing')
+    for (const [token, name] of [[plainToken, 'wake-plain'], [silentToken, 'wake-silent'], [closingToken, 'wake-closing']]) {
+      await fetch(`${BASE}/api/register`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ wake_url: `http://127.0.0.1:${wakePort}/wake` }),
+      })
+    }
+    const post = (path, token, payload) => fetch(`${BASE}${path}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).then((response) => response.json())
+    const plainSend = await post('/api/send', aliceToken, { to: 'wake-plain', subject: 'no reply without reply_to', body: 'wake me', no_reply: true })
+    const silentSend = await post('/api/send', aliceToken, { to: 'wake-silent', subject: 'silent', body: 'do not wake', silent: true })
+    const closingSend = await post('/api/send', aliceToken, { to: 'wake-closing', subject: 'closing', body: 'no wake', no_reply: true, reply_to: 'parent-message-id' })
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    wakeServer.close()
+    const woken = new Set(wakeHits.map((hit) => { try { return JSON.parse(hit.body).agent } catch { return null } }))
+    check(
+      'no_reply without reply_to is ignored and wakes',
+      plainSend.no_reply_ignored === true && plainSend.no_reply === false && woken.has('wake-plain'),
+      `ignored=${plainSend.no_reply_ignored}, woken=${woken.has('wake-plain')}`,
+    )
+    check(
+      'silent stores without waking',
+      silentSend.silent === true && !woken.has('wake-silent'),
+      `silent=${silentSend.silent}, woken=${woken.has('wake-silent')}`,
+    )
+    check(
+      'no_reply with reply_to still does not wake',
+      closingSend.no_reply === true && !woken.has('wake-closing'),
+      `no_reply=${closingSend.no_reply}, woken=${woken.has('wake-closing')}`,
+    )
+    const mcpClosing = await call(alice.client, 'mesh_send', { to: 'wake-mcp', body: 'mcp no_reply', no_reply: true })
+    check('MCP send ignores no_reply without reply_to', mcpClosing.no_reply_ignored === true, `ignored=${mcpClosing.no_reply_ignored}`)
   } else {
     console.log('SKIP  wake push (hub started without MESH_WAKE_SECRET)')
   }
@@ -359,6 +400,50 @@ try {
       bobInbox.messages.some((m) => m.id === sent.id && m.pinned === 1),
       `${bobInbox.messages.length} messages`,
     )
+  }
+
+  // --- inbox ordering + cursor: newest must be reachable past the page cap ------
+  {
+    const orderedToken = await mint('ordered')
+    for (let index = 0; index < 30; index += 1) {
+      await fetch(`${BASE}/api/send`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ to: 'ordered', subject: `page ${index}`, body: `message ${index}` }),
+      })
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
+    const firstPage = await (await fetch(`${BASE}/api/inbox?unread=1&limit=20&order=desc`, {
+      headers: { authorization: `Bearer ${orderedToken}` },
+    })).json()
+    check(
+      'inbox order=desc returns the newest page with a cursor',
+      firstPage.count === 20 && firstPage.messages[0]?.subject === 'page 29' &&
+        firstPage.has_more === true && Number.isFinite(firstPage.next_before),
+      `count=${firstPage.count}, has_more=${firstPage.has_more}`,
+    )
+    const seen = new Set(firstPage.messages.map((message) => message.id))
+    let cursor = firstPage.next_before
+    let pages = 1
+    while (cursor) {
+      const page = await (await fetch(`${BASE}/api/inbox?unread=1&limit=20&order=desc&before=${cursor}`, {
+        headers: { authorization: `Bearer ${orderedToken}` },
+      })).json()
+      for (const message of page.messages) seen.add(message.id)
+      pages += 1
+      cursor = page.has_more ? page.next_before : null
+      if (pages > 10) break
+    }
+    check('before cursor pages through the whole backlog', seen.size === 30, `pages=${pages}, seen=${seen.size}`)
+
+    const orderedClient = await connect('ordered', orderedToken)
+    const mcpInbox = await call(orderedClient.client, 'mesh_inbox', { unread_only: false, limit: 5 })
+    check(
+      'MCP inbox defaults to desc when reading everything',
+      mcpInbox.order === 'desc' && mcpInbox.messages[0]?.subject === 'page 29',
+      String(mcpInbox.order ?? 'missing'),
+    )
+    await orderedClient.transport.close()
   }
 
   // --- relay wake: only the deployment's configured target may be registered -----
