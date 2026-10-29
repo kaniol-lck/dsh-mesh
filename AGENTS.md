@@ -118,6 +118,13 @@ node scripts/mesh-dispatch.mjs --title "mesh · hub" --file .worklog/dispatch/hu
 **派活必须带回执**：`mesh_dispatch`（或 CLI）要带 `taskId`；多单用同一 `batchId`，全部结束才唤醒一次。
 不带 taskId = 放弃回执，只能靠翻 git log 猜完没完。
 
+**回执是线索，产物才是证据**：收到 `status=completed` 必须核对产物 —— commit 确实存在、目标文件/接口确实改了、
+测试数对得上、部署后 `/health` 或 `process` 版本确实变了。**不得仅凭回执宣布完成**。
+（已发生过：任务注入时目标会话正在跑上一轮，上一轮的 `turn/end` 被误记为本任务完成。）
+
+**派活前先看目标会话忙不忙**：`GET /mesh/batches` 或 `/mesh/status` 的 `pendingTasks`；若目标在 `working`，
+要明确知道「这条会排队到下一轮」并据此调整预期，不要往同一条队列里叠太多单。
+
 细节见 `docs/multi-session-playbook.md`。
 
 ## 与镜像仓的关系

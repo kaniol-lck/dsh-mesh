@@ -53,6 +53,14 @@
 **为什么**：没有归口、没有新鲜进展的「进行中」= 僵尸项——看板会长期显示它，但没人推进；
 真实案例是一条无 `归属`/`进展` 的 P2 在 2026-10-22 挂成「进行中」整整一周。
 
+## 回执与验收
+
+`mesh_dispatch` / `dsh-mesh-dispatch` 带 `taskId` 时，插件会在回合结束时写回执（`~/.dsh/mesh-waker/receipts.jsonl`）。
+**回执只说明「那一轮结束了」，不说明「任务达成了」**：验收必须落到产物（commit / 文件 / 测试 / 部署后的版本号）。
+
+`status` 取值：`completed | error | aborted | blocked | max-tokens | interrupted | forked | not-started | lost`；
+`summary` 是该回合最后一条助手消息的截断，可能是思考片段，只作线索。
+
 ## 关口（阶段性验收）
 
 `scripts/roadmap.gates.json` 定义阶段验收：每个关口是一组 `requires`，`--write` 时机械判定是否达成，写进 ROADMAP 自动段的「### 关口（阶段性验收）」。
