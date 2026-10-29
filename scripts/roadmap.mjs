@@ -385,7 +385,15 @@ function gateRequireEntries(require, entries) {
 
 function evaluateGate(gate, entries) {
   const met = []
+  const seen = new Set()
   const blocking = []
+  // Several requires can point at the same todo (e.g. feature:运维交付 + match:release.md);
+  // report each item once, keeping require order then item order.
+  const pushBlocker = (key, title) => {
+    if (seen.has(key)) return
+    seen.add(key)
+    blocking.push(title)
+  }
   for (const require of gate.requires ?? []) {
     const matched = gateRequireEntries(require, entries)
     const open = matched.filter((entry) => entry.status !== '已完成')
@@ -393,7 +401,8 @@ function evaluateGate(gate, entries) {
       met.push(require)
       continue
     }
-    blocking.push(matched.length === 0 ? `「${gateRequireLabel(require)}」无匹配` : open[0].displayTitle)
+    if (matched.length === 0) pushBlocker(`missing:${gateRequireLabel(require)}`, `「${gateRequireLabel(require)}」无匹配`)
+    else pushBlocker(`${open[0].file}:${open[0].line}`, open[0].displayTitle)
   }
   return {
     id: gate.id,
