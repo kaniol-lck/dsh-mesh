@@ -1,0 +1,15 @@
+{
+  "commands": [
+    { "name": "node", "minVersion": "20", "blocking": true },
+    { "name": "npm", "blocking": false },
+    { "name": "python", "minVersion": "3.10", "blocking": true }
+  ],
+  "python": [
+    { "module": "sqlite3", "blocking": true },
+    { "module": "requests", "blocking": false, "hint": "pip install requests" }
+  ],
+  "env": [
+    { "name": "MESH_HUB", "blocking": true },
+    { "name": "MESH_TOKEN", "blocking": true }
+  ]
+}
