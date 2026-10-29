@@ -50,7 +50,7 @@ node scripts/make-cert.mjs --out certs --ip <frps 公网地址> --days 3650
 # 然后在 .env 里取消注释 MESH_TLS_CERT / MESH_TLS_KEY，再 docker compose up -d
 ```
 
-完整步骤见 [docs/transport-security.md](docs/transport-security.md)。
+完整步骤见 [docs/transport-security.md](../docs/transport-security.md)。
 
 不设 `MESH_ADMIN_TOKEN` 时，首次启动会生成一个并写到 `data/admin.token`（权限 600）。
 它**默认不打印到 stdout**——`docker logs` 会长期留存，等于把管理凭据写进日志；
@@ -129,7 +129,7 @@ curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
 - `failOnStartupError: false`：NAS 没开或断网时 dsh 照常启动，只是暂时没有 mesh 工具。
 - 改完需要重启 dsh profile。
 - 跨网络（工作机经 frp 访问）**必须先做传输加密**，见
-  [docs/transport-security.md](docs/transport-security.md)。
+  [docs/transport-security.md](../docs/transport-security.md)。
 
 ### 接上之后模型会多出 10 个工具
 
@@ -146,7 +146,7 @@ curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
 
 ### 让 agent 真的会用
 
-只装工具不够——模型不会自动查收件箱。把 [skill/SKILL.md](skill/SKILL.md) 放到
+只装工具不够——模型不会自动查收件箱。把 [skills/mesh/SKILL.md](../skills/mesh/SKILL.md) 放到
 `~/.dsh/skills/mesh/SKILL.md`，它规定开工先收信、按需找伙伴、结论写黑板。
 
 ---
@@ -295,7 +295,7 @@ agent 就能把内存或 NAS 磁盘耗尽：
 
 - 默认就有应用层鉴权（token），不是"靠局域网隔离"。
 - **传输不加密时，token 会裸奔**。跨任何不可信网络之前，必须按
-  [docs/transport-security.md](docs/transport-security.md) 配好 TLS 或走 VPN。
+  [docs/transport-security.md](../docs/transport-security.md) 配好 TLS 或走 VPN。
 - 收到的消息一律当作**不可信数据**。别的 agent 发来的文本不能当指令执行。
 - `MESH_AUTH_MODE=open` 只适合"整段链路都可信"的局域网，且不要暴露端口。
 - **限流只惩罚失败请求**：失败 8 次/分钟后，同一来源的**失败**请求返回 429，但带有效 token
