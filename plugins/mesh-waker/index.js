@@ -2328,8 +2328,12 @@ export function apply(ctx, config) {
     try {
       const sessionId = typeof session === 'string' ? session : session?.id ?? session?.sessionId
       if (!sessionId || !event || typeof event !== 'object') return
-      const type = String(event.type ?? '')
-      const turn = Number.isFinite(Number(event.turn)) ? Number(event.turn) : null
+      // DSH hands over an envelope `{ type, seq, time, data }`: turn/reason/message/tool
+      // fields live under `data`. Synthetic producers may still pass a flat payload, so
+      // prefer the real shape and fall back to the event itself.
+      const d = event.data && typeof event.data === 'object' ? event.data : event
+      const type = String(event.type ?? d.type ?? '')
+      const turn = Number.isFinite(Number(d.turn)) ? Number(d.turn) : null
       const ledger = livenessFor(sessionId)
       const now = Date.now()
       ledger.lastEventAt = now
@@ -2343,19 +2347,19 @@ export function apply(ctx, config) {
           break
         case 'turn/end':
           ledger.openTurn = null
-          ledger.lastReason = event.reason ?? null
+          ledger.lastReason = d.reason ?? null
           ledger.openCalls.clear()
           ledger.openJobs.clear()
           ledger.openApprovals.clear()
           break
         case 'tool/call':
-          ledger.openCalls.set(String(event.callId ?? randomUUID()), {
-            name: String(event.name ?? 'tool'),
+          ledger.openCalls.set(String(d.callId ?? randomUUID()), {
+            name: String(d.name ?? 'tool'),
             startedAt: now,
           })
           break
         case 'tool/result': {
-          const callId = event.callId ?? event.message?.callId
+          const callId = d.callId ?? d.message?.callId
           if (callId !== undefined) ledger.openCalls.delete(String(callId))
           else {
             const first = ledger.openCalls.keys().next()
@@ -2364,23 +2368,23 @@ export function apply(ctx, config) {
           break
         }
         case 'job/registered': {
-          const jobId = event.jobId ?? event.id ?? event.job?.id ?? randomUUID()
+          const jobId = d.jobId ?? d.id ?? d.job?.id ?? randomUUID()
           ledger.openJobs.set(String(jobId), { startedAt: now })
           break
         }
         case 'job/settled': {
-          const jobId = event.jobId ?? event.id ?? event.job?.id
+          const jobId = d.jobId ?? d.id ?? d.job?.id
           if (jobId !== undefined) ledger.openJobs.delete(String(jobId))
           break
         }
         case 'approval/asked':
-          ledger.openApprovals.set(String(event.id ?? randomUUID()), {
-            toolName: String(event.toolName ?? event.name ?? 'tool'),
+          ledger.openApprovals.set(String(d.id ?? randomUUID()), {
+            toolName: String(d.toolName ?? d.name ?? 'tool'),
             askedAt: now,
           })
           break
         case 'approval/decided':
-          if (event.id !== undefined) ledger.openApprovals.delete(String(event.id))
+          if (d.id !== undefined) ledger.openApprovals.delete(String(d.id))
           break
         case 'llm/retry':
         case 'llm/retry-started':
@@ -2398,12 +2402,12 @@ export function apply(ctx, config) {
         return
       }
       if (type === 'assistant/message') {
-        const text = messageText(event.message)
+        const text = messageText(d.message)
         if (text) assistantText.set(sessionId, { turn, text })
         return
       }
       if (type === 'turn/end') {
-        const classified = classifyTurnEnd(event.reason)
+        const classified = classifyTurnEnd(d.reason)
         for (const [taskId, task] of [...pendingTasks]) {
           if (task.sessionId !== sessionId || task.settled) continue
           if (task.baselineTurn !== null && turn !== null && turn < task.baselineTurn) continue

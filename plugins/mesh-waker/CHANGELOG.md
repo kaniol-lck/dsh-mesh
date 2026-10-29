@@ -2,12 +2,21 @@
 
 本文件记录 `dsh-mesh-waker` 的变更。格式仿 `hub/CHANGES.md`：每节写清改了什么、怎么复验。
 
-> **发版状态**：`0.4.56`–`0.5.2` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
-> `next` 是 0.4.55）；0.4.60、0.5.0–0.5.2 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
+> **发版状态**：`0.4.56`–`0.5.3` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
+> `next` 是 0.4.55）；0.4.60、0.5.0–0.5.3 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封）。
 
 ---
+
+## v0.5.3（2026-10-29，修复 session/event 信封层级）
+
+| 项 | 内容 |
+|---|---|
+| 修复 | DSH 的 `ctx.on('session/event', (session, event))` 传来的是信封 `{ type, seq, time, data }`，`turn` / `reason` / `message` / `callId` / `jobId` / `approval` 全在 `event.data` 下。0.5.2 直接读 `event.*`，导致真机上回执 `turn:null`、`summary:""`，且 `waiting-tool` / `waiting-job` / `waiting-approval` 三态永远不触发 |
+| 修法 | `handleSessionEvent` 顶部统一取 `const d = event.data ?? event`（真实信封优先，保留扁平对象兼容），所有字段改从 `d` 读取；`event.type` 仍取顶层 |
+| 测试 | 新增 5 例真实信封形态：`turn/end data → turn=1/status=completed`、`assistant/message data → summary="OK"`、`tool/call data → waiting-tool(bash)`、`approval/asked data → waiting-approval(bash)`、`job/registered data → waiting-job(job-9)`；连同原有 26 例共 31/31 |
+| 验证 | `node --check` 两文件 exit 0；`node test/waker-endpoints.test.js` 31/31；真机批次待本机进程重启到 0.5.3 后复验（安装目录同步由协调会话执行） |
 
 ## v0.5.2（2026-10-29，批次屏障 + 事件驱动 liveness）
 

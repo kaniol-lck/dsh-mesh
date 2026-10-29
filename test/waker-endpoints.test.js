@@ -827,6 +827,66 @@ async function main() {
     report('batch: DELETE cancels and suppresses the aggregate', ok, `listed=${(list.json?.batches ?? []).length} detailTotal=${detail.json?.total ?? '-'} delete=${cancelled.status} aggregates=${aggregates.length}`)
   })
 
+  // 28-32. Real DSH envelope shape: {type, seq, time, data}; fields live under `data`.
+  await runCase('envelope: turn/end data settles with the real turn number', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-env', title: 'env target' }] })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'env target', text: 'envelope task', meta: { taskId: 'T-env' } } })
+    h.emit('session/event', { id: 'session-env' }, { type: 'turn/start', seq: 1, time: 0, data: { turn: 1 } })
+    h.emit('session/event', { id: 'session-env' }, { type: 'turn/end', seq: 9, time: 0, data: { turn: 1, reason: { kind: 'completed' } } })
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-env'), 4000)
+    const ok = receipt?.turn === 1 && receipt?.status === 'completed'
+    report('envelope: turn/end data settles with the real turn number', ok, `turn=${receipt?.turn ?? '-'} status=${receipt?.status ?? '-'}`)
+  })
+
+  await runCase('envelope: assistant/message data yields the summary', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-env-msg', title: 'env msg target' }] })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'env msg target', text: 'summary task', meta: { taskId: 'T-env-msg' } } })
+    h.emit('session/event', { id: 'session-env-msg' }, { type: 'turn/start', data: { turn: 1 } })
+    h.emit('session/event', { id: 'session-env-msg' }, {
+      type: 'assistant/message',
+      seq: 3,
+      time: 0,
+      data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'OK' }] } },
+    })
+    h.emit('session/event', { id: 'session-env-msg' }, { type: 'turn/end', seq: 4, time: 0, data: { turn: 1, reason: { kind: 'completed' } } })
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-env-msg'), 4000)
+    const ok = receipt?.summary === 'OK' && receipt?.turn === 1
+    report('envelope: assistant/message data yields the summary', ok, `summary=${JSON.stringify(receipt?.summary ?? '')} turn=${receipt?.turn ?? '-'}`)
+  })
+
+  await runCase('envelope: tool/call data reaches waiting-tool', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-tool', title: 'tool target' }] })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'tool target', text: 'tool task', meta: { taskId: 'T-tool', batchId: 'B-tool' } } })
+    h.emit('session/event', { id: 'session-tool' }, { type: 'turn/start', data: { turn: 1 } })
+    h.emit('session/event', { id: 'session-tool' }, { type: 'tool/call', data: { turn: 1, step: 1, callId: 'c1', name: 'bash' } })
+    const detail = await request(h.base, '/mesh/batches/B-tool')
+    const task = detail.json?.tasks?.[0]
+    const ok = detail.json?.ok === true && task?.status === 'waiting-tool' && /bash/.test(task?.detail ?? '')
+    report('envelope: tool/call data reaches waiting-tool', ok, `status=${task?.status ?? '-'} detail=${task?.detail ?? '-'}`)
+  })
+
+  await runCase('envelope: approval/asked data reaches waiting-approval', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-appr', title: 'appr target' }] })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'appr target', text: 'approval task', meta: { taskId: 'T-appr', batchId: 'B-appr' } } })
+    h.emit('session/event', { id: 'session-appr' }, { type: 'turn/start', data: { turn: 2 } })
+    h.emit('session/event', { id: 'session-appr' }, { type: 'approval/asked', data: { id: 'a1', toolName: 'bash', reason: 'needs approval' } })
+    const detail = await request(h.base, '/mesh/batches/B-appr')
+    const task = detail.json?.tasks?.[0]
+    const ok = detail.json?.ok === true && task?.status === 'waiting-approval' && /bash/.test(task?.detail ?? '')
+    report('envelope: approval/asked data reaches waiting-approval', ok, `status=${task?.status ?? '-'} detail=${task?.detail ?? '-'}`)
+  })
+
+  await runCase('envelope: job/registered data reaches waiting-job', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-job', title: 'job target' }] })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'job target', text: 'job task', meta: { taskId: 'T-job', batchId: 'B-job' } } })
+    h.emit('session/event', { id: 'session-job' }, { type: 'turn/start', data: { turn: 1 } })
+    h.emit('session/event', { id: 'session-job' }, { type: 'job/registered', data: { jobId: 'job-9' } })
+    const detail = await request(h.base, '/mesh/batches/B-job')
+    const task = detail.json?.tasks?.[0]
+    const ok = detail.json?.ok === true && task?.status === 'waiting-job' && /job-9/.test(task?.detail ?? '')
+    report('envelope: job/registered data reaches waiting-job', ok, `status=${task?.status ?? '-'} detail=${task?.detail ?? '-'}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
