@@ -115,6 +115,9 @@ node scripts/mesh-dispatch.mjs --title "mesh · hub" --file .worklog/dispatch/hu
 
 **不要用 `Invoke-RestMethod` / `ConvertTo-Json` 发任务正文**（会把多行字符串收成 `[object Object]`）。
 
+**派活必须带回执**：`mesh_dispatch`（或 CLI）要带 `taskId`；多单用同一 `batchId`，全部结束才唤醒一次。
+不带 taskId = 放弃回执，只能靠翻 git log 猜完没完。
+
 细节见 `docs/multi-session-playbook.md`。
 
 ## 与镜像仓的关系

@@ -353,7 +353,7 @@ python scripts/handoff/handoff.py receive --id <blob> --dir ./incoming --sha256 
 发起对话时把回信钉在当前会话，别让它落进「Mesh 收件箱」：
 
 - **MCP 发信**：mesh_send 带 session: <本会话 id>（shell 里可用 $DSH_SESSION_ID）；
-- **脚本发信**：直接用 scripts/mesh-send.py，它会自动读 DSH_SESSION_ID 带上；
+- **CLI / 脚本发信**：自动读环境变量 `DSH_SESSION_ID` 带上 `session` 即可（DSH 会话里已就绪）；
 - 远端回信到达时，waker 看到 origin_session 会把该对话**自动绑定**到发起会话（用户手动绑定优先）；
 - 绑定晚于消息也不丢：POST /mesh/bind {conversation, sessionId, deliver:true, backfill:12} 会把最近消息补投进会话；
 - **三种投递模式**：queue（排队，默认）/ steer（插队）/ ranch（fork 侧会话）。
@@ -362,22 +362,111 @@ python scripts/handoff/handoff.py receive --id <blob> --dir ./incoming --sha256 
   侧会话标题 mesh · <主题> · 分支，12 小时内复用。
 - 已读消息不会自动重投——历史只能靠 ackfill 补，绑定时值得顺手带上。
 
-## 17. 本机会话协作（不经中枢）
+## 17. 多会话分工（任意项目可用）
 
-同一台机器、同一个 DSH 里的会话可以直接互相派活，走 waker 的 loopback 接口：
+把一个项目拆给多个会话并行做（例：一个写后端、一个写文档、一个跑验收），
+协调会话负责拆活、派活、验收。协调会话不必是「人」，任意 agent 会话都可以。
+
+**本技能不假设任何目录约定**：`.worklog/`、`scripts/`、`docs/` 都只是某个具体项目的习惯，
+不是 mesh 的要求；下面所有命令在任意项目里都能照用。
+
+### 三种角色
+
+| 角色 | 做什么 | 不做什么 |
+|---|---|---|
+| 协调 | 拆活、派活、看回执、验收、汇总 | 不替执行会话改文件 |
+| 执行 | 在自己的工作区干活、提交、写回执 | 不擅自改别人的活 |
+| 验收 | 复核产物（git diff / 测试 / 命令输出） | 不只看回执 `summary` 就判过 |
+
+### 派活：优先工具，其次 CLI，最后 HTTP
+
+**1）工具（推荐）**
+
+```
+mesh_dispatch({
+  target: "backend",              // 会话标题或 session id
+  text: "实现 /api/x。只改 backend/；验收：测试通过并提交",
+  taskId: "T-1",
+  batchId: "B-1",
+  receipt: true,
+  deadline: 1800,
+  createIfMissing: true           // 没有现成会话时，按标题开一个
+})
+```
+
+- `createIfMissing: true` 是**新项目的起手式**：不用先手动建会话；
+- 没有现成会话又不开 `createIfMissing` 会失败，先 `/mesh/sessions` 看有哪些标题；
+- 多单用同一个 `batchId`，结束统一回执（见下）。
+
+**2）CLI**
+
+```bash
+npx dsh-mesh-dispatch --target "backend" --text "实现 /api/x；验收：测试通过" \
+  --task T-1 --batch B-1 --create
+```
+
+**3）HTTP 兜底**（工具/CLI 不可用时）
+
+```bash
+curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: application/json' `
+  -d '{"title":"backend","text":"实现 /api/x；验收：测试通过","meta":{"taskId":"T-1","batchId":"B-1","receipt":true}}'
+```
+
+- `session` 与 `title` 二选一（标题不存在就用 `/mesh/sessions/create` 显式建）；
+- `mode` 默认 `queue`；`steer` 会打断当前回合，慎用。
+
+### 批次屏障：全部结束才回执一次
+
+同一 `batchId` 的多单，**全部结束后只回执一次**，别给每单单独叫醒协调会话——
+3 个并行任务会换来 3 次打断，协调方反而更慢。收到批次回执后再统一验收。
+
+### 回执怎么读
+
+`~/.dsh/mesh-waker/receipts.jsonl`，一行一条 JSON：
+
+| 字段 | 含义 |
+|---|---|
+| `taskId` / `sessionId` / `turn` | 哪一单、哪个会话、第几回合 |
+| `status` | `completed` / `error` / `aborted` / `blocked` / `max-tokens` / `interrupted` / `forked` / `not-started` / `lost` |
+| `reasonKind` | 失败分类（通常与 `status` 一致） |
+| `durationMs` | 该回合耗时 |
+| `summary` | 该回合最后一条助手消息（截断） |
+
+**`summary` 只说「这轮说了什么」，不等于「任务达成」**——验收仍要看产物（git diff、测试、命令输出）。
+
+### 卡住怎么判（别干等）
+
+```bash
+curl.exe -s http://127.0.0.1:8795/mesh/batches
+```
+
+每个任务一行 liveness：
+
+| 状态 | 含义 | 动作 |
+|---|---|---|
+| `working` | 正在跑 | 等 |
+| `waiting-approval` | 等你批准 | **立刻处理** |
+| `waiting-job` | 等后台任务 | 可以等 |
+| `waiting-tool` | 等工具返回 | 等 |
+| `stalled` | 静默超过 5 分钟 | **介入**（问「卡在哪」） |
+| `not-started` / `lost` | 没起来 / 丢了 | 重派 |
+
+### 失败与兜底
+
+- `8795` 不通 → 插件没装或没激活：看 `/mesh/status` 的 `mode`、`registered`、`lastError`；
+- 跨机协作走 hub 消息（见 §2），**本机派活不经过中枢**；
+- 派活前先 `mesh_peers` 或 `curl /mesh/sessions` 确认目标存在，避免派给写错的标题。
+
+### 本机会话相关接口（同一台机器）
 
 ```powershell
 curl.exe -s http://127.0.0.1:8795/mesh/sessions          # 列会话：id/标题/cwd/live/archived
-curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: application/json' `
-  -d '{"title":"mesh · hub","text":"核对 README 与文档，只列不改"}'
 curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/create -H 'content-type: application/json' `
-  -d '{"title":"mesh · docs","workspacePath":"<repo>","prompt":"先读 docs/ 列待办"}'
+  -d '{"title":"backend","workspacePath":"<repo>","prompt":"先读 README 列待办"}'
 ```
 
 铁律：
 
 1. **cwd/workspacePath 必须指向具体仓库根**，不要指向包含多个仓的上级目录，否则相对路径找不到文件；
-2. 新建会话传 `workspacePath` 或 `cwd` 都会尝试解析/绑定工作区（`plugins/mesh-waker/index.js:1674-1695`）；解析/创建失败才回退为不绑定、侧栏不显示；显式传 `workspacePath` 更好排错；
-3. 注入默认 `queue`，`steer` 会打断当前回合，慎用；
-4. 一个任务派一个会话，明确“只改哪里 / 什么算完成 / 怎么回报”；
-5. 清理重复会话用 `/mesh/sessions/archive`（侧栏隐藏）或 `/mesh/sessions/delete`（文件可能仍在磁盘）。
+2. 新建会话传 `workspacePath` 或 `cwd` 都会尝试解析/绑定工作区；失败才回退为不绑定、侧栏不显示；显式传 `workspacePath` 更好排错；
+3. 清理重复会话用 `/mesh/sessions/archive`（侧栏隐藏）或 `/mesh/sessions/delete`（文件可能仍在磁盘）。
