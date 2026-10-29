@@ -1240,6 +1240,21 @@ ${auth.role === 'admin' ? '' : '<p class="muted">只读会话：需要轮换令�
 <tbody id="agents"></tbody></table>
 <p class="muted" id="adminNote"></p>
 
+<h2>新节点配对</h2>
+<p class="muted">注册码 10 分钟有效、单次使用。也可以让新节点自己发起设备码，由你在这里批准。</p>
+${auth.role === 'admin' ? '<button type="button" id="genEnroll">生成注册码</button>' : '<p class="muted">只读会话：用管理员令牌登录后可生成注册码或批准设备。</p>'}
+<div id="enrollOut" style="display:none; margin-top:10px">
+  <div class="token" id="enrollCode" style="font-size:26px; letter-spacing:4px; display:inline-block"></div>
+  <span class="muted" id="enrollMeta"></span>
+  <button type="button" id="copyEnroll" style="margin-left:8px">复制码</button>
+  <pre class="token" id="enrollCmds" style="white-space:pre-wrap; margin-top:10px"></pre>
+  <p class="muted">token 只返回一次；落盘 0600；配置 tokenFile 后重载插件。</p>
+</div>
+<h3 style="font-size:13px;margin-top:20px">待批准设备</h3>
+<table><thead><tr><th>用户码</th><th>请求名</th><th>主机</th><th>请求时间</th><th>剩余</th><th>操作</th></tr></thead>
+<tbody id="pending"></tbody></table>
+<p class="muted" id="pendingEmpty" style="display:none">暂无待配对设备</p>
+
 <h2>审计（最近 20 条）</h2>
 <table><thead><tr><th>时间</th><th>agent</th><th>动作</th><th>结果</th></tr></thead>
 <tbody id="audit"></tbody></table>
@@ -1249,6 +1264,23 @@ const CSRF = ${JSON.stringify(csrf)};
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const card = (label, value) => '<div class="card"><div class="k">' + esc(label) + '</div><div class="v">' + esc(value) + '</div></div>';
 const ALL_SCOPES = ['read', 'send', 'board', 'blob'];
+const HUB = location.origin;
+let enrollTimer = null;
+let enrollExpires = 0;
+function fmtClock(seconds) {
+  const safe = Math.max(0, Math.round(seconds));
+  return Math.floor(safe / 60) + ' 分 ' + String(safe % 60).padStart(2, '0') + ' 秒';
+}
+function copyText(text) {
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.style.position = 'fixed';
+  area.style.opacity = '0';
+  document.body.appendChild(area);
+  area.select();
+  try { document.execCommand('copy'); } catch (error) { window.prompt('复制失败，请手动复制：', text); }
+  area.remove();
+}
 async function post(path, payload) {
   const response = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json', 'x-mesh-csrf': CSRF }, body: JSON.stringify(payload) });
   const data = await response.json().catch(() => ({}));
@@ -1257,11 +1289,12 @@ async function post(path, payload) {
 }
 async function refresh() {
   try {
-    const [overview, peers, audit, agents] = await Promise.all([
+    const [overview, peers, audit, agents, pending] = await Promise.all([
       fetch('/console/api/overview').then((r) => r.json()),
       fetch('/console/api/peers').then((r) => r.json()),
       fetch('/console/api/audit?limit=20').then((r) => r.json()),
       fetch('/console/api/agents').then((r) => r.json()),
+      fetch('/console/enroll/pending').then((r) => r.json()),
     ]);
     document.getElementById('sub').textContent =
       '中枢 ' + (overview.hub?.version ?? '?') + ' · 最低要求 waker ' + (overview.hub?.min_waker ?? '?') +
@@ -1302,6 +1335,7 @@ async function refresh() {
     document.getElementById('adminNote').textContent = isAdmin
       ? '管理员会话：可直接改权限；轮换/吊销会立即影响对应节点。'
       : '只读会话：如需修改权限或令牌，请用管理员令牌登录。';
+    renderPending(pending);
     document.getElementById('audit').innerHTML = (audit.entries || []).map((row) =>
       '<tr><td>' + esc(new Date(row.at).toLocaleTimeString()) + '</td><td>' + esc(row.agent || '—') + '</td>' +
       '<td>' + esc(row.action) + '</td><td>' + (row.ok ? '<span class="badge ok">ok</span>' : '<span class="badge warn">fail</span>') + '</td></tr>'
@@ -1333,6 +1367,59 @@ document.addEventListener('click', async (event) => {
     if (result) refresh();
   }
 });
+async function generateEnroll() {
+  const data = await post('/console/enroll-code', {});
+  if (!data) return;
+  document.getElementById('enrollOut').style.display = 'block';
+  document.getElementById('enrollCode').textContent = data.code;
+  enrollExpires = Date.now() + (data.expires_in_seconds || 600) * 1000;
+  const cmds = [
+    '# 1) 用注册码换 token（token 只返回一次）',
+    "curl -s -X POST " + HUB + "/api/enroll -H 'content-type: application/json' -d '{\\"code\\":\\"" + data.code + "\\",\\"name\\":\\"<节点名>\\"}'",
+    '',
+    '# 2) 把返回的 token 落盘（0600）',
+    'umask 077; mkdir -p ~/.dsh/mesh-waker; cat > ~/.dsh/mesh-waker/token',
+    '',
+    '# 3) 验证 token',
+    'curl -s -H "Authorization: Bearer $(cat ~/.dsh/mesh-waker/token)" ' + HUB + '/api/status',
+  ].join('\\n');
+  document.getElementById('enrollCmds').textContent = cmds;
+  renderEnrollMeta();
+  clearInterval(enrollTimer);
+  enrollTimer = setInterval(renderEnrollMeta, 1000);
+}
+function renderEnrollMeta() {
+  const left = enrollExpires - Date.now();
+  const meta = document.getElementById('enrollMeta');
+  if (!meta) return;
+  if (left <= 0) { meta.textContent = '已过期'; clearInterval(enrollTimer); return; }
+  meta.textContent = '剩余 ' + fmtClock(left / 1000);
+}
+function renderPending(pending) {
+  const rows = pending.pending || [];
+  document.getElementById('pending').innerHTML = rows.map((p) => {
+    const left = Math.max(0, Math.round(((p.expires_at || 0) - Date.now()) / 1000));
+    const actions = ROLE === 'admin'
+      ? '<button data-enroll="approve" data-code="' + esc(p.user_code) + '">批准</button> ' +
+        '<button data-enroll="deny" data-code="' + esc(p.user_code) + '" class="danger">拒绝</button>'
+      : '<span class="muted">只读</span>';
+    return '<tr><td><code>' + esc(p.user_code) + '</code></td><td>' + esc(p.name || '—') + '</td>' +
+      '<td>' + esc(p.host || '—') + '</td><td>' + esc(new Date(p.created_at).toLocaleTimeString()) + '</td>' +
+      '<td>' + fmtClock(left) + '</td><td>' + actions + '</td></tr>';
+  }).join('');
+  document.getElementById('pendingEmpty').style.display = rows.length ? 'none' : 'block';
+}
+document.addEventListener('click', async (event) => {
+  if (event.target.closest('#genEnroll')) { generateEnroll(); return; }
+  if (event.target.closest('#copyEnroll')) { copyText(document.getElementById('enrollCode').textContent); return; }
+  const decide = event.target.closest('button[data-enroll]');
+  if (!decide) return;
+  const act = decide.getAttribute('data-enroll');
+  const code = decide.getAttribute('data-code');
+  const result = await post('/console/enroll/' + act, { user_code: code });
+  if (result) refresh();
+});
+
 refresh();
 setInterval(refresh, 15000);
 </script>
@@ -1497,6 +1584,26 @@ async function handleConsole(req, res, url) {
       return sendJson(res, 200, { ok: true, name, revoked: true })
     }
     return sendJson(res, 404, { error: 'unknown action' })
+  }
+
+  if (path === '/console/enroll/pending' && req.method === 'GET') {
+    const auth = consoleAuthorized(req)
+    if (!auth) return sendJson(res, 401, { error: 'unauthorized' })
+    return sendJson(res, 200, { pending: pendingDevices() })
+  }
+
+  if ((path === '/console/enroll/approve' || path === '/console/enroll/deny') && req.method === 'POST') {
+    const auth = consoleAuthorized(req)
+    if (!auth || auth.role !== 'admin') return sendJson(res, 403, { error: 'admin role required' })
+    if (!csrfOk(req, auth)) return sendJson(res, 403, { error: 'bad csrf token' })
+    let body
+    try {
+      body = await readJson(req)
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message })
+    }
+    const result = decideDevice(body, path.endsWith('/approve'), ip)
+    return sendJson(res, result.status, result.body)
   }
 
   if (path === '/console/enroll-code' && req.method === 'POST') {
@@ -2037,6 +2144,195 @@ async function handleEnroll(req, res) {
 }
 
 /**
+ * Device-code pairing: the node asks for a code, a human approves it in the console, and
+ * the node polls until its token is ready. Nothing secret has to travel through chat.
+ *
+ *   POST /api/enroll/request {name?, host?, description?} -> {user_code, device_code, ...}
+ *   POST /api/enroll/token   {device_code}               -> 202 pending / 201 {name, token}
+ *   POST /console/enroll/approve|deny {user_code}        (admin console session)
+ *   POST /api/admin/enroll/approve|deny {user_code}      (admin token)
+ *   GET  /console/enroll/pending                          (console session)
+ */
+const DEVICE_CODE_TTL_MS = 10 * 60_000
+const DEVICE_POLL_INTERVAL_MS = 5_000
+const ENROLL_RATE_WINDOW_MS = 60_000
+const ENROLL_REQUEST_LIMIT = 5
+const ENROLL_POLL_LIMIT = 10
+const deviceCodes = new Map() // user_code -> record
+const deviceByCode = new Map() // device_code -> record
+const deviceRequestRate = new Map() // ip -> { count, resetAt }
+const devicePollRate = new Map()
+
+/** Optional agent name from a request body; same grammar as the rest of enrollment. */
+function optionalAgentName(raw) {
+  if (raw === undefined || raw === null || raw === '') return null
+  if (typeof raw !== 'string') throw new BadRequest('name must be a string')
+  const name = raw.trim()
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) throw new BadRequest('name must match [A-Za-z0-9_-]{1,32}')
+  return name
+}
+
+/** Sliding fixed window per IP; the maps are pruned by sweepEnrollState(). */
+function overRate(map, ip, limit) {
+  const ts = now()
+  const entry = map.get(ip)
+  if (!entry || ts >= entry.resetAt) {
+    map.set(ip, { count: 1, resetAt: ts + ENROLL_RATE_WINDOW_MS })
+    return false
+  }
+  entry.count += 1
+  return entry.count > limit
+}
+
+function dropDevice(rec) {
+  deviceCodes.delete(rec.userCode)
+  deviceByCode.delete(rec.deviceCode)
+}
+
+function pruneDeviceCodes() {
+  const ts = now()
+  for (const rec of deviceCodes.values()) if (rec.expiresAt <= ts) dropDevice(rec)
+}
+
+function sweepEnrollState() {
+  pruneDeviceCodes()
+  for (const map of [deviceRequestRate, devicePollRate]) {
+    for (const [ip, entry] of map) if (now() >= entry.resetAt) map.delete(ip)
+  }
+}
+
+/** Human-readable, single-use pairing code: four letters/digits, a dash, four more. */
+function mintUserCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  for (;;) {
+    let raw = ''
+    for (let index = 0; index < 8; index += 1) raw += alphabet[randomBytes(1)[0] % alphabet.length]
+    const code = `${raw.slice(0, 4)}-${raw.slice(4)}`
+    if (!deviceCodes.has(code)) return code
+  }
+}
+
+/** Flip a pending request to approved/denied; shared by the console and admin faces. */
+function decideDevice(body, approve, ip) {
+  const userCode = String(body.user_code ?? '').trim().toUpperCase()
+  const rec = deviceCodes.get(userCode)
+  if (!rec || rec.expiresAt <= now()) {
+    if (rec) dropDevice(rec)
+    audit(approve ? 'enroll.approve' : 'enroll.deny', null, ip, false)
+    return { status: 404, body: { error: 'unknown or expired user code' } }
+  }
+  if (rec.status !== 'pending') {
+    audit(approve ? 'enroll.approve' : 'enroll.deny', rec.name ?? null, ip, false)
+    return { status: 409, body: { error: `device code already ${rec.status}` } }
+  }
+  try {
+    const name = optionalAgentName(body.name)
+    if (name) rec.name = name
+    if (body.host !== undefined) rec.host = String(body.host).trim().slice(0, 200) || null
+  } catch (error) {
+    return { status: 400, body: { error: error.message } }
+  }
+  rec.status = approve ? 'approved' : 'denied'
+  rec.decidedAt = now()
+  if (!rec.name && approve) rec.name = `node-${randomBytes(3).toString('hex')}`
+  audit(approve ? 'enroll.approve' : 'enroll.deny', rec.name ?? null, ip, true)
+  return {
+    status: 200,
+    body: { ok: true, user_code: rec.userCode, status: rec.status, name: rec.name, host: rec.host, expires_at: rec.expiresAt },
+  }
+}
+
+/** Pending requests as shown in the console — never contains device_code. */
+function pendingDevices() {
+  const ts = now()
+  return [...deviceCodes.values()]
+    .filter((rec) => rec.status === 'pending' && rec.expiresAt > ts)
+    .sort((left, right) => left.createdAt - right.createdAt)
+    .map((rec) => ({
+      user_code: rec.userCode,
+      name: rec.name,
+      host: rec.host,
+      description: rec.description,
+      created_at: rec.createdAt,
+      expires_at: rec.expiresAt,
+    }))
+}
+
+async function handleDeviceEnroll(req, res, url) {
+  if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' })
+  const ip = clientIp(req)
+  const path = url.pathname
+
+  try {
+    if (path === '/api/enroll/request') {
+      if (overRate(deviceRequestRate, ip, ENROLL_REQUEST_LIMIT)) {
+        audit('enroll.request', null, ip, false)
+        return sendJson(res, 429, { error: 'too many enrollment requests, retry later' })
+      }
+      const body = await readJson(req)
+      const name = optionalAgentName(body.name)
+      const host = body.host === undefined || body.host === null ? null : String(body.host).trim().slice(0, 200) || null
+      const description = body.description === undefined || body.description === null ? null : String(body.description).trim().slice(0, 200) || null
+      pruneDeviceCodes()
+      const userCode = mintUserCode()
+      const deviceCode = randomBytes(32).toString('hex')
+      const ts = now()
+      const rec = { userCode, deviceCode, name, host, description, createdAt: ts, expiresAt: ts + DEVICE_CODE_TTL_MS, status: 'pending' }
+      deviceCodes.set(userCode, rec)
+      deviceByCode.set(deviceCode, rec)
+      audit('enroll.request', name ?? null, ip, true)
+      return sendJson(res, 201, {
+        user_code: userCode,
+        device_code: deviceCode,
+        expires_at: rec.expiresAt,
+        interval_ms: DEVICE_POLL_INTERVAL_MS,
+      })
+    }
+
+    if (path === '/api/enroll/token') {
+      if (overRate(devicePollRate, ip, ENROLL_POLL_LIMIT)) {
+        audit('enroll.token', null, ip, false)
+        return sendJson(res, 429, { error: 'too many enrollment polls, retry later' })
+      }
+      const body = await readJson(req)
+      const deviceCode = String(body.device_code ?? '').trim()
+      if (!/^[0-9a-f]{64}$/.test(deviceCode)) return sendJson(res, 400, { error: 'device_code must be 64 hex chars' })
+      const rec = deviceByCode.get(deviceCode)
+      if (!rec || rec.expiresAt <= now()) {
+        if (rec) dropDevice(rec)
+        audit('enroll.token', null, ip, false)
+        return sendJson(res, 410, { error: 'expired or unknown device code' })
+      }
+      if (rec.status === 'denied') {
+        audit('enroll.token', rec.name ?? null, ip, false)
+        return sendJson(res, 403, { error: 'denied' })
+      }
+      if (rec.status !== 'approved') return sendJson(res, 202, { status: 'pending', interval_ms: DEVICE_POLL_INTERVAL_MS })
+
+      const ts = now()
+      const name = rec.name
+      const token = mintToken('mesh')
+      const existing = db.prepare('SELECT name FROM agents WHERE name = ?').get(name)
+      if (existing) {
+        db.prepare('UPDATE agents SET token_hash = ?, token_issued_at = ?, host = COALESCE(?, host), description = COALESCE(?, description) WHERE name = ?')
+          .run(hashToken(token), ts, rec.host ?? null, rec.description ?? null, name)
+      } else {
+        db.prepare('INSERT INTO agents (name, host, description, first_seen, last_seen, token_hash, token_issued_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(name, rec.host ?? null, rec.description ?? null, ts, ts, hashToken(token), ts)
+      }
+      dropDevice(rec)
+      audit('enroll.token', name, ip, true)
+      console.log(`[mesh] device-code enrolled ${name} from ${ip}`)
+      return sendJson(res, 201, { name, token, note: 'store this now; rotate or re-enroll if lost' })
+    }
+
+    return sendJson(res, 404, { error: 'unknown enrollment endpoint' })
+  } catch (error) {
+    return sendJson(res, 400, { error: error.message })
+  }
+}
+
+/**
  * Admin face: mint, rotate and revoke agent tokens.
  * Requires `Authorization: Bearer <MESH_ADMIN_TOKEN>` (or the generated
  * data/admin.token on first boot). A minted token is returned exactly once 鈥? * the hub only keeps its SHA-256.
@@ -2087,6 +2383,12 @@ async function handleAdmin(req, res, url) {
       db.prepare('UPDATE agents SET token_hash = ? WHERE name = ?').run(hashToken(token), name)
       audit('admin.rotate', name, ip, true)
       return sendJson(res, 200, { name, token, note: 'previous token is now invalid' })
+    }
+
+    if ((path === '/api/admin/enroll/approve' || path === '/api/admin/enroll/deny') && req.method === 'POST') {
+      const body = await readJson(req)
+      const result = decideDevice(body, path.endsWith('/approve'), ip)
+      return sendJson(res, result.status, result.body)
     }
 
     if (path === '/api/admin/enroll-codes' && req.method === 'POST') {
@@ -2155,6 +2457,11 @@ const httpServer = makeServer(async (req, res) => {
 
   if (url.pathname.startsWith('/api/admin/')) {
     await handleAdmin(req, res, url)
+    return
+  }
+
+  if (url.pathname === '/api/enroll/request' || url.pathname === '/api/enroll/token') {
+    await handleDeviceEnroll(req, res, url)
     return
   }
 
@@ -2239,6 +2546,7 @@ setInterval(() => {
   try {
     sweepSessions()
     sweepFailures()
+    sweepEnrollState()
   } catch (error) {
     console.error('[mesh] sweep failed:', error.message)
   }

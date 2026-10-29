@@ -498,6 +498,87 @@ try {
   check('unrestricted token still sends over REST', unrestrictedSend.status === 201, `HTTP ${unrestrictedSend.status}`)
 }
 
+// --- enrollment: legacy 8-char code and device-code pairing -------------------
+{
+  const minted = await (await admin('/api/admin/enroll-codes', { method: 'POST', body: '{}' })).json()
+  const enrolled = await fetch(`${BASE}/api/enroll`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: minted.code, name: 'code-node' }),
+  })
+  const enrolledBody = await enrolled.json().catch(() => ({}))
+  check(
+    'enrollment code exchanges for a token',
+    enrolled.status === 201 && String(enrolledBody.token ?? '').startsWith('mesh_') && enrolledBody.name === 'code-node',
+    `HTTP ${enrolled.status}`,
+  )
+  const reused = await fetch(`${BASE}/api/enroll`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: minted.code, name: 'code-node-2' }),
+  })
+  check('enrollment code is single use', reused.status === 401, `HTTP ${reused.status}`)
+
+  // device code: request -> pending -> approve -> token -> gone
+  const requested = await fetch(`${BASE}/api/enroll/request`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'device-node', host: 'device-host' }),
+  })
+  const requestBody = await requested.json().catch(() => ({}))
+  const pollToken = () => fetch(`${BASE}/api/enroll/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ device_code: requestBody.device_code }),
+  })
+  check(
+    'device code request returns a human code and a device code',
+    requested.status === 201 && /^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(requestBody.user_code ?? '') &&
+      /^[0-9a-f]{64}$/.test(requestBody.device_code ?? '') && requestBody.interval_ms === 5000,
+    `HTTP ${requested.status}`,
+  )
+  const pendingPoll = await pollToken()
+  check('unapproved device poll returns 202 pending', pendingPoll.status === 202, `HTTP ${pendingPoll.status}`)
+  const approved = await admin('/api/admin/enroll/approve', { method: 'POST', body: JSON.stringify({ user_code: requestBody.user_code }) })
+  check('admin approves the device code', approved.status === 200, `HTTP ${approved.status}`)
+  const tokenPoll = await pollToken()
+  const tokenBody = await tokenPoll.json().catch(() => ({}))
+  check(
+    'approved device poll issues the token once',
+    tokenPoll.status === 201 && String(tokenBody.token ?? '').startsWith('mesh_') && tokenBody.name === 'device-node',
+    `HTTP ${tokenPoll.status}`,
+  )
+  const tokenAgain = await pollToken()
+  check('device code expires after the token is issued', tokenAgain.status === 410, `HTTP ${tokenAgain.status}`)
+
+  // deny path
+  const deniedRequest = await fetch(`${BASE}/api/enroll/request`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'denied-node' }),
+  })
+  const deniedBody = await deniedRequest.json().catch(() => ({}))
+  const denied = await admin('/api/admin/enroll/deny', { method: 'POST', body: JSON.stringify({ user_code: deniedBody.user_code }) })
+  const deniedPoll = await fetch(`${BASE}/api/enroll/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ device_code: deniedBody.device_code }),
+  })
+  check('denied device poll is refused', denied.status === 200 && deniedPoll.status === 403, `deny ${denied.status}, poll ${deniedPoll.status}`)
+
+  // polling is rate-limited per IP (10/min), so keep hammering an unknown code.
+  let limited = false
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    const response = await fetch(`${BASE}/api/enroll/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ device_code: '0'.repeat(64) }),
+    })
+    if (response.status === 429) { limited = true; break }
+  }
+  check('device-code polling is rate-limited per IP', limited, limited ? '429 seen' : 'no 429')
+}
+
 // --- rotation and revocation ------------------------------------------------
 const rotated = await (await admin('/api/admin/rotate', { method: 'POST', body: JSON.stringify({ name: 'alice' }) })).json()
 const oldTokenAfterRotate = await fetch(`${BASE}/api/peers`, { headers: { authorization: `Bearer ${aliceToken}` } })
