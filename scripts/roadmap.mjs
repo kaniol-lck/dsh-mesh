@@ -27,12 +27,15 @@ const STATUSES = ['未开始', '进行中', '已完成']
 const FEATURES = ['接入体验', '收件箱', '协作编排', '传输安全', '运维交付', '控制台', '文档', '未分类']
 /** Keyword fallback, first match wins (checked in this order). Title first, description second only. */
 const FEATURE_RULES = [
-  ['接入体验', /接入|新手|onboard|joinCode|bootstrap|自举|pull|轮询|standalone|注册码|设备码|配对/i],
-  ['收件箱', /收件箱|inbox|消息|no_reply|silent|claim|排序|游标|已读|静默/i],
-  ['协作编排', /批量|batch|回执|receipt|liveness|活力|派活|账本|屏障|里程碑|进度/i],
-  ['控制台', /控制台|console|面板|页面|按钮/i],
-  ['运维交付', /部署|发版|发布|巡检|门禁|脚本化|CI|tag|镜像|容器/i],
-  ['文档', /文档|README|docs|技能|示例|注释/i],
+  ['接入体验', /接入|新手|onboard|joinCode|bootstrap|自举|pull|轮询|standalone|注册码|设备码|配对|运行态|探测|\bT2\b/i],
+  ['收件箱', /收件箱|inbox|消息|no_reply|silent|claim|排序|游标|已读|静默|黑板|\bboard\b|\bCAS\b|读隔离/i],
+  [
+    '协作编排',
+    /批量|batch|回执|receipt|liveness|活力|派活|账本|屏障|里程碑|进度|\bdelete\b|端点|sessions|归档|会话|假成功|\blive\b|唤醒|--wake|防抖|绑定/i,
+  ],
+  ['控制台', /控制台|console|面板|页面|按钮|blobs|visible_to|MAX_BODY|\bpeers\b|时间字段|管理员/i],
+  ['运维交付', /部署|发版|发布|巡检|门禁|脚本化|CI|tag|镜像|容器|版本|收口|漂移|CHANGELOG|package\.json|自检|预检|凭据|frpc|隧道|NAS|云/i],
+  ['文档', /文档|README|docs|技能|示例|注释|ROADMAP|playbook|约定|口径|回填/i],
   ['传输安全', /TLS|证书|自签|scopes|allowed_cidrs|F-?orwarded|明文传输|轮换/i],
 ]
 const DONE_LIST_CAP = 60
