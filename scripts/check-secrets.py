@@ -16,7 +16,9 @@ PATTERNS = [
     (re.compile(r"sk-[A-Za-z0-9]{20,}"), "api key"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private key"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "aws key"),
-    (re.compile(r"(?i)(password|passwd|secret|token)\s*[:=]\s*['\"][^'\"]{8,}['\"]"), "inline credential"),
+    # A value that starts with / is a path (e.g. '/api/enroll/token') and a value that
+    # starts with http(s):// is a URL: neither can be the credential itself.
+    (re.compile(r"(?i)(password|passwd|secret|token)\s*[:=]\s*['\"](?!/|https?://)[^'\"]{8,}['\"]"), "inline credential"),
 ]
 
 # Files that legitimately contain documentation about secrets.
