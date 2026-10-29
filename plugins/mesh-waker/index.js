@@ -954,7 +954,21 @@ export function apply(ctx, config) {
     })
   }
 
-  /** Resolve `{id}` then exact title, then a unique title substring; ambiguous is an error. */
+  function ambiguityError(matches) {
+    const listed = matches
+      .slice(0, 5)
+      .map((session) => `${session.id}(${session.title})`)
+      .join(', ')
+    return new Error(
+      `标题匹配到多个会话，请改用 id：${listed}；可用 GET /mesh/sessions 查看 archived 字段，或直接配置 session id`,
+    )
+  }
+
+  /**
+   * Resolve `{id}` then exact title, then a unique title substring; ambiguous is an error.
+   * Title matching prefers non-archived sessions: an old same-title history must not make
+   * the live session permanently ambiguous. Archived sessions are a fallback only.
+   */
   function resolveLocalSession(draft) {
     const sessions = listLocalSessions()
     const wanted = String(draft.session ?? draft.id ?? '').trim()
@@ -965,14 +979,22 @@ export function apply(ctx, config) {
     }
     if (title) {
       const exact = sessions.filter((session) => session.title === title)
+      const activeExact = exact.filter((session) => !session.archived)
+      if (activeExact.length === 1) return activeExact[0]
+      if (activeExact.length > 1) throw ambiguityError(activeExact)
       if (exact.length === 1) return exact[0]
+      if (exact.length > 1) throw ambiguityError(exact)
+
       const fuzzy = sessions.filter((session) => session.title && session.title.includes(title))
+      const activeFuzzy = fuzzy.filter((session) => !session.archived)
+      if (activeFuzzy.length === 1) return activeFuzzy[0]
+      if (activeFuzzy.length > 1) throw ambiguityError(activeFuzzy)
       if (fuzzy.length === 1) return fuzzy[0]
-      if (fuzzy.length > 1) {
-        throw new Error('标题匹配到多个会话，请改用 id：' + fuzzy.slice(0, 5).map((session) => `${session.id}(${session.title})`).join(', '))
-      }
+      if (fuzzy.length > 1) throw ambiguityError(fuzzy)
     }
-    throw new Error('找不到会话；可用 GET /mesh/sessions 查看本机会话列表')
+    throw new Error(
+      '找不到会话；可用 GET /mesh/sessions 查看本机会话列表（含 archived 字段），或用完整 session id 寻址',
+    )
   }
 
   const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
@@ -2755,9 +2777,12 @@ export function apply(ctx, config) {
         return
       }
       try {
+        const url = new URL(req.url ?? '/', 'http://localhost')
         const sessions = listLocalSessions()
+        // live=1 is the panel/script convenience filter: drop archived sessions.
+        const listed = url.searchParams.get('live') === '1' ? sessions.filter((session) => !session.archived) : sessions
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-        res.end(JSON.stringify({ ok: true, sessions }))
+        res.end(JSON.stringify({ ok: true, sessions: listed }))
       } catch (error) {
         res.writeHead(500, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: error.message }))

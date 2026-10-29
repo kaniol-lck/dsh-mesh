@@ -2,12 +2,21 @@
 
 本文件记录 `dsh-mesh-waker` 的变更。格式仿 `hub/CHANGES.md`：每节写清改了什么、怎么复验。
 
-> **发版状态**：`0.4.56`–`0.5.3` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
-> `next` 是 0.4.55）；0.4.60、0.5.0–0.5.3 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
+> **发版状态**：`0.4.56`–`0.5.4` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
+> `next` 是 0.4.55）；0.4.60、0.5.0–0.5.4 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析）。
 
 ---
+
+## v0.5.4（2026-10-30，标题解析优先活跃会话；`/mesh/sessions?live=1`）
+
+| 项 | 内容 |
+|---|---|
+| 修复 | 真机日志 `标题匹配到多个会话 … session-7fa21aa4…(mesh · 协调), session-18f66de1…(mesh · 协调)`：`resolveLocalSession` 的标题匹配把**已归档**同名会话也算进候选（历史上有 4 个「mesh · 协调」），导致 `receiptTo` 永久歧义、聚合回执只能落文件。现在标题（精确与唯一子串）先只在**未归档**会话里找：恰好 1 个即命中；多个仍报错列候选；未归档 0 个但归档里唯一 1 个时允许退回 |
+| 提示 | 歧义与找不到的报错文案补「可用 `GET /mesh/sessions` 查看 `archived` 字段，或直接配置 session id」 |
+| 新增 | `GET /mesh/sessions?live=1` 只返回未归档会话（面板/脚本便捷过滤），默认行为不变 |
+| 验证 | `node --check` exit 0；`node test/waker-endpoints.test.js` 35/35（新增 4 例：活跃 + 多个同名归档 → 命中活跃；全部归档且唯一 → 仍命中；两个活跃同名 → 400 且带 archived 提示；`?live=1` 只留未归档） |
 
 ## v0.5.3（2026-10-29，修复 session/event 信封层级）
 

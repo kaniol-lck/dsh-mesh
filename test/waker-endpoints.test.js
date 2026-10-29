@@ -70,7 +70,7 @@ function seedSession(sessionsRoot, { id, title, workspace = 'ws-test' }) {
  * and standalone boots must not touch the network. Pass `config` to boot a hub-mode
  * install (bootstrap / pull) and `writeToken: false` to start with no stored token.
  */
-async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null } = {}) {
+async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null, archivedIds = [] } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-endpoints-'))
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
@@ -129,7 +129,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   }
 
   const workspaceRegistry = {
-    archivedSessionIds: () => new Set(),
+    archivedSessionIds: () => new Set(archivedIds),
     async archiveSession(id) {
       state.archived.push(id)
       if (state.archiveError) throw new Error(state.archiveError)
@@ -885,6 +885,58 @@ async function main() {
     const task = detail.json?.tasks?.[0]
     const ok = detail.json?.ok === true && task?.status === 'waiting-job' && /job-9/.test(task?.detail ?? '')
     report('envelope: job/registered data reaches waiting-job', ok, `status=${task?.status ?? '-'} detail=${task?.detail ?? '-'}`)
+  })
+
+  // 33-36. Title resolution prefers live sessions; archived history is a fallback only.
+  await runCase('title resolution prefers the live namesake over archived history', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-live', title: 'mesh · 协调' },
+        { id: 'session-old-a', title: 'mesh · 协调' },
+        { id: 'session-old-b', title: 'mesh · 协调' },
+      ],
+      archivedIds: ['session-old-a', 'session-old-b'],
+    })
+    const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'mesh · 协调', text: 'hello live' } })
+    const ok = res.status === 200 && res.json?.sessionId === 'session-live' && h.state.prompts.length === 1
+    report('title resolution prefers the live namesake over archived history', ok, `status=${res.status} sessionId=${res.json?.sessionId ?? '-'} prompts=${h.state.prompts.length}`)
+  })
+
+  await runCase('title resolution falls back to a unique archived session', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-arch', title: 'archived only' }], archivedIds: ['session-arch'] })
+    const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'archived only', text: 'hello archived' } })
+    const ok = res.status === 200 && res.json?.sessionId === 'session-arch'
+    report('title resolution falls back to a unique archived session', ok, `status=${res.status} sessionId=${res.json?.sessionId ?? '-'}`)
+  })
+
+  await runCase('title resolution still refuses two live namesakes, with the archived hint', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-live-1', title: 'dup live' },
+        { id: 'session-live-2', title: 'dup live' },
+        { id: 'session-old', title: 'dup live' },
+      ],
+      archivedIds: ['session-old'],
+    })
+    const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'dup live', text: 'nope' } })
+    const ok = res.status === 400 && /多个/.test(res.json?.error ?? '') && /archived/.test(res.json?.error ?? '') && h.state.prompts.length === 0
+    report('title resolution still refuses two live namesakes, with the archived hint', ok, `status=${res.status} hint=${/archived/.test(res.json?.error ?? '')}`)
+  })
+
+  await runCase('GET /mesh/sessions?live=1 lists only non-archived sessions', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-keep', title: 'keep' },
+        { id: 'session-drop', title: 'drop' },
+      ],
+      archivedIds: ['session-drop'],
+    })
+    const filtered = await request(h.base, '/mesh/sessions?live=1')
+    const all = await request(h.base, '/mesh/sessions')
+    const filteredIds = (filtered.json?.sessions ?? []).map((session) => session.id)
+    const allIds = (all.json?.sessions ?? []).map((session) => session.id)
+    const ok = filteredIds.join(',') === 'session-keep' && allIds.length === 2
+    report('GET /mesh/sessions?live=1 lists only non-archived sessions', ok, `live=${JSON.stringify(filteredIds)} all=${allIds.length}`)
   })
 
   const failed = results.filter((result) => !result.ok)

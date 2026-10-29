@@ -138,7 +138,7 @@ HTTP（loopback）：`GET /mesh/batches`、`GET /mesh/batches/<id>`（含每个�
 
 | 端点 | 作用 |
 |---|---|
-| `GET /mesh/sessions` | 列出本机会话（最多 80 条，按最后活动排序）：`id` / `title` / `cwd` / `workspace` / `last_active` / `live` / `archived` |
+| `GET /mesh/sessions` | 列出本机会话（最多 80 条，按最后活动排序）：`id` / `title` / `cwd` / `workspace` / `last_active` / `live` / `archived`；加 `?live=1` 只返回未归档会话 |
 | `POST /mesh/inject` | 向已有会话投一轮任务：按 `session`（完整 id）→ 精确标题 → 标题唯一子串寻址；歧义或找不到返回 400。`mode` 为 `queue`（默认，等当前回合）或 `steer`（打断当前回合） |
 | `POST /mesh/sessions/create` | 新建会话并绑定工作区，可选首轮 `prompt`；返回 `sessionId` / `workspaceId` / `workspacePath` / `prompted` |
 | `POST /mesh/sessions/archive` | 归档会话：日志保留、侧栏隐藏；存活的会话会被宿主拒绝（`workspace/session-active`） |
