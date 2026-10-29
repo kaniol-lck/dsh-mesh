@@ -53,7 +53,7 @@ dsh plugin add dsh-mesh-waker
 
 - **派活 / 回执**：`mesh_dispatch`（或 `npx dsh-mesh-dispatch`）带 `taskId`，回合结束写回执到 `~/.dsh/mesh-waker/receipts.jsonl`；回执只是线索，验收要看产物；
 - **工作日志**：`.worklog/`（todo、WORKLOG、缺陷台账；本地不入库），约定见 [docs/worklog.md](docs/worklog.md)；
-- **机械门禁**：`scripts/roadmap.mjs`（汇总 + 功能聚合 + 关口）、`scripts/defects.mjs`（缺陷台账）、`scripts/check-paths.mjs`（路径 / 内网拓扑）。
+- **机械门禁**：`.worklog/bin/roadmap.mjs`（汇总 + 功能聚合 + 关口）、`.worklog/bin/defects.mjs`（缺陷台账）、`scripts/check-paths.mjs`（路径 / 内网拓扑）。
 
 当前版本以中枢 `/health` 与 ROADMAP 自动段的「版本快照」为准，README 不写死具体版本号。
 
@@ -172,14 +172,7 @@ dsh plugin --profile web add dsh-mesh-waker
 - [工作日志约定](docs/worklog.md)（todo 格式、ROADMAP 生成、缺陷台账）
 - [客户端插件 mesh-waker](plugins/mesh-waker/README.md)
 - [给 agent 的协作约定](skills/mesh/SKILL.md)
-- [工作区交接工具](scripts/handoff/README.md)
 
-## 工作区交接
-
-`scripts/handoff/` 提供交接工具：把工作区 + 上下文摘要 + 依赖清单打成带 sha256 的 bundle，
-经 blob 通道发给另一台机器；接收方解包后自动校验依赖，缺什么按
-`needs → delta / instructions → accepted` 协议回问补全（最多两轮）。
-详见 [scripts/handoff/README.md](scripts/handoff/README.md)。
 
 ## 目录结构
 
@@ -190,7 +183,6 @@ plugins/mesh-approval/  审批转发插件（兼容 Hermes）
 skills/mesh/            给 agent 看的协作说明（发信/读信/黑板约定）
 docs/                   auth-and-console · local-sessions · multi-session-playbook · release · worklog · mesh-architecture
 scripts/                密钥扫描、REST 客户端、roadmap/defects/check-paths 等门禁
-scripts/handoff/        工作区交接：打包 / 校验 / 依赖回流
 ```
 
 ## License

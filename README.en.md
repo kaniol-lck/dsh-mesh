@@ -66,8 +66,8 @@ in a local work log:
   verify the artifact;
 - **Work log**: `.worklog/` (todos, WORKLOG, defect ledger; local, never committed), see
   [docs/worklog.md](docs/worklog.md);
-- **Mechanical gates**: `scripts/roadmap.mjs` (rollup + feature aggregate + stage gates),
-  `scripts/defects.mjs` (defect ledger), `scripts/check-paths.mjs` (paths / LAN topology).
+- **Mechanical gates**: `.worklog/bin/roadmap.mjs` (rollup + feature aggregate + stage gates),
+  `.worklog/bin/defects.mjs` (defect ledger), `scripts/check-paths.mjs` (paths / LAN topology).
 
 The current version lives in the hub's `/health` and the ROADMAP "version snapshot"; the
 README does not pin a version.
@@ -200,14 +200,7 @@ token; the plugin keeps the token in an owner-only file, not in the profile patc
 - [Work-log convention](docs/worklog.md) (todo format, ROADMAP generation, defect ledger)
 - [Client plugin: mesh-waker](plugins/mesh-waker/README.md)
 - [Agent-facing conventions](skills/mesh/SKILL.md)
-- [Workspace handoff](scripts/handoff/README.md)
 
-## Workspace handoff
-
-`scripts/handoff/` packages a workspace plus a context summary and a requirement manifest into a
-sha256-checked bundle, ships it over the blob channel, and on the receiving side verifies the
-requirements — negotiating missing pieces with `needs -> delta / instructions -> accepted`
-(at most two rounds). See [scripts/handoff/README.md](scripts/handoff/README.md).
 
 ## Repository layout
 
@@ -218,7 +211,6 @@ plugins/mesh-approval/  approval transport plugin (Hermes-compatible)
 skills/mesh/            agent-facing usage guide (send/read/board conventions)
 docs/                   auth-and-console · local-sessions · multi-session-playbook · release · worklog · mesh-architecture
 scripts/                secret scan, REST helpers, roadmap/defects/check-paths gates
-scripts/handoff/        workspace handoff: pack / verify / requirement loop
 ```
 
 ## License

@@ -23,7 +23,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 为什么 | 以前派活靠本仓 `scripts/mesh-dispatch.mjs`，别的项目装了 waker 也没有这个能力；现在工具与 CLI 都随 npm 包发布 |
+| 为什么 | 以前派活靠本仓 `dsh-mesh-dispatch`，别的项目装了 waker 也没有这个能力；现在工具与 CLI 都随 npm 包发布 |
 | 工具 | `mesh_dispatch`（`ctx.tools.register` + `@deepseek-ai/dsh-tools` 的 `defineTool`）：`target`/`text` 必填，`createIfMissing` 解析不到时按 target 当标题新建会话再投，`mode` queue/steer，可选 `taskId`（缺省 `T-<base36>`）、`batchId`（barrier）、`receipt`、`deadline`（`30m`/`2h`/`600s`）。返回 `{ok, sessionId, title, taskId, batchId, mode, created}`；描述写明「投递后不要轮询，回合结束写回执；要全部完成再叫就用 batchId」 |
 | 兼容 | `@deepseek-ai/dsh-tools` 是可选 peer；链接安装解析不到时用同一份 JSON Schema 定义注册，插件不因 import 失败而挂掉 |
 | CLI | `bin/dispatch.mjs` → `dsh-mesh-dispatch`（`bin` 已进 `files`）：零外部依赖（Node 内置 fetch），`--target/--text|--file/--mode/--task [id]/--batch [id]/--receipt/--deadline/--create/--json/--waker`；成功打印 `sent session=… task=… batch=…`，`--json` 结构化；连不上默认 8795 → 退出码 2；未知参数 → 退出码 1 + 用法 |
@@ -52,7 +52,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 批次屏障 | `/mesh/inject` 的 `meta` 增 `batchId` / `deadlineMs`（响应回显 `batchId`）；`scripts/mesh-dispatch.mjs` 增 `--batch [id]`（缺省 `B-<base36>`，同 id 复用）与 `--deadline 2h\|90m\|600s`；全部任务结算 → **一条**聚合回执（文本 + JSONL `{kind:"batch",…, done, total}`），deadline 到点仍有关键未结 → 部分完成聚合，未结项带 liveness；批次内单任务只写自己的 JSONL、不 queue/wake；完成判定有 300ms grace，允许连续派发的下一单加入 |
+| 批次屏障 | `/mesh/inject` 的 `meta` 增 `batchId` / `deadlineMs`（响应回显 `batchId`）；`dsh-mesh-dispatch` 增 `--batch [id]`（缺省 `B-<base36>`，同 id 复用）与 `--deadline 2h\|90m\|600s`；全部任务结算 → **一条**聚合回执（文本 + JSONL `{kind:"batch",…, done, total}`），deadline 到点仍有关键未结 → 部分完成聚合，未结项带 liveness；批次内单任务只写自己的 JSONL、不 queue/wake；完成判定有 300ms grace，允许连续派发的下一单加入 |
 | liveness | 每会话账本（openTurn / lastEventAt / openCalls / openJobs / openApprovals / lastLlmAt），事件面覆盖 `turn/start|end`、`step/*`、`assistant/message`、`tool/call|result`、`job/registered|settled`、`approval/asked|decided`、`llm/retry*`、`agent/error`；`deriveLivenessState` 纯函数按 `not-started → lost → waiting-approval → waiting-job → waiting-tool → stalled → idle → working` 判定 |
 | 卡住先报 | 批次内任务处于 stalled / waiting-approval / waiting-job 且超过 `waitLongMs` → 发一次 `[BATCH-ALERT]`（同批次+任务+状态只发一次），不结算，继续等 `turn/end` 或 deadline |
 | 持久化与端点 | 批次写入 `batchFile`（0600，启动恢复、>24h 清理；恢复时 open 任务按 `lost` 结算）；`GET /mesh/batches`、`GET /mesh/batches/<id>`（含逐任务 liveness）、`DELETE /mesh/batches/<id>`（取消且不再回执） |
@@ -64,7 +64,7 @@
 
 | 项 | 内容 |
 |---|---|
-| meta 透传 | `/mesh/inject` 支持可选 `meta { taskId, receipt }`（不污染正文），响应回显 `taskId`；`scripts/mesh-dispatch.mjs` 新增 `--task [id]`（缺省自动 `T-<base36 时间戳>`，`--receipt` 隐含开启）与 `--receipt file\|queue\|wake`，成功输出打印 `task=<id>` |
+| meta 透传 | `/mesh/inject` 支持可选 `meta { taskId, receipt }`（不污染正文），响应回显 `taskId`；`dsh-mesh-dispatch` 新增 `--task [id]`（缺省自动 `T-<base36 时间戳>`，`--receipt` 隐含开启）与 `--receipt file\|queue\|wake`，成功输出打印 `task=<id>` |
 | 结算 | 订阅 `ctx.on('session/event')`：`turn/start` 维护每个会话的最大 turn 并解除「未开工」判定，`assistant/message` 记住本 turn 最后一条文本，`turn/end` 按 `turn >= baselineTurn` 结算 pending 任务；一个 taskId 只结算一次 |
 | 回执字段 | `taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode`；`status` 覆盖 `completed / aborted / blocked / error / max-tokens / interrupted / forked / not-started`；摘要按码点截断 |
 | 三档去向 | `receiptMode=file`（默认，只追加 `receiptFile`）→ `queue`（再把 `[RECEIPT]` 注入 `receiptTo`）→ `wake`（再唤醒；无 `wakeSecret` 时降级 queue 并 WARN）；`receiptTo` 解析不到只写文件 + `lastError`，绝不打扰其他会话 |

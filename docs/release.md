@@ -23,7 +23,7 @@ bundle 能否被 loader 认领"——`node --check` 通过、宿主接口也正�
 - 发版时一次性同步（漏一处就会出现 drift）：
   - hub：`HUB_VERSION`（`hub/server.mjs`）+ `hub/package.json` + `hub/package-lock.json` + `CHANGES.md` 对应条目；
   - waker：`plugins/mesh-waker/package.json` + `CHANGELOG.md`（新版本条目；还没有就先新建）；
-- 发版前必须全绿：`node scripts/roadmap.mjs --check`（含版本一致性硬校验）、`node scripts/check-paths.mjs`、
+- 发版前必须全绿：`node .worklog/bin/roadmap.mjs --check`（含版本一致性硬校验）、`node scripts/check-paths.mjs`、
   `python scripts/release.py --preflight`；
 - 文档里**不要抄当前版本号**：ROADMAP 自动段的「版本快照」是唯一展示位，其余文档只写「以中枢 `/health` / 自动段为准」。
 

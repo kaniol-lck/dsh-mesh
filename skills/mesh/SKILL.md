@@ -315,38 +315,9 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
   此时不要改用 REST 兜底去猜地址，等工具回来即可。
 
 
-## 14. 工作区交接（mesh handoff）
+## 14. 工作区交接（内部工具，不随公开仓发布）
 
-需要把一整块工作交给另一台机器继续做时，**不要手打包**，用工具：
-
-```bash
-# 发送方
-python scripts/handoff/handoff.py pack --workspace DIR --out bundle.tar.gz \
-  --id <id> --conversation conv/handoff-<id> --next "解包|读摘要|继续构建"
-python scripts/handoff/handoff.py send --file bundle.tar.gz --to <peer> \
-  --conversation conv/handoff-<id> --id <id> --visible-to <me>,<peer>
-
-# 接收方
-python scripts/handoff/handoff.py receive --id <blob> --dir ./incoming --sha256 <sha>
-# 缺依赖时：msg --type needs → 发送方 delta/instructions/release → verify → msg --type accepted
-```
-
-- 打包自动排除 `.git` / `node_modules` / `*.env` / `token*`，并在打包前做密钥扫描（命中即拒绝）；
-- manifest 里 `blocking: false` 表示"缺了也不阻塞交接"；
-- 同一 `conversation` 贯穿全程，消息用 `important: true`；`round` 最多 2 轮，超过转人工；
-- blob 单文件 ≤64 MiB、默认 24h 过期，大工作区分卷；
-- **跨机不搬会话**：只带结构化摘要 + 文件 + 下一步；同机才能续同一个会话。
-
-### 接收方实跑要点（2026-10-25 跨机演练实测）
-
-- **必须显式设 `MESH_HUB_URL`**：`handoff.py` 默认连 `127.0.0.1:8790`，跨机不设必失败；
-- token 默认读 `~/.dsh/mesh-waker/token`；`PATH` 上的 python 若是 Microsoft Store stub，先把真实 python 目录前置；
-- 主包 `receive` 预期 **exit 2**（缺 blocking 依赖）；把输出里的 `missing` 原样作为 `msg --type needs` 的 `--missing`；
-- **delta 用同一条 `receive --dir <同一 incoming>` 下**：会解出 `vendor/` 并自动重新 verify，不必再单独跑 verify；补完 `exit 0` 才算过；
-- verify 对 `.cmd`/脚本工具常记 `version: null`，而 `minVersion` 只在取到版本号时才比较——null 仍可能判满足，别当失败信号；
-- 发送方动手前先在本机干跑一遍 `receive → delta → build`，能提前发现指令错误；
-- 对方可能重复发 needs（重连/补收）：先看中枢已读状态，再决定是否重发 delta，别重复上传。
-
+交接工具属于本仓内部流程（`.worklog/bin/handoff/`），公开仓不含它；外部协作请走 blob 通道 + 消息约定（见 §2 / §9）：把工作区打成带 sha256 的 bundle 发到 blob，接收方校验后继续，缺依赖用消息协商。
 
 ## 15. 会话绑定与回信落点
 

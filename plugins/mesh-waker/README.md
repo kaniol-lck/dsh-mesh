@@ -65,11 +65,11 @@ CA 只记 sha256 前 16 位，token 只记 `fp=<前6位>… len=<n>`；任何日
 
 ## 任务回执（0.5.1）
 
-`/mesh/inject` 可以带 `meta.taskId`（不污染正文）：插件在该会话的回合结束时写**恰好一条**回执，一个 taskId 只结算一次；配合 `scripts/mesh-dispatch.mjs` 使用：
+`/mesh/inject` 可以带 `meta.taskId`（不污染正文）：插件在该会话的回合结束时写**恰好一条**回执，一个 taskId 只结算一次；配合 `dsh-mesh-dispatch` 使用：
 
 ```bash
-node scripts/mesh-dispatch.mjs --title "mesh · hub" --file task.txt --task T-20261029-hub
-node scripts/mesh-dispatch.mjs --title "mesh · hub" --file task.txt --task --receipt queue
+npx dsh-mesh-dispatch --title "mesh · hub" --file task.txt --task T-20261029-hub
+npx dsh-mesh-dispatch --title "mesh · hub" --file task.txt --task --receipt queue
 ```
 
 `--task` 不带值时自动生成 `T-<base36 时间戳>`；`--receipt` 可覆盖全局默认（并隐含开启 task）。
@@ -88,11 +88,11 @@ node scripts/mesh-dispatch.mjs --title "mesh · hub" --file task.txt --task --re
 
 ## 批次与进度判定（0.5.2）
 
-**batch**：一次派 N 单，全部结束才通知一次。`scripts/mesh-dispatch.mjs` 加 `--batch [id]`（同 id 的多次调用归同一批，不带值自动生成 `B-<base36>`）与 `--deadline 2h|90m|600s`：
+**batch**：一次派 N 单，全部结束才通知一次。`dsh-mesh-dispatch` 加 `--batch [id]`（同 id 的多次调用归同一批，不带值自动生成 `B-<base36>`）与 `--deadline 2h|90m|600s`：
 
 ```bash
-node scripts/mesh-dispatch.mjs --title "mesh · hub"  --file t1.txt --batch B-20261029 --deadline 90m
-node scripts/mesh-dispatch.mjs --title "mesh · docs" --file t2.txt --batch B-20261029
+npx dsh-mesh-dispatch --title "mesh · hub"  --file t1.txt --batch B-20261029 --deadline 90m
+npx dsh-mesh-dispatch --title "mesh · docs" --file t2.txt --batch B-20261029
 ```
 
 批次内单任务**不单独打扰**（回执按 `file` 处理），只有聚合回执走 `barrierMode`：
@@ -167,7 +167,7 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/delete -H 'content-type:
 
 ## 多会话分工（任何项目可用）
 
-派活能力长在插件里：装了 waker 的项目，模型可以直接调 `mesh_dispatch` 工具，CLI 也行——**不需要**本仓的 `scripts/mesh-dispatch.mjs`。
+派活能力长在插件里：装了 waker 的项目，模型可以直接调 `mesh_dispatch` 工具，CLI 也行——**不需要**本仓的 `dsh-mesh-dispatch`。
 
 **3 步示例**（任何项目根目录）：
 
@@ -221,7 +221,7 @@ MIT
 
 这条路径**只服务跨机来件**：hub 把消息 ping 给 waker，若该 `conversation` 有 `deliverTo`，waker 直接把 wake prompt 投进那个会话（默认 `mode: 'queue'`，像用户打字一样排队），而不是另起/复用「Mesh 收件箱」会话。
 
-> **本机会话之间不要用这套。** 同机派活走 `/mesh/inject`（命令行：`node scripts/mesh-dispatch.mjs --title "mesh · hub" --file .worklog/dispatch/hub.txt`，叫协调会话加 `--wake`）——毫秒级、离线可用，不必让消息绕中枢一圈。
+> **本机会话之间不要用这套。** 同机派活走 `/mesh/inject`（命令行：`npx dsh-mesh-dispatch --title "mesh · hub" --file .worklog/dispatch/hub.txt`，叫协调会话加 `--wake`）——毫秒级、离线可用，不必让消息绕中枢一圈。
 
 ### `POST /mesh/bind`
 

@@ -64,8 +64,8 @@
 ## 内部文档与私有镜像
 
 - 内部文档（决策过程、本地实况、事故复盘、作业纪律、实验结论）只住 `.worklog/docs-internal/`（本地，不入库）；
-- 同步到私有镜像仓：`python scripts/sync-internal-docs.py`（默认 dry-run；`--apply` 才写并提交推送；`--no-push`、`--prune` 见脚本 help）；
-- 每轮收尾一条命令：`python scripts/round-close.py` —— `roadmap --write/--check` → `check-paths` → `check-secrets` → 同步内部文档，任一步失败即停，全绿打印 `ROUND CLOSE OK`；
+- 同步到私有镜像仓：`python .worklog/bin/sync-internal-docs.py`（默认 dry-run；`--apply` 才写并提交推送；`--no-push`、`--prune` 见脚本 help）；
+- 每轮收尾一条命令：`python .worklog/bin/round-close.py` —— `roadmap --write/--check` → `check-paths` → `check-secrets` → 同步内部文档，任一步失败即停，全绿打印 `ROUND CLOSE OK`；
 - 公开/私有的判据见 `.worklog/docs-internal/README.md`。
 
 ## 关口（阶段性验收）
@@ -84,11 +84,11 @@
 
 ## 自动汇总与渲染
 
-`scripts/roadmap.mjs` 把 todo 汇总进仓外 ROADMAP（只替换标记之间的自动段），并渲染本地 HTML：
+`.worklog/bin/roadmap.mjs` 把 todo 汇总进仓外 ROADMAP（只替换标记之间的自动段），并渲染本地 HTML：
 
 ```powershell
-node scripts/roadmap.mjs --write   # 重写 ROADMAP 自动段 + .worklog/roadmap.html
-node scripts/roadmap.mjs --check   # 只比对：一致 0 / 漂移 1 / 缺标记 2
+node .worklog/bin/roadmap.mjs --write   # 重写 ROADMAP 自动段 + .worklog/roadmap.html
+node .worklog/bin/roadmap.mjs --check   # 只比对：一致 0 / 漂移 1 / 缺标记 2
 ```
 
 - `<!-- AUTO:TODO START -->` 与 `<!-- AUTO:TODO END -->` 之间整段由脚本生成，**手改会被覆盖**；标记外内容原样保留；
@@ -99,7 +99,7 @@ node scripts/roadmap.mjs --check   # 只比对：一致 0 / 漂移 1 / 缺标记
 
 ## 汇总：协调会话 → `..\ROADMAP.md`
 
-- **不再手工抄写**：跑 `node scripts/roadmap.mjs --write`，脚本把 `.worklog/todo/*.md` 的明细写进 ROADMAP 的自动段；
+- **不再手工抄写**：跑 `node .worklog/bin/roadmap.mjs --write`，脚本把 `.worklog/todo/*.md` 的明细写进 ROADMAP 的自动段；
 - ROADMAP 只放**阶段目标与取舍**（「本阶段焦点」「发布状态」等手写段由协调会话判断），明细（验收、状态、归属）留在本地 todo 文件；
 - 执行会话不直接改 ROADMAP。
 
@@ -125,7 +125,7 @@ YYYY-MM-DD HH:mm · <会话> · <动作> · <产物或 commit>
 
 - 确定源（决定 READY）：`.worklog/WORKLOG.md` 里的 `DEFECT: <签名> · <域> · <证据> · <blocking:yes|no>` 行（字段可缺，缺了记 `?`），以及 roadmap 标出的跨会话疑似重复**对**（一对算 1 条；**双方都标了 `归属` 的重复登记不算缺陷**，只有未归口或状态冲突的对计入 READY）；
 - 推断源（只计数，不决定 READY）：WORKLOG 里命中 `修复|漂移|坑|失败|超时|不一致` 的行，台账里标 `?`；
-- 统计：`node scripts/defects.mjs --scan --threshold 3` 生成 `.worklog/defects.md`（本地文件，不入库）；`--json` 只打印不写文件，`--taxonomy` 打印词表；
+- 统计：`node .worklog/bin/defects.mjs --scan --threshold 3` 生成 `.worklog/defects.md`（本地文件，不入库）；`--json` 只打印不写文件，`--taxonomy` 打印词表；
 - 某签名**确定性**次数 ≥ threshold 时才标 `READY FOR PATCH`（推断源永不触发）：到了才起草约定补丁 → owner 批准 → docs 落盘 → 协调会话记 WORKLOG 一行；
 - 工具失败归 fail-log-guide，默认**不纳入**台账；`--with-fail-log` 只把去重后的错误签名列进「工具失败（参考）」节，不计入 READY；
 - `DEFECT:` 进料目前是**建议不是强制**：先观察两轮真实进料量，再决定要不要升级为硬性要求。
@@ -133,7 +133,7 @@ YYYY-MM-DD HH:mm · <会话> · <动作> · <产物或 commit>
 ## 收尾检查
 
 - `git status` 必须干净：`.worklog/` 全部被忽略，不会出现在 status 里；`git ls-files .worklog` 应为空；
-- `node scripts/roadmap.mjs --check` 必须退出 0（1=漂移、2=缺标记），否则先 `--write` 再复查；
+- `node .worklog/bin/roadmap.mjs --check` 必须退出 0（1=漂移、2=缺标记），否则先 `--write` 再复查；
 - `--write` 对并发安全（同目录临时文件 + rename 原子替换，`.worklog/roadmap.lock` 互斥；拿不到锁只 WARN 不阻塞、退出 0）；会话改完自己的 todo 可自行运行 `--write`；`--check` 只读、不写；
 - 不要把 `.worklog/` 下任何文件加入暂存区（不要用 `git add -A`，也不要 `git add -f`）；
 - 需要把日志带进交接包/镜像仓时，导出摘要到 `docs/`，不要整体拷贝本目录。

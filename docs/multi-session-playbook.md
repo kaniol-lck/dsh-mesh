@@ -46,7 +46,7 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: applicat
 ```
 
 **优先用 `mesh_dispatch` 工具**（带 `taskId`，多单同一 `batchId`，`createIfMissing:true` 可起新会话）；
-通用做法见 `skills/mesh` §17「多会话分工」，跨项目都一样。本仓的 `scripts/mesh-dispatch.mjs` 只是本地辅助入口，适合脚本化或无工具环境。
+通用做法见 `skills/mesh` §17「多会话分工」，跨项目都一样。本仓的 `.worklog/bin/mesh-dispatch.mjs` 只是本地辅助入口，适合脚本化或无工具环境。
 
 原则：**一个任务一个会话**；写清楚“只改哪里、什么算完成、怎么回报”。
 
@@ -59,9 +59,9 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: applicat
 PowerShell 5.1 的 `ConvertTo-Json` 会把多行字符串序列化成 `{"value":"…"}`，经 `/mesh/inject` 投递后对方只收到 15 字符的 `[object Object]`（`Invoke-RestMethod -Body` 同理）。把任务正文写成纯文本文件，用脚本发：
 
 ```powershell
-node scripts/mesh-dispatch.mjs --title "mesh · hub" --file .worklog/dispatch/hub.txt
-node scripts/mesh-dispatch.mjs --title "mesh · docs" --file .worklog/dispatch/docs.txt --dry-run
-node scripts/mesh-dispatch.mjs --session session-… --file task.txt --mode steer
+node .worklog/bin/mesh-dispatch.mjs --title "mesh · hub" --file .worklog/dispatch/hub.txt
+node .worklog/bin/mesh-dispatch.mjs --title "mesh · docs" --file .worklog/dispatch/docs.txt --dry-run
+node .worklog/bin/mesh-dispatch.mjs --session session-… --file task.txt --mode steer
 ```
 
 脚本按标题找目标时只考虑 `archived:false` 且 cwd 为仓根的会话，多条取 `last_active` 最新；打印选中的 session id 与 `chars=`，非 200 或 `ok:false` 时退出码 1。
@@ -76,7 +76,7 @@ node scripts/mesh-dispatch.mjs --session session-… --file task.txt --mode stee
 | archive 后仍出现在 `/mesh/sessions` | 该列表扫磁盘，不看注册表 | 侧栏以注册表为准；要彻底清理需删目录并重启 DSH |
 | 注入没反应 | 目标会话忙/标题匹配歧义 | 用完整 session id；查 `live` 字段 |
 | `create` 返回 400 | 缺 `title`，或标题匹配不到目标 | 看响应里的 `error` |
-| 注入只收到 15 字符 `"[object Object]"` | PowerShell 5.1 `ConvertTo-Json` 把多行字符串包成 `{"value":…}` | 改用 `mesh_dispatch` 工具 / `npx dsh-mesh-dispatch`；本仓也可用 `scripts/mesh-dispatch.mjs`，不要用 `Invoke-RestMethod` |
+| 注入只收到 15 字符 `"[object Object]"` | PowerShell 5.1 `ConvertTo-Json` 把多行字符串包成 `{"value":…}` | 改用 `mesh_dispatch` 工具 / `npx dsh-mesh-dispatch`；本仓也可用 `.worklog/bin/mesh-dispatch.mjs`，不要用 `Invoke-RestMethod` |
 | 用 PS `Set-Content -Encoding utf8` 改 `package.json` 后 JSON 解析失败 | Windows PowerShell 5.1 的 `-Encoding utf8` 会写 UTF-8 **BOM**，`JSON.parse` 报 `Unexpected token '﻿'` | 改 JSON/JS 时用 `[IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))`，或直接用编辑工具；写完 `node -e "JSON.parse(...)"` 验一遍 |
 | 测试 version drift 后 `hub/package.json` 未还原 | 手工改完没 `git checkout`，测试值被提交进去 | 测完立即 `git checkout -- hub/package.json`（或改前先备份），提交前 `git diff hub/` 确认为空 |
 
@@ -95,11 +95,11 @@ python scripts/release.py --promote       # 提 latest
 改完 `.worklog/todo/<自己>.md` 后固定跑五步：
 
 ```powershell
-node scripts/roadmap.mjs --write   # 汇总进 ROADMAP 自动段 + 重渲染 .worklog/roadmap.html
-node scripts/defects.mjs --scan    # 复核缺陷台账（.worklog/defects.md）
+node .worklog/bin/roadmap.mjs --write   # 汇总进 ROADMAP 自动段 + 重渲染 .worklog/roadmap.html
+node .worklog/bin/defects.mjs --scan    # 复核缺陷台账（.worklog/defects.md）
 git status                         # 应干净：产物都在忽略目录 / 仓外
 node scripts/check-paths.mjs       # 路径/内网拓扑门禁：本机绝对路径、真实 LAN IP 一律不得入库
-node scripts/roadmap.mjs --check   # 必须退出 0
+node .worklog/bin/roadmap.mjs --check   # 必须退出 0
 ```
 
 `--check` 退出 1 表示 todo 与 ROADMAP 自动段漂移，跑 `--write` 后复查；退出 2 表示 ROADMAP 缺 AUTO 标记，找协调会话。看到 `WARN: .worklog/roadmap.html 过期` 就补跑一次 `--write`（不阻塞收尾，但别把过期页面当现状）。
@@ -112,10 +112,10 @@ node scripts/roadmap.mjs --check   # 必须退出 0
 
 ```powershell
 # P0 / 安全：立刻叫醒协调会话
-node scripts/mesh-dispatch.mjs --wake --title "mesh · 协调" --text "[WAKE] hub/README 的 TLS 示例仍指向明文 HTTP，涉及安全，需你决定是否先改文档"
+node .worklog/bin/mesh-dispatch.mjs --wake --title "mesh · 协调" --text "[WAKE] hub/README 的 TLS 示例仍指向明文 HTTP，涉及安全，需你决定是否先改文档"
 
 # 需要 owner 决策：一句话说清现状和选项，细节放第二段
-node scripts/mesh-dispatch.mjs --wake --title "mesh · 协调" --text "[WAKE] latest 发布前需要 owner 确认，两个候选版本已备好"
+node .worklog/bin/mesh-dispatch.mjs --wake --title "mesh · 协调" --text "[WAKE] latest 发布前需要 owner 确认，两个候选版本已备好"
 ```
 
 - 触发门槛（满足其一才叫）：P0 / 安全；需要 owner 决策；阻塞自己 ≥30 分钟；任务完成且结论会影响别人下一步；
@@ -138,4 +138,4 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/bind -H 'content-type: applicatio
 
 - 只有绑定过的 `conversation`，新消息才会注入指定会话；未绑定的落到「mesh 收件箱」会话；
 - `deliver:false` 只做展示绑定、不投递；
-- **已实测（2026-10-29）**：临时会话绑定一段 conversation 后，经 hub 发 1 条消息 → 该会话自动起一轮（实测 604ms），消息注入绑定会话；测试后解绑，`/mesh/admin/bindings` 无残留。本机会话之间不要走这条路（用 `scripts/mesh-dispatch.mjs --wake` 直接 inject）。
+- **已实测（2026-10-29）**：临时会话绑定一段 conversation 后，经 hub 发 1 条消息 → 该会话自动起一轮（实测 604ms），消息注入绑定会话；测试后解绑，`/mesh/admin/bindings` 无残留。本机会话之间不要走这条路（用 `.worklog/bin/mesh-dispatch.mjs --wake` 直接 inject）。
