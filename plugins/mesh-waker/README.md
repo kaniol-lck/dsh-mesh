@@ -165,6 +165,46 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/delete -H 'content-type:
 
 细节与约定见 [docs/local-sessions.md](https://github.com/kaniol-lck/dsh-mesh/blob/main/docs/local-sessions.md)；端点验收：`node test/waker-endpoints.test.js`。
 
+## 多会话分工（任何项目可用）
+
+派活能力长在插件里：装了 waker 的项目，模型可以直接调 `mesh_dispatch` 工具，CLI 也行——**不需要**本仓的 `scripts/mesh-dispatch.mjs`。
+
+**3 步示例**（任何项目根目录）：
+
+```bash
+# 1. 看本机有哪些会话（?live=1 只看未归档；id/title/archived 都在返回里）
+curl.exe -s "http://127.0.0.1:8795/mesh/sessions?live=1"
+
+# 2. 派活（带 taskId 才会写回执；同一批用同一个 batchId，全部结束只叫一次）
+dsh-mesh-dispatch --target "mesh · hub" --file task.txt --task --batch B-20261030 --deadline 90m
+# → sent session=session-… task=T-mf3k… batch=B-20261030
+
+# 3. 读回执（默认 ~/.dsh/mesh-waker/receipts.jsonl；批次的聚合行 kind="batch"）
+tail -n 2 ~/.dsh/mesh-waker/receipts.jsonl
+```
+
+模型入口（工具）参数与 CLI 一一对应：
+
+| 工具参数 | CLI | 说明 |
+|---|---|---|
+| `target`（必填） | `--target` | 会话 id、完整标题或唯一标题子串 |
+| `text`（必填） | `--text` / `--file` | 原样投递，≤64 KiB |
+| `createIfMissing` | `--create` | 解析不到时按 `target` 当标题**新建会话**再投递（新会话用 `sessionCwd`/默认工作区） |
+| `mode` | `--mode` | `queue`（默认，等当前回合）或 `steer`（打断） |
+| `taskId` | `--task [id]` | 不传自动 `T-<base36>`；不带值也自动生成 |
+| `batchId` | `--batch [id]` | 同批次 barrier：全部结束只回执一次 |
+| `receipt` | `--receipt` | `file`/`queue`/`wake`，覆盖插件默认 |
+| `deadline` | `--deadline` | `30m`/`2h`/`600s`，默认 `batchDeadlineMs` |
+
+工具描述里明确写了：投递后**不要轮询等待**，插件会在回合结束时写回执；要「全部完成再叫我」就用同一个 `batchId`。
+
+```bash
+# 新建一个执行会话并投第一单（--create 的典型用法）
+dsh-mesh-dispatch --target "worker-a" --create --text "先读 README，列出与实现不一致处" --task --batch B-a
+```
+
+CLI 只依赖 Node 内置 `fetch`，通过 `--waker` 指向本机 waker（默认 `http://127.0.0.1:8795`）；连不上时退出码 2。
+
 ## 依赖
 
 中枢本体见 [hub/](https://github.com/kaniol-lck/dsh-mesh/tree/main/hub)，Docker 一条命令即可起：

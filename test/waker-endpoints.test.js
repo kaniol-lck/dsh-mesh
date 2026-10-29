@@ -100,6 +100,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
     agents: new Map(),
     workspace: null,
     workspacePath: null,
+    tools: [],
   }
 
   const sessionController = {
@@ -176,6 +177,12 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
       }
     },
     commands: { register: () => () => {} },
+    tools: {
+      register: (definition) => {
+        state.tools.push(definition)
+        return () => {}
+      },
+    },
     sessionController,
     agents,
     workspaceRegistry,
@@ -937,6 +944,77 @@ async function main() {
     const allIds = (all.json?.sessions ?? []).map((session) => session.id)
     const ok = filteredIds.join(',') === 'session-keep' && allIds.length === 2
     report('GET /mesh/sessions?live=1 lists only non-archived sessions', ok, `live=${JSON.stringify(filteredIds)} all=${allIds.length}`)
+  })
+
+  // 37-41. mesh_dispatch tool + dsh-mesh-dispatch CLI (offline, no real HTTP).
+  await runCase('mesh_dispatch: tool metadata and schema', async () => {
+    const { MESH_DISPATCH_TOOL } = await import(pathToFileURL(ENTRY).href)
+    const params = MESH_DISPATCH_TOOL.parameters
+    const ok =
+      MESH_DISPATCH_TOOL.name === 'mesh_dispatch' &&
+      params.target?.required === true &&
+      params.text?.required === true &&
+      MESH_DISPATCH_TOOL.required.join(',') === 'target,text' &&
+      /batchId/.test(MESH_DISPATCH_TOOL.description) &&
+      /不要轮询|do NOT poll/i.test(MESH_DISPATCH_TOOL.description)
+    report('mesh_dispatch: tool metadata and schema', ok, `name=${MESH_DISPATCH_TOOL.name} required=${MESH_DISPATCH_TOOL.required.join(',')}`)
+  })
+
+  await runCase('mesh_dispatch: createIfMissing=false reports the option name', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-only', title: 'only one' }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    let message = ''
+    try {
+      await h.state.tools[0].execute({ target: 'nobody here', text: 'hello' })
+    } catch (error) {
+      message = error.message
+    }
+    const ok = /createIfMissing/.test(message) && /list_local_sessions/.test(message)
+    report('mesh_dispatch: createIfMissing=false reports the option name', ok, `message=${message.slice(0, 100)}`)
+  })
+
+  await runCase('mesh_dispatch: createIfMissing=true creates the session and injects', async (boot) => {
+    const h = await boot({})
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const result = await h.state.tools[0].execute({ target: 'brand new worker', text: 'bootstrap it', createIfMissing: true })
+    const ok =
+      result.ok === true &&
+      result.created === true &&
+      Boolean(result.sessionId) &&
+      h.state.created.length === 1 &&
+      h.state.prompts.length === 1
+    report('mesh_dispatch: createIfMissing=true creates the session and injects', ok, `created=${result.created} session=${result.sessionId} createCalls=${h.state.created.length} prompts=${h.state.prompts.length}`)
+  })
+
+  await runCase('mesh_dispatch: taskId auto-generates and explicit ids pass through', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-disp', title: 'dispatch target' }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const auto = await h.state.tools[0].execute({ target: 'dispatch target', text: 'a' })
+    const explicit = await h.state.tools[0].execute({ target: 'dispatch target', text: 'b', taskId: 'T-explicit-1' })
+    const ok = /^T-[0-9a-z]+$/.test(auto.taskId) && explicit.taskId === 'T-explicit-1'
+    report('mesh_dispatch: taskId auto-generates and explicit ids pass through', ok, `auto=${auto.taskId} explicit=${explicit.taskId}`)
+  })
+
+  await runCase('CLI: parses deadline/task flags and refuses unknown args', async () => {
+    const { parseArgs, durationMs } = await import(
+      pathToFileURL(path.join(REPO, 'plugins', 'mesh-waker', 'bin', 'dispatch.mjs')).href
+    )
+    const parsed = parseArgs(['--target', 'mesh · hub', '--text', 'hi', '--deadline', '30m', '--task', '--batch', 'B-1', '--mode', 'steer'])
+    let unknown = ''
+    try {
+      parseArgs(['--target', 'x', '--text', 'y', '--bogus'])
+    } catch (error) {
+      unknown = error.message
+    }
+    const ok =
+      parsed.deadlineMs === 1800000 &&
+      parsed.task === '' &&
+      parsed.batch === 'B-1' &&
+      parsed.mode === 'steer' &&
+      durationMs('600s') === 600000 &&
+      /unknown argument: --bogus/.test(unknown) &&
+      /Usage/.test(unknown)
+    report('CLI: parses deadline/task flags and refuses unknown args', ok, `deadline=${parsed.deadlineMs} task=${JSON.stringify(parsed.task)} usage=${/Usage/.test(unknown)}`)
   })
 
   const failed = results.filter((result) => !result.ok)

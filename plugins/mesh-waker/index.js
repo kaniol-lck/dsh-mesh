@@ -370,6 +370,50 @@ export function buildBatchReceipt({ batchId, tasks = [], startedAt = 0, endedAt 
   return { record, body: [header, ...lines].join('\n') }
 }
 
+/** "30m" / "2h" / "600s" / "500ms" -> milliseconds; null when empty, throw when malformed. */
+export function durationToMs(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return null
+  const match = /^(\d+)(ms|s|m|h)$/i.exec(String(value).trim())
+  if (!match) throw new Error(`deadline must look like 600s, 90m or 2h (got ${value})`)
+  return Number(match[1]) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[match[2].toLowerCase()]
+}
+
+/** Fill the dispatch meta defaults: taskId always exists, batchId/deadline only when asked. */
+export function buildDispatchMeta({ taskId, batchId, deadline } = {}, now = Date.now()) {
+  return {
+    taskId: String(taskId ?? '').trim() || `T-${now.toString(36)}`,
+    batchId: String(batchId ?? '').trim() || null,
+    deadlineMs: durationToMs(deadline),
+  }
+}
+
+/**
+ * Model-callable dispatch tool. It lives in the plugin so any project gets local
+ * multi-session dispatch without this repository's scripts/.
+ */
+export const MESH_DISPATCH_TOOL = {
+  name: 'mesh_dispatch',
+  description:
+    'Dispatch a task text into another local DSH session (same machine, no hub). target = session id, full title, or a unique title substring. ' +
+    'Returns immediately with taskId; do NOT poll or wait for the result — the waker writes a receipt when that turn ends (file by default). ' +
+    'Pass the same batchId for several tasks to get exactly one aggregate notice after all of them finish (batch barrier). ' +
+    'Set createIfMissing:true to create the session when target does not resolve.',
+  parameters: {
+    target: { type: 'string', required: true, description: 'Session id, full title, or a unique title substring.' },
+    text: { type: 'string', required: true, description: 'Task text, delivered verbatim (max 64 KiB).' },
+    createIfMissing: {
+      type: 'boolean',
+      description: 'Create a session titled with target when it does not resolve (default false).',
+    },
+    mode: { type: 'string', enum: ['queue', 'steer'], description: 'queue (default) or steer.' },
+    taskId: { type: 'string', description: 'Receipt task id; a T-<base36 timestamp> is generated when omitted.' },
+    batchId: { type: 'string', description: 'Batch barrier id: one aggregate receipt after every task ends.' },
+    receipt: { type: 'string', enum: ['file', 'queue', 'wake'], description: 'Override the plugin receipt mode.' },
+    deadline: { type: 'string', description: 'Batch deadline such as 30m / 2h / 600s.' },
+  },
+  required: ['target', 'text'],
+}
+
 function normalizeBase(config) {
   const c = config ?? {}
   // Secrets may be inlined (older configs) or, preferably, read from owner-only files so
@@ -2748,6 +2792,137 @@ export function apply(ctx, config) {
       return typeof off === 'function' ? off : undefined
     })
   }
+
+  // ---------------------------------------------------------------- model tool
+  //
+  // mesh_dispatch exposes the /mesh/inject pipeline to the model so any project (this repo
+  // or not) can split work across local sessions. Registration is best effort:
+  // @deepseek-ai/dsh-tools is a host peer dependency that a linked install may not resolve,
+  // in which case the same definition is registered with a plain JSON Schema.
+
+  const DISPATCH_OUTPUT = {
+    schema: {
+      type: 'object',
+      properties: {
+        ok: { type: 'boolean' },
+        sessionId: { type: 'string' },
+        title: { type: ['string', 'null'] },
+        taskId: { type: 'string' },
+        batchId: { type: ['string', 'null'] },
+        mode: { type: 'string' },
+        created: { type: 'boolean' },
+      },
+      required: ['ok', 'sessionId', 'taskId', 'mode', 'created'],
+    },
+    render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+  }
+
+  async function createDispatchTarget(title) {
+    const name = String(title ?? '').trim().slice(0, 60)
+    if (!name) throw new Error('createIfMissing needs a non-empty target to use as the title')
+    let workspaceId
+    try {
+      workspaceId = await ensureWorkspaceId()
+    } catch {
+      workspaceId = undefined
+    }
+    const created = await ctx.sessionController.create(
+      workspaceId ? { workspaceId, agentPreset: c.agentPreset } : { cwd: c.sessionCwd, agentPreset: c.agentPreset },
+    )
+    const sessionId = created?.sessionId
+    if (!sessionId) throw new Error('sessionController.create returned no sessionId')
+    try {
+      await ctx.sessionController.rename({ sessionId, title: name })
+    } catch (error) {
+      fileLog(`renaming dispatch-created session failed: ${error.message}`)
+    }
+    fileLog(`created session ${sessionId} for mesh_dispatch target "${name}"`)
+    return { id: sessionId, title: name }
+  }
+
+  async function dispatchLocalTask(args = {}) {
+    const target = String(args.target ?? '').trim()
+    const text = String(args.text ?? '')
+    if (!target) throw new Error('target is required (session id, full title, or a unique title substring)')
+    if (!text.trim()) throw new Error('text is required')
+    if (text.length > 64 * 1024) throw new Error('text is too large (max 64 KiB)')
+    let session = null
+    let createdSession = false
+    try {
+      session = resolveLocalSession({ session: target, title: target })
+    } catch (error) {
+      if (args.createIfMissing !== true) {
+        throw new Error(
+          `找不到会话 "${target}"；可用 list_local_sessions 查看，或设 createIfMissing:true 新建（${error.message}）`,
+        )
+      }
+      session = await createDispatchTarget(target)
+      createdSession = true
+    }
+    const resolved = buildDispatchMeta(args)
+    const meta = {
+      taskId: resolved.taskId,
+      ...(resolved.batchId ? { batchId: resolved.batchId } : {}),
+      ...(args.receipt ? { receipt: String(args.receipt) } : {}),
+      ...(resolved.deadlineMs ? { deadlineMs: resolved.deadlineMs } : {}),
+    }
+    let taskId = null
+    try {
+      taskId = registerPendingTask(session, meta)
+      await promptWithResume(session.id, text, args.mode === 'steer' ? 'steer' : 'queue')
+    } catch (error) {
+      if (taskId) cancelPendingTask(taskId)
+      throw error
+    }
+    fileLog(
+      `mesh_dispatch: ${text.length} chars -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''} created=${createdSession}`,
+    )
+    return {
+      ok: true,
+      sessionId: session.id,
+      title: session.title ?? null,
+      taskId,
+      batchId: meta.batchId ?? null,
+      mode: args.mode === 'steer' ? 'steer' : 'queue',
+      created: createdSession,
+    }
+  }
+
+  void (async () => {
+    let definition = null
+    try {
+      const { defineTool } = await import('@deepseek-ai/dsh-tools')
+      definition = defineTool({
+        name: MESH_DISPATCH_TOOL.name,
+        description: MESH_DISPATCH_TOOL.description,
+        parameters: MESH_DISPATCH_TOOL.parameters,
+        output: DISPATCH_OUTPUT,
+        execute: (args) => dispatchLocalTask(args),
+      })
+    } catch (error) {
+      const properties = {}
+      for (const [key, spec] of Object.entries(MESH_DISPATCH_TOOL.parameters)) {
+        const { required: _required, ...rest } = spec
+        properties[key] = rest
+      }
+      definition = {
+        name: MESH_DISPATCH_TOOL.name,
+        description: MESH_DISPATCH_TOOL.description,
+        parameters: { type: 'object', properties, required: MESH_DISPATCH_TOOL.required },
+        output: DISPATCH_OUTPUT,
+        execute: (args) => dispatchLocalTask(args),
+      }
+      fileLog(`dsh-tools not resolvable (${error.message}); mesh_dispatch registered with a plain JSON Schema`)
+    }
+    try {
+      const tools = typeof ctx.get === 'function' ? ctx.get('tools') : ctx.tools
+      if (!tools?.register) throw new Error('host exposes no tools service')
+      ctx.effect(() => tools.register(definition))
+      fileLog('registered tool mesh_dispatch')
+    } catch (error) {
+      log.warn(`[mesh-waker] mesh_dispatch tool not registered: ${error.message}`)
+    }
+  })()
 
   // Restore batches before the listener comes up, then poll liveness for early alerts.
   restoreBatches()

@@ -2,12 +2,23 @@
 
 本文件记录 `dsh-mesh-waker` 的变更。格式仿 `hub/CHANGES.md`：每节写清改了什么、怎么复验。
 
-> **发版状态**：`0.4.56`–`0.5.4` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
-> `next` 是 0.4.55）；0.4.60、0.5.0–0.5.4 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
+> **发版状态**：`0.4.56`–`0.5.5` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
+> `next` 是 0.4.55）；0.4.60、0.5.0–0.5.5 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数）。
 
 ---
+
+## v0.5.5（2026-10-30，派活能力进插件：`mesh_dispatch` 工具 + `dsh-mesh-dispatch` CLI）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | 以前派活靠本仓 `scripts/mesh-dispatch.mjs`，别的项目装了 waker 也没有这个能力；现在工具与 CLI 都随 npm 包发布 |
+| 工具 | `mesh_dispatch`（`ctx.tools.register` + `@deepseek-ai/dsh-tools` 的 `defineTool`）：`target`/`text` 必填，`createIfMissing` 解析不到时按 target 当标题新建会话再投，`mode` queue/steer，可选 `taskId`（缺省 `T-<base36>`）、`batchId`（barrier）、`receipt`、`deadline`（`30m`/`2h`/`600s`）。返回 `{ok, sessionId, title, taskId, batchId, mode, created}`；描述写明「投递后不要轮询，回合结束写回执；要全部完成再叫就用 batchId」 |
+| 兼容 | `@deepseek-ai/dsh-tools` 是可选 peer；链接安装解析不到时用同一份 JSON Schema 定义注册，插件不因 import 失败而挂掉 |
+| CLI | `bin/dispatch.mjs` → `dsh-mesh-dispatch`（`bin` 已进 `files`）：零外部依赖（Node 内置 fetch），`--target/--text|--file/--mode/--task [id]/--batch [id]/--receipt/--deadline/--create/--json/--waker`；成功打印 `sent session=… task=… batch=…`，`--json` 结构化；连不上默认 8795 → 退出码 2；未知参数 → 退出码 1 + 用法 |
+| 测试 | `node test/waker-endpoints.test.js` 新增 5 例：工具元数据（必填 target/text、描述含 batchId）、`createIfMissing=false` 报错含 createIfMissing、`createIfMissing=true` 调 create 后投递成功、taskId 自动 `T-` 前缀与显式透传、CLI 参数解析（`--deadline 30m`→1800000、裸 `--task` 自动生成、未知参数抛用法）；离线、不起真实 HTTP |
+| 文档 | README 新增「多会话分工（任何项目可用）」：3 步示例（列会话 → 派活带 taskId → 读回执/批次）、工具与 CLI 对照表、`createIfMissing` 用途 |
 
 ## v0.5.4（2026-10-30，标题解析优先活跃会话；`/mesh/sessions?live=1`）
 
