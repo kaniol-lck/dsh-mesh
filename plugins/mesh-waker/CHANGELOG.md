@@ -3,7 +3,7 @@
 本文件记录 `dsh-mesh-waker` 的变更。格式仿 `hub/CHANGES.md`：每节写清改了什么、怎么复验。
 
 > **发版状态**：`0.4.56`–`0.5.6` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
-> `next` 是 0.4.55）；0.4.60、0.5.0–0.5.6 的发布仍需 owner 确认，`npm publish` 由协调会话执行。
+> `next` 是 0.4.55）；0.4.60 及 0.5.x 的发布由维护者执行。
 
 复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线）。
 
@@ -34,7 +34,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 修复 | 真机日志 `标题匹配到多个会话 … session-7fa21aa4…(mesh · 协调), session-18f66de1…(mesh · 协调)`：`resolveLocalSession` 的标题匹配把**已归档**同名会话也算进候选（历史上有 4 个「mesh · 协调」），导致 `receiptTo` 永久歧义、聚合回执只能落文件。现在标题（精确与唯一子串）先只在**未归档**会话里找：恰好 1 个即命中；多个仍报错列候选；未归档 0 个但归档里唯一 1 个时允许退回 |
+| 修复 | 标题匹配歧义：`resolveLocalSession` 的标题匹配把**已归档**同名会话也算进候选，导致 `receiptTo` 永久歧义、聚合回执只能落文件。现在标题（精确与唯一子串）先只在**未归档**会话里找：恰好 1 个即命中；多个仍报错列候选；未归档 0 个但归档里唯一 1 个时允许退回 |
 | 提示 | 歧义与找不到的报错文案补「可用 `GET /mesh/sessions` 查看 `archived` 字段，或直接配置 session id」 |
 | 新增 | `GET /mesh/sessions?live=1` 只返回未归档会话（面板/脚本便捷过滤），默认行为不变 |
 | 验证 | `node --check` exit 0；`node test/waker-endpoints.test.js` 35/35（新增 4 例：活跃 + 多个同名归档 → 命中活跃；全部归档且唯一 → 仍命中；两个活跃同名 → 400 且带 archived 提示；`?live=1` 只留未归档） |
@@ -46,7 +46,7 @@
 | 修复 | DSH 的 `ctx.on('session/event', (session, event))` 传来的是信封 `{ type, seq, time, data }`，`turn` / `reason` / `message` / `callId` / `jobId` / `approval` 全在 `event.data` 下。0.5.2 直接读 `event.*`，导致真机上回执 `turn:null`、`summary:""`，且 `waiting-tool` / `waiting-job` / `waiting-approval` 三态永远不触发 |
 | 修法 | `handleSessionEvent` 顶部统一取 `const d = event.data ?? event`（真实信封优先，保留扁平对象兼容），所有字段改从 `d` 读取；`event.type` 仍取顶层 |
 | 测试 | 新增 5 例真实信封形态：`turn/end data → turn=1/status=completed`、`assistant/message data → summary="OK"`、`tool/call data → waiting-tool(bash)`、`approval/asked data → waiting-approval(bash)`、`job/registered data → waiting-job(job-9)`；连同原有 26 例共 31/31 |
-| 验证 | `node --check` 两文件 exit 0；`node test/waker-endpoints.test.js` 31/31；真机批次待本机进程重启到 0.5.3 后复验（安装目录同步由协调会话执行） |
+| 验证 | `node --check` 两文件 exit 0；`node test/waker-endpoints.test.js` 31/31；真机批次待本机进程重启到 0.5.3 后复验（安装目录同步需手动执行） |
 
 ## v0.5.2（2026-10-29，批次屏障 + 事件驱动 liveness）
 
@@ -109,7 +109,7 @@
 | 新增 | `POST /mesh/sessions/archive { session }`：归档会话（文件保留、侧栏隐藏）；存活会话由宿主拒绝 |
 | 验证 | 创建后侧栏出现在对应工作区；归档后列表 `archived=true` 且不再出现在侧栏 |
 
-## v0.4.57（2026-10-28，协调会话可创建执行会话）
+## v0.4.57（2026-10-28，可创建执行会话）
 
 | 项 | 内容 |
 |---|---|

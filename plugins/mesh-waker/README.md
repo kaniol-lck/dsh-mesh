@@ -13,7 +13,7 @@ dsh plugin --profile web add dsh-mesh-waker
 
 装完打开 **设置 → Mesh**，填两样就能接入：
 
-1. `hubUrl`，例如 `http://<NAS-IP>:8790` 或 `https://mesh.example.com`；
+1. `hubUrl`，例如 `http://<HUB-HOST>:8790` 或 `https://mesh.example.com`；
 2. `joinCode`（中枢控制台/管理员发的 8 位一次性注册码）。
 
 启动时插件 `GET /api/bootstrap` 取服务信息（以及可选 CA），再 `POST /api/enroll` 换回自己的 agent token，按 `0600` 写进 `tokenFile`；日志里只出现 `token fp=<前6位>… len=<n>`，重启后不再需要 `joinCode`。
@@ -68,8 +68,8 @@ CA 只记 sha256 前 16 位，token 只记 `fp=<前6位>… len=<n>`；任何日
 `/mesh/inject` 可以带 `meta.taskId`（不污染正文）：插件在该会话的回合结束时写**恰好一条**回执，一个 taskId 只结算一次；配合 `dsh-mesh-dispatch` 使用：
 
 ```bash
-npx dsh-mesh-dispatch --title "mesh · hub" --file task.txt --task T-20261029-hub
-npx dsh-mesh-dispatch --title "mesh · hub" --file task.txt --task --receipt queue
+npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task T-20261029-hub
+npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task --receipt queue
 ```
 
 `--task` 不带值时自动生成 `T-<base36 时间戳>`；`--receipt` 可覆盖全局默认（并隐含开启 task）。
@@ -78,7 +78,7 @@ npx dsh-mesh-dispatch --title "mesh · hub" --file task.txt --task --receipt que
 |---|---|---|
 | `receiptMode` | `file` | `file` 只写 JSONL；`queue` 再把 `[RECEIPT]` 注入 `receiptTo`（mode=queue）；`wake` 额外唤醒（需 `wakeSecret`，否则降级 queue 并记 WARN） |
 | `receiptFile` | `~/.dsh/mesh-waker/receipts.jsonl` | 追加写，一行一条 JSON（0600） |
-| `receiptTo` | 空 | 接收回执的会话：标题（如 `mesh · 协调`）或 `session-…`；为空则只写文件 |
+| `receiptTo` | 空 | 接收回执的会话：标题（如 `<session-title>`）或 `session-…`；为空则只写文件 |
 | `receiptSummaryChars` | `300` | 摘要按**码点**截断，不会切出半个字符 |
 | `receiptStallMs` | `600000` | 注入后这么久仍无 `turn/start`，判 `not-started` |
 
@@ -91,8 +91,8 @@ npx dsh-mesh-dispatch --title "mesh · hub" --file task.txt --task --receipt que
 **batch**：一次派 N 单，全部结束才通知一次。`dsh-mesh-dispatch` 加 `--batch [id]`（同 id 的多次调用归同一批，不带值自动生成 `B-<base36>`）与 `--deadline 2h|90m|600s`：
 
 ```bash
-npx dsh-mesh-dispatch --title "mesh · hub"  --file t1.txt --batch B-20261029 --deadline 90m
-npx dsh-mesh-dispatch --title "mesh · docs" --file t2.txt --batch B-20261029
+npx dsh-mesh-dispatch --title "<session-title>"  --file t1.txt --batch B-20261029 --deadline 90m
+npx dsh-mesh-dispatch --title "<session-title>" --file t2.txt --batch B-20261029
 ```
 
 批次内单任务**不单独打扰**（回执按 `file` 处理），只有聚合回执走 `barrierMode`：
@@ -154,7 +154,7 @@ curl.exe -s http://127.0.0.1:8795/mesh/sessions
 curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: application/json' -d '{"title":"hub 文档维护","text":"列出 README 与实现不一致处，只列不改"}'
 
 # 3. 新建执行会话并立刻投首轮任务（cwd 指向具体仓库根）
-curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/create -H 'content-type: application/json' -d '{"title":"mesh · 临时工","cwd":"D:\\Libraries\\Documents\\projects\\dsh-mesh\\public","prompt":"先读 hub/README.md，列出与 docs 不一致处"}'
+curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/create -H 'content-type: application/json' -d '{"title":"<session-title>","cwd":"<workspace>","prompt":"先读 hub/README.md，列出与 docs 不一致处"}'
 
 # 4. 归档 / 删除（都按完整 id）
 curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/archive -H 'content-type: application/json' -d '{"session":"session-…"}'
@@ -176,7 +176,7 @@ curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/delete -H 'content-type:
 curl.exe -s "http://127.0.0.1:8795/mesh/sessions?live=1"
 
 # 2. 派活（带 taskId 才会写回执；同一批用同一个 batchId，全部结束只叫一次）
-dsh-mesh-dispatch --target "mesh · hub" --file task.txt --task --batch B-20261030 --deadline 90m
+dsh-mesh-dispatch --target "<session-title>" --file task.txt --task --batch B-20261030 --deadline 90m
 # → sent session=session-… task=T-mf3k… batch=B-20261030
 
 # 3. 读回执（默认 ~/.dsh/mesh-waker/receipts.jsonl；批次的聚合行 kind="batch"）
@@ -221,7 +221,7 @@ MIT
 
 这条路径**只服务跨机来件**：hub 把消息 ping 给 waker，若该 `conversation` 有 `deliverTo`，waker 直接把 wake prompt 投进那个会话（默认 `mode: 'queue'`，像用户打字一样排队），而不是另起/复用「Mesh 收件箱」会话。
 
-> **本机会话之间不要用这套。** 同机派活走 `/mesh/inject`（命令行：`npx dsh-mesh-dispatch --title "mesh · hub" --file .worklog/dispatch/hub.txt`，叫协调会话加 `--wake`）——毫秒级、离线可用，不必让消息绕中枢一圈。
+> **本机会话之间不要用这套。** 同机派活走 `/mesh/inject`（命令行：`npx dsh-mesh-dispatch --title "<session-title>" --file task.txt`，需要唤醒时加 `--wake`）——毫秒级、离线可用，不必让消息绕中枢一圈。
 
 ### `POST /mesh/bind`
 
@@ -247,7 +247,7 @@ MIT
   "ok": true,
   "self": "dsh-kaniol-pc",
   "bindings": [
-    { "conversation": "conv/wake-verify", "panelSessionId": "session-…", "deliverTo": "session-…", "wakes": 1, "title": "mesh · conv/wake-verify" }
+    { "conversation": "conv/wake-verify", "panelSessionId": "session-…", "deliverTo": "session-…", "wakes": 1, "title": "conv/wake-verify" }
   ]
 }
 ```

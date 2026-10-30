@@ -1,6 +1,6 @@
 # dsh-mesh
 
-局域网 agent 互通中枢。一个常驻在 NAS 上的进程，让**会关机的多台 dsh** 和**常驻的 Hermes** 之间能：
+局域网 agent 互通中枢。一个常驻在任一台常开主机上的进程，让**会关机的多台 dsh** 和**常驻的 Hermes** 之间能：
 
 - **感知对方**——谁在线、在哪台机器、最后活动时间
 - **交换信息**——点对点消息，落库保存，对端关机也不丢
@@ -15,7 +15,7 @@ dsh 的机器会关机。任何"把 dsh 当服务端"的方案（A2A server、MC
 所以拓扑只能是 **hub-and-spoke**：
 
 ```
-        ┌────────────── NAS（常开）──────────────┐
+        ┌────────────── <HUB-HOST>（常开）──────────────┐
         │                                        │
         │   dsh-mesh  :8790                      │
         │    ├ 在线表（心跳 + TTL）               │
@@ -33,7 +33,7 @@ dsh 的机器会关机。任何"把 dsh 当服务端"的方案（A2A server、MC
 
 ---
 
-## 一、在 NAS 上跑起来（Docker）
+## 一、在常开主机上跑起来（Docker）
 
 ```bash
 cd /volume1/docker/dsh-mesh
@@ -43,7 +43,7 @@ docker compose up -d
 docker logs dsh-mesh | head -20
 ```
 
-构建默认从 `https://registry.npmmirror.com` 装依赖（NAS 访问 npmjs 会超时）；要用官方源可覆盖：
+构建默认从 `https://registry.npmmirror.com` 装依赖；若你的网络能直连官方源，可覆盖：
 `docker build --build-arg NPM_REGISTRY=https://registry.npmjs.org .`。
 
 只想先跑局域网（不加密）就这样够了。要跨网络访问，再加 TLS：
@@ -59,10 +59,10 @@ node scripts/make-cert.mjs --out certs --ip <frps 公网地址> --days 3650
 它**默认不打印到 stdout**——`docker logs` 会长期留存，等于把管理凭据写进日志；
 用 `cat data/admin.token` 取。确需打印（只适合一次性本地测试）时设 `MESH_PRINT_ADMIN_TOKEN=1`。
 
-健康检查：`curl http://<NAS-IP>:8790/health`
+健康检查：`curl http://<HUB-HOST>:8790/health`
 
-> 直接跑也行（NAS 有 Node ≥ 22.13 时）：`MESH_HOST=0.0.0.0 node server.mjs`
-> `node_modules` 已随目录带过去，NAS 不需要联网安装。Node 22.5–22.12 也能跑，但要加 `--experimental-sqlite`。
+> 直接跑也行（主机有 Node ≥ 22.13 时）：`MESH_HOST=0.0.0.0 node server.mjs`
+> `node_modules` 随目录带过去即可，主机不需要联网安装。Node 22.5–22.12 也能跑，但要加 `--experimental-sqlite`。
 
 ### 鉴权是默认开启的
 
@@ -129,7 +129,7 @@ curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
           maxAttempts: 20
 ```
 
-- `failOnStartupError: false`：NAS 没开或断网时 dsh 照常启动，只是暂时没有 mesh 工具。
+- `failOnStartupError: false`：中枢主机没开或断网时 dsh 照常启动，只是暂时没有 mesh 工具。
 - 改完需要重启 dsh profile。
 - 跨网络（工作机经 frp 访问）**必须先做传输加密**，见
   [docs/transport-security.md](../docs/transport-security.md)。
@@ -159,7 +159,7 @@ curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
 Hermes 支持 MCP，直接连即可：
 
 ```
-url:     http://<NAS-IP>:8790/mcp
+url:     http://<HUB-HOST>:8790/mcp
 headers: Authorization: Bearer <给 Hermes 单独签发的 token>
 ```
 
@@ -168,13 +168,13 @@ REST 兜底（同一份数据，给脚本或不便接 MCP 的场景）：
 ```bash
 H='-H "X-Mesh-Agent: ignored" -H "Authorization: Bearer $TOKEN"'
 
-curl -X POST http://NAS:8790/api/send \
+curl -X POST http://<HUB-HOST>:8790/api/send \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"to":"dsh-study","subject":"早上好","body":"昨天的清单在 board 上"}'
 
-curl 'http://NAS:8790/api/inbox?mark_read=1' -H "Authorization: Bearer $TOKEN"
-curl 'http://NAS:8790/api/peers?offline=1'  -H "Authorization: Bearer $TOKEN"
-curl 'http://NAS:8790/api/board?key=env/nas' -H "Authorization: Bearer $TOKEN"
+curl 'http://<HUB-HOST>:8790/api/inbox?mark_read=1' -H "Authorization: Bearer $TOKEN"
+curl 'http://<HUB-HOST>:8790/api/peers?offline=1'  -H "Authorization: Bearer $TOKEN"
+curl 'http://<HUB-HOST>:8790/api/board?key=env/host' -H "Authorization: Bearer $TOKEN"
 ```
 
 > 在 token 模式下 `X-Mesh-Agent` 被忽略——身份完全由 token 决定，防止冒用。
@@ -291,7 +291,7 @@ curl -s -X POST "$HUB/api/blob/<id>/commit"
 ### 为什么是这些上限
 
 中枢是**常驻进程**，凡是可以被调用方无限创建的东西都必须有天花板，否则一个失控的
-agent 就能把内存或 NAS 磁盘耗尽：
+agent 就能把内存或主机磁盘耗尽：
 
 - **MCP 会话**存在进程内存里。dsh 关机不会发 `DELETE /mcp`，不回收就会随重启次数线性增长，
   所以有 `MESH_SESSION_IDLE_MS`（每分钟扫描，按最近一次请求计时）和 `MESH_MAX_SESSIONS`。
@@ -331,7 +331,7 @@ agent 就能把内存或 NAS 磁盘耗尽：
 
 - 在线判定靠"最近一次请求"，不是长连接心跳。空闲机器会在 TTL 后显示离线；需要精确在线时让 agent 定期调一次 `mesh_peers`。
 - 消息是点对点，没有广播组（用黑板代替）。
-- 没有端到端加密（TLS 保护传输层）；库内明文存储，依赖 NAS 的磁盘权限。
+- 没有端到端加密（TLS 保护传输层）；库内明文存储，依赖主机磁盘权限。
 - 单进程 SQLite，写并发在几十次/秒级，家庭规模足够。
 - 自签证书需要客户端 `NODE_EXTRA_CA_CERTS` 信任，详见传输文档。
 - 令牌轮换入口：控制台单行「轮换」或 admin API `POST /api/admin/rotate {name}`；旧 token 立即失效，动作进 audit（`console.rotate` / `admin.rotate`），节点侧不再需要本地 admin-token 文件。
