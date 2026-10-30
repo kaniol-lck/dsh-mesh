@@ -2,8 +2,8 @@
 
 本文件记录 `dsh-mesh-waker` 的变更。格式仿 `hub/CHANGES.md`：每节写清改了什么、怎么复验。
 
-> **发版状态**：`0.4.56`–`0.5.6` 目前只在本仓，尚未发布到 npm（`latest` 仍是 0.4.41，
-> `next` 是 0.4.55）；0.4.60 及 0.5.x 的发布由维护者执行。
+> **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
+> `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
 复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线）。
 
