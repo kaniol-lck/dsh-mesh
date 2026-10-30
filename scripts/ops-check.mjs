@@ -7,7 +7,7 @@
  *   node scripts/ops-check.mjs --base http://hub:8790 --waker http://127.0.0.1:8795
  *
  * Typical output:
- *   PASS  hub reachable            http://192.168.10.2:8790 (v0.7.15)
+ *   PASS  hub reachable            http://<HUB-HOST>:8790 (v0.7.15)
  *   WARN  unpushed commits         2 commit(s) ahead of upstream
  *   summary: 9 PASS / 2 WARN / 0 FAIL / 1 SKIP
  *
