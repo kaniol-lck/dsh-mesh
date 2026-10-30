@@ -9,6 +9,14 @@
 
 ---
 
+## v0.7.4（2026-10-31，修 exports：loader 读不到清单）
+
+| 项 | 内容 |
+|---|---|
+| 事故 | DSH 启动后 waker 未加载（8795 无响应），loader 报 `ERR_PACKAGE_PATH_NOT_EXPORTED`：`package.json` 的 `exports` 没有暴露 `./package.json` 与 `./cordis.patch.yml`，宿主读清单时被 exports 拦下 |
+| 修法 | `exports` 增加 `"./package.json": "./package.json"` 与 `"./cordis.patch.yml": "./cordis.patch.yml"` |
+| 防复发 | `sync-local-waker.mjs` 增加自检：安装目录的 `exports` 必须含这两个键，否则 `SELF-CHECK` 失败并拒绝同步 |
+| 验证 | 重启 DSH 后 `/mesh/status` 返回 200 且 `pluginVersions.process = 0.7.4` |
 ## v0.7.3（2026-10-31，桥会话发送前预留，杜绝 pull/push 抢走问题与回复）
 
 | 项 | 内容 |
