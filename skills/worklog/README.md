@@ -26,6 +26,7 @@ node scripts/roadmap.mjs --check           # 0 一致 / 1 漂移 / 2 配置问�
 node scripts/roadmap.mjs --json            # 机器可读模型
 node scripts/defects.mjs --scan            # 缺陷台账（写 <worklog-dir>/defects.md）
 node scripts/defects.mjs --taxonomy        # 查看签名词表
+# --json 字段：counts / features / gates（数组）/ gatesPath / unclassified / entries
 ```
 
 自定义路径：

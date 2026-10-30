@@ -101,6 +101,8 @@ node scripts/defects.mjs --scan --worklog-dir ./.worklog
 
 `--write` 对并发安全（临时文件 + rename，`<worklog-dir>/.roadmap.lock` 互斥；拿不到锁只 WARN 并退出 0）。
 
+`--json` 的关键字段：`counts`、`features`、`gates`（结构化判定数组，元素含 `id / name / question / met / total / satisfied / blocking`）、`gatesPath`（关口定义文件路径）、`unclassified`、`entries`（每条含 `liveInProgress` / `demoteReason`）。
+
 ## 8. 示例
 
 `examples/` 是一个最小可跑项目：
