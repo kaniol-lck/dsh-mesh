@@ -390,7 +390,7 @@ function featureStats(entries, features) {
     const open = group.filter((entry) => entry.status !== '已完成')
     const topPriority = PRIORITIES.find((priority) => open.some((entry) => entry.priority === priority)) ?? null
     const owners = [...new Set(group.filter((entry) => entry.explicitOwner).map((entry) => entry.owner))].sort()
-    return { name, open: open.length, done: group.length - open.length, topPriority, owners }
+    return { name, total: group.length, open: open.length, done: group.length - open.length, topPriority, owners }
   })
 }
 
@@ -422,6 +422,8 @@ function evaluateGate(gate, entries) {
   const met = []
   const seen = new Set()
   const blocking = []
+  const capsules = []
+  const capsuleSeen = new Set()
   const pushBlocker = (key, title) => {
     if (seen.has(key)) return
     seen.add(key)
@@ -429,6 +431,12 @@ function evaluateGate(gate, entries) {
   }
   for (const require of gate.requires ?? []) {
     const matched = gateRequireEntries(require, entries)
+    for (const entry of matched) {
+      const key = `${entry.file}:${entry.line}`
+      if (capsuleSeen.has(key)) continue
+      capsuleSeen.add(key)
+      capsules.push(entry)
+    }
     const open = matched.filter((entry) => entry.status !== '已完成')
     if (matched.length > 0 && open.length === 0) {
       met.push(require)
@@ -437,6 +445,11 @@ function evaluateGate(gate, entries) {
     if (matched.length === 0) pushBlocker(`missing:${gateRequireLabel(require)}`, `「${gateRequireLabel(require)}」无匹配`)
     else pushBlocker(`${open[0].file}:${open[0].line}`, open[0].displayTitle)
   }
+  capsules.sort((left, right) => {
+    const leftDone = left.status === '已完成' ? 1 : 0
+    const rightDone = right.status === '已完成' ? 1 : 0
+    return leftDone - rightDone || priorityCompare(left, right) || ownerCompare(left, right)
+  })
   return {
     id: gate.id,
     name: gate.name,
@@ -445,7 +458,27 @@ function evaluateGate(gate, entries) {
     met: met.length,
     total: (gate.requires ?? []).length,
     blocking,
+    capsules: capsules.map((entry) => ({ title: entry.displayTitle, status: entry.status, owner: entry.owner, feature: entry.feature })),
   }
+}
+
+/** Next-step digest: unfinished P1 grouped by owner (max 3 each, 12 total); P2 when no P1. */
+function nextUp(entries) {
+  const unfinished = entries.filter((entry) => entry.status !== '已完成')
+  const pool = unfinished.filter((entry) => entry.priority === 'P1')
+  const source = pool.length ? pool : unfinished.filter((entry) => entry.priority === 'P2')
+  const byOwner = new Map()
+  for (const entry of [...source].sort(ownerCompare)) {
+    if (!byOwner.has(entry.owner)) byOwner.set(entry.owner, [])
+    const list = byOwner.get(entry.owner)
+    if (list.length < 3) list.push(entry)
+  }
+  return [...byOwner.values()].flat().slice(0, 12).map((entry) => ({
+    priority: entry.priority,
+    title: entry.displayTitle,
+    owner: entry.owner,
+    feature: entry.feature,
+  }))
 }
 
 function gateRows(gates, entries) {
@@ -495,9 +528,10 @@ function buildSegment(entries, generatedAt, hash, version, gates, sourceLabel, f
       lines.push(`| ${row.name} | ${row.open} | ${row.done} | ${row.topPriority ?? '—'} | ${row.owners.length ? row.owners.join(', ') : '—'} |`)
     }
   }
+  const gateResult = gates.length ? gateRows(gates, entries) : []
   if (gates.length) {
     lines.push('', '### 关口（阶段性验收）', '', '| 关口 | 问题 | 状态 | 还差什么 |', '|---|---|---|---|')
-    const rows = gateRows(gates, entries)
+    const rows = gateResult
     for (const row of rows) {
       const status = row.satisfied ? '✅ 达成' : `⏳ ${row.met}/${row.total}`
       let remain = '—'
@@ -509,6 +543,21 @@ function buildSegment(entries, generatedAt, hash, version, gates, sourceLabel, f
       lines.push(`| ${row.id} ${row.name} | ${row.question} | ${status} | ${remain} |`)
     }
     if (rows.length && rows.every((row) => row.satisfied)) lines.push('', '> 全部关口已达成。')
+  }
+  const unmet = gateResult.filter((row) => !row.satisfied)
+  if (unmet.length) {
+    lines.push('', '### 待办聚合', '', '按关口聚合（只列未达成关口；未完成项在前）：')
+    for (const row of unmet) {
+      lines.push('', `#### ${row.id} ${row.name}（⏳ ${row.met}/${row.total}）`, '', '| 状态 | 条目 | 归属 |', '|---|---|---|')
+      for (const capsule of row.capsules) {
+        lines.push(`| ${capsule.status === '已完成' ? '✅' : '⏳'} | ${capsule.title} | ${capsule.owner} |`)
+      }
+    }
+    const next = nextUp(entries)
+    if (next.length) {
+      lines.push('', '#### 下一步 Top')
+      for (const item of next) lines.push(`- [${item.feature}] ${item.title} — ${item.owner}`)
+    }
   }
   for (const priority of PRIORITIES) {
     const group = unfinished.filter((entry) => entry.priority === priority).sort(ownerCompare)
@@ -985,6 +1034,7 @@ async function main() {
       html: htmlPath,
       gatesPath,
       gates: gateRows(gates, entries),
+      nextUp: nextUp(entries),
       hash,
       version,
       counts: countEntries(entries),

@@ -74,6 +74,7 @@ whenToUse: 多个 agent 会话并行做一个项目；需要可审计的任务�
 - 脚本机械判定，输出 `✅ 达成` 或 `⏳ m/n` 与「还差什么」；
 - 匹配不到任何条目时 `--check` 会 WARN（标题改过？），记得同步改 gates.json。
 - **优先用 `match` 胶囊清单**：`feature` 判据会把整个功能算进来，任何新增同功能条目（哪怕是后续跟进项）都会让已绿关口回退；`--check` 会对使用 `feature` 的关口输出 WARN，提示改成 match 清单。
+- 未达成的关口会在 ROADMAP 的「**待办聚合**」里展开成胶囊表格（未完成在前），后面跟「**下一步 Top**」：未完成 P1 按归属聚合（每组 ≤3、总 ≤12；无 P1 时退化为 P2）。人读视图与 `--json` 的 `gates[].capsules` / `nextUp` 来自同一份计算。
 
 ## 6. 缺陷回流
 
@@ -104,7 +105,16 @@ node scripts/defects.mjs --scan --worklog-dir ./.worklog
 
 `--write` 对并发安全（临时文件 + rename，`<worklog-dir>/.roadmap.lock` 互斥；拿不到锁只 WARN 并退出 0）。
 
-`--json` 的关键字段：`counts`、`features`、`gates`（结构化判定数组，元素含 `id / name / question / met / total / satisfied / blocking`）、`gatesPath`（关口定义文件路径）、`unclassified`、`entries`（每条含 `liveInProgress` / `demoteReason`）。
+`--json` 的关键字段（稳定契约，改字段要同步本文档）：
+
+| 字段 | 形态 | 说明 |
+|---|---|---|
+| `counts` | 对象 | `total / P0 / P1 / P2 / done / inProgress` |
+| `features` | 数组 | `[{name, total, open, done, topPriority, owners}]` |
+| `gates` | 数组 | `[{id, name, question, met, total, satisfied, blocking, capsules}]`；`capsules` 为 `[{title, status, owner, feature}]`，未完成在前 |
+| `nextUp` | 数组 | 下一步建议 `[{priority, title, owner, feature}]`：未完成 P1 按归属聚合（每组 ≤3、总 ≤12），无 P1 时退化为 P2 |
+| `gatesPath` | 字符串 | 关口定义文件路径 |
+| `unclassified` / `entries` | 数组 | 未分类标题；每条含 `liveInProgress` / `demoteReason` |
 
 ## 8. 示例
 

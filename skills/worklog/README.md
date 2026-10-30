@@ -26,7 +26,7 @@ node scripts/roadmap.mjs --check           # 0 一致 / 1 漂移 / 2 配置问�
 node scripts/roadmap.mjs --json            # 机器可读模型
 node scripts/defects.mjs --scan            # 缺陷台账（写 <worklog-dir>/defects.md）
 node scripts/defects.mjs --taxonomy        # 查看签名词表
-# --json 字段：counts / features / gates（数组）/ gatesPath / unclassified / entries
+# --json 字段：counts / features（[{name,total,open,done}]）/ gates（含 capsules）/ nextUp / gatesPath / entries
 ```
 
 自定义路径：
@@ -42,6 +42,7 @@ node scripts/defects.mjs --scan --worklog-dir ./.worklog
 - 做完同一轮改状态并写验收证据；
 - 分类优先级：显式 `功能：` > 标题关键词 > `未分类`（显式字段永远优先）；
 - 关口优先用 `match` 清单：`feature` 判据会被新增同功能条目拖回退（`--check` 会 WARN）。
+- 关口未达成时，ROADMAP 会多出「待办聚合」（按关口列胶囊，未完成在前）与「下一步 Top」（未完成 P1 按归属聚合）。
 - 验收看产物，不看回执/自我声明。
 
 ## 示例
