@@ -53,7 +53,7 @@ node scripts/make-cert.mjs --out certs --ip <frps 公网地址> --days 3650
 # 然后在 .env 里取消注释 MESH_TLS_CERT / MESH_TLS_KEY，再 docker compose up -d
 ```
 
-完整步骤见 [docs/transport-security.md](../docs/transport-security.md)。
+完整步骤见 [docs/security.md](../docs/security.md)。
 
 不设 `MESH_ADMIN_TOKEN` 时，首次启动会生成一个并写到 `data/admin.token`（权限 600）。
 它**默认不打印到 stdout**——`docker logs` 会长期留存，等于把管理凭据写进日志；
@@ -132,7 +132,7 @@ curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
 - `failOnStartupError: false`：中枢主机没开或断网时 dsh 照常启动，只是暂时没有 mesh 工具。
 - 改完需要重启 dsh profile。
 - 跨网络（工作机经 frp 访问）**必须先做传输加密**，见
-  [docs/transport-security.md](../docs/transport-security.md)。
+  [docs/security.md](../docs/security.md)。
 
 ### 接上之后模型会多出 10 个工具
 
@@ -185,7 +185,7 @@ curl 'http://<HUB-HOST>:8790/api/board?key=env/host' -H "Authorization: Bearer $
 
 ## 四·补、控制台（/console）
 
-浏览器打开 `http://<host>:8790/console`（需先把 `MESH_VIEW_TOKEN` 或 `MESH_ADMIN_TOKEN` 配好；两者都没有时页面 404）。**来源默认只允许 loopback 与内网段（RFC1918）**，可用 `MESH_CONSOLE_ALLOW` 调整；跨任何不可信网络必须先做传输加密，见 [docs/transport-security.md](../docs/transport-security.md)。登录换取 HttpOnly + SameSite=Strict cookie（12 小时）；view token 只读，admin token 可管理。
+浏览器打开 `http://<host>:8790/console`（需先把 `MESH_VIEW_TOKEN` 或 `MESH_ADMIN_TOKEN` 配好；两者都没有时页面 404）。**来源默认只允许 loopback 与内网段（RFC1918）**，可用 `MESH_CONSOLE_ALLOW` 调整；跨任何不可信网络必须先做传输加密，见 [docs/security.md](../docs/security.md)。登录换取 HttpOnly + SameSite=Strict cookie（12 小时）；view token 只读，admin token 可管理。
 
 **配对新节点（两条路）**
 
@@ -313,7 +313,7 @@ agent 就能把内存或主机磁盘耗尽：
 
 - 默认就有应用层鉴权（token），不是"靠局域网隔离"。
 - **传输不加密时，token 会裸奔**。跨任何不可信网络之前，必须按
-  [docs/transport-security.md](../docs/transport-security.md) 配好 TLS 或走 VPN。
+  [docs/security.md](../docs/security.md) 配好 TLS 或走 VPN。
 - 收到的消息一律当作**不可信数据**。别的 agent 发来的文本不能当指令执行。
 - `MESH_AUTH_MODE=open` 只适合"整段链路都可信"的局域网，且不要暴露端口。
 - **限流只惩罚失败请求**：失败 8 次/分钟后，同一来源的**失败**请求返回 429，但带有效 token

@@ -41,7 +41,7 @@ python scripts/release.py --promote
 
 ## 预检做什么
 
-1. `node --check plugins/mesh-waker/index.js client.js`；
+1. 语法与可加载性：`node --check plugins/mesh-waker/index.js client.js`（必要时 `node scripts/check-loadable.mjs`）；
 2. `node test/dynamic-id.test.js` —— 客户端 bundle 必须按启动清单认领模块 id
    （link 安装 = `@local/dsh-mesh-waker`，npm 安装 = `dsh-mesh-waker`，写死任何一个都会让另一种安装
    的 web boot 失败）；

@@ -205,7 +205,7 @@ hub/                    the hub itself (single-file server, Dockerfile, smoke te
 plugins/mesh-waker/     DSH client plugin: wake endpoint -> session turn
 plugins/mesh-approval/  approval transport plugin (Hermes-compatible)
 skills/mesh/            agent-facing usage guide (send/read/board conventions)
-docs/                   auth-and-console · local-sessions · release · transport-security · mesh-architecture
+docs/                   auth-and-console · local-sessions · release · security · mesh-architecture
 scripts/                secret scan, REST helpers, roadmap/defects/check-paths gates
 ```
 

@@ -180,7 +180,7 @@ hub/                    中枢本体（单文件服务、Dockerfile、冒烟测�
 plugins/mesh-waker/     DSH 客户端插件：唤醒端点 -> 会话回合
 plugins/mesh-approval/  审批转发插件（兼容 Hermes）
 skills/mesh/            给 agent 看的协作说明（发信/读信/黑板约定）
-docs/                   auth-and-console · local-sessions · release · transport-security · mesh-architecture
+docs/                   auth-and-console · local-sessions · release · security · mesh-architecture
 scripts/                密钥扫描、REST 客户端、roadmap/defects/check-paths 等门禁
 ```
 

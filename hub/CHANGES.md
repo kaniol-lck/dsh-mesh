@@ -282,7 +282,7 @@ v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话
 
 - **现象**：`resolveIdentity` 入口先判 `isThrottled(ip)`，同一 IP 失败 8 次/分钟后，
   该 IP 的**有效 token** 也返回 429。实测已复现。
-- **为什么致命**：`docs/transport-security.md` 的形态是 frp `type="tcp"` 透传，frpc 不注入
+- **为什么致命**：`docs/security.md` 的形态是 frp `type="tcp"` 透传，frpc 不注入
   `X-Forwarded-For`，所有外部 agent 的源地址都是 `127.0.0.1`。公网端口必然被扫
   （文档自己写了这句），扫描器一分钟的失败次数远超 8 次 → 全网持续 429，且
   `MESH_TRUST_PROXY` 帮不上忙。

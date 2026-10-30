@@ -103,7 +103,7 @@ push 不可达时会**静默回落**到 pull，不会报错。
 | `ECONNREFUSED` / 端口不通 | 出站端口被防火墙拦、hub 没起 | 换 443 端口（反代）；`curl -v <hub-url>/api/bootstrap` 看卡在 connect 还是 TLS |
 | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` / `SELF_SIGNED_CERT_IN_CHAIN` | 自签 CA 未信任，或把叶子证书当锚 | 用自举自动信任；或配 `caFile` 指向 CA PEM；**不要**用 `NODE_TLS_REJECT_UNAUTHORIZED=0` |
 | `401 invalid token` / `token expired` | token 被轮换/吊销，或文件被手改 | 删掉 `tokenFile`，重新用 `joinCode` 自举 |
-| `403 scope …` / `403 … allowlist` | 节点 scopes 不足，或 IP 白名单不含你 | 控制台给该节点勾 scope；公网接入时 `allowed_cidrs` 通常不适用（见 `docs/transport-security.md`） |
+| `403 scope …` / `403 … allowlist` | 节点 scopes 不足，或 IP 白名单不含你 | 控制台给该节点勾 scope；公网接入时 `allowed_cidrs` 通常不适用（见 `docs/security.md`） |
 | `429 too many …` | 触发限速（bootstrap 60 次/分钟、失败认证限流） | 等窗口结束再试；先修配置，别连着重试 |
 | `lastError` 里只有 HTTP 状态 | 没有更细的错误体（如 502/503） | 对照状态码：4xx 查配置/权限，5xx 查中枢与反代；`curl` 复现同一请求 |
 
