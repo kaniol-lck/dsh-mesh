@@ -9,6 +9,15 @@
 
 ---
 
+## v0.5.8（2026-10-30，拒绝的主题投递不得消费消息；拒绝日志收敛）
+
+| 项 | 内容 |
+|---|---|
+| 缺陷 | 真机 `ops/selftest-guarded`（`allowFrom` 外发送方）投递被拒后，消息 `read_at` 仍被写上（约 10s 后），运营者无法在收件箱审计「谁试图投递、投了什么」 |
+| 定位 | waker 日志：`10:22:25.606 topic denied …` → `10:22:25.607 woke conversation … in 133ms`，期间**没有** `marked N message(s) read`；`read_at` 出现在 10s+ 后、同一批正常投递回合结束附近（该回合的 agent 侧 `mesh_inbox(mark_read)` 会清空整个未读收件箱）。waker 的拒绝分支原本就在任何 markRead 之前 return，本次把它写成**硬约束**并消除相邻触发面 |
+| 修法 | ① 拒绝路径显式约定：不 claim、不 read、不注入、不建会话，消息保持 `read_at=null`（注释固化意图）；② 投递提示加强：内联消息时明确「无需调用 mesh_inbox，也不要把收件箱里其它消息标记为已读（不是本轮任务）」，减少 agent 顺手清箱；③ 拒绝日志收敛：按 `(label|sender|message id)` 去重，新消息立即记一条，重复拒绝累计，每 50 次才补一条 `suppressed` |
+| 测试 | 共 49/49：拒绝用例改为跨**两次轮询**断言 `prompts=0 unread=1 read_at=null(true) deniedLines=1`（即无 `/api/read`、消息未消费、日志只一条）；新增「重复 label 只保留第一个定义」用例。原有 48 例全绿 |
+
 ## v0.5.7（2026-10-30，主题路由：远程按标签投递，不暴露会话 id/标题）
 
 | 项 | 内容 |

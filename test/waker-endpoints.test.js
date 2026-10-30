@@ -272,6 +272,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
  */
 async function startFakeHub({ token = 'tok-' + 'selftest', messages = [] } = {}) {
   const requests = []
+  const readIds = []
   let unread = messages.map((message) => ({ ...message }))
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://fake-hub')
@@ -307,6 +308,7 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [] } = {})
       if (url.pathname === '/api/inbox') return send(200, { messages: unread })
       if (url.pathname === '/api/read') {
         const ids = new Set((body.ids ?? []).map(String))
+        for (const id of ids) readIds.push(id)
         unread = unread.filter((message) => !ids.has(String(message.id)))
         return send(200, { ok: true })
       }
@@ -323,6 +325,9 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [] } = {})
     requests,
     push(message) {
       unread.push({ ...message })
+    },
+    get readIds() {
+      return readIds
     },
     get unread() {
       return unread
@@ -1134,7 +1139,7 @@ async function main() {
     }
   })
 
-  await runCase('topics: allowFrom denies a foreign sender and leaves the message unread', async (boot) => {
+  await runCase('topics: allowFrom denies a foreign sender without consuming the message', async (boot) => {
     const fake = await startFakeHub({
       token: 'tok-' + 'selftest',
       messages: [{ id: 'm-deny-1', sender: 'peer-b', conversation: 'ops/secure', body: 'should not run' }],
@@ -1152,15 +1157,40 @@ async function main() {
           topics: [{ label: 'ops/secure', titlePattern: 'secure 运维', allowFrom: ['peer-a'] }],
         },
       })
-      await waitFor(() => fake.requests.some((entry) => entry.path === '/api/inbox'), 15000)
-      await sleep(1500)
+      // Two polls: the denial is re-evaluated, and it must still not read/inject.
+      await waitFor(() => fake.requests.filter((entry) => entry.path === '/api/inbox').length >= 2, 15000)
+      await sleep(500)
       const logText = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').slice(logStart) : ''
-      const ok = h.state.prompts.length === 0 && fake.unread.length === 1 && /topic denied label=ops\/secure peer=peer-b/.test(logText)
-      report('topics: allowFrom denies a foreign sender and leaves the message unread', ok, `prompts=${h.state.prompts.length} unread=${fake.unread.length} deniedLog=${/topic denied/.test(logText)}`)
+      const deniedLines = logText.split(/\r?\n/).filter((line) => /topic denied label=ops\/secure peer=peer-b/.test(line))
+      const ok =
+        h.state.prompts.length === 0 &&
+        fake.unread.length === 1 &&
+        fake.readIds.length === 0 &&
+        deniedLines.length === 1
+      report(
+        'topics: allowFrom denies a foreign sender without consuming the message',
+        ok,
+        `prompts=${h.state.prompts.length} unread=${fake.unread.length} read_at=null(${fake.readIds.length === 0}) deniedLines=${deniedLines.length}`,
+      )
     } finally {
       if (h) h.close()
       await fake.close()
     }
+  })
+
+  await runCase('topics: duplicate label keeps only the first definition', async (boot) => {
+    const h = await boot({
+      config: {
+        topics: [
+          { label: 'ops/dup', titlePattern: 'first 运维' },
+          { label: 'ops/dup', titlePattern: 'second 运维' },
+        ],
+      },
+    })
+    const status = await request(h.base, '/mesh/status')
+    const listed = status.json?.topics ?? []
+    const ok = listed.length === 1 && listed[0]?.label === 'ops/dup'
+    report('topics: duplicate label keeps only the first definition', ok, `topics=${JSON.stringify(listed)}`)
   })
 
   await runCase('topics: invalid label is ignored at startup', async (boot) => {

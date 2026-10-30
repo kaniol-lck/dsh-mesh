@@ -1100,6 +1100,29 @@ export function apply(ctx, config) {
     return fuzzy.length === 1 ? fuzzy[0] : null
   }
 
+  // A denied delivery is re-evaluated on every poll, so the log must not repeat per tick.
+  // Remember (label|sender|message id); new messages log immediately, repeats are counted
+  // and reported every 50 suppressions.
+  const deniedSeen = new Set()
+  let deniedRepeat = 0
+  function logTopicDenied(topic, sender, messages) {
+    const ids = (Array.isArray(messages) ? messages : []).map((message) => String(message?.id ?? '')).filter(Boolean)
+    const fresh = ids.filter((id) => !deniedSeen.has(`${topic.label}|${sender}|${id}`))
+    for (const id of fresh) deniedSeen.add(`${topic.label}|${sender}|${id}`)
+    if (deniedSeen.size > 1000) {
+      for (const key of [...deniedSeen].slice(0, 500)) deniedSeen.delete(key)
+    }
+    if (!ids.length || fresh.length) {
+      fileLog(`topic denied label=${topic.label} peer=${sender} msgs=${ids.length || 1}${deniedRepeat ? ` (suppressed ${deniedRepeat} repeat(s))` : ''}`)
+      deniedRepeat = 0
+      return
+    }
+    deniedRepeat += 1
+    if (deniedRepeat % 50 === 0) {
+      fileLog(`topic denied label=${topic.label} peer=${sender} (suppressed ${deniedRepeat} repeat(s))`)
+    }
+  }
+
   /**
    * Bind a topic's conversation to the live session matching its titlePattern. A live
    * binding (manual or previous auto-bind) is kept; a dead one is re-resolved so an
@@ -1400,7 +1423,7 @@ export function apply(ctx, config) {
       ? `本轮对话 id：${meta.conversation}。回复时 mesh_send 必须带 conversation:"${meta.conversation}"。\n`
       : '本条消息没有 conversation；回复时不要自造对话 id，除非用户要求。\n'
     const body = messages.length
-      ? `以下 ${messages.length} 条消息已内联，无需再调用 mesh_inbox：\n\n${renderMessages(messages)}\n`
+      ? `以下 ${messages.length} 条消息已内联，无需再调用 mesh_inbox，也不要把收件箱里其它消息标记为已读（不是本轮任务）：\n\n${renderMessages(messages)}\n`
       : '收件箱没有新的未读消息（可能已被处理）；直接回一句状态即可。\n'
 
     return [
@@ -1723,7 +1746,8 @@ export function apply(ctx, config) {
       // allowFrom is a delivery gate, not an inbox rule: the message stays unread so the
       // agent can still see it, but it never reaches a local session.
       if (topic.allowFrom.length && !topic.allowFrom.includes(sender)) {
-        fileLog(`topic denied label=${topic.label} peer=${sender}`)
+        // Never claim, never read, never inject: the message stays unread for audit.
+        logTopicDenied(topic, sender, messages)
         return
       }
       ensureTopicBinding(topic)
