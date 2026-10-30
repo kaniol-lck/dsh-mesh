@@ -264,6 +264,39 @@ request_id：call-12345678
 - **防自批**：审批会话（`approval/` 前缀）由 bridge 独占消费，pull 循环不会把它注入任何会话；bridge 正在等待的会话会跳过消费，避免抢答。
 - **审计**：每次决定写一行 `approval decision call=… by=… outcome=… ms=…`，不含命令全文。
 
+## 向人提问（mesh_ask / questionBridge，0.7.0）
+
+**提问是商量，不是安全闸门**：危险命令放行仍走 approval（fail-closed）；`mesh_ask` 只承载「发不发版 / 选哪个方案 / 继续还是停」这类协调决策，超时返回**未回答**，绝不替调用者挑默认值。
+
+```yaml
+questionBridge:
+  enabled: true                # 默认 false；控制 user-questions 接缝与默认收件人
+  to: 'dsh-kaniol-pc'
+  allowFrom: ['dsh-kaniol-pc'] # 只接受这些 peer 的回复；空=不等待，直接 unanswered
+  timeoutSeconds: 300          # 1–3600（建议 ≥30）
+  pollMs: 2000
+  conversationPrefix: 'question/'
+  diag: false
+```
+
+模型侧直接调工具（也可只传 `to`，不依赖 enabled）：
+
+```js
+mesh_ask({
+  question: '这版要不要现在发到 npm？',
+  options: ['现在发', '等 CI 绿了再发', '先不发'],
+  timeoutSeconds: 300,
+})
+// → { status: 'answered', answer: '等 CI 绿了再发', by: 'dsh-kaniol-pc', ms: 41230, questionId: 'q-…' }
+// 超时 → { status: 'unanswered', timeoutSeconds: 300, questionId: 'q-…' }
+```
+
+- **消息**：`silent: true`（不唤醒任何 agent）、`conversation = question/<id 前 10 位>`，正文是问题 + 编号选项 + 「回 1/2/3 或直接回复文字」+ 超时说明。
+- **回答**：纯数字命中选项 → 返回该选项文本；否则原样返回文字（去首尾空白、截 2000）。
+- **超时**：`unanswered`，不带任何选项；调用方自己决定怎么继续。
+- **隔离**：`question/` 会话由提问工具独占消费（claim + read），pull 循环不注入、不建会话；`allowFrom` 外的回复忽略并保持未读（日志 `question ignored`，按消息去重）。
+- **可选接缝**：运行时若存在 `ctx.userQuestions` 服务才挂 `user-questions/request`（形状不认识或超时一律 `next()` 交回本地 UI）；没有接缝只记一行 `user-questions seam absent; mesh_ask only`，工具照常可用。插件**不 import** `@deepseek-ai/dsh-user-questions` 或 `dsh-user-approval`，缺包不影响加载。
+
 ## 依赖
 
 中枢本体见 [hub/](https://github.com/kaniol-lck/dsh-mesh/tree/main/hub)，Docker 一条命令即可起：

@@ -5,9 +5,20 @@
 > **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
 > `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥）。
 
 ---
+
+## v0.7.0（2026-10-30，提问桥：agent 经 mesh 收件箱向人提问）
+
+| 项 | 内容 |
+|---|---|
+| 定位 | **提问是商量，不是安全闸门**：危险命令仍走 approval（fail-closed）；`mesh_ask` 只承载「发不发版 / 选哪个方案 / 继续还是停」这类协调决策，超时返回未回答而不是挑默认值 |
+| 主路径 | 新增模型工具 `mesh_ask`（`question` 必填 ≤2000、`options` 2–6、`to`、`timeoutSeconds`）：经中枢发 `silent: true` 消息（不唤醒 agent），`conversation = question/<id 前 10 位>`；轮询该会话回复，数字映射到选项文本，否则原样返回（去空白、截 2000）；返回 `{status:'answered'|'unanswered', answer?, by?, ms?, questionId, timeoutSeconds?}` |
+| 可选接缝 | 运行时探测 `ctx.userQuestions` 服务；存在才挂 `ctx.on('user-questions/request')`（形状不认识/超时/未回答一律 `next()` 交回本地 UI），缺失则日志 `user-questions seam absent; mesh_ask only` 并继续提供工具。**不 import `@deepseek-ai/dsh-user-questions` 或 `dsh-user-approval`**，缺包不影响加载 |
+| 配置 | `questionBridge: { enabled, to, allowFrom, timeoutSeconds(1–3600, 默认 300), conversationPrefix('question/'), pollMs, diag }`；`enabled` 只控制接缝与默认收件人，工具可显式传 `to` 直接使用 |
+| 隔离与安全 | pull 循环遇 `question/` 前缀只 claim+read 消费，不进入 `wakeConversation`、不建会话；`allowFrom` 外 sender 的回复忽略且保持未读（日志 `question ignored`，按 message id 去重）；工具返回体不含 token/内部路径；与 approval 前缀、allowFrom 完全独立 |
+| 测试 | +7（共 63/63）：工具元数据（含「NOT a security gate」）、silent+前缀+数字 2→第二个选项、自由文本原样、超时 unanswered 且无 answer、名单外回复忽略后超时、`question/` 流量 `prompts=0 created=0 unread=0`、无接缝时插件与工具仍可用。既有 56 例全绿 |
 
 ## v0.6.0（2026-10-30，远程审批：通过 mesh 收件箱回复 approve/deny）
 

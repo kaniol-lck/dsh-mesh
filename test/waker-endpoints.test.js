@@ -385,6 +385,36 @@ async function startApprovalHarness(boot, fake, overrides = {}) {
   return h
 }
 
+/** Boot a hub-mode harness with the question bridge enabled, armed and tool-registered. */
+async function startQuestionHarness(boot, fake, overrides = {}) {
+  const h = await boot({
+    config: {
+      hubUrl: fake.url,
+      questionBridge: {
+        enabled: true,
+        to: 'peer-owner',
+        allowFrom: ['peer-owner'],
+        timeoutSeconds: 5,
+        pollMs: 250,
+        ...overrides,
+      },
+    },
+  })
+  await waitFor(async () => {
+    const status = await request(h.base, '/mesh/status')
+    return status.json?.mode && status.json.mode !== 'standalone' ? status.json : null
+  }, 8000)
+  await waitFor(() => h.state.tools.find((tool) => tool.name === 'mesh_ask'), 8000)
+  return h
+}
+
+function meshAskTool(h) {
+  const tool = h.state.tools.find((entry) => entry.name === 'mesh_ask')
+  if (!tool) throw new Error('mesh_ask was not registered')
+  return tool
+}
+
+
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms))
 
 function readReceipts(file) {
@@ -1382,6 +1412,126 @@ async function main() {
       if (h) h.close()
       await fake.close()
     }
+  })
+
+  // 57-63. mesh_ask: ask a human through the inbox (coordination, not a security gate).
+  await runCase('mesh_ask: tool metadata documents that it is not a security gate', async () => {
+    const { MESH_ASK_TOOL } = await import(pathToFileURL(ENTRY).href)
+    const ok =
+      MESH_ASK_TOOL.name === 'mesh_ask' &&
+      MESH_ASK_TOOL.parameters?.question?.required === true &&
+      MESH_ASK_TOOL.required.join(',') === 'question' &&
+      /NOT a security gate/.test(MESH_ASK_TOOL.description)
+    report('mesh_ask: tool metadata documents that it is not a security gate', ok, `name=${MESH_ASK_TOOL.name} required=${MESH_ASK_TOOL.required.join(',')}`)
+  })
+
+  await runCase('mesh_ask: silent message and numbered reply maps to the option text', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake)
+      const pending = meshAskTool(h).execute({ question: 'Ship it?', options: ['yes, ship', 'no, wait'] })
+      await waitFor(() => fake.sends.length > 0, 8000)
+      const notice = fake.sends[0]
+      fake.push({ id: 'm-ask-2', sender: 'peer-owner', conversation: notice.conversation, body: '2' })
+      const result = await pending
+      const ok = result.status === 'answered' && result.answer === 'no, wait' && notice.silent === true && /^question\//.test(notice.conversation)
+      report('mesh_ask: silent message and numbered reply maps to the option text', ok, `status=${result.status} answer=${JSON.stringify(result.answer)} silent=${notice.silent} conv=${notice.conversation}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('mesh_ask: free-text reply is returned verbatim', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake)
+      const pending = meshAskTool(h).execute({ question: 'When should we ship?' })
+      await waitFor(() => fake.sends.length > 0, 8000)
+      fake.push({ id: 'm-ask-text', sender: 'peer-owner', conversation: fake.sends[0].conversation, body: '  ship it later  ' })
+      const result = await pending
+      const ok = result.status === 'answered' && result.answer === 'ship it later'
+      report('mesh_ask: free-text reply is returned verbatim', ok, `status=${result.status} answer=${JSON.stringify(result.answer)}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('mesh_ask: timeout is unanswered and picks no option', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake, { timeoutSeconds: 1 })
+      const result = await meshAskTool(h).execute({ question: 'Continue?', options: ['yes', 'no'] })
+      const ok = result.status === 'unanswered' && result.answer === undefined && result.timeoutSeconds === 1 && Boolean(result.questionId)
+      report('mesh_ask: timeout is unanswered and picks no option', ok, `status=${result.status} answer=${JSON.stringify(result.answer)} timeout=${result.timeoutSeconds}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('mesh_ask: reply from outside allowFrom is ignored, then unanswered', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake, { timeoutSeconds: 1 })
+      const logStart = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').length : 0
+      const pending = meshAskTool(h).execute({ question: 'Deploy now?', options: ['yes', 'no'] })
+      await waitFor(() => fake.sends.length > 0, 8000)
+      fake.push({ id: 'm-ask-intruder', sender: 'peer-intruder', conversation: fake.sends[0].conversation, body: '1' })
+      const result = await pending
+      const logText = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').slice(logStart) : ''
+      const ok = result.status === 'unanswered' && /question ignored/.test(logText)
+      report('mesh_ask: reply from outside allowFrom is ignored, then unanswered', ok, `status=${result.status} ignoredLog=${/question ignored/.test(logText)}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('mesh_ask: question traffic never reaches a session', async (boot) => {
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-ask-traffic', sender: 'peer-owner', conversation: 'question/abcdef12', body: '1' }],
+    })
+    let h = null
+    try {
+      const logStart = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').length : 0
+      h = await boot({
+        config: {
+          hubUrl: fake.url,
+          pollIntervalMs: 5000,
+          pollBusyIntervalMs: 1000,
+          pollIdleIntervalMs: 5000,
+          questionBridge: { enabled: true, to: 'peer-owner', allowFrom: ['peer-owner'], timeoutSeconds: 5, pollMs: 250 },
+        },
+      })
+      await waitFor(() => fake.requests.some((entry) => entry.path === '/api/inbox'), 15000)
+      await sleep(1500)
+      const logText = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').slice(logStart) : ''
+      const ok =
+        h.state.prompts.length === 0 &&
+        h.state.created.length === 0 &&
+        fake.unread.length === 0 &&
+        /question traffic consumed/.test(logText)
+      report('mesh_ask: question traffic never reaches a session', ok, `prompts=${h.state.prompts.length} created=${h.state.created.length} unread=${fake.unread.length} consumed=${/question traffic consumed/.test(logText)}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('mesh_ask: absent user-questions seam keeps the plugin and tool available', async (boot) => {
+    const logStart = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').length : 0
+    const h = await boot({})
+    await waitFor(() => h.state.tools.find((tool) => tool.name === 'mesh_ask'), 8000)
+    const logText = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').slice(logStart) : ''
+    const ok = Boolean(meshAskTool(h)) && /user-questions seam absent; mesh_ask only/.test(logText)
+    report('mesh_ask: absent user-questions seam keeps the plugin and tool available', ok, `tools=${h.state.tools.map((tool) => tool.name).join(',')} seamAbsentLog=${/seam absent/.test(logText)}`)
   })
 
   const failed = results.filter((result) => !result.ok)

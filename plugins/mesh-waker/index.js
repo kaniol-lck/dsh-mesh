@@ -423,6 +423,24 @@ export const MESH_DISPATCH_TOOL = {
 }
 
 /**
+ * Model-callable "ask the human" tool. This is a coordination channel, not a security
+ * gate: approvals stay on approval/request and fail closed.
+ */
+export const MESH_ASK_TOOL = {
+  name: 'mesh_ask',
+  description:
+    'Ask a human a question through the mesh inbox and wait for an answer. Use it when a decision needs the owner (ship or not, which option, continue or stop); it is NOT a security gate — dangerous commands must keep going through approvals. ' +
+    'Accepts free text or 2–6 numbered options; the answer comes back as text. On timeout it returns {status:"unanswered"} and never guesses a default.',
+  parameters: {
+    question: { type: 'string', required: true, description: 'Question text, at most 2000 characters.' },
+    options: { type: 'array', items: { type: 'string' }, description: 'Optional 2–6 choices; the answer may be a number.' },
+    to: { type: 'string', description: 'Peer to ask; defaults to questionBridge.to.' },
+    timeoutSeconds: { type: 'number', description: 'How long to wait (30–3600, default questionBridge.timeoutSeconds).' },
+  },
+  required: ['question'],
+}
+
+/**
  * Map one inbox reply body to an ApprovalOutcome. A reply that contains both an approval
  * and a rejection word fails closed: unattended approvals must never be widened by a
  * confusing message.
@@ -514,6 +532,20 @@ function normalizeBase(config) {
       conversationPrefix: String(c.approvalBridge?.conversationPrefix ?? 'approval/'),
       pollMs: clampInterval(c.approvalBridge?.pollMs, 2000, 250, 60000),
       diag: c.approvalBridge?.diag === true,
+    },
+    // Question bridge (0.7.0): mesh_ask asks a human through the inbox. Not a security
+    // gate — approvals stay in approvalBridge; this only carries "which option?" style
+    // decisions and always reports unanswered on timeout instead of guessing.
+    questionBridge: {
+      enabled: c.questionBridge?.enabled === true,
+      to: String(c.questionBridge?.to ?? '').trim(),
+      allowFrom: (Array.isArray(c.questionBridge?.allowFrom) ? c.questionBridge.allowFrom : [])
+        .map((peer) => String(peer).trim())
+        .filter(Boolean),
+      timeoutSeconds: Math.min(3600, Math.max(1, Number(c.questionBridge?.timeoutSeconds ?? 300))),
+      conversationPrefix: String(c.questionBridge?.conversationPrefix ?? 'question/'),
+      pollMs: clampInterval(c.questionBridge?.pollMs, 2000, 250, 60000),
+      diag: c.questionBridge?.diag === true,
     },
     // Whether a sender may pick the delivery mode (queue | steer | branch) per message.
     allowSenderDeliveryMode: c.allowSenderDeliveryMode !== false,
@@ -1353,6 +1385,160 @@ export function apply(ctx, config) {
     }
     for (const message of ignored) {
       fileLog(`approval ignored conv=${conversation} peer=${String(message.sender ?? '')}`)
+    }
+  }
+
+  // ---------------------------------------------------------------- question bridge
+  //
+  // mesh_ask asks a human "which option?" through the hub. It is a coordination channel,
+  // never a security gate: the answer drives a decision the model could also make alone,
+  // and a timeout is reported as unanswered instead of picked for the caller.
+
+  const questionBridge = c.questionBridge
+  const questionWaiting = new Set()
+  // Ignored replies are re-evaluated on every poll; keep the log to one line per message.
+  const questionDeniedSeen = new Set()
+
+  function truncateAnswer(value) {
+    return String(value ?? '').replace(/\s+$/, '').trim().slice(0, 2000)
+  }
+
+  function questionNotice(question, options, timeoutSeconds) {
+    const lines = [String(question ?? '').trim().slice(0, 2000)]
+    if (options.length) {
+      lines.push('', '选项：')
+      options.forEach((option, index) => lines.push(`${index + 1}. ${option}`))
+      lines.push('', '回复方式：回 1/2/3 选对应项，或直接回复文字。')
+    } else {
+      lines.push('', '回复方式：直接回复文字。')
+    }
+    lines.push(`${timeoutSeconds}s 内未回复视为「未回答」，不会替你决定。`)
+    lines.push('（本消息 silent，不会唤醒任何 agent）')
+    return lines.join('\n')
+  }
+
+  async function askViaMesh({ question, options = [], to, timeoutSeconds }) {
+    const questionId = `q-${randomUUID().replace(/-/g, '').slice(0, 16)}`
+    const conversation = `${questionBridge.conversationPrefix}${questionId.slice(0, 10)}`
+    const recipient = String(to ?? questionBridge.to ?? '').trim()
+    if (!recipient) throw new Error('mesh_ask needs a recipient: pass to or configure questionBridge.to')
+    if (!hubReady) throw new Error('mesh_ask needs the hub: configure hubUrl + token (or joinCode)')
+    const seconds = Math.min(3600, Math.max(1, Math.round(Number(timeoutSeconds) || questionBridge.timeoutSeconds)))
+    const cleanOptions = options.map((option) => truncateAnswer(option).slice(0, 200)).filter(Boolean).slice(0, 6)
+    const started = Date.now()
+    const res = await hubFetch('/api/send', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        to: recipient,
+        conversation,
+        silent: true,
+        subject: 'question',
+        body: questionNotice(question, cleanOptions, seconds),
+      }),
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!res.ok) throw new Error(`hub HTTP ${res.status}`)
+    if (!questionBridge.allowFrom.length) {
+      fileLog(`question notify-only id=${questionId} (allowFrom empty)`)
+      return { status: 'unanswered', timeoutSeconds: seconds, questionId }
+    }
+    questionWaiting.add(conversation)
+    const deadline = started + seconds * 1000
+    try {
+      while (Date.now() < deadline) {
+        let replies = []
+        try {
+          replies = await approvalReplies(conversation)
+        } catch (error) {
+          fileLog(`question poll failed id=${questionId}: ${error.message}`)
+        }
+        for (const message of replies) {
+          const sender = String(message.sender ?? '')
+          if (!questionBridge.allowFrom.includes(sender)) {
+            const key = `${conversation}|${sender}|${String(message.id ?? '')}`
+            if (!questionDeniedSeen.has(key)) {
+              questionDeniedSeen.add(key)
+              if (questionDeniedSeen.size > 1000) {
+                for (const stale of [...questionDeniedSeen].slice(0, 500)) questionDeniedSeen.delete(stale)
+              }
+              fileLog(`question ignored id=${questionId} peer=${sender}`)
+            }
+            continue
+          }
+          const raw = truncateAnswer(message.body)
+          const numbered = /^(\d{1,2})$/.exec(raw)
+          const answer = numbered && cleanOptions[Number(numbered[1]) - 1] ? cleanOptions[Number(numbered[1]) - 1] : raw
+          try {
+            await markApprovalRead([message])
+          } catch (error) {
+            fileLog(`question mark-read failed id=${questionId}: ${error.message}`)
+          }
+          fileLog(`question answered id=${questionId} by=${sender} ms=${Date.now() - started}`)
+          return { status: 'answered', answer, by: sender, ms: Date.now() - started, questionId }
+        }
+        await sleep(questionBridge.pollMs)
+      }
+      fileLog(`question timeout id=${questionId} after=${seconds}s -> unanswered`)
+      return { status: 'unanswered', timeoutSeconds: seconds, questionId }
+    } finally {
+      questionWaiting.delete(conversation)
+    }
+  }
+
+  /** Pull-loop consumption for question traffic: never inject, acknowledge allowed replies. */
+  async function consumeQuestionTraffic(conversation, messages) {
+    const allowed = (messages ?? []).filter(
+      (message) => !questionBridge.allowFrom.length || questionBridge.allowFrom.includes(String(message.sender ?? '')),
+    )
+    if (allowed.length) {
+      try {
+        await markApprovalRead(allowed)
+        fileLog(`question traffic consumed conv=${conversation} msgs=${allowed.length}`)
+      } catch (error) {
+        fileLog(`question traffic mark-read failed conv=${conversation}: ${error.message}`)
+      }
+    }
+  }
+
+  /**
+   * Optional seam: `user-questions/request` answerer. The package is often absent, so the
+   * service is probed instead of imported; without it mesh_ask still works on its own.
+   */
+  async function handleUserQuestion(request, next) {
+    const delegate = () => (typeof next === 'function' ? next() : Promise.resolve(undefined))
+    if (!questionBridge.enabled || !questionBridge.to) return delegate()
+    if (questionBridge.diag) {
+      const keys = Object.keys(request ?? {})
+      const shape = keys
+        .map((key) => {
+          const value = request?.[key]
+          const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value
+          return `${key}:${type}`
+        })
+        .join(' ')
+      const text = String(request?.question ?? request?.prompt ?? request?.title ?? '')
+      fileLog(`question diag keys=${keys.join(',')} ${shape} questionLen=${text.length} questionHead=${JSON.stringify(text.slice(0, 60))}`)
+    }
+    const question = String(request?.question ?? request?.prompt ?? request?.title ?? '').trim()
+    const rawOptions = Array.isArray(request?.options) ? request.options : []
+    const options = rawOptions.map((option) => (typeof option === 'string' ? option : String(option?.label ?? option?.text ?? ''))).filter(Boolean)
+    if (!question) return delegate()
+    try {
+      const result = await askViaMesh({ question, options })
+      if (result.status !== 'answered') return delegate()
+      return result.answer
+    } catch (error) {
+      fileLog(`user-questions seam failed: ${error.message}`)
+      return delegate()
+    }
+  }
+
+  function probeUserQuestionsSeam() {
+    try {
+      return typeof ctx.get === 'function' ? ctx.get('userQuestions') : undefined
+    } catch {
+      return undefined
     }
   }
 
@@ -2492,6 +2678,11 @@ export function apply(ctx, config) {
             if (!bridgeWaiting.has(key)) await consumeApprovalTraffic(key, group)
             continue
           }
+          // Question traffic is answered by mesh_ask; never inject it into a session.
+          if (key && key.startsWith(questionBridge.conversationPrefix)) {
+            if (!questionWaiting.has(key)) await consumeQuestionTraffic(key, group)
+            continue
+          }
           const first = group[0] ?? {}
           await wake(key ? { conversation: key, sender: first.sender, subject: first.subject } : {})
         }
@@ -3148,6 +3339,22 @@ export function apply(ctx, config) {
       const off = ctx.on('approval/request', handleApprovalRequest)
       return typeof off === 'function' ? off : undefined
     })
+    // Optional user-questions seam: probe the service instead of importing the package.
+    // Missing seam means mesh_ask still works; the local UI stays in charge of questions.
+    const userQuestions = probeUserQuestionsSeam()
+    if (userQuestions) {
+      try {
+        ctx.effect(() => {
+          const off = ctx.on('user-questions/request', handleUserQuestion)
+          return typeof off === 'function' ? off : undefined
+        })
+        fileLog('user-questions seam detected; mesh_ask bridge attached')
+      } catch (error) {
+        fileLog(`user-questions seam attach failed: ${error.message}; mesh_ask only`)
+      }
+    } else {
+      fileLog('user-questions seam absent; mesh_ask only')
+    }
   }
 
   // ---------------------------------------------------------------- model tool
@@ -3278,6 +3485,70 @@ export function apply(ctx, config) {
       fileLog('registered tool mesh_dispatch')
     } catch (error) {
       log.warn(`[mesh-waker] mesh_dispatch tool not registered: ${error.message}`)
+    }
+  })()
+
+  // mesh_ask (0.7.0): same registration path as mesh_dispatch — defineTool when the host
+  // package resolves, otherwise the same JSON Schema definition. Question traffic is
+  // consumed by the pull loop; the tool waits for one inbox reply or reports unanswered.
+  const ASK_OUTPUT = {
+    schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string' },
+        answer: { type: 'string' },
+        by: { type: 'string' },
+        ms: { type: 'number' },
+        questionId: { type: 'string' },
+        timeoutSeconds: { type: 'number' },
+      },
+      required: ['status', 'questionId'],
+    },
+    render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+  }
+
+  async function registerModelTool({ name, description, parameters, required = [], output, execute }) {
+    let definition = null
+    try {
+      const { defineTool } = await import('@deepseek-ai/dsh-tools')
+      definition = defineTool({ name, description, parameters, output, execute })
+    } catch (error) {
+      const properties = {}
+      for (const [key, spec] of Object.entries(parameters)) {
+        const { required: _required, ...rest } = spec
+        properties[key] = rest
+      }
+      definition = { name, description, parameters: { type: 'object', properties, required }, output, execute }
+      fileLog(`defineTool unavailable for ${name} (${error.message}); using a plain JSON Schema`)
+    }
+    const tools = typeof ctx.get === 'function' ? ctx.get('tools') : ctx.tools
+    if (!tools?.register) throw new Error('host exposes no tools service')
+    ctx.effect(() => tools.register(definition))
+    fileLog(`registered tool ${name}`)
+    return definition
+  }
+
+  void (async () => {
+    try {
+      await registerModelTool({
+        name: MESH_ASK_TOOL.name,
+        description: MESH_ASK_TOOL.description,
+        parameters: MESH_ASK_TOOL.parameters,
+        required: MESH_ASK_TOOL.required,
+        output: ASK_OUTPUT,
+        execute: async (args) => {
+          const question = String(args?.question ?? '').trim()
+          if (!question) throw new Error('question is required')
+          if (question.length > 2000) throw new Error('question is too long (max 2000 characters)')
+          const options = (Array.isArray(args?.options) ? args.options : [])
+            .map((option) => String(option))
+            .filter(Boolean)
+            .slice(0, 6)
+          return await askViaMesh({ question, options, to: args?.to, timeoutSeconds: args?.timeoutSeconds })
+        },
+      })
+    } catch (error) {
+      log.warn(`[mesh-waker] mesh_ask tool not registered: ${error.message}`)
     }
   })()
 
