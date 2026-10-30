@@ -1,6 +1,6 @@
 <!-- AUTO:TODO START -->
-<!-- generated: 2026-10-30 10:30; 5 items; src=3d67fc3a2491 -->
-共 5 条 · P0 0 / P1 2 / P2 2（未完成 4）· 进行中 1 · 已完成 1 · 来源 skills/worklog/examples/todo/*.md
+<!-- generated: 2026-10-30 10:34; 5 items; src=7d0ae55bbbf2 -->
+共 5 条 · P0 0 / P1 2 / P2 2（未完成 4）· 进行中 2 · 已完成 1 · 来源 skills/worklog/examples/todo/*.md
 
 ### 按功能聚合
 
@@ -25,7 +25,7 @@
 - [docs] 部署文档补齐 — 未开始
 
 ### P2（2）
-- [backend] 旧的鉴权方案清理 — 待办（进行中·缺归属，按待办处理）
+- [backend] 旧的鉴权方案清理 — 进行中
 - [review] 验收脚本 — 未开始
 
 <details>
