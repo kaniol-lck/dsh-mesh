@@ -47,15 +47,15 @@ dsh plugin add dsh-mesh-waker
 - **blob 通道**：单文件最大 64 MiB，支持断点续传、sha256 校验、按 blob 的 ACL，放不适合塞进消息体的东西；
 - **审批转发**（可选，`plugins/mesh-approval`）：把编码 agent 的"危险命令待批准"提示转发给人，经 mesh 回复 approve / deny。
 
-## 多会话协作与工作日志
+## 多会话协作
 
-把项目拆给多个 agent 会话并行做时，本仓把过程落成可审计的本地工作日志：
+把项目拆给多个 agent 会话并行做时：
 
-- **派活 / 回执**：`mesh_dispatch`（或 `npx dsh-mesh-dispatch`）带 `taskId`，回合结束写回执到 `~/.dsh/mesh-waker/receipts.jsonl`；回执只是线索，验收要看产物；
-- **工作日志**：`.worklog/`（todo、WORKLOG、缺陷台账；本地不入库），约定见 [docs/worklog.md](docs/worklog.md)；
-- **机械门禁**：`.worklog/bin/roadmap.mjs`（汇总 + 功能聚合 + 关口）、`.worklog/bin/defects.mjs`（缺陷台账）、`scripts/check-paths.mjs`（路径 / 内网拓扑）。
+- **派活 / 回执**：`mesh_dispatch` 工具（或 `npx dsh-mesh-dispatch` CLI）带 `taskId`，回合结束写回执到 `~/.dsh/mesh-waker/receipts.jsonl`；回执只是线索，验收要看产物；
+- **批次**：多单用同一个 `batchId`，全部结束才回执一次；
+- **门禁**：`scripts/check-paths.mjs` 与 `scripts/check-secrets.py` 保证仓库不混入本机路径与凭据。
 
-当前版本以中枢 `/health` 与 ROADMAP 自动段的「版本快照」为准，README 不写死具体版本号。
+当前版本以中枢 `/health` 为准，README 不写死具体版本号。
 
 ## 快速开始（5 分钟）
 
@@ -167,9 +167,8 @@ dsh plugin --profile web add dsh-mesh-waker
 - [架构说明](docs/mesh-architecture.md)
 - [鉴权与控制台](docs/auth-and-console.md)（token 生命周期、scopes、IP 白名单、注册码派发、控制台角色）
 - [本机会话协作](docs/local-sessions.md)（会话发现与定向注入，不经过中枢）
-- [多会话协作手册](docs/multi-session-playbook.md)（协调/执行分工、派活模板、故障清理）
-- [发布流程](docs/release.md)（插件预检、next/latest 两级、owner 确认门）
-- [工作日志约定](docs/worklog.md)（todo 格式、ROADMAP 生成、缺陷台账）
+- [发布流程](docs/release.md)（插件预检、next/latest 两级、hub 发布与回滚）
+- [文档索引](docs/README.md) · [贡献指南](CONTRIBUTING.md)
 - [客户端插件 mesh-waker](plugins/mesh-waker/README.md)
 - [给 agent 的协作约定](skills/mesh/SKILL.md)
 
@@ -181,7 +180,7 @@ hub/                    中枢本体（单文件服务、Dockerfile、冒烟测�
 plugins/mesh-waker/     DSH 客户端插件：唤醒端点 -> 会话回合
 plugins/mesh-approval/  审批转发插件（兼容 Hermes）
 skills/mesh/            给 agent 看的协作说明（发信/读信/黑板约定）
-docs/                   auth-and-console · local-sessions · multi-session-playbook · release · worklog · mesh-architecture
+docs/                   auth-and-console · local-sessions · release · transport-security · mesh-architecture
 scripts/                密钥扫描、REST 客户端、roadmap/defects/check-paths 等门禁
 ```
 

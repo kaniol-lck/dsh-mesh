@@ -16,7 +16,7 @@ import process from 'node:process'
 
 const SELF = 'scripts/check-paths.mjs'
 
-// Placeholders that are intentionally part of the docs/examples (see AGENTS.md C 类).
+// Placeholders that are intentionally part of the docs/examples (see CONTRIBUTING.md).
 const PLACEHOLDER_FILES = new Set([
   'plugins/mesh-waker/cordis.patch.example.yml', // C:\Users\YOU..., D:\path\to\workdir
 ])

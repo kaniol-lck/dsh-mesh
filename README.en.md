@@ -56,21 +56,18 @@ triage, revoking access): [docs/agent-onboarding.md](docs/agent-onboarding.md).
 - **Approval relay** (optional, `plugins/mesh-approval`) — forward a coding agent's
   dangerous-command approval prompt to a human over the mesh.
 
-## Multi-session collaboration and work log
+## Multi-session collaboration
 
-When a project is split across several agent sessions, this repo keeps the process auditable
-in a local work log:
+When a project is split across several agent sessions:
 
-- **Dispatch / receipts**: `mesh_dispatch` (or `npx dsh-mesh-dispatch`) with a `taskId`;
+- **Dispatch / receipts**: the `mesh_dispatch` tool (or `npx dsh-mesh-dispatch`) with a `taskId`;
   the turn end writes a receipt to `~/.dsh/mesh-waker/receipts.jsonl`. A receipt is a hint —
   verify the artifact;
-- **Work log**: `.worklog/` (todos, WORKLOG, defect ledger; local, never committed), see
-  [docs/worklog.md](docs/worklog.md);
-- **Mechanical gates**: `.worklog/bin/roadmap.mjs` (rollup + feature aggregate + stage gates),
-  `.worklog/bin/defects.mjs` (defect ledger), `scripts/check-paths.mjs` (paths / LAN topology).
+- **Batches**: several dispatches share one `batchId` and settle with a single receipt;
+- **Gates**: `scripts/check-paths.mjs` and `scripts/check-secrets.py` keep local paths and
+  credentials out of the repo.
 
-The current version lives in the hub's `/health` and the ROADMAP "version snapshot"; the
-README does not pin a version.
+The current version lives in the hub's `/health`; the README does not pin a version.
 
 ## Quick start (5 minutes)
 
@@ -141,7 +138,7 @@ dsh plugin --profile web add dsh-mesh-waker
 ```
 
 After installing, open **Settings → Mesh**, set the hub URL and paste this machine's agent
-token; the plugin keeps the token in an owner-only file, not in the profile patch.
+token; the plugin keeps the token in a file only you can read, not in the profile patch.
 
 ## API surface (short)
 
@@ -195,9 +192,8 @@ token; the plugin keeps the token in an owner-only file, not in the profile patc
 - [Architecture](docs/mesh-architecture.md)
 - [Auth & console](docs/auth-and-console.md) (token lifecycle, scopes, IP allowlist, enrollment codes, console roles)
 - [Local sessions](docs/local-sessions.md) (session discovery and injection, no hub)
-- [Multi-session playbook](docs/multi-session-playbook.md) (coordinator/worker split, dispatch, cleanup)
-- [Release process](docs/release.md) (plugin preflight, next/latest promotion, owner gate)
-- [Work-log convention](docs/worklog.md) (todo format, ROADMAP generation, defect ledger)
+- [Release process](docs/release.md) (plugin preflight, next/latest promotion, maintainer gate)
+- [Docs index](docs/README.md) · [Contributing](CONTRIBUTING.md)
 - [Client plugin: mesh-waker](plugins/mesh-waker/README.md)
 - [Agent-facing conventions](skills/mesh/SKILL.md)
 
@@ -209,7 +205,7 @@ hub/                    the hub itself (single-file server, Dockerfile, smoke te
 plugins/mesh-waker/     DSH client plugin: wake endpoint -> session turn
 plugins/mesh-approval/  approval transport plugin (Hermes-compatible)
 skills/mesh/            agent-facing usage guide (send/read/board conventions)
-docs/                   auth-and-console · local-sessions · multi-session-playbook · release · worklog · mesh-architecture
+docs/                   auth-and-console · local-sessions · release · transport-security · mesh-architecture
 scripts/                secret scan, REST helpers, roadmap/defects/check-paths gates
 ```
 

@@ -26,12 +26,15 @@ hub/certs/
 
 .npmrc
 
-# 参考实现的工作笔记（默认不入库，见工作区 AGENTS.md §6）
+# 参考实现的工作笔记（默认不入库）
 REFS.md
 
 # Python bytecode from local preflight runs
 __pycache__/
 *.pyc
 
-# Local work log data (never tracked; convention lives in docs/worklog.md)
+# Local work log data (never tracked; convention lives in .worklog/docs-internal/worklog.md)
 .worklog/
+
+# 本仓内部会话约定（不入库）
+/AGENTS.md

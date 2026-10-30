@@ -35,7 +35,7 @@ dsh plugin add dsh-mesh-waker@0.5.0
 ```
 
 - `hubUrl`：中枢根地址，如 `https://mesh.example.com` 或 `http://10.0.0.5:8790`；
-- `joinCode`：owner / 管理员给你的一次性注册码（默认 10 分钟内有效、单次使用）；
+- `joinCode`：管理员给你的一次性注册码（默认 10 分钟内有效、单次使用）；
 - 其余键全部有默认值，**先别填**。
 
 ### 第 3 步：重启并确认

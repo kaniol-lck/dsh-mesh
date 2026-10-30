@@ -1,8 +1,7 @@
 # 本机会话协作（不经过中枢）
 
-同机、同一个 DSH 里的多个会话可以直接互相投递任务：waker 在 `127.0.0.1:8795` 提供会话发现与注入接口，全程本地、毫秒级、离线可用。
-
-五个端点与 `plugins/mesh-waker/index.js`（0.4.59）的路由一一对应，全部**只接受 loopback 请求**（非本机返回 `403 loopback only`）。
+同一个 DSH 进程里的多个会话可以直接互相投递任务：waker 在 `127.0.0.1:8795` 提供会话发现与注入接口，
+全程本地、毫秒级、离线可用。所有端点**只接受 loopback 请求**（非本机返回 `403 loopback only`）。
 
 ## 端点
 
@@ -23,10 +22,10 @@
   "ok": true,
   "sessions": [
     {
-      "id": "session-c61c2456-…",
-      "title": "hermes · rehome",
-      "cwd": "<repo>",
-      "workspace": "--<repo-path-slug>--",
+      "id": "session-…",
+      "title": "<session-title>",
+      "cwd": "<workspace>",
+      "workspace": "--<workspace-slug>--",
       "last_active": 1793167809000,
       "live": true,
       "archived": false,
@@ -47,15 +46,16 @@
 
 ```json
 {
-  "title": "mesh · hub 开发",
-  "workspacePath": "<repo>",
-  "prompt": "先读 hub/README.md，列出与 docs 不一致处（只列不改）。",
+  "title": "<session-title>",
+  "workspacePath": "<workspace>",
+  "prompt": "先读 README.md，列出待办（只列不改）。",
   "mode": "queue"
 }
 ```
 
 - `title` 必填（≤60 字符）；
-- `workspacePath` 或 `cwd`：**两者都会**被尝试解析/创建工作区（`plugins/mesh-waker/index.js:1674-1695`）。只有解析/创建失败时才回退成「无工作区」会话，侧栏因此不显示；显式传 `workspacePath` 更好排错；
+- `workspacePath` 或 `cwd`：**两者都会**被尝试解析/创建工作区；只有解析/创建失败时才回退成「无工作区」会话，
+  侧栏因此不显示；显式传 `workspacePath` 更好排错；
 - 两者都省略时用 waker 的 `sessionCwd`（收件箱目录）；
 - `prompt` 可选：给了就按 `mode`（`queue` 默认 / `steer`）投首轮；不给则只建会话；
 - `workspaceTitle` 可选：需要新建工作区时用这个名字。
@@ -66,9 +66,9 @@
 {
   "ok": true,
   "sessionId": "session-…",
-  "title": "mesh · hub 开发",
+  "title": "<session-title>",
   "workspaceId": "workspace-…",
-  "workspacePath": "<repo>",
+  "workspacePath": "<workspace>",
   "prompted": true
 }
 ```
@@ -79,13 +79,14 @@
 
 ```json
 {
-  "session": "session-c61c2456-330b-4471-a6ac-4245bfc8c41a",
-  "text": "请处理 hub/README.md 的文档更新，完成后回报改了哪些行。",
+  "session": "session-…",
+  "text": "请按 README 核对实现，完成后回报改了哪些行。",
   "mode": "queue"
 }
 ```
 
-- 寻址优先级：`session`（完整 id，可省略 `session-` 前缀）→ 精确标题 → 标题唯一子串；歧义或找不到返回 400 并提示用 `GET /mesh/sessions`；
+- 寻址优先级：`session`（完整 id，可省略 `session-` 前缀）→ 精确标题 → 标题唯一子串；
+  歧义或找不到返回 400 并提示用 `GET /mesh/sessions`；
 - `mode`：`queue`（默认，等当前回合结束）/ `steer`（打断当前回合）；
 - 返回 `{"ok":true,"sessionId":"…","title":"…","mode":"queue"}`，并写入 waker 日志 `injected … into local session …`。
 
@@ -96,7 +97,7 @@
 ```
 
 - 支持 `session` 完整 id 或 `title`（与 inject 同一套寻址）；
-- 走 `workspaceRegistry.archiveSession()`：侧栏隐藏、会话文件保留；
+- 走工作区注册表的归档：侧栏隐藏、会话文件保留；
 - 成功返回 `{"ok":true,"sessionId":"…","title":"…"}`；找不到目标或注册表拒绝时返回 400，原因在 `error` 里。
 
 ### `POST /mesh/sessions/delete`
@@ -106,9 +107,10 @@
 ```
 
 - **只认完整 id**（不接受标题寻址，这是与 inject/archive 的差别之一）；
-- 先试 `workspaceRegistry.deleteKnown(id)`，没有该方法或失败时退回 `delete(id)`；
+- 先试注册表的 `deleteKnown(id)`，没有该方法或失败时退回 `delete(id)`；
 - 返回 `{"ok":true,"sessionId":"…","method":"deleteKnown"}`；
-- 注意：两种方法都不可用时仍返回 200 且 `method:"unknown"`（已知缺陷，调用方需自行确认结果）；**不会关闭正在运行的会话**，也不清理 `conversations.json` 里指向该 id 的绑定。
+- 注意：两种方法都不可用时仍返回 200 且 `method:"unknown"`（已知缺陷，调用方需自行确认结果）；
+  **不会关闭正在运行的会话**，也不清理 `conversations.json` 里指向该 id 的绑定。
 
 ### archive 与 delete 的差别
 
@@ -117,28 +119,7 @@
 | `archive` | 隐藏 | 消失 | 保留 | 不处理 |
 | `delete` | 从注册表删除 | 消失 | 可能仍在磁盘 | 不清理（已知限制） |
 
-## 典型用法：一个协调会话 + 多个执行会话
-
-```powershell
-# 1. 看看有哪些会话
-curl.exe -s http://127.0.0.1:8795/mesh/sessions
-
-# 2. 给某个执行会话派活
-curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: application/json' -d '{
-  "title": "hub 文档维护",
-  "text": "请按 docs/auth-and-console.md 核对 hub/README.md，列出不一致处，不要直接改。"
-}'
-
-# 3. 收结果：执行会话把结论写进项目文件或黑板，协调会话再读取
-```
-
-约定建议：
-
-- 执行会话**按目录/文件分工**（例如一个管 `hub/`，一个管 `plugins/`），避免同文件并发；
-- 跨会话任务用黑板登记（`mesh_board_set`），完成后释放；
-- 长任务用 git 分支，不要让两个会话同时改同一分支。
-
-## 与中枢路径的分工
+## 何时用本接口，何时用中枢
 
 | 场景 | 用哪条 |
 |---|---|
