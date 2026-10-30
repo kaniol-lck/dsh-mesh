@@ -16,4 +16,4 @@
 技能（给 agent 看）：
 
 - [skills/mesh](../skills/mesh/SKILL.md) —— 中枢协作约定（收件箱、黑板、派活、批次）
-- [skills/handoff](../skills/handoff/SKILL.md) —— 工作区交接（bundle + 依赖协商）
+- [skills/handoff](../skills/handoff/SKILL.md) —— 工作区交接（bundle + 依赖协商）`n- [skills/worklog](../skills/worklog/SKILL.md) —— 多会话台账与总览（todo / WORKLOG / 路线图 / 关口 / 缺陷回流）
