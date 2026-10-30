@@ -233,6 +233,37 @@ POST /api/send { "to": "<本机 agent 名>", "conversation": "ops/frontend", "bo
 - **对外最少暴露**：`GET /mesh/status` 只给 `topics: [{ label, bound, lastDeliveredAt }]`，**不含会话 id/标题**（本地细节看 `/mesh/admin/bindings`）。会话 id 是内部句柄且易失，运维会话能执行 shell，暴露 id 等于开放提权面。
 - **零配置兼容**：不配 `topics` 时行为与 0.5.6 完全一致。
 
+## 远程审批（approvalBridge，0.6.0）
+
+人不在电脑前时，让 DSH 的审批请求走 mesh：危险命令触发 `approval/request` → waker 给 owner 的 peer 发一条**静默消息** → owner 回 `approve` / `deny` → 命令放行或被拒。
+
+```yaml
+approvalBridge:
+  enabled: true                 # 默认 false：不配就完全不接管（零影响）
+  to: 'dsh-kaniol-pc'           # 审批请求发给谁
+  allowFrom: ['dsh-kaniol-pc']  # 只接受这些 sender 的回复；空=只通知、不接受回复
+  timeoutSeconds: 120           # 超时后 next() 交回本地提示框，绝不自动放行
+  conversationPrefix: 'approval/'
+  pollMs: 2000
+  diag: false                   # true 时打印请求字段名/类型（不含命令全文），用于核对内核形状
+```
+
+消息长这样（`conversation: approval/<callId 前 8 位>`，`silent: true`）：
+
+```
+【审批请求】bash · 会话「mesh · hub」
+摘要：run a dangerous command
+request_id：call-12345678
+回复方式：approve 放行 / deny 拒绝（只回一个词即可）。
+120s 内未回复则转本地提示框；超时不会自动放行。
+```
+
+- **判定**：`approve/allow/同意/批准/放行` → `allowed-once`；`deny/reject/拒绝/不同意/驳回` → `rejected`；同时出现两边词或其它内容 → **rejected（fail-closed）**。
+- **超时**：一律 `next()` 透传本地提示框——不自动放行，也不静默拒绝。无人值守时误杀一个长任务比多问一次更糟。
+- **为什么 silent**：唤醒 agent 等于把「批准权」交给可能被注入的 agent；silent 只落收件箱，`allowFrom` 之外的人回复会被忽略并保持未读。
+- **防自批**：审批会话（`approval/` 前缀）由 bridge 独占消费，pull 循环不会把它注入任何会话；bridge 正在等待的会话会跳过消费，避免抢答。
+- **审计**：每次决定写一行 `approval decision call=… by=… outcome=… ms=…`，不含命令全文。
+
 ## 依赖
 
 中枢本体见 [hub/](https://github.com/kaniol-lck/dsh-mesh/tree/main/hub)，Docker 一条命令即可起：

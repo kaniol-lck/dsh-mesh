@@ -248,6 +248,11 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
     emit(name, ...args) {
       for (const fn of listeners.get(name) ?? []) fn(...args)
     },
+    async callApproval(request, next) {
+      const listener = (listeners.get('approval/request') ?? [])[0]
+      if (!listener) throw new Error('the plugin did not register an approval/request listener')
+      return await listener(request, next ?? (async () => 'unavailable'))
+    },
     close() {
       if (globalThis.fetch !== realFetch) globalThis.fetch = realFetch
       for (const dispose of disposers) {
@@ -273,6 +278,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
 async function startFakeHub({ token = 'tok-' + 'selftest', messages = [] } = {}) {
   const requests = []
   const readIds = []
+  const sends = []
   let unread = messages.map((message) => ({ ...message }))
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://fake-hub')
@@ -306,6 +312,10 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [] } = {})
         return send(201, { name: body.name ?? 'dsh-test', token })
       }
       if (url.pathname === '/api/inbox') return send(200, { messages: unread })
+      if (url.pathname === '/api/send') {
+        sends.push(body)
+        return send(201, { id: 'msg-' + sends.length, silent: body.silent === true })
+      }
       if (url.pathname === '/api/read') {
         const ids = new Set((body.ids ?? []).map(String))
         for (const id of ids) readIds.push(id)
@@ -329,6 +339,9 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [] } = {})
     get readIds() {
       return readIds
     },
+    get sends() {
+      return sends
+    },
     get unread() {
       return unread
     },
@@ -348,6 +361,28 @@ async function waitFor(check, timeoutMs = 10000, stepMs = 100) {
     await new Promise((resolveWait) => setTimeout(resolveWait, stepMs))
   }
   return null
+}
+
+/** Boot a hub-mode harness with the approval bridge enabled and wait until it is armed. */
+async function startApprovalHarness(boot, fake, overrides = {}) {
+  const h = await boot({
+    config: {
+      hubUrl: fake.url,
+      approvalBridge: {
+        enabled: true,
+        to: 'peer-owner',
+        allowFrom: ['peer-owner'],
+        timeoutSeconds: 5,
+        pollMs: 250,
+        ...overrides,
+      },
+    },
+  })
+  await waitFor(async () => {
+    const status = await request(h.base, '/mesh/status')
+    return status.json?.mode && status.json.mode !== 'standalone' ? status.json : null
+  }, 8000)
+  return h
 }
 
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms))
@@ -1210,6 +1245,143 @@ async function main() {
     const payload = JSON.stringify(status.json?.topics ?? [])
     const ok = /"label":"ops\/leak"/.test(payload) && !payload.includes('session-') && !payload.includes('leak 运维')
     report('topics: status exposes labels only, never ids or titles', ok, `topics=${payload}`)
+  })
+
+  // 50-56. Remote approval bridge (approval/request answerer).
+  const approvalRequest = { agent: { id: 'session-topic-a' }, toolName: 'bash', callId: 'call-12345678', reason: 'run a dangerous command' }
+
+  await runCase('approval bridge: disabled delegates to next()', async (boot) => {
+    const h = await boot({})
+    let nextCalls = 0
+    const outcome = await h.callApproval(approvalRequest, async () => {
+      nextCalls += 1
+      return 'unavailable'
+    })
+    const ok = nextCalls === 1 && outcome === 'unavailable'
+    report('approval bridge: disabled delegates to next()', ok, `nextCalls=${nextCalls} outcome=${outcome}`)
+  })
+
+  await runCase('approval bridge: approve reply returns allowed-once', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startApprovalHarness(boot, fake, { diag: true })
+      const pending = h.callApproval(approvalRequest)
+      await waitFor(() => fake.sends.length > 0, 8000)
+      const notice = fake.sends[0]
+      fake.push({ id: 'm-appr-ok', sender: 'peer-owner', conversation: notice.conversation, body: 'approve' })
+      const outcome = await pending
+      const ok = outcome === 'allowed-once' && notice.silent === true && /^approval\//.test(notice.conversation) && /approve/.test(notice.body)
+      report('approval bridge: approve reply returns allowed-once', ok, `outcome=${outcome} silent=${notice.silent} conversation=${notice.conversation}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('approval bridge: deny reply returns rejected', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startApprovalHarness(boot, fake)
+      const pending = h.callApproval(approvalRequest)
+      await waitFor(() => fake.sends.length > 0, 8000)
+      fake.push({ id: 'm-appr-deny', sender: 'peer-owner', conversation: fake.sends[0].conversation, body: 'deny' })
+      const outcome = await pending
+      report('approval bridge: deny reply returns rejected', outcome === 'rejected', `outcome=${outcome}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('approval bridge: timeout delegates to next() without deciding', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startApprovalHarness(boot, fake, { timeoutSeconds: 1, pollMs: 250 })
+      let nextCalls = 0
+      const outcome = await h.callApproval(approvalRequest, async () => {
+        nextCalls += 1
+        return 'unavailable'
+      })
+      const ok = nextCalls === 1 && outcome === 'unavailable' && outcome !== 'allowed-once' && outcome !== 'rejected'
+      report('approval bridge: timeout delegates to next() without deciding', ok, `nextCalls=${nextCalls} outcome=${outcome}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('approval bridge: sender outside allowFrom is ignored', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startApprovalHarness(boot, fake, { timeoutSeconds: 1, pollMs: 250 })
+      const logStart = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').length : 0
+      let nextCalls = 0
+      const pending = h.callApproval(approvalRequest, async () => {
+        nextCalls += 1
+        return 'unavailable'
+      })
+      await waitFor(() => fake.sends.length > 0, 8000)
+      fake.push({ id: 'm-appr-intruder', sender: 'peer-intruder', conversation: fake.sends[0].conversation, body: 'approve' })
+      const outcome = await pending
+      const logText = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').slice(logStart) : ''
+      const ok = outcome === 'unavailable' && nextCalls === 1 && /approval ignored/.test(logText)
+      report('approval bridge: sender outside allowFrom is ignored', ok, `outcome=${outcome} nextCalls=${nextCalls} ignoredLog=${/approval ignored/.test(logText)}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('approval bridge: conflicting words fail closed', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startApprovalHarness(boot, fake)
+      const pending = h.callApproval(approvalRequest)
+      await waitFor(() => fake.sends.length > 0, 8000)
+      fake.push({ id: 'm-appr-mix', sender: 'peer-owner', conversation: fake.sends[0].conversation, body: 'approve? no — deny' })
+      const outcome = await pending
+      report('approval bridge: conflicting words fail closed', outcome === 'rejected', `outcome=${outcome}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('approval bridge: approval traffic never reaches a session', async (boot) => {
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-appr-traffic', sender: 'peer-owner', conversation: 'approval/abcdef12', body: 'approve' }],
+    })
+    let h = null
+    try {
+      const logStart = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').length : 0
+      h = await boot({
+        config: {
+          hubUrl: fake.url,
+          pollIntervalMs: 5000,
+          pollBusyIntervalMs: 1000,
+          pollIdleIntervalMs: 5000,
+          approvalBridge: { enabled: true, to: 'peer-owner', allowFrom: ['peer-owner'], timeoutSeconds: 5, pollMs: 250 },
+        },
+      })
+      await waitFor(() => fake.requests.some((entry) => entry.path === '/api/inbox'), 15000)
+      await sleep(1500)
+      const logText = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').slice(logStart) : ''
+      const ok =
+        h.state.prompts.length === 0 &&
+        h.state.created.length === 0 &&
+        fake.unread.length === 0 &&
+        /approval traffic consumed/.test(logText)
+      report('approval bridge: approval traffic never reaches a session', ok, `prompts=${h.state.prompts.length} created=${h.state.created.length} unread=${fake.unread.length} consumed=${/approval traffic consumed/.test(logText)}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
   })
 
   const failed = results.filter((result) => !result.ok)

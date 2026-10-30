@@ -422,6 +422,19 @@ export const MESH_DISPATCH_TOOL = {
   required: ['target', 'text'],
 }
 
+/**
+ * Map one inbox reply body to an ApprovalOutcome. A reply that contains both an approval
+ * and a rejection word fails closed: unattended approvals must never be widened by a
+ * confusing message.
+ */
+export function decideApprovalReply(text) {
+  const value = String(text ?? '').toLowerCase()
+  const approve = /approve|allow|同意|批准|放行/.test(value)
+  const deny = /deny|reject|拒绝|不同意|驳回/.test(value)
+  if (deny) return 'rejected'
+  return approve ? 'allowed-once' : 'rejected'
+}
+
 function normalizeBase(config) {
   const c = config ?? {}
   // Secrets may be inlined (older configs) or, preferably, read from owner-only files so
@@ -489,6 +502,19 @@ function normalizeBase(config) {
     // to a local session by title. Raw entries are validated in apply() where warnings can
     // be logged; an empty list keeps the previous behaviour byte for byte.
     topics: Array.isArray(c.topics) ? c.topics : [],
+    // Remote approval bridge (0.6.0): answer DSH approval prompts through the mesh inbox.
+    // Disabled unless explicitly enabled, so an install without config keeps the old path.
+    approvalBridge: {
+      enabled: c.approvalBridge?.enabled === true,
+      to: String(c.approvalBridge?.to ?? '').trim(),
+      allowFrom: (Array.isArray(c.approvalBridge?.allowFrom) ? c.approvalBridge.allowFrom : [])
+        .map((peer) => String(peer).trim())
+        .filter(Boolean),
+      timeoutSeconds: Math.min(3600, Math.max(1, Number(c.approvalBridge?.timeoutSeconds ?? 120))),
+      conversationPrefix: String(c.approvalBridge?.conversationPrefix ?? 'approval/'),
+      pollMs: clampInterval(c.approvalBridge?.pollMs, 2000, 250, 60000),
+      diag: c.approvalBridge?.diag === true,
+    },
     // Whether a sender may pick the delivery mode (queue | steer | branch) per message.
     allowSenderDeliveryMode: c.allowSenderDeliveryMode !== false,
     maxSteerPerWindow: Number(c.maxSteerPerWindow ?? 1),
@@ -1166,6 +1192,168 @@ export function apply(ctx, config) {
     topic.lastDeliveredAt = Date.now()
     const bound = conversations[conversation]?.deliverTo
     if (bound) topic.boundSessionId = bound
+  }
+
+  // ---------------------------------------------------------------- approval bridge
+  //
+  // DSH asks `approval/request` before a dangerous tool call. When enabled, the bridge
+  // forwards the question to a peer through the hub as a SILENT message (silent = no wake,
+  // so no agent turn can approve itself), waits for a reply word, and returns the outcome.
+  // Timeout always delegates with next(): the local prompt stays authoritative and nothing
+  // is silently allowed or silently denied.
+
+  const bridge = c.approvalBridge
+  // Conversations currently awaited by the bridge; the pull loop must not consume them.
+  const bridgeWaiting = new Set()
+  const bridgeOutcome = (value) => (['allowed-once', 'rejected', 'cancelled', 'unavailable'].includes(value) ? value : 'unavailable')
+
+  function approvalNotice(request, conversation) {
+    const toolName = String(request?.toolName ?? 'tool')
+    const reason = String(request?.reason ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 400)
+    let title = ''
+    try {
+      const sessionId = String(request?.agent?.id ?? '')
+      title = listLocalSessions().find((session) => session.id === sessionId)?.title ?? ''
+    } catch {
+      title = ''
+    }
+    return [
+      `【审批请求】${toolName}${title ? ` · 会话「${title}」` : ''}`,
+      `摘要：${reason || '（无）'}`,
+      `request_id：${String(request?.callId ?? '')}`,
+      '回复方式：approve 放行 / deny 拒绝（只回一个词即可）。',
+      `${bridge.timeoutSeconds}s 内未回复则转本地提示框；超时不会自动放行。`,
+      `（本消息 silent，不会唤醒任何 agent；回复请用同一 conversation）`,
+    ].join('\n')
+  }
+
+  async function postApprovalNotice(conversation, request) {
+    const res = await hubFetch('/api/send', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        to: bridge.to,
+        conversation,
+        silent: true,
+        subject: `approval ${String(request?.toolName ?? 'tool')}`,
+        body: approvalNotice(request, conversation),
+      }),
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!res.ok) throw new Error(`hub HTTP ${res.status}`)
+  }
+
+  async function approvalReplies(conversation) {
+    const res = await hubFetch(
+      `/api/inbox?unread=1&limit=50&claim=1&claim_ttl_ms=${c.claimTtlMs}`,
+      { headers: { authorization: `Bearer ${c.token}` }, signal: AbortSignal.timeout(8000) },
+    )
+    if (!res.ok) throw new Error(`hub HTTP ${res.status}`)
+    const data = await res.json()
+    return (data.messages ?? []).filter((message) => message.conversation === conversation)
+  }
+
+  async function markApprovalRead(messages) {
+    const ids = messages.map((message) => message.id).filter(Boolean)
+    if (!ids.length) return
+    const res = await hubFetch('/api/read', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ ids }),
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!res.ok) throw new Error(`hub HTTP ${res.status}`)
+  }
+
+  /** answerer on approval/request: notify, wait for a word, else delegate with next(). */
+  async function handleApprovalRequest(request, next) {
+    const delegate = () => (typeof next === 'function' ? next() : Promise.resolve('unavailable'))
+    if (!bridge.enabled || !bridge.to || !hubReady) return delegate()
+    const callId = String(request?.callId ?? '').trim()
+    if (!callId) return delegate()
+    if (bridge.diag) {
+      const keys = Object.keys(request ?? {})
+      const shape = keys
+        .map((key) => {
+          const value = request?.[key]
+          const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value
+          return `${key}:${type}`
+        })
+        .join(' ')
+      const reason = String(request?.reason ?? '')
+      fileLog(
+        `approval diag keys=${keys.join(',')} ${shape} toolName=${String(request?.toolName ?? '')} callId=${callId} reasonLen=${reason.length} reasonHead=${JSON.stringify(reason.slice(0, 40))}`,
+      )
+    }
+    const started = Date.now()
+    const conversation = `${bridge.conversationPrefix}${callId.slice(0, 8)}`
+    try {
+      await postApprovalNotice(conversation, request)
+    } catch (error) {
+      fileLog(`approval notice failed call=${callId}: ${error.message}`)
+      return delegate()
+    }
+    if (!bridge.allowFrom.length) {
+      fileLog(`approval notify-only call=${callId} (allowFrom empty)`)
+      return delegate()
+    }
+    bridgeWaiting.add(conversation)
+    const deadline = started + bridge.timeoutSeconds * 1000
+    try {
+      while (Date.now() < deadline) {
+        let replies = []
+        try {
+          replies = await approvalReplies(conversation)
+        } catch (error) {
+          fileLog(`approval poll failed call=${callId}: ${error.message}`)
+        }
+        for (const message of replies) {
+          const sender = String(message.sender ?? '')
+          if (!bridge.allowFrom.includes(sender)) {
+            fileLog(`approval ignored call=${callId} peer=${sender}`)
+            continue
+          }
+          const outcome = decideApprovalReply(message.body)
+          try {
+            await markApprovalRead([message])
+          } catch (error) {
+            fileLog(`approval mark-read failed call=${callId}: ${error.message}`)
+          }
+          fileLog(`approval decision call=${callId} by=${sender} outcome=${outcome} ms=${Date.now() - started}`)
+          return outcome
+        }
+        await sleep(bridge.pollMs)
+      }
+      fileLog(`approval timeout call=${callId} after=${bridge.timeoutSeconds}s -> next()`)
+      return delegate()
+    } finally {
+      bridgeWaiting.delete(conversation)
+    }
+  }
+
+  /**
+   * Pull-loop consumption for approval traffic: never inject it into an agent session,
+   * acknowledge allowed replies so the inbox does not fill up.
+   */
+  async function consumeApprovalTraffic(conversation, messages) {
+    const allowed = (messages ?? []).filter(
+      (message) => !bridge.allowFrom.length || bridge.allowFrom.includes(String(message.sender ?? '')),
+    )
+    const ignored = (messages ?? []).filter((message) => !allowed.includes(message))
+    if (allowed.length) {
+      try {
+        await markApprovalRead(allowed)
+        fileLog(`approval traffic consumed conv=${conversation} msgs=${allowed.length}`)
+      } catch (error) {
+        fileLog(`approval traffic mark-read failed conv=${conversation}: ${error.message}`)
+      }
+    }
+    for (const message of ignored) {
+      fileLog(`approval ignored conv=${conversation} peer=${String(message.sender ?? '')}`)
+    }
   }
 
   /**
@@ -2299,6 +2487,11 @@ export function apply(ctx, config) {
           groups.get(key).push(message)
         }
         for (const [key, group] of groups) {
+          // Approval traffic must never reach an agent turn: an agent could approve itself.
+          if (bridge.enabled && key && key.startsWith(bridge.conversationPrefix)) {
+            if (!bridgeWaiting.has(key)) await consumeApprovalTraffic(key, group)
+            continue
+          }
           const first = group[0] ?? {}
           await wake(key ? { conversation: key, sender: first.sender, subject: first.subject } : {})
         }
@@ -2948,6 +3141,11 @@ export function apply(ctx, config) {
   if (typeof ctx.on === 'function') {
     ctx.effect(() => {
       const off = ctx.on('session/event', handleSessionEvent)
+      return typeof off === 'function' ? off : undefined
+    })
+    // Remote approvals: disabled installs delegate straight to the next answerer.
+    ctx.effect(() => {
+      const off = ctx.on('approval/request', handleApprovalRequest)
       return typeof off === 'function' ? off : undefined
     })
   }

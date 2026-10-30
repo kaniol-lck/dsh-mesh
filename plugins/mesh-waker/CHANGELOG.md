@@ -5,9 +5,23 @@
 > **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
 > `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批）。
 
 ---
+
+## v0.6.0（2026-10-30，远程审批：通过 mesh 收件箱回复 approve/deny）
+
+| 项 | 内容 |
+|---|---|
+| 能力 | 启用后挂 `ctx.on('approval/request', …)`：把 DSH 的审批请求转发给 `to`（**silent 消息，不唤醒任何 agent**），等待 `allowFrom` 名单里的 peer 回复一个词，返回 `allowed-once` / `rejected` |
+| 内核契约 | 请求形状以 `@deepseek-ai/dsh-user-approval` 类型为准：`{ agent, toolName, callId?, reason?, signal? }`（`agent.id` 即会话 id）；`ApprovalOutcome = allowed-once | rejected | cancelled | unavailable`；`approvalBridge.diag:true` 时 `fileLog` 打印 `Object.keys`、字段类型与 `reason` 长度/前 40 字符（不含命令全文） |
+| 配置 | `enabled`（默认 false，零影响）、`to`、`allowFrom`、`timeoutSeconds`（1–3600，默认 120）、`conversationPrefix`（默认 `approval/`）、`pollMs`（250–60000，默认 2000）、`diag` |
+| 消息 | `conversation = <prefix><callId 前 8 位>`，正文含工具名、会话标题、`reason` 摘要（去换行、截 400 字符）、request_id、回复方式、超时说明；`silent: true` 防 agent 自批 |
+| 判定 | `approve/allow/同意/批准/放行` → `allowed-once`；`deny/reject/拒绝/不同意/驳回` → `rejected`；两者同时出现 → **rejected（fail-closed）**；其它内容 → rejected |
+| 超时 | 到 `timeoutSeconds` 一律 `next()` 透传本地提示框——**绝不自动放行，也不静默 rejected**（避免无人值守误杀长任务）；`allowFrom` 为空时只通知、不等待，直接 `next()` |
+| 防自批 | ① 通知 silent；② `allowFrom` 外 sender 的回复忽略且保持未读（日志 `approval ignored`）；③ pull 循环遇 `<prefix>` 会话直接消费（claim+read），**不进入 `wakeConversation`**；bridge 正在等待的会话跳过消费，避免抢答 |
+| 审计 | 每次决定 `fileLog('approval decision call=… by=… outcome=… ms=…')`；超时/忽略/通知失败均有单行原因；不含命令全文 |
+| 测试 | +7（共 56/56）：未启用→`next()`；approve→`allowed-once` 且 `silent=true`、conversation 前缀正确；deny→`rejected`；超时→`next()`；名单外 sender 忽略并最终超时；approve+deny 混淆→`rejected`；`approval/` 消息不建会话不注入（`prompts=0 created=0 unread=0`）。既有 49 例全绿（`enabled:false` 零变化） |
 
 ## v0.5.8（2026-10-30，拒绝的主题投递不得消费消息；拒绝日志收敛）
 
