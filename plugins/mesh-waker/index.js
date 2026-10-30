@@ -1334,24 +1334,31 @@ export function apply(ctx, config) {
     const reason = String(request?.reason ?? '')
       .replace(/\s+/g, ' ')
       .trim()
+    const waitForReply = bridge.allowFrom.length > 0
+    const deadline = started + bridge.timeoutSeconds * 1000
+    // Reserve before sending: pull/push can deliver the notice while /api/send is still in
+    // flight, and a late reservation loses that race (the message would be claimed by a
+    // regular wake and the reply would never reach this loop).
+    if (waitForReply) {
+      bridgeWaiting.set(conversation, {
+        conversation,
+        askedAt: started,
+        expiresAt: deadline,
+        preview: previewText(`${toolName} · ${reason}`),
+        toolName,
+      })
+    }
     try {
       await postApprovalNotice(conversation, request)
     } catch (error) {
+      if (waitForReply) bridgeWaiting.delete(conversation)
       fileLog(`approval notice failed call=${callId}: ${error.message}`)
       return delegate()
     }
-    if (!bridge.allowFrom.length) {
+    if (!waitForReply) {
       fileLog(`approval notify-only call=${callId} (allowFrom empty)`)
       return delegate()
     }
-    const deadline = started + bridge.timeoutSeconds * 1000
-    bridgeWaiting.set(conversation, {
-      conversation,
-      askedAt: started,
-      expiresAt: deadline,
-      preview: previewText(`${toolName} · ${reason}`),
-      toolName,
-    })
     try {
       while (Date.now() < deadline) {
         let replies = []
@@ -1445,37 +1452,49 @@ export function apply(ctx, config) {
     const cleanOptions = options.map((option) => truncateAnswer(option).slice(0, 200)).filter(Boolean).slice(0, 6)
     const started = Date.now()
     const noticeBody = questionNotice(question, cleanOptions, seconds)
-    const res = await hubFetch('/api/send', {
-      method: 'POST',
-      headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        to: recipient,
+    const deadline = started + seconds * 1000
+    // Reserve before sending: a pull/push tick can deliver the notice the moment it lands,
+    // and a late reservation loses that race (T-175: the wake path created a session and
+    // the reply never reached this loop).
+    const waitForReply = questionBridge.allowFrom.length > 0
+    if (waitForReply) {
+      questionWaiting.set(conversation, {
         conversation,
-        silent: true,
-        subject: 'question',
-        body: noticeBody,
-      }),
-      signal: AbortSignal.timeout(8000),
-    })
-    if (!res.ok) throw new Error(`hub HTTP ${res.status}`)
-    const sent = await res.json().catch(() => ({}))
+        askedAt: started,
+        expiresAt: deadline,
+        preview: previewText(question),
+        options: cleanOptions,
+      })
+    }
+    let sent = {}
+    try {
+      const res = await hubFetch('/api/send', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          to: recipient,
+          conversation,
+          silent: true,
+          subject: 'question',
+          body: noticeBody,
+        }),
+        signal: AbortSignal.timeout(8000),
+      })
+      if (!res.ok) throw new Error(`hub HTTP ${res.status}`)
+      sent = await res.json().catch(() => ({}))
+    } catch (error) {
+      if (waitForReply) questionWaiting.delete(conversation)
+      throw error
+    }
     // When the recipient is this same agent, the notice lands in our own inbox. Without
     // these guards the poll treats it as an answer ("answered" in under a second).
     const sentId = String(sent?.id ?? '')
     // A real reply must be written after the ask; allow one second of clock skew.
     const historyCutoff = started - 1000
-    if (!questionBridge.allowFrom.length) {
+    if (!waitForReply) {
       fileLog(`question notify-only id=${questionId} (allowFrom empty)`)
       return { status: 'unanswered', timeoutSeconds: seconds, questionId }
     }
-    const deadline = started + seconds * 1000
-    questionWaiting.set(conversation, {
-      conversation,
-      askedAt: started,
-      expiresAt: deadline,
-      preview: previewText(question),
-      options: cleanOptions,
-    })
     try {
       while (Date.now() < deadline) {
         let replies = []
@@ -2158,6 +2177,18 @@ export function apply(ctx, config) {
    * session, and a different dialogue gets its own, so their context never mixes.
    */
   async function wakeConversation(conversation, meta, messages) {
+    // Bridge traffic must never reach a session, no matter which path woke us (pull, a
+    // signed push ping, or catch-up). Both bridges reserve their conversation before the
+    // send, but this guard is the backstop when a message arrives with no active ask or a
+    // reservation was missed.
+    if (conversation.startsWith(questionBridge.conversationPrefix)) {
+      if (!questionWaiting.has(conversation)) await consumeQuestionTraffic(conversation, messages)
+      return
+    }
+    if (bridge.enabled && conversation.startsWith(bridge.conversationPrefix)) {
+      if (!bridgeWaiting.has(conversation)) await consumeApprovalTraffic(conversation, messages)
+      return
+    }
     const topic = topics.get(conversation)
     if (topic) {
       const sender = String(meta?.sender ?? '')

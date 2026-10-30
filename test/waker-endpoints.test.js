@@ -275,7 +275,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
  * Minimal hub for bootstrap + pull: /api/bootstrap, /api/enroll, /api/inbox, /api/read,
  * /api/conversations, /api/peers. Messages stay unread until /api/read, like the real hub.
  */
-async function startFakeHub({ token = 'tok-' + 'selftest', messages = [] } = {}) {
+async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDelayMs = 0, sendStatus = 201, onSend = null } = {}) {
   const requests = []
   const readIds = []
   const sends = []
@@ -314,7 +314,16 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [] } = {})
       if (url.pathname === '/api/inbox') return send(200, { messages: unread })
       if (url.pathname === '/api/send') {
         sends.push(body)
-        return send(201, { id: 'm-sent-' + sends.length, silent: body.silent === true, conversation: body.conversation })
+        if (typeof onSend === 'function') onSend(body)
+        const respond = () =>
+          send(
+            sendStatus,
+            sendStatus >= 200 && sendStatus < 300
+              ? { id: 'm-sent-' + sends.length, silent: body.silent === true, conversation: body.conversation }
+              : { error: 'send failed' },
+          )
+        if (sendDelayMs > 0) return setTimeout(respond, sendDelayMs)
+        return respond()
       }
       if (url.pathname === '/api/read') {
         const ids = new Set((body.ids ?? []).map(String))
@@ -364,10 +373,11 @@ async function waitFor(check, timeoutMs = 10000, stepMs = 100) {
 }
 
 /** Boot a hub-mode harness with the approval bridge enabled and wait until it is armed. */
-async function startApprovalHarness(boot, fake, overrides = {}) {
+async function startApprovalHarness(boot, fake, overrides = {}, extra = {}) {
   const h = await boot({
     config: {
       hubUrl: fake.url,
+      ...extra,
       approvalBridge: {
         enabled: true,
         to: 'peer-owner',
@@ -386,10 +396,11 @@ async function startApprovalHarness(boot, fake, overrides = {}) {
 }
 
 /** Boot a hub-mode harness with the question bridge enabled, armed and tool-registered. */
-async function startQuestionHarness(boot, fake, overrides = {}) {
+async function startQuestionHarness(boot, fake, overrides = {}, extra = {}) {
   const h = await boot({
     config: {
       hubUrl: fake.url,
+      ...extra,
       questionBridge: {
         enabled: true,
         to: 'peer-owner',
@@ -1676,6 +1687,94 @@ async function main() {
     const preview = previewText(`line one\nline two ${long}`)
     const ok = Array.from(preview).length === 80 && !/\n/.test(preview)
     report('status: preview is truncated to 80 characters', ok, `len=${Array.from(preview).length} newline=${/\n/.test(preview)}`)
+  })
+
+  // 71-74. The bridge conversation is reserved before the notice is sent, so a pull tick
+  // that sees the message immediately cannot claim it or create a session.
+  await runCase('mesh_ask: reserves the conversation before /api/send so pull cannot claim it', async (boot) => {
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      sendDelayMs: 1200,
+      onSend: (body) => {
+        fake.push({ id: 'm-question-own', sender: 'peer-owner', conversation: body.conversation, body: body.body, created_at: Date.now() })
+      },
+    })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake, {}, { pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 })
+      const pending = meshAskTool(h).execute({ question: '继续吗？', options: ['继续', '收工'] })
+      await sleep(1500)
+      const during = await request(h.base, '/mesh/status')
+      const listed = during.json?.pendingQuestions ?? []
+      const reservedDuringSend = listed.length === 1
+      const untouched = !fake.readIds.includes('m-question-own') && h.state.created.length === 0 && h.state.prompts.length === 0
+      fake.push({ id: 'm-question-reply', sender: 'peer-owner', conversation: listed[0]?.conversation ?? '', body: '1', created_at: Date.now() + 1000 })
+      const result = await pending
+      const ok = reservedDuringSend && untouched && result.status === 'answered' && result.answer === '继续'
+      report('mesh_ask: reserves the conversation before /api/send so pull cannot claim it', ok, `reservedDuringSend=${reservedDuringSend} claimedByPull=${fake.readIds.includes('m-question-own')} created=${h.state.created.length} prompts=${h.state.prompts.length} status=${result.status}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('mesh_ask: a failed send rolls the reservation back', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest', sendStatus: 500 })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake)
+      let error = ''
+      try {
+        await meshAskTool(h).execute({ question: '会失败吗？' })
+      } catch (caught) {
+        error = caught.message
+      }
+      const status = await request(h.base, '/mesh/status')
+      const ok = /HTTP 500/.test(error) && (status.json?.pendingQuestions ?? []).length === 0
+      report('mesh_ask: a failed send rolls the reservation back', ok, `error=${JSON.stringify(error)} pendingQuestions=${(status.json?.pendingQuestions ?? []).length}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('approval bridge: reserves the conversation before /api/send', async (boot) => {
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      sendDelayMs: 1200,
+      onSend: (body) => {
+        fake.push({ id: 'm-approval-own', sender: 'peer-owner', conversation: body.conversation, body: 'approve', created_at: Date.now() })
+      },
+    })
+    let h = null
+    try {
+      h = await startApprovalHarness(boot, fake)
+      const pending = h.callApproval({ agent: { id: 'session-x' }, toolName: 'bash', callId: 'call-abcdef12', reason: 'danger' })
+      await sleep(400)
+      const during = await request(h.base, '/mesh/status')
+      const reservedDuringSend = (during.json?.pendingApprovals ?? []).length === 1
+      const outcome = await pending
+      const ok = reservedDuringSend && outcome === 'allowed-once'
+      report('approval bridge: reserves the conversation before /api/send', ok, `reservedDuringSend=${reservedDuringSend} outcome=${outcome}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('approval bridge: a failed send rolls the reservation back', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest', sendStatus: 500 })
+    let h = null
+    try {
+      h = await startApprovalHarness(boot, fake)
+      const outcome = await h.callApproval({ agent: { id: 'session-x' }, toolName: 'bash', callId: 'call-abcdef12', reason: 'danger' })
+      const status = await request(h.base, '/mesh/status')
+      const ok = outcome === 'unavailable' && (status.json?.pendingApprovals ?? []).length === 0
+      report('approval bridge: a failed send rolls the reservation back', ok, `outcome=${outcome} pendingApprovals=${(status.json?.pendingApprovals ?? []).length}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
   })
 
   const failed = results.filter((result) => !result.ok)

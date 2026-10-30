@@ -294,7 +294,8 @@ mesh_ask({
 - **消息**：`silent: true`（不唤醒任何 agent）、`conversation = question/<id 前 10 位>`，正文是问题 + 编号选项 + 「回 1/2/3 或直接回复文字」+ 超时说明。
 - **回答**：纯数字命中选项 → 返回该选项文本；否则原样返回文字（去首尾空白、截 2000）。
 - **超时**：`unanswered`，不带任何选项；调用方自己决定怎么继续。
-- **隔离**：`question/` 会话由提问工具独占消费（claim + read），pull 循环不注入、不建会话；`allowFrom` 外的回复忽略并保持未读（日志 `question ignored`，按消息去重）。
+- **隔离**：`question/` 会话由提问工具独占消费（claim + read），pull/push/catch-up 都不注入、不建会话；桥在发送**之前**就登记该会话，避免消息落库瞬间被常规 wake 抢走。`allowFrom` 外的回复忽略并保持未读（日志 `question ignored`，按消息去重）。
+- **遗留清理**：历史上被误建的 `mesh · question/…` 会话（0.7.3 之前）请运营者手工归档；插件不会自动删除，以免误删真实会话。
 - **可选接缝**：运行时若存在 `ctx.userQuestions` 服务才挂 `user-questions/request`（形状不认识或超时一律 `next()` 交回本地 UI）；没有接缝只记一行 `user-questions seam absent; mesh_ask only`，工具照常可用。插件**不 import** `@deepseek-ai/dsh-user-questions` 或 `dsh-user-approval`，缺包不影响加载。
 
 ### `/mesh/status` 的待办字段（0.7.2）

@@ -5,9 +5,18 @@
 > **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
 > `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留）。
 
 ---
+
+## v0.7.3（2026-10-31，桥会话发送前预留，杜绝 pull/push 抢走问题与回复）
+
+| 项 | 内容 |
+|---|---|
+| 缺陷 | 真机 00:28：`question/q-ad774b89` 被常规 wake 链路当成新对话，创建 `mesh · question/q-ad774b89` 会话并把问题投了进去；运营者的回复随后被该会话 wake 链路 claim/read，提问桥轮询看不到 → 90s 后 `unanswered`，agent 拿到 `answer: null`。根因是**先发送后登记**：`/api/send` 落库后、`questionWaiting.add` 之前，pull（或 push/catch-up）可能已经取走消息 |
+| 修法 | ① 提问桥：`questionWaiting` 在 `/api/send` **之前**登记（conversation 发送前已生成），发送失败删除回滚；② 审批桥同样改为发送前 `bridgeWaiting` 预留，失败回滚；③ 防御性拦截收口到 `wakeConversation` 入口：`question/` 前缀无论是否在等待集合都只 `consumeQuestionTraffic` 后返回，`approval/` 前缀（启用时）同理——pull、签名 push ping、catch-up 三条入口都覆盖，不会建会话、不会注入 |
+| 遗留数据 | 历史上被误建的 `mesh · question/…` 会话需运营者手工归档；插件不自动删（避免误删真实会话） |
+| 测试 | +4（共 74/74）：发送被 mock 延迟 1.2s 期间 `/api/send` 回调让 pull 立刻看到问题消息 → `reservedDuringSend=true`、`claimedByPull=false`、`created=0`、`prompts=0`，随后真回复仍能命中；发送 500 → 预留回滚（`pendingQuestions=[]`）；审批桥同样验证发送前预留（`pendingApprovals=1`）与失败回滚。既有 70 例全绿 |
 
 ## v0.7.2（2026-10-30，`/mesh/status` 暴露待答问题与待批审批）
 
