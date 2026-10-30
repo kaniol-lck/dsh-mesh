@@ -1426,6 +1426,7 @@ export function apply(ctx, config) {
     const seconds = Math.min(3600, Math.max(1, Math.round(Number(timeoutSeconds) || questionBridge.timeoutSeconds)))
     const cleanOptions = options.map((option) => truncateAnswer(option).slice(0, 200)).filter(Boolean).slice(0, 6)
     const started = Date.now()
+    const noticeBody = questionNotice(question, cleanOptions, seconds)
     const res = await hubFetch('/api/send', {
       method: 'POST',
       headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
@@ -1434,11 +1435,17 @@ export function apply(ctx, config) {
         conversation,
         silent: true,
         subject: 'question',
-        body: questionNotice(question, cleanOptions, seconds),
+        body: noticeBody,
       }),
       signal: AbortSignal.timeout(8000),
     })
     if (!res.ok) throw new Error(`hub HTTP ${res.status}`)
+    const sent = await res.json().catch(() => ({}))
+    // When the recipient is this same agent, the notice lands in our own inbox. Without
+    // these guards the poll treats it as an answer ("answered" in under a second).
+    const sentId = String(sent?.id ?? '')
+    // A real reply must be written after the ask; allow one second of clock skew.
+    const historyCutoff = started - 1000
     if (!questionBridge.allowFrom.length) {
       fileLog(`question notify-only id=${questionId} (allowFrom empty)`)
       return { status: 'unanswered', timeoutSeconds: seconds, questionId }
@@ -1454,9 +1461,22 @@ export function apply(ctx, config) {
           fileLog(`question poll failed id=${questionId}: ${error.message}`)
         }
         for (const message of replies) {
+          const messageId = String(message.id ?? '')
+          if (sentId && messageId === sentId) {
+            // Our own notice: acknowledging it is fine, but it is never the answer.
+            try {
+              await markApprovalRead([message])
+            } catch {
+              /* best effort */
+            }
+            continue
+          }
+          if (message.body === noticeBody) continue
+          const createdAt = Number(message.created_at)
+          if (Number.isFinite(createdAt) && createdAt > 0 && createdAt <= historyCutoff) continue
           const sender = String(message.sender ?? '')
           if (!questionBridge.allowFrom.includes(sender)) {
-            const key = `${conversation}|${sender}|${String(message.id ?? '')}`
+            const key = `${conversation}|${sender}|${messageId}`
             if (!questionDeniedSeen.has(key)) {
               questionDeniedSeen.add(key)
               if (questionDeniedSeen.size > 1000) {

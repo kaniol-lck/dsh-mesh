@@ -314,7 +314,7 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [] } = {})
       if (url.pathname === '/api/inbox') return send(200, { messages: unread })
       if (url.pathname === '/api/send') {
         sends.push(body)
-        return send(201, { id: 'msg-' + sends.length, silent: body.silent === true })
+        return send(201, { id: 'm-sent-' + sends.length, silent: body.silent === true, conversation: body.conversation })
       }
       if (url.pathname === '/api/read') {
         const ids = new Set((body.ids ?? []).map(String))
@@ -1532,6 +1532,71 @@ async function main() {
     const logText = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').slice(logStart) : ''
     const ok = Boolean(meshAskTool(h)) && /user-questions seam absent; mesh_ask only/.test(logText)
     report('mesh_ask: absent user-questions seam keeps the plugin and tool available', ok, `tools=${h.state.tools.map((tool) => tool.name).join(',')} seamAbsentLog=${/seam absent/.test(logText)}`)
+  })
+
+  await runCase('mesh_ask: our own question notice is not treated as the answer', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake, { timeoutSeconds: 3 })
+      const pending = meshAskTool(h).execute({ question: '今晚继续还是收工？', options: ['继续', '收工'] })
+      await waitFor(() => fake.sends.length > 0, 8000)
+      const notice = fake.sends[0]
+      // The notice lands in our own inbox when to === self; it must never count as an answer.
+      fake.push({ id: 'm-sent-1', sender: 'peer-owner', conversation: notice.conversation, body: notice.body, created_at: Date.now() })
+      const early = await Promise.race([
+        pending.then((value) => ({ resolved: true, value })),
+        sleep(800).then(() => ({ resolved: false })),
+      ])
+      fake.push({ id: 'm-real-answer', sender: 'peer-owner', conversation: notice.conversation, body: '2', created_at: Date.now() + 1000 })
+      const result = await pending
+      const ok = early.resolved === false && result.status === 'answered' && result.answer === '收工' && result.by === 'peer-owner'
+      report('mesh_ask: our own question notice is not treated as the answer', ok, `earlyAnswered=${early.resolved} status=${result.status} answer=${JSON.stringify(result.answer)}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('mesh_ask: a reply written before the ask is ignored', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake, { timeoutSeconds: 1 })
+      const pending = meshAskTool(h).execute({ question: '现在发版吗？', options: ['发', '不发'] })
+      await waitFor(() => fake.sends.length > 0, 8000)
+      fake.push({
+        id: 'm-old-answer',
+        sender: 'peer-owner',
+        conversation: fake.sends[0].conversation,
+        body: '1',
+        created_at: Date.now() - 60000,
+      })
+      const result = await pending
+      const ok = result.status === 'unanswered' && result.answer === undefined
+      report('mesh_ask: a reply written before the ask is ignored', ok, `status=${result.status} answer=${JSON.stringify(result.answer)}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('mesh_ask: only our own notice until timeout stays unanswered', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake, { timeoutSeconds: 1 })
+      const pending = meshAskTool(h).execute({ question: '继续吗？', options: ['继续', '停'] })
+      await waitFor(() => fake.sends.length > 0, 8000)
+      const notice = fake.sends[0]
+      fake.push({ id: 'm-sent-1', sender: 'peer-owner', conversation: notice.conversation, body: notice.body, created_at: Date.now() })
+      const result = await pending
+      const ok = result.status === 'unanswered' && result.answer === undefined
+      report('mesh_ask: only our own notice until timeout stays unanswered', ok, `status=${result.status} answer=${JSON.stringify(result.answer)}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
   })
 
   const failed = results.filter((result) => !result.ok)
