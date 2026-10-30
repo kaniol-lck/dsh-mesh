@@ -485,6 +485,10 @@ function normalizeBase(config) {
     boundDeliveryMode: ['queue', 'steer', 'branch'].includes(String(c.boundDeliveryMode))
       ? String(c.boundDeliveryMode)
       : 'queue',
+    // Topic routing (0.5.7): remote senders address a stable label; the plugin resolves it
+    // to a local session by title. Raw entries are validated in apply() where warnings can
+    // be logged; an empty list keeps the previous behaviour byte for byte.
+    topics: Array.isArray(c.topics) ? c.topics : [],
     // Whether a sender may pick the delivery mode (queue | steer | branch) per message.
     allowSenderDeliveryMode: c.allowSenderDeliveryMode !== false,
     maxSteerPerWindow: Number(c.maxSteerPerWindow ?? 1),
@@ -1050,6 +1054,96 @@ export function apply(ctx, config) {
   }
 
   const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
+
+  // ---------------------------------------------------------------- topic routing
+  //
+  // A remote peer addresses a stable label (`ops/frontend`); the label is resolved to a
+  // local session by title only inside this process. Session ids and titles never leave the
+  // machine — `/mesh/status` reports just label / bound / lastDeliveredAt.
+
+  const topics = new Map()
+  for (const raw of c.topics) {
+    const label = String(raw?.label ?? '').trim()
+    const titlePattern = String(raw?.titlePattern ?? '').trim()
+    if (!/^[a-z0-9][a-z0-9/_-]{1,40}$/.test(label)) {
+      log.warn(
+        `[mesh-waker] topic ignored: label ${JSON.stringify(label)} must match ^[a-z0-9][a-z0-9/_-]{1,40}$`,
+      )
+      continue
+    }
+    if (topics.has(label)) {
+      log.warn(`[mesh-waker] topic ignored: duplicate label ${label}`)
+      continue
+    }
+    if (!titlePattern) {
+      log.warn(`[mesh-waker] topic ignored: ${label} has an empty titlePattern`)
+      continue
+    }
+    const allowFrom = (Array.isArray(raw?.allowFrom) ? raw.allowFrom : [])
+      .map((peer) => String(peer).trim())
+      .filter(Boolean)
+    topics.set(label, {
+      label,
+      titlePattern,
+      allowFrom,
+      mode: raw?.mode === 'steer' ? 'steer' : 'queue',
+      boundSessionId: null,
+      lastDeliveredAt: null,
+    })
+  }
+
+  function matchTopicSession(topic, active) {
+    const exact = active.filter((session) => session.title === topic.titlePattern)
+    if (exact.length === 1) return exact[0]
+    if (exact.length > 1) return null
+    const fuzzy = active.filter((session) => session.title && session.title.includes(topic.titlePattern))
+    return fuzzy.length === 1 ? fuzzy[0] : null
+  }
+
+  /**
+   * Bind a topic's conversation to the live session matching its titlePattern. A live
+   * binding (manual or previous auto-bind) is kept; a dead one is re-resolved so an
+   * archived/recreated session is picked up automatically. Unresolved only logs.
+   */
+  function ensureTopicBinding(topic) {
+    const entry = conversations[topic.label] ?? (conversations[topic.label] = { sessionId: null, createdAt: 0, wakes: 0, title: null })
+    const active = listLocalSessions().filter((session) => !session.archived)
+    if (entry.deliverTo && active.some((session) => session.id === entry.deliverTo)) {
+      topic.boundSessionId = entry.deliverTo
+      return entry.deliverTo
+    }
+    const match = matchTopicSession(topic, active)
+    if (!match) {
+      fileLog(`topic unresolved label=${topic.label} pattern=${topic.titlePattern}`)
+      return null
+    }
+    entry.deliverTo = match.id
+    entry.boundByTopic = true
+    entry.createdAt = entry.createdAt || Date.now()
+    conversations[topic.label] = entry
+    saveConversations()
+    topic.boundSessionId = match.id
+    fileLog(`topic bound label=${topic.label} pattern=${topic.titlePattern}`)
+    return match.id
+  }
+
+  function autoBindTopics() {
+    for (const topic of topics.values()) {
+      try {
+        ensureTopicBinding(topic)
+      } catch (error) {
+        fileLog(`topic bind failed label=${topic.label}: ${error.message}`)
+      }
+    }
+  }
+
+  function recordTopicDelivery(conversation) {
+    const topic = topics.get(conversation)
+    if (!topic) return
+    topic.lastDeliveredAt = Date.now()
+    const bound = conversations[conversation]?.deliverTo
+    if (bound) topic.boundSessionId = bound
+  }
 
   /**
    * Drop every conversations.json binding that points at one session: the delivery target
@@ -1623,6 +1717,17 @@ export function apply(ctx, config) {
    * session, and a different dialogue gets its own, so their context never mixes.
    */
   async function wakeConversation(conversation, meta, messages) {
+    const topic = topics.get(conversation)
+    if (topic) {
+      const sender = String(meta?.sender ?? '')
+      // allowFrom is a delivery gate, not an inbox rule: the message stays unread so the
+      // agent can still see it, but it never reaches a local session.
+      if (topic.allowFrom.length && !topic.allowFrom.includes(sender)) {
+        fileLog(`topic denied label=${topic.label} peer=${sender}`)
+        return
+      }
+      ensureTopicBinding(topic)
+    }
     // The agent often drains the inbox with mesh_inbox before this turn starts (the ping
     // and the tool call race). Re-check: injecting a prompt for messages that are already
     // read leaves a stale turn in the user's input queue.
@@ -1651,7 +1756,7 @@ export function apply(ctx, config) {
         applyTrustPolicy(target, trustFor(meta.sender))
         const requested = requestedDeliveryMode(messages)
         const wanted = requested ?? (steerModeFor(target, messages) === 'steer' ? 'steer' : c.boundDeliveryMode)
-        const mode = wanted === 'steer' ? steerModeFor(target, messages, requested === 'steer') : 'queue'
+        const mode = topic?.mode === 'steer' ? 'steer' : wanted === 'steer' ? steerModeFor(target, messages, requested === 'steer') : 'queue'
         if (wanted === 'branch') {
           const branch = await ensureBranchSession(conversation, entry, meta, target)
           applyTrustPolicy(branch, trustFor(meta.sender))
@@ -1662,6 +1767,7 @@ export function apply(ctx, config) {
           saveConversations()
           state.sessionId = branch
           state.conversations = Object.keys(conversations).length
+          recordTopicDelivery(conversation)
           fileLog(`delivered ${messages.length} msg into branch session ${branch} (${conversation}) mode=branch`)
           return
         }
@@ -1672,6 +1778,7 @@ export function apply(ctx, config) {
         saveConversations()
         state.sessionId = target
         state.conversations = Object.keys(conversations).length
+        recordTopicDelivery(conversation)
         fileLog(`delivered ${messages.length} msg into bound session ${target} (${conversation}) mode=${mode}`)
         return
       } catch (error) {
@@ -1729,6 +1836,7 @@ export function apply(ctx, config) {
     saveConversations()
     state.sessionId = entry.sessionId
     state.conversations = Object.keys(conversations).length
+    recordTopicDelivery(conversation)
   }
 
   async function wake(meta = {}) {
@@ -2953,6 +3061,7 @@ export function apply(ctx, config) {
 
   // Restore batches before the listener comes up, then poll liveness for early alerts.
   restoreBatches()
+  autoBindTopics()
   batchSweepTimer = setInterval(sweepBatches, Math.max(1000, Math.min(30000, Math.floor(c.waitLongMs / 2))))
   batchSweepTimer.unref?.()
 
@@ -3278,6 +3387,13 @@ export function apply(ctx, config) {
               // they go. The file path is a local path, never a credential.
               pendingTasks: pendingTasks.size,
               pendingBatches: batches.size,
+              // Topic routing: labels only. Session ids and titles stay local (see
+              // /mesh/admin/bindings for the local view).
+              topics: [...topics.values()].map((topic) => ({
+                label: topic.label,
+                bound: Boolean(conversations[topic.label]?.deliverTo),
+                lastDeliveredAt: topic.lastDeliveredAt ?? null,
+              })),
               lastReceipt,
               receiptMode: c.receiptMode,
               receiptFile: c.receiptFile,

@@ -205,6 +205,34 @@ dsh-mesh-dispatch --target "worker-a" --create --text "先读 README，列出与
 
 CLI 只依赖 Node 内置 `fetch`，通过 `--waker` 指向本机 waker（默认 `http://127.0.0.1:8795`）；连不上时退出码 2。
 
+## 主题路由（topics，0.5.7）
+
+远程不掌握本机的会话 id，也不该掌握：**用稳定标签投递**，由 waker 在本机解析成当前匹配的会话。
+
+```yaml
+# cordis.patch.yml / 插件配置
+topics:
+  - label: "ops/frontend"       # 对外的稳定标签，也用作 conversation
+    titlePattern: "web 运维"     # 本地解析：标题唯一子串（也接受精确标题）
+    allowFrom: ["dsh-kaniol-pc"] # 可选：只允许这些 peer 投递；空/缺省=不限制
+    mode: "queue"                # 可选，默认 queue；steer 插当前轮
+```
+
+远端（跨机）发消息时把 `conversation` 写成标签即可：
+
+```json
+POST /api/send { "to": "<本机 agent 名>", "conversation": "ops/frontend", "body": "…" }
+```
+
+行为与边界：
+
+- **自动绑定/重绑**：启动时和每次投递前按 `titlePattern` 找未归档会话（精确或唯一子串）；绑定的会话被归档/删除后，下次投递自动改绑到新会话。解析不到只记 `topic unresolved label=… pattern=…`，不报错，落回原有「收件箱 / 按 conversation 新建」兜底。
+- **不覆盖手工绑定**：`/mesh/bind` 绑到仍存活会话时，topic 不会改动它。
+- **allowFrom**：非空时只允许名单里的 sender；其他人投递**不注入**、消息留在收件箱未读，本地日志记 `topic denied label=… peer=…`。这是投递闸门，不是收件箱规则——agent 仍能在收件箱看到它。
+- **标签校验**：`^[a-z0-9][a-z0-9/_-]{1,40}$`；非法或重复的 label 启动时 WARN 并忽略该条。
+- **对外最少暴露**：`GET /mesh/status` 只给 `topics: [{ label, bound, lastDeliveredAt }]`，**不含会话 id/标题**（本地细节看 `/mesh/admin/bindings`）。会话 id 是内部句柄且易失，运维会话能执行 shell，暴露 id 等于开放提权面。
+- **零配置兼容**：不配 `topics` 时行为与 0.5.6 完全一致。
+
 ## 依赖
 
 中枢本体见 [hub/](https://github.com/kaniol-lck/dsh-mesh/tree/main/hub)，Docker 一条命令即可起：

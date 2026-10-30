@@ -5,9 +5,21 @@
 > **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
 > `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由）。
 
 ---
+
+## v0.5.7（2026-10-30，主题路由：远程按标签投递，不暴露会话 id/标题）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | 远程需要把运维问题投到「对应本地会话」，但会话 id 是内部句柄且易失，运维会话能执行 shell——把 id 上报中枢等于开放提权面。改为上报/寻址**稳定标签** |
+| 配置 | `topics: [{ label, titlePattern, allowFrom?, mode? }]`；`label` 须匹配 `^[a-z0-9][a-z0-9/_-]{1,40}$`（非法/重复/空 pattern 启动 WARN 并忽略）；远端把 `conversation` 写成 `label` 即可 |
+| 绑定 | 启动时与每次投递前，按 `titlePattern`（精确或唯一子串）在**未归档**会话里解析并等价 `/mesh/bind` 自动绑定；绑定的会话归档/删除后，下次投递自动重绑到新同名会话；解析不到只记 `topic unresolved`，落回原有收件箱/新建兜底 |
+| 白名单 | `allowFrom` 非空时只允许名单 peer；其他人投递不注入、消息保持未读，日志 `topic denied label=… peer=…`；不覆盖仍存活的用户手工绑定 |
+| 对外 | `GET /mesh/status` 增 `topics: [{ label, bound, lastDeliveredAt }]`，**不含 session id 与标题**（本地细节仍在 `/mesh/admin/bindings`） |
+| 兼容 | 不配 `topics` 时行为与 0.5.6 完全一致；`mode: steer` 可插当前轮，默认 queue |
+| 测试 | +5（共 48/48）：标签命中 A（B 不受影响）、归档后重绑到同名新会话（id 不同）、allowFrom 外 sender 被拒且消息仍未读、非法 label 启动忽略、status 输出不含 `session-`/标题；零配置回归即原 43 例 |
 
 ## v0.5.6（2026-10-30，修复「注入发生在回合进行中时被上一轮 turn/end 提前结算」）
 

@@ -321,6 +321,9 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [] } = {})
   return {
     url: `http://127.0.0.1:${port}`,
     requests,
+    push(message) {
+      unread.push({ ...message })
+    },
     get unread() {
       return unread
     },
@@ -1064,6 +1067,119 @@ async function main() {
     const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-fresh'), 4000)
     const ok = receipt?.turn === 1 && receipt?.baselineTurn === null && receipt?.injectedDuringTurn === false
     report('task receipt: no turn history still settles on the first turn/end', ok, `turn=${receipt?.turn ?? '-'} baseline=${receipt?.baselineTurn ?? '-'} during=${receipt?.injectedDuringTurn ?? '-'}`)
+  })
+
+  // 45-49. Topic routing: labels resolve locally; ids/titles never leave the machine.
+  await runCase('topics: a label delivers to the session matching the title', async (boot) => {
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-topic-1', sender: 'peer-a', conversation: 'ops/x', subject: 'ops', body: 'restart the frontend' }],
+    })
+    let h = null
+    try {
+      h = await boot({
+        seedSessions: [
+          { id: 'session-topic-a', title: 'web 运维' },
+          { id: 'session-topic-b', title: 'other project' },
+        ],
+        config: {
+          hubUrl: fake.url,
+          pollIntervalMs: 5000,
+          pollBusyIntervalMs: 1000,
+          pollIdleIntervalMs: 5000,
+          topics: [{ label: 'ops/x', titlePattern: 'web 运维' }],
+        },
+      })
+      const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
+      const ok = delivered?.sessionId === 'session-topic-a' && h.state.prompts.every((prompt) => prompt.sessionId === 'session-topic-a')
+      report('topics: a label delivers to the session matching the title', ok, `session=${delivered?.sessionId ?? '-'} prompts=${h.state.prompts.length}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('topics: archived session is rebound to the recreated namesake', async (boot) => {
+    const archived = ['session-topic-old']
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-rebind-1', sender: 'peer-a', conversation: 'ops/rb', body: 'first' }],
+    })
+    let h = null
+    try {
+      h = await boot({
+        seedSessions: [
+          { id: 'session-topic-live', title: 'rebind 运维' },
+          { id: 'session-topic-old', title: 'rebind 运维' },
+        ],
+        archivedIds: archived,
+        config: {
+          hubUrl: fake.url,
+          pollIntervalMs: 5000,
+          pollBusyIntervalMs: 1000,
+          pollIdleIntervalMs: 5000,
+          topics: [{ label: 'ops/rb', titlePattern: 'rebind 运维' }],
+        },
+      })
+      const first = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
+      archived.push('session-topic-live')
+      archived.splice(archived.indexOf('session-topic-old'), 1)
+      fake.push({ id: 'm-rebind-2', sender: 'peer-a', conversation: 'ops/rb', body: 'second' })
+      const second = await waitFor(() => (h.state.prompts.length >= 2 ? h.state.prompts[1] : null), 15000)
+      const ok = first?.sessionId === 'session-topic-live' && second?.sessionId === 'session-topic-old'
+      report('topics: archived session is rebound to the recreated namesake', ok, `first=${first?.sessionId ?? '-'} second=${second?.sessionId ?? '-'}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('topics: allowFrom denies a foreign sender and leaves the message unread', async (boot) => {
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-deny-1', sender: 'peer-b', conversation: 'ops/secure', body: 'should not run' }],
+    })
+    const logStart = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').length : 0
+    let h = null
+    try {
+      h = await boot({
+        seedSessions: [{ id: 'session-topic-sec', title: 'secure 运维' }],
+        config: {
+          hubUrl: fake.url,
+          pollIntervalMs: 5000,
+          pollBusyIntervalMs: 1000,
+          pollIdleIntervalMs: 5000,
+          topics: [{ label: 'ops/secure', titlePattern: 'secure 运维', allowFrom: ['peer-a'] }],
+        },
+      })
+      await waitFor(() => fake.requests.some((entry) => entry.path === '/api/inbox'), 15000)
+      await sleep(1500)
+      const logText = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').slice(logStart) : ''
+      const ok = h.state.prompts.length === 0 && fake.unread.length === 1 && /topic denied label=ops\/secure peer=peer-b/.test(logText)
+      report('topics: allowFrom denies a foreign sender and leaves the message unread', ok, `prompts=${h.state.prompts.length} unread=${fake.unread.length} deniedLog=${/topic denied/.test(logText)}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('topics: invalid label is ignored at startup', async (boot) => {
+    const h = await boot({ config: { topics: [{ label: 'Ops X', titlePattern: 'web 运维' }] } })
+    const status = await request(h.base, '/mesh/status')
+    const listed = status.json?.topics ?? []
+    const ok = Array.isArray(listed) && listed.length === 0
+    report('topics: invalid label is ignored at startup', ok, `topics=${JSON.stringify(listed)}`)
+  })
+
+  await runCase('topics: status exposes labels only, never ids or titles', async (boot) => {
+    const h = await boot({
+      seedSessions: [{ id: 'session-topic-leak', title: 'leak 运维' }],
+      config: { topics: [{ label: 'ops/leak', titlePattern: 'leak 运维' }] },
+    })
+    const status = await request(h.base, '/mesh/status')
+    const payload = JSON.stringify(status.json?.topics ?? [])
+    const ok = /"label":"ops\/leak"/.test(payload) && !payload.includes('session-') && !payload.includes('leak 运维')
+    report('topics: status exposes labels only, never ids or titles', ok, `topics=${payload}`)
   })
 
   const failed = results.filter((result) => !result.ok)
