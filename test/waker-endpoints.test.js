@@ -1599,6 +1599,85 @@ async function main() {
     }
   })
 
+  // 67-70. /mesh/status surfaces what is waiting for the operator.
+  await runCase('status: pendingQuestions lists the active question and clears after the answer', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake, { timeoutSeconds: 5 })
+      const pending = meshAskTool(h).execute({ question: '今晚继续\n还是收工？', options: ['继续', '收工'] })
+      await waitFor(() => fake.sends.length > 0, 8000)
+      const during = await request(h.base, '/mesh/status')
+      const listed = during.json?.pendingQuestions ?? []
+      const entry = listed[0] ?? {}
+      const previewLength = Array.from(entry.preview ?? '').length
+      const okDuring =
+        listed.length === 1 &&
+        /^question\//.test(entry.conversation ?? '') &&
+        typeof entry.preview === 'string' &&
+        !/\n/.test(entry.preview) &&
+        previewLength <= 80 &&
+        Array.isArray(entry.options) &&
+        entry.options.join(',') === '继续,收工' &&
+        Number.isFinite(entry.askedAt) &&
+        Number.isFinite(entry.expiresAt)
+      fake.push({ id: 'm-status-answer', sender: 'peer-owner', conversation: entry.conversation, body: '1' })
+      const result = await pending
+      const after = await request(h.base, '/mesh/status')
+      const okAfter = result.status === 'answered' && (after.json?.pendingQuestions ?? []).length === 0
+      report('status: pendingQuestions lists the active question and clears after the answer', okDuring && okAfter, `during=${listed.length} preview=${JSON.stringify(entry.preview)} cleared=${(after.json?.pendingQuestions ?? []).length}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('status: pending arrays exist and are empty by default', async (boot) => {
+    const h = await boot({})
+    const status = await request(h.base, '/mesh/status')
+    const ok =
+      Array.isArray(status.json?.pendingQuestions) &&
+      status.json.pendingQuestions.length === 0 &&
+      Array.isArray(status.json?.pendingApprovals) &&
+      status.json.pendingApprovals.length === 0
+    report('status: pending arrays exist and are empty by default', ok, `pendingQuestions=${JSON.stringify(status.json?.pendingQuestions)} pendingApprovals=${JSON.stringify(status.json?.pendingApprovals)}`)
+  })
+
+  await runCase('status: pendingApprovals lists the active approval request', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startApprovalHarness(boot, fake)
+      const pending = h.callApproval({ agent: { id: 'session-x' }, toolName: 'bash', callId: 'call-abcdef12', reason: 'rm -rf a very dangerous directory' })
+      await waitFor(() => fake.sends.length > 0, 8000)
+      const during = await request(h.base, '/mesh/status')
+      const listed = during.json?.pendingApprovals ?? []
+      const entry = listed[0] ?? {}
+      const okDuring =
+        listed.length === 1 &&
+        /^approval\//.test(entry.conversation ?? '') &&
+        entry.toolName === 'bash' &&
+        /bash/.test(entry.preview ?? '') &&
+        Array.from(entry.preview ?? '').length <= 80
+      fake.push({ id: 'm-status-deny', sender: 'peer-owner', conversation: entry.conversation, body: 'deny' })
+      const outcome = await pending
+      const after = await request(h.base, '/mesh/status')
+      const okAfter = outcome === 'rejected' && (after.json?.pendingApprovals ?? []).length === 0
+      report('status: pendingApprovals lists the active approval request', okDuring && okAfter, `during=${listed.length} tool=${entry.toolName ?? '-'} cleared=${(after.json?.pendingApprovals ?? []).length}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('status: preview is truncated to 80 characters', async () => {
+    const { previewText } = await import(pathToFileURL(ENTRY).href)
+    const long = 'x'.repeat(200)
+    const preview = previewText(`line one\nline two ${long}`)
+    const ok = Array.from(preview).length === 80 && !/\n/.test(preview)
+    report('status: preview is truncated to 80 characters', ok, `len=${Array.from(preview).length} newline=${/\n/.test(preview)}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

@@ -5,9 +5,18 @@
 > **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
 > `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段）。
 
 ---
+
+## v0.7.2（2026-10-30，`/mesh/status` 暴露待答问题与待批审批）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | 提问桥自己用 `claim=1` 轮询，问题消息在收件箱里被 claim；`to` 指向本机时运营者甚至看不到，只能翻日志猜「有没有在等我回答」 |
+| 新字段 | `pendingQuestions: [{conversation, askedAt, expiresAt, preview, options}]`、`pendingApprovals: [{conversation, askedAt, expiresAt, preview, toolName}]`；`preview` 单行、≤80 字符、不含 token/路径；无待答时是 `[]`（字段始终存在）；条目随等待集合进出自动出现/消失 |
+| 语义 | 仅本机 `GET /mesh/status` 可读；不改变投递/超时/隔离逻辑，纯状态暴露；`questionWaiting`/`bridgeWaiting` 由 Set 改为 Map 携带元数据，pull 跳过的判断不变 |
+| 测试 | +4（共 70/70）：提问进行中 status 一条（前缀 `question/`、preview 去换行且 ≤80、options 正确、askedAt/expiresAt 是数字）→ 回答后清空；默认两字段均为 `[]`；审批进行中 `pendingApprovals` 一条（`approval/` 前缀、`toolName=bash`、preview 含 bash）→ deny 后清空；`previewText` 截断到 80 且无换行。既有 66 例全绿 |
 
 ## v0.7.1（2026-10-30，修复 mesh_ask 把自己的问题当回答）
 

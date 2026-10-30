@@ -297,6 +297,17 @@ mesh_ask({
 - **隔离**：`question/` 会话由提问工具独占消费（claim + read），pull 循环不注入、不建会话；`allowFrom` 外的回复忽略并保持未读（日志 `question ignored`，按消息去重）。
 - **可选接缝**：运行时若存在 `ctx.userQuestions` 服务才挂 `user-questions/request`（形状不认识或超时一律 `next()` 交回本地 UI）；没有接缝只记一行 `user-questions seam absent; mesh_ask only`，工具照常可用。插件**不 import** `@deepseek-ai/dsh-user-questions` 或 `dsh-user-approval`，缺包不影响加载。
 
+### `/mesh/status` 的待办字段（0.7.2）
+
+运营者不用翻日志就能发现「现在有东西在等我」，`GET /mesh/status`（仅本机）新增：
+
+| 字段 | 形如 | 说明 |
+|---|---|---|
+| `pendingQuestions` | `[{conversation, askedAt, expiresAt, preview, options}]` | 正在等待回答的 `mesh_ask` 问题；`preview` 单行 ≤80 字符；回答或超时后自动消失；无则为 `[]` |
+| `pendingApprovals` | `[{conversation, askedAt, expiresAt, preview, toolName}]` | 正在等待决定的审批请求；`preview` 形如 `bash · <摘要>`；无则为 `[]` |
+
+两个字段都只在本机 status 输出里；`conversation` 可以直接用来在收件箱里定位原消息（问题/审批消息本身仍按各自桥的隔离规则处理）。
+
 ## 依赖
 
 中枢本体见 [hub/](https://github.com/kaniol-lck/dsh-mesh/tree/main/hub)，Docker 一条命令即可起：

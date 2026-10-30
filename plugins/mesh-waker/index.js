@@ -453,6 +453,14 @@ export function decideApprovalReply(text) {
   return approve ? 'allowed-once' : 'rejected'
 }
 
+/** One-line, bounded preview for local status output (newlines collapsed, no secrets). */
+export function previewText(text, max = 80) {
+  return String(text ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max)
+}
+
 function normalizeBase(config) {
   const c = config ?? {}
   // Secrets may be inlined (older configs) or, preferably, read from owner-only files so
@@ -1236,7 +1244,7 @@ export function apply(ctx, config) {
 
   const bridge = c.approvalBridge
   // Conversations currently awaited by the bridge; the pull loop must not consume them.
-  const bridgeWaiting = new Set()
+  const bridgeWaiting = new Map()
   const bridgeOutcome = (value) => (['allowed-once', 'rejected', 'cancelled', 'unavailable'].includes(value) ? value : 'unavailable')
 
   function approvalNotice(request, conversation) {
@@ -1322,6 +1330,10 @@ export function apply(ctx, config) {
     }
     const started = Date.now()
     const conversation = `${bridge.conversationPrefix}${callId.slice(0, 8)}`
+    const toolName = String(request?.toolName ?? 'tool')
+    const reason = String(request?.reason ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
     try {
       await postApprovalNotice(conversation, request)
     } catch (error) {
@@ -1332,8 +1344,14 @@ export function apply(ctx, config) {
       fileLog(`approval notify-only call=${callId} (allowFrom empty)`)
       return delegate()
     }
-    bridgeWaiting.add(conversation)
     const deadline = started + bridge.timeoutSeconds * 1000
+    bridgeWaiting.set(conversation, {
+      conversation,
+      askedAt: started,
+      expiresAt: deadline,
+      preview: previewText(`${toolName} · ${reason}`),
+      toolName,
+    })
     try {
       while (Date.now() < deadline) {
         let replies = []
@@ -1395,7 +1413,7 @@ export function apply(ctx, config) {
   // and a timeout is reported as unanswered instead of picked for the caller.
 
   const questionBridge = c.questionBridge
-  const questionWaiting = new Set()
+  const questionWaiting = new Map()
   // Ignored replies are re-evaluated on every poll; keep the log to one line per message.
   const questionDeniedSeen = new Set()
 
@@ -1450,8 +1468,14 @@ export function apply(ctx, config) {
       fileLog(`question notify-only id=${questionId} (allowFrom empty)`)
       return { status: 'unanswered', timeoutSeconds: seconds, questionId }
     }
-    questionWaiting.add(conversation)
     const deadline = started + seconds * 1000
+    questionWaiting.set(conversation, {
+      conversation,
+      askedAt: started,
+      expiresAt: deadline,
+      preview: previewText(question),
+      options: cleanOptions,
+    })
     try {
       while (Date.now() < deadline) {
         let replies = []
@@ -3900,6 +3924,10 @@ export function apply(ctx, config) {
               // they go. The file path is a local path, never a credential.
               pendingTasks: pendingTasks.size,
               pendingBatches: batches.size,
+              // Queues an operator can act on without reading logs. Local-only status:
+              // previews are one-line and bounded, no tokens or paths.
+              pendingQuestions: [...questionWaiting.values()],
+              pendingApprovals: [...bridgeWaiting.values()],
               // Topic routing: labels only. Session ids and titles stay local (see
               // /mesh/admin/bindings for the local view).
               topics: [...topics.values()].map((topic) => ({
