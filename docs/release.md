@@ -39,6 +39,18 @@ python scripts/release.py --promote
 凭据只从环境变量 `NPM_TOKEN` 读，脚本把临时 `.npmrc` 写到系统临时目录并用 `--userconfig` 指过去，
 **不会在仓库里留下任何凭据文件**。
 
+## 发布顺序（hub 与 waker）
+
+两者独立发布、互不阻塞。若当次**两边都变**，先发 hub、再发 waker：客户端插件通常依赖中枢的新端点/新字段，
+先上 hub 才能让 waker 的新行为有落点；反过来会出现一段「插件已升级、中枢还不支持」的窗口。
+
+## 回滚
+
+- **hub**：把容器镜像换回上一个版本 tag 并重启；数据卷不受影响。回滚后立刻核对 `/health` 版本。
+- **waker（npm）**：用 `npm dist-tag add dsh-mesh-waker@<旧版本> latest` 把 `latest` 指回旧版本；
+  **不要用 `npm unpublish`**——已发布版本可能已被别人安装，unpublish 会破坏可复现性，npm 对时间窗也有限制。
+  回滚后让一台机器重装验证：`dsh plugin add dsh-mesh-waker`。
+
 ## 预检做什么
 
 1. 语法与可加载性：`node --check plugins/mesh-waker/index.js client.js`（必要时 `node scripts/check-loadable.mjs`）；
@@ -46,7 +58,16 @@ python scripts/release.py --promote
    （link 安装 = `@local/dsh-mesh-waker`，npm 安装 = `dsh-mesh-waker`，写死任何一个都会让另一种安装
    的 web boot 失败）；
 3. `scripts/check-secrets.py`；
-4. 仓库内存在 `.npmrc` 直接判失败。
+4. 仓库内存在 `.npmrc` 直接判失败；
+5. **双轴版本自检**（任一不一致即 FAIL，并打印差异）：
+
+| 轴 | 校验内容 |
+|---|---|
+| **waker 轴** | `plugins/mesh-waker/package.json` 的 `version` 与 `CHANGELOG.md` 顶部 `## v<版本>` 条目一致 |
+| **hub 轴** | `hub/server.mjs` 的 `HUB_VERSION` == `hub/package.json` 的 `version`，且 `hub/CHANGES.md` 顶部有 `## v<版本>` 条目 |
+
+预检失败时**先改版本文件，不要改脚本**：把上面涉及的常量、`package.json` 与变更记录顶部条目对齐到同一个版本号，再重跑预检。
+为什么要它：版本号散落在多个文件里，靠人记必出错；三处不一致时部署出去，`/health` 与仓库对不上，排查成本远高于这条检查。
 
 CI（`.github/workflows/plugin-check.yml`）在 push / PR 时跑前两项，失败即挡在发布之前。
 
@@ -59,7 +80,7 @@ hub 不走 npm，按下面的通用步骤发布；部署目标（本机、容器
 3. **构建镜像**：用仓库 `hub/Dockerfile` 构建，镜像 tag 用版本号（不要只留 `latest`，回滚才有抓手）；
 4. **部署并验证**：`/health` 返回的版本等于新版本；若经反代/隧道暴露，再验一次公网入口返回 200；
 5. **打 tag**：`git tag v<版本> && git push origin v<版本>`；
-6. **回滚**：把容器镜像换回上一个版本 tag 并重启；数据卷不受影响。
+6. **回滚**：见下方「回滚」一节（镜像 tag 换回上一版，数据卷不动）。
 
 ## 提升前的人工验收
 
