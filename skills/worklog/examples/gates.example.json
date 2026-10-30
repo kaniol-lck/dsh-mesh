@@ -5,8 +5,7 @@
       "name": "接入闭环",
       "question": "外部客户端能否完成一次鉴权读写？",
       "requires": [
-        { "match": "接入 API" },
-        { "feature": "接入" }
+        { "match": "接入 API" }
       ]
     },
     {
@@ -14,8 +13,8 @@
       "name": "可交付",
       "question": "文档、迁移与验收脚本都完成了吗？",
       "requires": [
-        { "feature": "文档" },
-        { "feature": "验收" },
+        { "match": "部署文档" },
+        { "match": "验收脚本" },
         { "match": "用户表迁移" }
       ]
     }

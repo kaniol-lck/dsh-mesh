@@ -190,12 +190,29 @@ function parseEntry(line, sessionName, file, lineNumber, errors, features, warni
     else if (key === '功能') fields.feature = value.trim()
     else fields.owner = value.trim()
   }
+  // Some lines write "…；验收：…。功能：X；归属：…" (the 功能 marker follows a period, not a
+  // semicolon), so the field parser sees it as part of 验收. Pull it out explicitly.
+  if (!fields.feature && fields.acceptance) {
+    const inline = /功能：([^；。\n]+)/.exec(fields.acceptance)
+    if (inline) {
+      fields.feature = inline[1].trim()
+      fields.acceptance = fields.acceptance.slice(0, inline.index).replace(/[。；]$/, '').trim()
+    }
+  }
   const head = descriptionParts.join('；')
   const splitAt = head.indexOf('——')
   const problems = []
   if (splitAt < 0) problems.push('missing " —— " between title and description')
   const title = splitAt < 0 ? '' : head.slice(0, splitAt).trim()
-  const description = splitAt < 0 ? '' : head.slice(splitAt + 2).trim()
+  let description = splitAt < 0 ? '' : head.slice(splitAt + 2).trim()
+  // The same marker can also land in the description when the line separates fields with 。
+  if (!fields.feature) {
+    const inline = /功能：([^；。\n]+)/.exec(description)
+    if (inline) {
+      fields.feature = inline[1].trim()
+      description = description.slice(0, inline.index).replace(/[。；]$/, '').trim()
+    }
+  }
   if (!title) problems.push('empty title')
   if (!fields.acceptance) problems.push('missing 验收：')
   if (!fields.status) problems.push('missing 状态：')
@@ -270,6 +287,9 @@ async function loadFeatures(file) {
   }
 }
 
+// Priority is explicit field > title keyword > description keyword > 未分类.
+// The explicit 功能： field always wins: keyword inference is a fallback for lines that did
+// not bother to classify themselves, and must never override a human decision.
 function resolveFeature(raw, title, description, features, file, lineNumber, warnings) {
   if (raw) {
     if (features.vocabulary.length && !features.vocabulary.includes(raw)) {
@@ -634,6 +654,10 @@ function warnIfDemotedInProgress(entries, today = new Date()) {
 function warnIfGateMisses(entries, gates) {
   for (const gate of gates) {
     for (const require of gate.requires ?? []) {
+      if (require.feature) {
+        console.log(`WARN: 关口 ${gate.id} 使用 feature 判据，新增同功能条目会让它回退；建议改为 match 清单`)
+        continue
+      }
       if (gateRequireEntries(require, entries).length > 0) continue
       console.log(`WARN: 关口 ${gate.id} 的 require「${gateRequireLabel(require)}」没有匹配到任何 todo（标题改过？）`)
     }

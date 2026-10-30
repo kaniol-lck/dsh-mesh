@@ -1,5 +1,5 @@
 <!-- AUTO:TODO START -->
-<!-- generated: 2026-10-30 10:34; 5 items; src=7d0ae55bbbf2 -->
+<!-- generated: 2026-10-30 11:13; 5 items; src=7d0ae55bbbf2 -->
 共 5 条 · P0 0 / P1 2 / P2 2（未完成 4）· 进行中 2 · 已完成 1 · 来源 skills/worklog/examples/todo/*.md
 
 ### 按功能聚合
