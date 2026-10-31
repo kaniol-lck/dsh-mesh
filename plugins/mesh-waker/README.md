@@ -58,26 +58,123 @@ dsh plugin --profile web add dsh-mesh-waker
 
 ## 配置
 
-全部可选；写在 profile 的 cordis patch 里（或 `~/.dsh/mesh-waker/config.json`）：
+全部可选；写在 profile 的 cordis patch 里（或 `~/.dsh/mesh-waker/config.json`）。按用途分组，每组一张表。
+
+### 中枢连接
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `hubUrl` | — | 中枢地址；留空 = standalone |
-| `token` / `tokenFile` | — | agent token；优先读 `tokenFile`（自举会把换到的 token 写进去） |
+| `token` | — | agent token 明文；优先级低于 `tokenFile` |
+| `tokenFile` | — | token 文件路径（自举会把换到的 token 写进去，0600） |
 | `joinCode` | — | 一次性注册码；有它且没有 token 时自动换 token |
-| `wakeSecret` / `wakeSecretFile` | — | **只有 push 需要**；pull 模式缺它不报错、不阻塞 |
+| `agentName` | — | 自举/注册时用的节点名（`[A-Za-z0-9_-]{1,32}`）；不填由中枢分配 |
+| `agentPreset` | — | 该节点的权限预设名（交给宿主解释） |
 | `mode` | `auto` | `auto`（pull 常开，push 叠加）/ `pull` / `push` |
+| `caFile` | — | 额外 CA PEM，用于出站 TLS（替代 `NODE_EXTRA_CA_CERTS`） |
+| `caSha256` | — | 可选指纹钉扎；与 `caFile` 或 bootstrap 的 `tls.ca_sha256` 不符即拒绝连接 |
+
+### 唤醒与轮询
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `wakeSecret` | — | **只有 push 需要**的 HMAC 密钥明文 |
+| `wakeSecretFile` | — | 密钥文件路径；与 `wakeSecret` 二选一 |
 | `listenHost` | `127.0.0.1` | 只有 push 才需要改 `0.0.0.0` 或 LAN 地址 |
 | `listenPort` | `8795` | 本地面板与会话端口 |
 | `advertiseHost` | — | push 时告诉中枢的可达地址（决定 `wakeUrl`） |
-| `caFile` | — | 额外 CA PEM，用于出站 TLS（替代 `NODE_EXTRA_CA_CERTS`） |
-| `caSha256` | — | 可选指纹钉扎；与 `caFile` 或 bootstrap 返回的 `tls.ca_sha256` 比对，不符即拒绝连接 |
+| `wakePath` | `/mesh/wake` | 唤醒端点路径 |
 | `pollIntervalMs` | `30000` | 常态轮询间隔（下限 5000，上限 600000） |
 | `pollBusyIntervalMs` | `5000` | 拉到消息后的快档间隔 |
 | `pollIdleIntervalMs` | `60000` | 连续 3 次空轮询后的慢档间隔 |
 | `claimTtlMs` | `300000` | claim 租约；puller 崩溃后由中枢自动回收 |
+| `registerIntervalMs` | `300000` | 向中枢重报 `wakeUrl` 的间隔 |
+| `historySyncIntervalMs` | `600000` | 面板历史同步间隔（下限 60000） |
+
+### 投递与会话
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `boundDeliveryMode` | `queue` | 绑定会话的默认投递：`queue` / `steer` / `branch` |
+| `allowSenderDeliveryMode` | `true` | 是否允许发送方按消息指定投递模式 |
+| `delivery` | — | 单条消息的投递覆盖（`queue`/`steer`/`branch`），非插件级配置 |
+| `sessionTitle` | `mesh 收件箱` | 收件箱会话标题 |
+| `sessionCwd` | — | 收件箱会话的工作目录 |
+| `workspacePath` | — | 收件箱会话绑定到的工作区路径 |
+| `workspaceTitle` | `Mesh 收件箱` | 侧栏里该工作区的显示名 |
+| `branchReuseHours` | `12` | branch 侧会话复用窗口（小时） |
+| `branchTitlePrefix` | `mesh · ` | branch 侧会话标题前缀 |
+| `resetAfterHours` | `12` | 收件箱会话闲置多久后重置 |
+| `maxWakes` | `50` | 单个会话累计唤醒次数上限 |
+| `maxSteerPerWindow` | `1` | 每窗口允许的 steer 次数 |
+| `steerWindowMs` | `60000` | steer 计数窗口 |
+| `maxInlineBytes` | `4096` | 超过该大小的消息正文不再内联进回合 |
+
+### 补收与冷却
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `catchUpOnStart` | `true` | 启动时补收离线期间的消息 |
+| `catchUpDelayMs` | `12000` | 启动后延迟多久开始补收 |
+| `catchUpMaxConversations` | `3` | 一次补收最多覆盖几个会话 |
+| `cooldownMs` | `1500` | 同一会话两轮之间的最小间隔 |
+| `conversationCooldownMs` | `60000` | 同一 conversation 的冷却窗口 |
+
+### 限速与节流
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `throttleMaxWakesPerWindow` | `30` | 每窗口最多唤醒次数 |
+| `throttleWindowMs` | `3600000` | 节流窗口（1 小时） |
+| `minMessageChars` | `24` | 短于该长度的消息不单独起一轮（合并处理） |
+
+### 主题路由
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `topics` | `[]` | 主题路由表：每项 `{label, title, allowFrom}`，把远端标签解析到本地会话 |
+| `allowFrom` | `[]` | 允许向该主题/桥发消息的 peer 白名单（空 = 不限制） |
+
+### 审批桥（approvalBridge）
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `approvalBridge` | 关 | 远程审批桥配置对象（下同） |
+| `enabled` | `false` | 是否启用 |
+| `to` | — | 审批消息发给哪个 peer |
+| `allowFrom` | `[]` | 只接受这些 peer 的回复（空 = 任何 peer，不推荐） |
+| `timeoutSeconds` | `120` | 等待决定的秒数（1–3600），超时按拒绝 |
+| `conversationPrefix` | `approval/` | 审批对话的 conversation 前缀 |
+| `pollMs` | `2000` | 轮询回复间隔（250–60000） |
+| `diag` | `false` | 打印诊断日志（含消息形状，不含正文） |
+
+### 提问桥（questionBridge）
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `questionBridge` | 关 | 向人提问的桥配置对象（下同） |
+| `enabled` | `false` | 是否启用 |
+| `to` | — | 提问消息发给哪个 peer |
+| `allowFrom` | `[]` | 只接受这些 peer 的回复 |
+| `timeoutSeconds` | `300` | 等待回答的秒数（1–3600） |
+| `conversationPrefix` | `question/` | 提问对话的 conversation 前缀 |
+| `pollMs` | `2000` | 轮询回复间隔（250–60000） |
+| `diag` | `false` | 诊断日志 |
+
+### 面板与日志
+
+| 键 | 默认 | 说明 |
+|---|---|---|
 | `logFile` | `<tmpdir>/mesh-waker.log` | 日志文件；推荐 `~/.dsh/mesh-waker/waker.log`（重启不丢） |
 | `logMaxBytes` | `2097152`（2 MiB） | 超过即滚动为 `<logFile>.1`（只留 1 份历史），下限 1 KiB |
+
+### 信任与权限
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `trust` | `normal` | 本机默认信任档：`strict` / `normal` / `full`（见下节） |
+| `trustByPeer` | `{}` | 按发送方覆盖信任档，如 `{"<peer>":"strict"}` |
+| `permissionPresetByTrust` | 见下节 | 信任档 → DSH 权限预设的映射 |
 
 **激活矩阵**：
 
@@ -89,6 +186,20 @@ dsh plugin --profile web add dsh-mesh-waker
 | 有 | 无 | 无 | standalone，且 `lastError="missing token (provide joinCode or tokenFile)"`（不静默退出） |
 
 CA 只记 sha256 前 16 位，token 只记 `fp=<前6位>… len=<n>`；任何日志都不打印密钥。
+
+## 信任与权限
+
+**信任档只在本机设置，中枢与对端都不能提升它**（代码注释原话：a remote message can never turn this machine into an unapproved execution surface）。远端能做的只有：在本机允许的档位内发消息。
+
+| 档位 | 被远程唤醒的这一轮允许做什么 |
+|---|---|
+| `strict` | 只读：只读取、只回复；不写文件、不执行命令、不装东西。要动手的事写进回信请人批准 |
+| `normal`（默认） | 能直接办的就办；写文件/装插件/改系统/提权这类先申请批准 |
+| `full` | 按完全信任执行，不停下来征求批准；只有不可逆操作才先确认 |
+
+- `trustByPeer` 按发送方覆盖默认档（存 `<tokenFile 目录>/trust.json`，或用 `POST /mesh/trust` 修改，**仅 loopback**）；
+- `permissionPresetByTrust` 把信任档映射到 DSH 权限预设，默认 `strict → read-only`、`normal → workspace-write`、`full → danger-full-access`；只有宿主的预设名不同或你想让某档更保守时才需要改；
+- `normal`/`strict` 下的「申请批准」走审批桥（`approvalBridge`，fail-closed、超时按拒绝），不是聊天问答；审批桥没启用时，危险操作会停在本机提示上等人处理。
 
 ## 任务回执（0.5.1）
 
