@@ -38,3 +38,5 @@ __pycache__/
 
 # 本仓内部会话约定（不入库）
 /AGENTS.md
+
+refs/
