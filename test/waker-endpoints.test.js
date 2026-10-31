@@ -2120,6 +2120,45 @@ async function main() {
     report('tools: both tools report registered on a normal host', ok, `tools=${JSON.stringify(status?.json?.tools)} toolsError=${JSON.stringify(status?.json?.toolsError)}`)
   })
 
+  // 94-97. maxInlineBytes is real (safe truncation + note), and seams/limits are observable.
+  await runCase('inline: a body over maxInlineBytes is truncated without U+FFFD', async () => {
+    const { inlineBodyText, truncateUtf8 } = await import(pathToFileURL(ENTRY).href)
+    const body = '中'.repeat(3000) // 9000 UTF-8 bytes
+    const inline = inlineBodyText(body, 4096)
+    const kept = inline.split('\n…（正文已截断')[0]
+    const keptBytes = Buffer.byteLength(kept, 'utf8')
+    const ok =
+      inline !== body &&
+      !inline.includes('\uFFFD') &&
+      keptBytes <= 4096 &&
+      /正文已截断：原文 9000 字节/.test(inline) &&
+      /maxInlineBytes=4096/.test(inline) &&
+      truncateUtf8('a'.repeat(4095) + '中', 4096) === 'a'.repeat(4095) &&
+      !truncateUtf8('a'.repeat(4095) + '中', 4096).includes('\uFFFD')
+    report('inline: a body over maxInlineBytes is truncated without U+FFFD', ok, `inputBytes=9000 keptBytes=${keptBytes} hasFFFD=${inline.includes('\uFFFD')} marker=${/原文 9000 字节/.test(inline)}`)
+  })
+
+  await runCase('inline: short bodies stay byte-identical', async () => {
+    const { inlineBodyText } = await import(pathToFileURL(ENTRY).href)
+    const short = 'hello 你好'
+    const ok = inlineBodyText(short, 4096) === short && inlineBodyText('', 4096) === ''
+    report('inline: short bodies stay byte-identical', ok, `same=${inlineBodyText(short, 4096) === short}`)
+  })
+
+  await runCase('status: limits and seams report the defaults', async (boot) => {
+    const h = await boot({})
+    const status = await request(h.base, '/mesh/status')
+    const ok = status.json?.limits?.maxInlineBytes === 4096 && status.json?.seams?.approval === 'disabled' && status.json?.seams?.questions === 'absent'
+    report('status: limits and seams report the defaults', ok, `limits=${JSON.stringify(status.json?.limits)} seams=${JSON.stringify(status.json?.seams)}`)
+  })
+
+  await runCase('status: seams report an attached approval bridge', async (boot) => {
+    const h = await boot({ config: { approvalBridge: { enabled: true, to: 'peer-owner', allowFrom: ['peer-owner'] } } })
+    const status = await request(h.base, '/mesh/status')
+    const ok = status.json?.seams?.approval === 'attached' && status.json?.seams?.questions === 'absent'
+    report('status: seams report an attached approval bridge', ok, `seams=${JSON.stringify(status.json?.seams)}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

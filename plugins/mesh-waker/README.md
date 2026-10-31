@@ -108,7 +108,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `maxWakes` | `50` | 单个会话累计唤醒次数上限 |
 | `maxSteerPerWindow` | `1` | 每窗口允许的 steer 次数 |
 | `steerWindowMs` | `60000` | steer 计数窗口 |
-| `maxInlineBytes` | `4096` | 超过该大小的消息正文不再内联进回合 |
+| `maxInlineBytes` | `4096` | 单条正文内联进唤醒回合的 UTF-8 字节上限；超出时按字符边界截断并**在正文末尾标注**「正文已截断：原文 N 字节…完整内容请用 mesh_inbox 读取」（收件箱原文不变） |
 
 ### 补收与冷却
 

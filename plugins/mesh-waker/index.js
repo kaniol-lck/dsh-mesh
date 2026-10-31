@@ -495,6 +495,37 @@ export function previewText(text, max = 80) {
     .slice(0, max)
 }
 
+/**
+ * Truncate to at most `maxBytes` UTF-8 bytes without splitting a multi-byte character
+ * (the same idea as the hub's truncateUtf8). Never emits U+FFFD.
+ */
+export function truncateUtf8(text, maxBytes) {
+  const value = String(text ?? '')
+  const bytes = new TextEncoder().encode(value)
+  const limit = Math.max(0, Math.floor(Number(maxBytes) || 0))
+  if (bytes.length <= limit) return value
+  if (limit === 0) return ''
+  // bytes[limit] is the first excluded byte; walk back over continuation bytes so the cut
+  // lands on a character boundary.
+  let end = limit
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1
+  return new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, end))
+}
+
+/**
+ * The inline text of one message body: bodies above maxInlineBytes keep their head and get a
+ * one-line note with the original byte count. Only the prompt text changes; the inbox keeps
+ * the full message.
+ */
+export function inlineBodyText(body, maxBytes) {
+  const value = String(body ?? '')
+  const limit = Math.floor(Number(maxBytes) || 0)
+  const total = new TextEncoder().encode(value).length
+  if (!Number.isFinite(limit) || limit <= 0 || total <= limit) return value
+  const kept = truncateUtf8(value, limit)
+  return `${kept}\n…（正文已截断：原文 ${total} 字节，超过 maxInlineBytes=${limit}；完整内容请用 mesh_inbox 或 GET /api/inbox 读取）`
+}
+
 export const SESSION_PAGE_DEFAULT = 80
 export const SESSION_PAGE_MAX = 500
 
@@ -1877,7 +1908,7 @@ export function apply(ctx, config) {
         signal: AbortSignal.timeout(5000),
       })
       if (!res.ok) {
-        fileLog(`register failed HTTP ${res.status}`)
+        fileLog(`register failed HTTP ${res.status} wakeUrl=${wakeUrl}`)
         log.warn(`[mesh-waker] registering ${wakeUrl} failed: HTTP ${res.status}`)
       } else {
         try {
@@ -1891,7 +1922,7 @@ export function apply(ctx, config) {
         log.info(`[mesh-waker] registered wake endpoint ${wakeUrl}`)
       }
     } catch (error) {
-      fileLog(`register threw: ${error.message}`)
+      fileLog(`register threw for ${wakeUrl}: ${error.message}`)
       log.warn(`[mesh-waker] registering wake endpoint failed: ${error.message}`)
     }
   }
@@ -1932,7 +1963,7 @@ export function apply(ctx, config) {
     return messages
       .map((m, index) => {
         const head = `${index + 1}) 来自 ${m.sender}${m.subject ? ` 主题：${m.subject}` : ''}${m.conversation ? `（${m.conversation}）` : ''}`
-        return `${head}\n${m.body}`
+        return `${head}\n${inlineBodyText(m.body, c.maxInlineBytes)}`
       })
       .join('\n\n')
   }
@@ -2490,7 +2521,7 @@ export function apply(ctx, config) {
       log.info(`[mesh-waker] woke session ${sessionId}`)
     } catch (error) {
       state.lastError = `${error.name}: ${error.message}`
-      fileLog(`wake FAILED: ${state.lastError}`)
+      fileLog(`wake FAILED conv=${meta?.conversation ?? '-'} from=${meta?.sender ?? '-'}: ${state.lastError}`)
       log.warn(`[mesh-waker] wake failed: ${error.message}`)
       if (!meta.conversation) {
         sessionId = undefined
@@ -3581,6 +3612,9 @@ export function apply(ctx, config) {
     state.pendingTasks = 0
   }
 
+  // Seam self-check: /mesh/status.seams reports whether the optional hooks really attached.
+  const seams = { approval: bridge.enabled ? 'failed' : 'disabled', questions: 'absent' }
+
   if (typeof ctx.on === 'function') {
     ctx.effect(() => {
       const off = ctx.on('session/event', handleSessionEvent)
@@ -3588,8 +3622,21 @@ export function apply(ctx, config) {
     })
     // Remote approvals: disabled installs delegate straight to the next answerer.
     ctx.effect(() => {
-      const off = ctx.on('approval/request', handleApprovalRequest)
-      return typeof off === 'function' ? off : undefined
+      try {
+        const off = ctx.on('approval/request', handleApprovalRequest)
+        if (bridge.enabled) {
+          seams.approval = 'attached'
+          fileLog('approval seam attached (approvalBridge enabled)')
+        } else {
+          seams.approval = 'disabled'
+          fileLog('approval bridge disabled; approvals stay local')
+        }
+        return typeof off === 'function' ? off : undefined
+      } catch (error) {
+        seams.approval = 'failed'
+        fileLog(`approval seam attach failed: ${error.message}; approvals fall through to the local UI`)
+        return undefined
+      }
     })
     // Optional user-questions seam: probe the service instead of importing the package.
     // Missing seam means mesh_ask still works; the local UI stays in charge of questions.
@@ -3600,11 +3647,14 @@ export function apply(ctx, config) {
           const off = ctx.on('user-questions/request', handleUserQuestion)
           return typeof off === 'function' ? off : undefined
         })
+        seams.questions = 'attached'
         fileLog('user-questions seam detected; mesh_ask bridge attached')
       } catch (error) {
+        seams.questions = 'failed'
         fileLog(`user-questions seam attach failed: ${error.message}; mesh_ask only`)
       }
     } else {
+      seams.questions = 'absent'
       fileLog('user-questions seam absent; mesh_ask only')
     }
   }
@@ -4229,6 +4279,9 @@ export function apply(ctx, config) {
               // Model-tool self-check: a silent registration failure is visible here.
               tools: { dispatch: toolState.dispatch.ok, ask: toolState.ask.ok },
               toolsError: toolState.dispatch.error ?? toolState.ask.error ?? null,
+              // Effective limits and optional-seam state, so operators never have to guess.
+              limits: { maxInlineBytes: c.maxInlineBytes },
+              seams: { approval: seams.approval, questions: seams.questions },
               ...state,
               throttled: throttleSummary(),
               historyCached: history.size,
@@ -4741,6 +4794,7 @@ export function apply(ctx, config) {
         lastWakeAt = ts
         void wake(meta)
       })().catch((error) => {
+        fileLog(`request failed ${req.method} ${(req.url ?? '').split('?')[0]}: ${error.message}`)
         log.warn(`[mesh-waker] request failed: ${error.message}`)
         try {
           res.writeHead(500).end()

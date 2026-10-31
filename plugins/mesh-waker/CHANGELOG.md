@@ -5,9 +5,19 @@
 > **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
 > `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留 + 分页/日志 + 归档面板/残留清理 + 回执按 requester 路由 + 工具注册自检）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留 + 分页/日志 + 归档面板/残留清理 + 回执按 requester 路由 + 工具注册自检 + 内联截断/接缝状态）。
 
 ---
+
+## v0.7.9（2026-10-31，maxInlineBytes 真正生效；接缝与运维错误可见）
+
+| 项 | 内容 |
+|---|---|
+| 文档承诺 vs 实况 | `maxInlineBytes` 此前只在配置里解析、全文没有任何使用点，README 却承诺「超过该大小的正文不再内联」→ 已实现：`renderMessages` 逐条调用 `inlineBodyText(body, c.maxInlineBytes)`，超限时按 UTF-8 字符边界安全截断（`truncateUtf8`，不会切出 U+FFFD），并在末尾追加「…（正文已截断：原文 N 字节，超过 maxInlineBytes=M；完整内容请用 mesh_inbox 或 GET /api/inbox 读取）」；只影响回合内联文本，收件箱原文不变 |
+| 接缝日志 | approval 接缝挂载前后各一行：成功 `approval seam attached (approvalBridge enabled)`、未启用 `approval bridge disabled; approvals stay local`、失败 `approval seam attach failed: <原因>; approvals fall through to the local UI`（user-questions 原有三行不动） |
+| 运维错误进日志 | 注册 wakeUrl 失败（带状态码与 URL）、注册 wake endpoint 抛错（带 URL）、wake 失败（带 conversation/sender）、请求处理失败（带 method/path）四处补齐 `fileLog`，同时保留 `log.warn`；预期降级（`defineTool unavailable`、topic 配置告警）仍保持原级别 |
+| 可观测 | `/mesh/status` 增 `limits: { maxInlineBytes }` 与 `seams: { approval, questions }`（attached/disabled/failed/absent） |
+| 测试 | +4（共 97/97）：9000 字节正文按 4096 截断且不含 U+FFFD、标记含「原文 9000 字节」与 `maxInlineBytes=4096`、多字节边界安全；短正文与空正文逐字节不变；standalone 默认 `seams.approval=disabled/seams.questions=absent/limits.maxInlineBytes=4096`；启用 approvalBridge 后 `seams.approval=attached`。既有 93 例全绿 |
 
 ## v0.7.8（2026-10-31，mesh_dispatch 注册不再静默失败）
 
