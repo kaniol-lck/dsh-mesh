@@ -2406,6 +2406,25 @@ async function main() {
     report('tasks: list filters by status/session and pages with total', ok, `pending=${byStatus.json?.total} sessionB=${bySession.json?.total} pageTotal=${page.json?.total} pageId=${page.json?.tasks?.[0]?.taskId ?? '-'}`)
   })
 
+  await runCase('tasks: a task whose turn never starts becomes stalled', async (boot) => {
+    const h = await boot({
+      seedSessions: [{ id: 'session-stall', title: 'stall target' }],
+      config: { receiptStallMs: 1000 },
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'stall target', text: 'never starts', meta: { taskId: 'T-reg-stall' } },
+    })
+    const detail = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-reg-stall')
+      return snapshot.json?.task?.status === 'stalled' ? snapshot : null
+    }, 6000)
+    const receipt = readReceipts(h.receiptsPath).find((entry) => entry.taskId === 'T-reg-stall')
+    const task = detail?.json?.task ?? {}
+    const ok = task.status === 'stalled' && receipt?.status === 'not-started' && Number.isFinite(task.settledAt)
+    report('tasks: a task whose turn never starts becomes stalled', ok, `status=${task.status ?? '-'} receipt=${receipt?.status ?? '-'} settledAt=${task.settledAt ?? '-'}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
