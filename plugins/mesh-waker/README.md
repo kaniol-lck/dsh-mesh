@@ -20,6 +20,31 @@ dsh plugin --profile web add dsh-mesh-waker
 
 > 不用中枢也能跑：**不填 `hubUrl` 就是 standalone**，只起本机 `127.0.0.1:8795` 的五个本地端点，供同一 DSH 里的会话互相 inject。
 
+## 开发模式：本机 link（不是 npm 安装）
+
+本仓库维护者跑的是**开发态**：DSH profile 的 `node_modules/@local/dsh-mesh-waker` 是指向本机 checkout 的 link，而不是 registry 上的 npm 包。这与发布态是两件事，混在一起就会出现「改了仓库为什么没生效」。
+
+| 形态 | 谁用 | 安装方式 | 改动如何生效 |
+|---|---|---|---|
+| 发布态 | 外部用户 | `dsh plugin add dsh-mesh-waker` | 重新 `npm install` / 升级版本 |
+| 开发态 | 维护本仓库的人 | DSH profile 的 `node_modules/@local/dsh-mesh-waker` **link** 到本机 checkout | 同步文件 + 重启 DSH |
+
+**为什么开发态要 link**：npm 安装的是 registry 上的版本，改本地 checkout 不会影响已安装副本；link 让 profile 直接加载 checkout 里的文件，才能边改边验。
+
+开发态的同步三步（`<checkout>` 是本机 clone 路径，`<link-target>` 是 profile 里 `@local/dsh-mesh-waker` 指向的目录）：
+
+1. **同步文件**：把 `plugins/mesh-waker/` 下的 `index.js`、`client.js`、`locale/*`、`icon.svg`、`README/CHANGELOG` 复制到 `<link-target>`（Windows 示例：`Copy-Item "<checkout>\plugins\mesh-waker\index.js" "<link-target>\index.js" -Force`）；
+2. **保护 link 目标的 `package.json`**：`name` 必须是 `@local/dsh-mesh-waker`，`dsh.bundle.patch` 必须是 `./cordis.patch.yml`。**不要用仓库的 `package.json` 覆盖它**——覆盖后宿主会按 npm 形态解析，插件加载失败、客户端也可能崩；
+3. **重启 DSH 并确认**：`curl http://127.0.0.1:8795/mesh/status`，`pluginVersions.process` 应等于新版本；若 `stale=true`，说明文件已换但进程还跑旧代码。
+
+**常见故障**：
+
+- `process` 版本没变 → 没重启 DSH，或状态里 `stale=true` 说明进程仍是旧的；
+- 插件完全不加载、8795 无响应 → 先查 profile 的 cordis patch 里是否有 `disabled: true` 的 waker 条目，再查 `<link-target>/package.json` 的 `exports` 是否包含 `./package.json` 与 `./cordis.patch.yml`（缺了会 `ERR_PACKAGE_PATH_NOT_EXPORTED`）；
+- 开发态与发布态混淆 → 对照上表：`@local/dsh-mesh-waker` 是 link 的开发态，`dsh-mesh-waker` 是 npm 发布态，两者可共存但加载的是不同副本。
+
+> 本仓库所有验证都在开发态（link）下完成；发布态用户按上面「安装」一节即可，不需要做这些步骤。
+
 ## 它提供什么
 
 - **唤醒端点**：`/mesh/wake`，校验 HMAC 与时间窗；错误签名直接拒绝，不消耗会话；
