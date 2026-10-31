@@ -261,6 +261,14 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 **面板**：任务面板在「Mesh 信箱」页面顶部标签「派活任务」里（与「信箱」并列）；设置页只保留一行跳转说明。列表列为 `ID / 批次 / 目标会话 / 状态 / 耗时 / 创建时间`，支持状态与目标会话过滤；点行展开正文与回执摘要，提供「打开会话」（宿主 `uiWorkspace.openSession`，不可用时复制会话 id）。顶部统计 `pending N · 今日完成 M · stalled K`（基于当前筛选结果）。入口名可用 `entryLabel` 配置（默认 `Mesh 信箱`）。
 
+## 设置页（0.7.13）
+
+设置页按功能分五章、每章可折叠：**接入**（中枢登记/控制台/唤醒端口/接入向导占位）、**唤醒行为**（信任级别、投递方式、`maxWakes`、`resetAfterHours`、启动补收、投递模式、发送方指定、按设备信任）、**界面**（`entryLabel`、收件箱目录、本机会话归档）、**任务与回执**（回执状态、任务库保留策略、去任务面板）、**维护**（本地缓存、清缓存、轮换令牌、右栏状态）。
+
+- **可编辑**：`saveConfig` 白名单内的字段（`trust` / `delivery` / `maxWakes` / `resetAfterHours` / `catchUpOnStart` / `boundDeliveryMode` / `allowSenderDeliveryMode` / `workspacePath` 等）在 UI 里直接改，保存走 `POST /mesh/config`，成功提示「已保存」、失败显示服务端原文；保存后重新拉 `/mesh/status`，控件值以服务端为准。
+- **只读**：不在白名单里的项（如 `entryLabel`、`tasksRetentionDays`、`tasksMaxRows`）灰显并在 tooltip 标注「需改配置文件并重启」，不做成假可编辑。
+- 布局：每行 flex（`min-height:32px`、`gap:16px`），标题/说明 `flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap`，控件 `flex-shrink:0`，完整文本放行级 `title`。
+
 ## 批次与进度判定（0.5.2）
 
 **batch**：一次派 N 单，全部结束才通知一次。`dsh-mesh-dispatch` 加 `--batch [id]`（同 id 的多次调用归同一批，不带值自动生成 `B-<base36>`）与 `--deadline 2h|90m|600s`：

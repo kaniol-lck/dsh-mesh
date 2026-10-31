@@ -683,19 +683,98 @@ try {
             display: 'flex',
             alignItems: 'center',
             gap: 16,
-            padding: '14px 0',
+            minHeight: 32,
+            padding: '6px 0',
             borderBottom: '0.5px solid var(--dsw-alias-border-l3)',
           },
         },
         h(
           'div',
-          { style: { flex: '1 1 auto', minWidth: 0, display: 'grid', gap: 4 } },
-          h('span', { style: { fontSize: 13, fontWeight: 500, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)' } }, title),
+          { title: description ? title + ' — ' + description : title, style: { flex: '1 1 auto', minWidth: 0, display: 'grid', gap: 2 } },
+          h(
+            'span',
+            {
+              title,
+              style: {
+                fontSize: 13,
+                fontWeight: 500,
+                lineHeight: '20px',
+                color: 'var(--dsw-alias-label-primary)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              },
+            },
+            title,
+          ),
           description
-            ? h('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', lineHeight: '20px' } }, description)
+            ? h(
+                'span',
+                {
+                  title: description,
+                  style: {
+                    fontSize: 12,
+                    color: 'var(--dsw-alias-label-secondary)',
+                    lineHeight: '18px',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  },
+                },
+                description,
+              )
             : null,
         ),
-        h('div', { style: { flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 8 } }, children),
+        h('div', { style: { flex: '0 0 auto', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8 } }, children),
+      )
+    }
+
+    /** Collapsible settings chapter: title + one-line purpose + its rows (open by default). */
+    function SettingsSection({ title, description, defaultOpen = true, children }) {
+      const [open, setOpen] = React.useState(defaultOpen)
+      return h(
+        'section',
+        { style: { borderBottom: '1px solid var(--dsw-alias-border-l2)', padding: '2px 0 6px' } },
+        h(
+          'button',
+          {
+            type: 'button',
+            onClick: () => setOpen((value) => !value),
+            'aria-expanded': open,
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              width: '100%',
+              minHeight: 32,
+              padding: '6px 0',
+              border: 'none',
+              background: 'transparent',
+              color: 'inherit',
+              cursor: 'pointer',
+              textAlign: 'left',
+            },
+          },
+          h('span', { style: { fontSize: 13, fontWeight: 600, flexShrink: 0 } }, (open ? '▾ ' : '▸ ') + title),
+          description
+            ? h(
+                'span',
+                {
+                  title: description,
+                  style: {
+                    fontSize: 12,
+                    opacity: 0.65,
+                    minWidth: 0,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  },
+                },
+                description,
+              )
+            : null,
+        ),
+        open ? h('div', { style: { display: 'grid', gap: 0 } }, children) : null,
       )
     }
 
@@ -1063,6 +1142,20 @@ try {
       const [peerFilter, setPeerFilter] = React.useState('')
       const [maintenanceNote, setMaintenanceNote] = React.useState(null)
       const [sessions, setSessions] = React.useState(null)
+      const [draftMaxWakes, setDraftMaxWakes] = React.useState('')
+      const [draftResetAfterHours, setDraftResetAfterHours] = React.useState('')
+      const [draftSessionTitle, setDraftSessionTitle] = React.useState('')
+      const [draftBranchReuseHours, setDraftBranchReuseHours] = React.useState('')
+      const [draftCatchUpDelayMs, setDraftCatchUpDelayMs] = React.useState('')
+
+      React.useEffect(() => {
+        // Keep the inputs in sync with whatever the server actually has.
+        if (config && config.maxWakes !== undefined) setDraftMaxWakes(String(config.maxWakes))
+        if (config && config.resetAfterHours !== undefined) setDraftResetAfterHours(String(config.resetAfterHours))
+        if (config && config.sessionTitle !== undefined) setDraftSessionTitle(String(config.sessionTitle))
+        if (config && config.branchReuseHours !== undefined) setDraftBranchReuseHours(String(config.branchReuseHours))
+        if (config && config.catchUpDelayMs !== undefined) setDraftCatchUpDelayMs(String(config.catchUpDelayMs))
+      }, [config && config.maxWakes, config && config.resetAfterHours, config && config.sessionTitle, config && config.branchReuseHours, config && config.catchUpDelayMs])
 
       const startDrag = (event) => {
         event.preventDefault()
@@ -1218,7 +1311,10 @@ try {
             body: JSON.stringify(patch),
           })
           setConfig(result.config ?? config)
-          setNote('已保存')
+          // Never trust the local echo: re-read /mesh/status so the controls show what the
+          // server really has (the write may have fallen back to the patch file or config.json).
+          await reload()
+          setNote('已保存' + (result.persisted === false ? '（仅本次运行：' + (result.reason ?? '未落盘') + '）' : ''))
         } catch (error) {
           setNote('保存失败：' + error.message)
         }
@@ -1279,331 +1375,411 @@ try {
               '⚠ ' + staleVersionNotice(status),
             )
           : null,
+        note ? h('div', { style: { fontSize: 12, opacity: 0.8, padding: '4px 0' } }, note) : null,
         h(
-          Row,
-          { title: '中枢登记', description: status && status.wakeUrl ? status.wakeUrl : '' },
-          h('span', { style: { fontSize: 13, opacity: 0.8 } }, status && status.registered ? '已登记' : '未登记'),
-        ),
-        h(
-          Row,
-          {
-            title: '本机会话',
-            description: '归档后置灰并标记；删除只走 CLI（面板不提供，避免误删会话目录）。',
-          },
+          SettingsSection,
+          { title: '接入', description: '中枢登记、控制台与本机唤醒端口；接入向导开发中。' },
           h(
-            'div',
-            { style: { display: 'grid', gap: 4, minWidth: 260, maxHeight: 220, overflowY: 'auto' } },
-            (sessions ?? []).map((session) => {
-              const row = formatSessionRow(session)
-              return h(
-                'div',
-                {
-                  key: row.id,
-                  title: row.title,
-                  style: { display: 'flex', alignItems: 'center', gap: 8, height: 28, minWidth: 0, opacity: row.opacity },
-                },
-                h(
-                  'span',
-                  { style: { flex: 1, minWidth: 0, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-                  row.title,
-                ),
-                row.label
-                  ? h(
-                      'span',
-                      {
-                        style: {
-                          flexShrink: 0,
-                          fontSize: 11,
-                          padding: '1px 6px',
-                          borderRadius: 4,
-                          background: 'rgba(120, 120, 120, 0.2)',
-                          color: 'var(--dsw-alias-label-secondary, inherit)',
-                        },
-                      },
-                      row.label,
-                    )
-                  : null,
-                row.disabled
-                  ? null
-                  : h(
-                      'button',
-                      {
-                        type: 'button',
-                        style: { ...styles.button, flexShrink: 0, width: 56, height: 24, padding: 0, fontSize: 11 },
-                        onClick: () => archiveSession(session),
-                      },
-                      '归档',
-                    ),
+            Row,
+            { title: '中枢登记', description: status && status.wakeUrl ? status.wakeUrl : '未配置 hubUrl 时为 standalone' },
+            h('span', { style: { fontSize: 13, opacity: 0.8 } }, status && status.registered ? '已登记' : '未登记'),
+          ),
+          status && status.hubConsoleUrl
+            ? h(
+                Row,
+                { title: '中枢控制台', description: '发注册码 / 批准节点 / 轮换令牌 / 改 scopes 在中枢控制台完成。' },
+                h(Btn, { onClick: () => window.open(status.hubConsoleUrl, '_blank', 'noopener,noreferrer') }, '打开'),
               )
+            : null,
+          h(
+            Row,
+            { title: '本机唤醒端口', description: '面板、注入与 push 共用的 loopback 端口' },
+            h(
+              'span',
+              { style: { fontFamily: 'monospace', fontSize: 12 } },
+              status && status.listenPort ? '127.0.0.1:' + status.listenPort : '127.0.0.1:8795',
+            ),
+          ),
+          h(
+            Row,
+            { title: '接入向导', description: '开发中：后续版本提供 hubUrl / 注册码的可视化配置' },
+            h('span', { style: { fontSize: 12, opacity: 0.6 } }, '接入向导开发中'),
+          ),
+        ),
+        h(
+          SettingsSection,
+          { title: '唤醒行为', description: '自动唤醒的权限口径、投递方式与频率上限。' },
+          h(
+            Row,
+            { title: '信任级别（默认）', description: 'strict 只读 / normal 需批准 / full 直接执行；只在本机生效' },
+            h(
+              MiniSelect,
+              { style: selectStyle, value: config.trust ?? 'normal', onChange: (event) => void save({ trust: event.target.value }) },
+              [
+                ['normal', 'normal（默认）'],
+                ['strict', 'strict（只读）'],
+                ['full', 'full（完全信任）'],
+              ].map(([value, label]) => h('option', { key: value, value }, label)),
+            ),
+          ),
+          h(
+            Row,
+            { title: '消息投递方式', description: '唤醒时把未读正文写进提示词；附件失败会自动回退为内联' },
+            h(
+              MiniSelect,
+              { style: selectStyle, value: config.delivery ?? 'inline', onChange: (event) => void save({ delivery: event.target.value }) },
+              [
+                ['inline', 'inline（内联正文）'],
+                ['both', 'both（内联+附件）'],
+                ['attachment', 'attachment（仅附件）'],
+                ['prompt-only', 'prompt-only（只发指令）'],
+              ].map(([value, label]) => h('option', { key: value, value }, label)),
+            ),
+          ),
+          h(
+            Row,
+            { title: '最大唤醒次数', description: '同一会话自动唤醒的上限（正整数，超出后等人工介入）' },
+            h('input', {
+              type: 'number',
+              min: 1,
+              step: 1,
+              style: { ...controlStyle, width: 96, fontSize: 12, padding: '2px 6px' },
+              value: draftMaxWakes,
+              onChange: (event) => setDraftMaxWakes(event.target.value),
             }),
-            (sessions ?? []).length ? null : h('span', { style: { fontSize: 12, opacity: 0.6 } }, '（无会话）'),
+            h(Btn, { onClick: () => void save({ maxWakes: Number(draftMaxWakes) }) }, '保存'),
           ),
-        ),
-        status && status.hubConsoleUrl
-          ? h(
-              Row,
+          h(
+            Row,
+            { title: '重置会话间隔（小时）', description: '超过该时长重新开一个唤醒会话（正数）' },
+            h('input', {
+              type: 'number',
+              min: 0.1,
+              step: 0.5,
+              style: { ...controlStyle, width: 96, fontSize: 12, padding: '2px 6px' },
+              value: draftResetAfterHours,
+              onChange: (event) => setDraftResetAfterHours(event.target.value),
+            }),
+            h(Btn, { onClick: () => void save({ resetAfterHours: Number(draftResetAfterHours) }) }, '保存'),
+          ),
+          h(
+            Row,
+            { title: '启动时补收未读', description: 'dsh 启动约 12 秒后扫一次未读，补上关机期间错过的消息' },
+            h(SwitchControl, {
+              checked: Boolean(config.catchUpOnStart),
+              label: '启动时补收未读',
+              onChange: (next) => void save({ catchUpOnStart: next }),
+            }),
+          ),
+          h(
+            Row,
+            { title: '投递模式', description: '本机默认：排队等当前回合 / 插队打断 / 分支 fork 侧会话' },
+            h(
+              MiniSelect,
               {
-                title: '中枢控制台',
-                description: '管理动作（发注册码 / 批准新节点 / 轮换令牌 / 改 scopes）在中枢控制台完成。',
-              },
-              h(
-                'button',
-                {
-                  type: 'button',
-                  style: styles.button,
-                  onClick: () => window.open(status.hubConsoleUrl, '_blank', 'noopener,noreferrer'),
+                style: selectStyle,
+                value: (config && config.boundDeliveryMode) || 'queue',
+                onChange: async (event) => {
+                  const value = event.target.value
+                  const label = { queue: '排队', steer: '插队', branch: '分支' }[value] ?? value
+                  try {
+                    await save({ boundDeliveryMode: value })
+                    setMaintenanceNote('投递模式已切换为「' + label + '」')
+                  } catch (error) {
+                    setMaintenanceNote('设置投递模式失败：' + error.message)
+                  }
                 },
-                '打开',
-              ),
-            )
-          : null,
-        h(
-          Row,
-          {
-            title: '任务回执',
-            description: '带 taskId 的 inject 在回合结束时写一条 JSONL；queue/wake 会再通知回执会话。只读。',
-          },
-          h(
-            'span',
-            { style: { fontSize: 12, opacity: 0.8 } },
-            (status.receiptMode ?? 'file') +
-              (status.lastReceipt
-                ? ` · 最近 ${status.lastReceipt.taskId} ${status.lastReceipt.status} ${new Date(status.lastReceipt.at).toLocaleTimeString()}`
-                : ' · 暂无回执') +
-              (status.pendingTasks ? ` · 等待结算 ${status.pendingTasks}` : '') +
-              (status.pendingBatches ? ` · 批次 ${status.pendingBatches}` : ''),
+              },
+              h('option', { value: 'queue' }, '排队（等待当前回合结束）'),
+              h('option', { value: 'steer' }, '插队（打断当前回合）'),
+              h('option', { value: 'branch' }, '分支（fork 侧会话）'),
+            ),
           ),
-        ),
-        h(
-          Row,
-          { title: '派活任务', description: `任务面板已移到「${entryLabel}」页面（顶部标签「派活任务」），设置页不再放表格。` },
           h(
-            'button',
-            {
-              type: 'button',
-              style: styles.button,
-              onClick: () =>
-                setNote(
-                  '请从左侧边栏打开「' + entryLabel + '」→ 顶部「派活任务」；宿主未暴露主页面导航 API（uiWorkspace 只有 startSession/openSession/openWorkspace 等）。',
-                ),
-            },
-            '去任务面板',
+            Row,
+            { title: '发送方指定', description: '允许对方在消息里指定排队/插队/分支；关闭后只按本机默认值' },
+            h(SwitchControl, {
+              checked: Boolean(config && config.allowSenderDeliveryMode),
+              label: '允许发送方指定',
+              onChange: (next) => void save({ allowSenderDeliveryMode: next }),
+            }),
           ),
-        ),
-        h(
-          Row,
-          { title: '信任级别（默认）', description: '自动唤醒会话的执行口径与权限：strict 只读 / normal 需批准 / full 直接执行。只在本机生效。' },
           h(
-            MiniSelect,
-            {
-              style: selectStyle,
-              value: config.trust ?? 'normal',
-              onChange: (event) => void save({ trust: event.target.value }),
-            },
-            [
-              ['normal', 'normal（默认）'],
-              ['strict', 'strict（只读）'],
-              ['full', 'full（完全信任）'],
-            ].map(([value, label]) => h('option', { key: value, value }, label)),
+            Row,
+            { title: '唤醒会话标题', description: '新建唤醒会话时使用的标题（≤60 字）' },
+            h('input', {
+              type: 'text',
+              style: { ...controlStyle, width: 220, fontSize: 12, padding: '2px 6px' },
+              value: draftSessionTitle,
+              onChange: (event) => setDraftSessionTitle(event.target.value),
+            }),
+            h(Btn, { onClick: () => void save({ sessionTitle: draftSessionTitle }) }, '保存'),
           ),
-        ),
-        h(
-          Row,
-          { title: '右栏信箱', description: '侧边栏「开始」里的 Mesh 信箱卡片；显示 pending/ok/missing 便于排查' },
-          h('span', { style: { fontSize: 12, opacity: 0.8 } }, String(rightTabState ?? 'unknown')),
-        ),
-        h(Row, { title: '按设备信任', description: '表格：设备 / 主机 / 状态 / 信任级别；没指定的跟随上面的默认级别' }),
-        others.length
-          ? h(
-              'table',
-              { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12, marginBottom: 8 } },
-              h(
-                'thead',
-                null,
+          h(
+            Row,
+            { title: '分支复用时长（小时）', description: 'branch 模式下复用同一侧会话的时间窗（正数）' },
+            h('input', {
+              type: 'number',
+              min: 0.5,
+              step: 1,
+              style: { ...controlStyle, width: 96, fontSize: 12, padding: '2px 6px' },
+              value: draftBranchReuseHours,
+              onChange: (event) => setDraftBranchReuseHours(event.target.value),
+            }),
+            h(Btn, { onClick: () => void save({ branchReuseHours: Number(draftBranchReuseHours) }) }, '保存'),
+          ),
+          h(
+            Row,
+            { title: '启动补收延迟（毫秒）', description: '启动后等待多久再扫未读，给宿主留初始化时间（≥0）' },
+            h('input', {
+              type: 'number',
+              min: 0,
+              step: 500,
+              style: { ...controlStyle, width: 110, fontSize: 12, padding: '2px 6px' },
+              value: draftCatchUpDelayMs,
+              onChange: (event) => setDraftCatchUpDelayMs(event.target.value),
+            }),
+            h(Btn, { onClick: () => void save({ catchUpDelayMs: Number(draftCatchUpDelayMs) }) }, '保存'),
+          ),
+          h(Row, { title: '按设备信任', description: '表格：设备 / 主机 / 状态 / 信任级别；没指定的跟随默认级别' }),
+          others.length
+            ? h(
+                'table',
+                { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12, marginBottom: 8 } },
                 h(
-                  'tr',
+                  'thead',
                   null,
-                  ['设备', '主机', '状态', '信任级别'].map((label) =>
-                    h(
-                      'th',
-                      {
-                        key: label,
-                        style: {
-                          textAlign: 'left',
-                          fontWeight: 600,
-                          padding: '5px 8px',
-                          borderBottom: '1px solid rgba(127,127,127,0.16)',
-                          color: 'var(--dsw-alias-label-secondary)',
-                        },
-                      },
-                      label,
-                    ),
-                  ),
-                ),
-              ),
-              h(
-                'tbody',
-                null,
-                others.map((peer) =>
                   h(
                     'tr',
-                    { key: peer.name },
-                    h('td', { style: { padding: '5px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } }, peer.name),
-                    h('td', { style: { padding: '5px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } }, peer.host || '—'),
-                    h('td', { style: { padding: '5px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } }, peer.online ? '在线' : '离线'),
-                    h(
-                      'td',
-                      { style: { padding: '4px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } },
+                    null,
+                    ['设备', '主机', '状态', '信任级别'].map((label) =>
                       h(
-                        MiniSelect,
+                        'th',
                         {
-                          style: { ...selectStyle, height: 28, padding: '0 24px 0 8px', fontSize: 12 },
-                          value: trustByPeer[peer.name] ?? '',
-                          onChange: (event) => void setPeerTrust(peer.name, event.target.value),
+                          key: label,
+                          style: {
+                            textAlign: 'left',
+                            fontWeight: 600,
+                            padding: '5px 8px',
+                            borderBottom: '1px solid rgba(127,127,127,0.16)',
+                            color: 'var(--dsw-alias-label-secondary)',
+                          },
                         },
-                        h('option', { value: '' }, '跟随默认'),
-                        [
-                          ['normal', 'normal'],
-                          ['strict', 'strict'],
-                          ['full', 'full'],
-                        ].map(([value, label]) => h('option', { key: value, value }, label)),
+                        label,
                       ),
                     ),
                   ),
                 ),
-              ),
-            )
-          : h('div', { style: { fontSize: 12, opacity: 0.6, padding: '8px 0' } }, '（暂无其他 agent）'),
+                h(
+                  'tbody',
+                  null,
+                  others.map((peer) =>
+                    h(
+                      'tr',
+                      { key: peer.name },
+                      h('td', { style: { padding: '5px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } }, peer.name),
+                      h('td', { style: { padding: '5px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } }, peer.host || '—'),
+                      h('td', { style: { padding: '5px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } }, peer.online ? '在线' : '离线'),
+                      h(
+                        'td',
+                        { style: { padding: '4px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } },
+                        h(
+                          MiniSelect,
+                          {
+                            style: { ...selectStyle, height: 28, padding: '0 24px 0 8px', fontSize: 12 },
+                            value: trustByPeer[peer.name] ?? '',
+                            onChange: (event) => void setPeerTrust(peer.name, event.target.value),
+                          },
+                          h('option', { value: '' }, '跟随默认'),
+                          [
+                            ['normal', 'normal'],
+                            ['strict', 'strict'],
+                            ['full', 'full'],
+                          ].map(([value, label]) => h('option', { key: value, value }, label)),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              )
+            : h('div', { style: { fontSize: 12, opacity: 0.6, padding: '8px 0' } }, '（暂无其他 agent）'),
+        ),
         h(
-          Row,
-          { title: '收件箱目录', description: '自动唤醒的会话建在这里；改动后下一个会话生效，旧会话归档' },
+          SettingsSection,
+          { title: '界面', description: '入口名称与本机会话目录；只读项需改配置文件并重启。' },
           h(
-            'span',
+            Row,
             {
-              style: {
-                fontFamily: 'monospace',
-                fontSize: 12,
-                opacity: 0.7,
-                maxWidth: 280,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              },
-              title: config.workspacePath ?? '',
+              title: '入口名称（entryLabel）',
+              description: config && config.entryLabel ? '当前：' + config.entryLabel + ' · 只读（需改配置文件并重启）' : '只读（需改配置文件并重启）',
             },
-            config.workspacePath || '（未设置）',
+            h('span', {
+              title: '需改配置文件并重启',
+              style: { fontSize: 12, opacity: 0.5 },
+            }, config && config.entryLabel ? config.entryLabel : 'Mesh 信箱'),
           ),
-          h(Btn, { onClick: pickDir }, '选择目录…'),
-        ),
-        h(
-          Row,
-          { title: '消息投递方式', description: '唤醒时把未读正文写进提示词；附件仍是实验态，失败会自动回退为内联' },
           h(
-            MiniSelect,
-            {
-              style: selectStyle,
-              value: config.delivery ?? 'inline',
-              onChange: (event) => void save({ delivery: event.target.value }),
-            },
-            [
-              ['inline', 'inline（内联正文）'],
-              ['both', 'both（内联+附件）'],
-              ['attachment', 'attachment（仅附件）'],
-              ['prompt-only', 'prompt-only（只发指令）'],
-            ].map(([value, label]) => h('option', { key: value, value }, label)),
-          ),
-        ),
-        h(
-          Row,
-          { title: '启动时补收未读', description: 'dsh 启动约 12 秒后扫一次未读并处理，补上关机期间错过的消息' },
-          h(SwitchControl, { checked: Boolean(config.catchUpOnStart), label: '启动时补收未读', onChange: (next) => void save({ catchUpOnStart: next }) }),
-        ),
-        h(
-          Row,
-          {
-            title: '会话历史（本地缓存）',
-            description:
-              (status && status.historyCached ? status.historyCached : 0) +
-              ' 条已缓存 · 中枢保留 7 天，重要消息不过期，本地永久',
-          },
-          h(
-            'div',
-            { style: { display: 'flex', gap: 8 } },
-            h(Btn, { onClick: syncHistory }, '从中枢同步'),
-            h(Btn, { onClick: () => void loadHistory() }, '刷新'),
-          ),
-        ),
-        historyNote ? h('div', { style: { fontSize: 12, opacity: 0.7, padding: '4px 0 8px' } }, historyNote) : null,
-        h(
-          Row,
-          {
-            title: '投递模式',
-            description:
-              '本机默认值：排队等当前回合结束 / 插队打断 / 分支 fork 侧会话。优先级：消息自带 delivery > interrupt > 本机默认；发送方指定插队时仍受本机频率上限约束',
-          },
-          h(
-            MiniSelect,
-            {
-              style: selectStyle,
-              value: (config && config.boundDeliveryMode) || 'queue',
-              onChange: async (event) => {
-                const value = event.target.value
-                const label = { queue: '排队', steer: '插队', branch: '分支' }[value] ?? value
-                try {
-                  const result = await json(BASE + '/mesh/config', {
-                    method: 'POST',
-                    headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify({ boundDeliveryMode: value }),
-                  })
-                  setMaintenanceNote('投递模式已切换为「' + label + '」' + (result.persisted ? '，已保存' : '，仅本次运行'))
-                  await reload()
-                } catch (error) {
-                  setMaintenanceNote('设置投递模式失败：' + error.message)
-                }
-              },
-            },
-            h('option', { value: 'queue' }, '排队（等待当前回合结束）'),
-            h('option', { value: 'steer' }, '插队（打断当前回合）'),
-            h('option', { value: 'branch' }, '分支（fork 侧会话）'),
-          ),
-        ),
-        h(
-          Row,
-          {
-            title: '发送方指定',
-            description: '允许对方在消息里用 delivery 字段指定排队/插队/分支；关闭后只按本机默认值处理',
-          },
-          h(SwitchControl, {
-            checked: Boolean(config && config.allowSenderDeliveryMode),
-            label: '允许发送方指定',
-            onChange: (next) => void save({ allowSenderDeliveryMode: next }),
-          }),
-        ),
-        h(
-          Row,
-          { title: '维护', description: '本地历史缓存与本机令牌；绑定管理在「Mesh 信箱」页面里' },
-          h(
-            'div',
-            { style: { display: 'flex', gap: 8 } },
+            Row,
+            { title: '收件箱目录', description: '自动唤醒的会话建在这里；改动后下一个会话生效，旧会话归档' },
             h(
-              Btn,
+              'span',
               {
-                onClick: async () => {
-                  try {
-                    const cache = await json(BASE + '/mesh/admin/cache')
-                    setMaintenanceNote('本地缓存 ' + (cache.messages ?? 0) + ' 条 · ' + Math.round((cache.bytes ?? 0) / 1024) + ' KB · ' + (cache.path ?? ''))
-                  } catch (error) {
-                    setMaintenanceNote('读取缓存信息失败：' + error.message)
-                  }
-                },
+                style: { fontFamily: 'monospace', fontSize: 12, opacity: 0.7, maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                title: config.workspacePath ?? '',
               },
-              '缓存状态',
+              config.workspacePath || '（未设置）',
             ),
-            h(Btn, { onClick: () => void clearLocalCache() }, '清空本地缓存'),
-            h(Btn, { onClick: () => void rotateToken() }, '轮换本机令牌'),
+            h(Btn, { onClick: pickDir }, '选择目录…'),
+          ),
+          h(
+            Row,
+            { title: '本机会话', description: '归档后置灰并标记；删除只走 CLI（面板不提供，避免误删会话目录）' },
+            h(
+              'div',
+              { style: { display: 'grid', gap: 4, minWidth: 260, maxHeight: 220, overflowY: 'auto' } },
+              (sessions ?? []).map((session) => {
+                const row = formatSessionRow(session)
+                return h(
+                  'div',
+                  {
+                    key: row.id,
+                    title: row.title,
+                    style: { display: 'flex', alignItems: 'center', gap: 8, height: 28, minWidth: 0, opacity: row.opacity },
+                  },
+                  h(
+                    'span',
+                    { style: { flex: 1, minWidth: 0, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                    row.title,
+                  ),
+                  row.label
+                    ? h(
+                        'span',
+                        {
+                          style: {
+                            flexShrink: 0,
+                            fontSize: 11,
+                            padding: '1px 6px',
+                            borderRadius: 4,
+                            background: 'rgba(120, 120, 120, 0.2)',
+                            color: 'var(--dsw-alias-label-secondary, inherit)',
+                          },
+                        },
+                        row.label,
+                      )
+                    : null,
+                  row.disabled
+                    ? null
+                    : h(
+                        'button',
+                        {
+                          type: 'button',
+                          style: { ...styles.button, flexShrink: 0, width: 56, height: 24, padding: 0, fontSize: 11 },
+                          onClick: () => archiveSession(session),
+                        },
+                        '归档',
+                      ),
+                )
+              }),
+              (sessions ?? []).length ? null : h('span', { style: { fontSize: 12, opacity: 0.6 } }, '（无会话）'),
+            ),
           ),
         ),
-        maintenanceNote ? h('div', { style: { fontSize: 12, opacity: 0.75, padding: '2px 0 8px' } }, maintenanceNote) : null,
+        h(
+          SettingsSection,
+          { title: '任务与回执', description: '回执留痕与任务库；保留策略只读（改配置文件并重启）。' },
+          h(
+            Row,
+            { title: '任务回执', description: '带 taskId 的 inject 在回合结束时写一条 JSONL；queue/wake 会再通知回执会话' },
+            h(
+              'span',
+              { style: { fontSize: 12, opacity: 0.8 } },
+              (status && status.receiptMode ? status.receiptMode : 'file') +
+                (status && status.lastReceipt
+                  ? ' · 最近 ' + status.lastReceipt.taskId + ' ' + status.lastReceipt.status + ' ' + new Date(status.lastReceipt.at).toLocaleTimeString()
+                  : ' · 暂无回执') +
+                (status && status.pendingTasks ? ' · 等待结算 ' + status.pendingTasks : '') +
+                (status && status.pendingBatches ? ' · 批次 ' + status.pendingBatches : ''),
+            ),
+          ),
+          h(
+            Row,
+            { title: '任务库保留策略', description: '只读：tasksRetentionDays / tasksMaxRows（需改配置文件并重启）' },
+            h(
+              'span',
+              { title: '需改配置文件并重启', style: { fontSize: 12, opacity: 0.8 } },
+              (config && config.tasksRetentionDays ? config.tasksRetentionDays : '?') +
+                ' 天 / ' +
+                (config && config.tasksMaxRows ? config.tasksMaxRows : '?') +
+                ' 条',
+            ),
+          ),
+          h(
+            Row,
+            { title: '派活任务', description: '任务面板在「' + entryLabel + '」页面顶部标签「派活任务」，设置页不放表格' },
+            h(
+              'button',
+              {
+                type: 'button',
+                style: styles.button,
+                onClick: () =>
+                  setNote(
+                    '请从左侧边栏打开「' + entryLabel + '」→ 顶部「派活任务」；宿主未暴露主页面导航 API（uiWorkspace 只有 startSession/openSession/openWorkspace 等）。',
+                  ),
+              },
+              '去任务面板',
+            ),
+          ),
+        ),
+        h(
+          SettingsSection,
+          { title: '维护', description: '本地缓存、本机令牌与面板状态；绑定管理在「' + entryLabel + '」页面。' },
+          h(
+            Row,
+            {
+              title: '会话历史（本地缓存）',
+              description:
+                (status && status.historyCached ? status.historyCached : 0) +
+                ' 条已缓存 · 中枢保留 7 天，重要消息不过期，本地永久',
+            },
+            h(
+              'div',
+              { style: { display: 'flex', gap: 8 } },
+              h(Btn, { onClick: syncHistory }, '从中枢同步'),
+              h(Btn, { onClick: () => void loadHistory() }, '刷新'),
+            ),
+          ),
+          historyNote ? h('div', { style: { fontSize: 12, opacity: 0.7, padding: '4px 0 8px' } }, historyNote) : null,
+          h(
+            Row,
+            { title: '本地缓存与本机令牌', description: '缓存状态只读；清空/轮换为高风险动作' },
+            h(
+              'div',
+              { style: { display: 'flex', gap: 8 } },
+              h(
+                Btn,
+                {
+                  onClick: async () => {
+                    try {
+                      const cache = await json(BASE + '/mesh/admin/cache')
+                      setMaintenanceNote('本地缓存 ' + (cache.messages ?? 0) + ' 条 · ' + Math.round((cache.bytes ?? 0) / 1024) + ' KB · ' + (cache.path ?? ''))
+                    } catch (error) {
+                      setMaintenanceNote('读取缓存信息失败：' + error.message)
+                    }
+                  },
+                },
+                '缓存状态',
+              ),
+              h(Btn, { onClick: () => void clearLocalCache() }, '清空本地缓存'),
+              h(Btn, { onClick: () => void rotateToken() }, '轮换本机令牌'),
+            ),
+          ),
+          h(
+            Row,
+            { title: '右栏信箱', description: '侧边栏「开始」里的卡片状态，便于排查' },
+            h('span', { style: { fontSize: 12, opacity: 0.8 } }, String(rightTabState ?? 'unknown')),
+          ),
+          maintenanceNote ? h('div', { style: { fontSize: 12, opacity: 0.75, padding: '2px 0 8px' } }, maintenanceNote) : null,
+        ),
         h(
           'div',
           {

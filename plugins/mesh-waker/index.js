@@ -2600,6 +2600,9 @@ export function apply(ctx, config) {
     catchUpDelayMs: c.catchUpDelayMs,
     // The client reads this to label the inbox entry/title (config.entryLabel).
     entryLabel: c.entryLabel,
+    // Read-only projection: retention is config-file only, the settings page just shows it.
+    tasksRetentionDays: c.tasksRetentionDays,
+    tasksMaxRows: c.tasksMaxRows,
   })
 
   /** The settings panel talks to this process over loopback; anything else may only wake. */
