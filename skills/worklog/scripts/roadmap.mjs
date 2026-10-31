@@ -30,6 +30,7 @@
  * Exit codes: 0 OK, 1 drift or parse error, 2 usage / missing markers.
  */
 
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -60,8 +61,11 @@ Options:
   --version-file <file>      optional source file holding a version constant
   --version-key <name>       constant name (default HUB_VERSION)
   --version-package <file>   optional package.json that must match the constant
+  --run-checks               run {check} gate requirements (default: yes in --check/--json)
+  --no-checks                skip {check} gate requirements
+  --fail-on-check            exit 1 when a non-optional check fails
 
-Exit codes: 0 = OK, 1 = drift or parse error, 2 = usage / missing markers.`
+Exit codes: 0 = OK, 1 = drift or parse error (or failed check with --fail-on-check), 2 = usage / missing markers.`
 
 function fail(code, message) {
   console.error(message)
@@ -80,6 +84,9 @@ function parseArgs(argv) {
     versionKey: 'HUB_VERSION',
     versionPackage: null,
     featuresFile: null,
+    noChecks: false,
+    runChecks: null,
+    failOnCheck: false,
   }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -101,6 +108,9 @@ function parseArgs(argv) {
       case '--version-key': options.versionKey = takeValue(); break
       case '--version-package': options.versionPackage = takeValue(); break
       case '--features-file': options.featuresFile = takeValue(); break
+      case '--no-checks': options.noChecks = true; break
+      case '--run-checks': options.runChecks = true; break
+      case '--fail-on-check': options.failOnCheck = true; break
       case '-h':
       case '--help':
         console.log(USAGE)
@@ -409,6 +419,7 @@ function formatItem(entry, today = new Date()) {
 }
 
 function gateRequireLabel(require) {
+  if (require?.check) return require.check.label ?? require.check.command ?? 'check'
   return require?.match ?? require?.feature ?? '(empty)'
 }
 
@@ -418,18 +429,74 @@ function gateRequireEntries(require, entries) {
   return entries.filter((entry) => entry.displayTitle.toLowerCase().includes(needle))
 }
 
-function evaluateGate(gate, entries) {
+/** Run every {check} requirement once. exit 0 = satisfied; timeout counts as failure. */
+function runGateChecks(gates, log = console.log) {
+  const results = {}
+  for (const gate of gates) {
+    const list = []
+    for (const require of gate.requires ?? []) {
+      if (!require.check) continue
+      const spec = require.check
+      const label = gateRequireLabel(require)
+      const command = String(spec.command ?? '')
+      const timeout = Number(spec.timeoutMs) > 0 ? Number(spec.timeoutMs) : 60_000
+      const started = Date.now()
+      let ok = false
+      let code = null
+      let outputTail = ''
+      if (!command) {
+        code = 'missing-command'
+        outputTail = 'check requires a command'
+      } else {
+        const proc = spawnSync(command, { shell: true, cwd: process.cwd(), timeout, encoding: 'utf8' })
+        code = proc.status ?? (proc.error?.code === 'ETIMEDOUT' ? 'timeout' : 'error')
+        ok = code === 0
+        outputTail = `${proc.stdout ?? ''}${proc.stderr ?? ''}`.trim().slice(-800)
+      }
+      const ms = Date.now() - started
+      const optional = spec.optional === true
+      list.push({ label, ok, optional, code, ms, outputTail })
+      if (ok) log(`ok check「${label}」(${ms}ms)`)
+      else {
+        const why = optional ? '（optional，不阻塞）' : ''
+        log(`WARN check「${label}」失败（exit ${code}, ${ms}ms）${why}`)
+        if (outputTail) for (const line of outputTail.split(/\r?\n/)) log(`  | ${line}`)
+      }
+    }
+    if (list.length) results[gate.id] = list
+  }
+  return results
+}
+
+function evaluateGate(gate, entries, checkResults) {
   const met = []
   const seen = new Set()
   const blocking = []
   const capsules = []
   const capsuleSeen = new Set()
+  const checks = []
   const pushBlocker = (key, title) => {
     if (seen.has(key)) return
     seen.add(key)
     blocking.push(title)
   }
   for (const require of gate.requires ?? []) {
+    if (require.check) {
+      const label = gateRequireLabel(require)
+      const result = (checkResults?.[gate.id] ?? []).find((item) => item.label === label)
+      if (!result) {
+        pushBlocker(`check-missing:${label}`, `check:${label}(未运行)`)
+        continue
+      }
+      checks.push(result)
+      if (result.ok) {
+        met.push(require)
+        continue
+      }
+      if (result.optional) continue
+      pushBlocker(`check:${label}`, `check:${label}`)
+      continue
+    }
     const matched = gateRequireEntries(require, entries)
     for (const entry of matched) {
       const key = `${entry.file}:${entry.line}`
@@ -458,6 +525,7 @@ function evaluateGate(gate, entries) {
     met: met.length,
     total: (gate.requires ?? []).length,
     blocking,
+    checks,
     capsules: capsules.map((entry) => ({ title: entry.displayTitle, status: entry.status, owner: entry.owner, feature: entry.feature })),
   }
 }
@@ -481,8 +549,29 @@ function nextUp(entries) {
   }))
 }
 
-function gateRows(gates, entries) {
-  return gates.map((gate) => evaluateGate(gate, entries))
+function gateRows(gates, entries, checkResults) {
+  return gates.map((gate) => evaluateGate(gate, entries, checkResults))
+}
+
+function checksCachePath(worklogDir) {
+  return path.join(worklogDir, 'checks.json')
+}
+
+async function loadChecksCache(worklogDir) {
+  try {
+    const parsed = JSON.parse(await readFile(checksCachePath(worklogDir), 'utf8'))
+    return parsed.checks ?? {}
+  } catch {
+    return {}
+  }
+}
+
+async function saveChecksCache(worklogDir, checks) {
+  try {
+    await atomicWrite(checksCachePath(worklogDir), JSON.stringify({ at: nowStamp(), checks }, null, 2) + '\n')
+  } catch (error) {
+    console.warn(`WARN: cannot cache check results: ${error.message}`)
+  }
 }
 
 async function loadGates(file) {
@@ -507,7 +596,7 @@ async function loadGates(file) {
   }
 }
 
-function buildSegment(entries, generatedAt, hash, version, gates, sourceLabel, features) {
+function buildSegment(entries, generatedAt, hash, version, gates, sourceLabel, features, checkResults) {
   const counts = countEntries(entries)
   const unfinished = entries.filter((entry) => entry.status !== '已完成')
   const done = entries.filter((entry) => entry.status === '已完成')
@@ -528,7 +617,7 @@ function buildSegment(entries, generatedAt, hash, version, gates, sourceLabel, f
       lines.push(`| ${row.name} | ${row.open} | ${row.done} | ${row.topPriority ?? '—'} | ${row.owners.length ? row.owners.join(', ') : '—'} |`)
     }
   }
-  const gateResult = gates.length ? gateRows(gates, entries) : []
+  const gateResult = gates.length ? gateRows(gates, entries, checkResults) : []
   if (gates.length) {
     lines.push('', '### 关口（阶段性验收）', '', '| 关口 | 问题 | 状态 | 还差什么 |', '|---|---|---|---|')
     const rows = gateResult
@@ -958,7 +1047,14 @@ async function assertWorklog(worklogDir) {
   if (!ok) fail(2, `missing todo directory: ${todo}\npass --worklog-dir <dir> (expects <dir>/todo/*.md)`)
 }
 
-async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, version, gates, sourceLabel, features) {
+function hasFailingCheck(checkResults) {
+  for (const list of Object.values(checkResults ?? {})) {
+    for (const item of list) if (!item.ok && !item.optional) return true
+  }
+  return false
+}
+
+async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, version, gates, sourceLabel, features, checkResults, failOnCheck) {
   if (version && version.packageVersion && version.value !== version.packageVersion) {
     console.error(`ERROR: version drift: ${version.key}=${version.value} vs package.json=${version.packageVersion}`)
     console.error('align the version constant and package.json before checking the ROADMAP block')
@@ -968,12 +1064,16 @@ async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, v
   const markers = locateMarkers(original)
   if (!markers.ok) fail(2, `missing marker ${markers.missing} in ${roadmapPath}`)
   const actual = stripGenerated(original.slice(markers.start + MARK_START.length, markers.end))
-  const expected = stripGenerated(buildSegment(entries, generatedAt, hash, version, gates, sourceLabel, features))
+  const expected = stripGenerated(buildSegment(entries, generatedAt, hash, version, gates, sourceLabel, features, checkResults))
   if (actual === expected) {
     console.log(`OK: ROADMAP auto section matches todo (${entries.length} items)`)
     await warnIfHtmlStale(htmlPath, hash)
     warnIfDemotedInProgress(entries)
     warnIfGateMisses(entries, gates)
+    if (failOnCheck && hasFailingCheck(checkResults)) {
+      console.error('ERROR: --fail-on-check: a non-optional check failed')
+      process.exit(1)
+    }
     return
   }
   const actualLines = actual.split('\n')
@@ -996,12 +1096,12 @@ async function checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, v
   process.exit(1)
 }
 
-async function writeRoadmap(roadmapPath, entries, generatedAt, hash, version, gates, sourceLabel, features) {
+async function writeRoadmap(roadmapPath, entries, generatedAt, hash, version, gates, sourceLabel, features, checkResults) {
   const original = await readRoadmap(roadmapPath)
   const markers = locateMarkers(original)
   if (!markers.ok) fail(2, `missing marker ${markers.missing} in ${roadmapPath}`)
   const newline = original.includes('\r\n') ? '\r\n' : '\n'
-  const segment = buildSegment(entries, generatedAt, hash, version, gates, sourceLabel, features).replace(/\n/g, newline)
+  const segment = buildSegment(entries, generatedAt, hash, version, gates, sourceLabel, features, checkResults).replace(/\n/g, newline)
   const next = original.slice(0, markers.start + MARK_START.length) + newline + segment + newline + original.slice(markers.end)
   await atomicWrite(roadmapPath, next)
   return next
@@ -1023,6 +1123,17 @@ async function main() {
   for (const warning of warnings) console.log(`WARN: ${warning.file} 行 ${warning.line} ${warning.message}`)
   markDuplicates(entries)
   const gates = await loadGates(gatesPath)
+  const shouldRunChecks =
+    !options.noChecks &&
+    (options.runChecks === true || (options.runChecks !== false && (options.mode === 'check' || options.json)))
+  let checkResults
+  if (shouldRunChecks && gates.length) {
+    const log = options.json ? (...args) => console.error(...args) : console.log
+    checkResults = runGateChecks(gates, log)
+    await saveChecksCache(worklogDir, checkResults)
+  } else {
+    checkResults = await loadChecksCache(worklogDir)
+  }
   const version = await readVersionInfo(options)
   const hash = sourceHash(entries, version)
   const generatedAt = nowStamp()
@@ -1033,7 +1144,7 @@ async function main() {
       roadmap: roadmapPath,
       html: htmlPath,
       gatesPath,
-      gates: gateRows(gates, entries),
+      gates: gateRows(gates, entries, checkResults),
       nextUp: nextUp(entries),
       hash,
       version,
@@ -1069,14 +1180,14 @@ async function main() {
   }
 
   if (options.mode === 'check') {
-    await checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, version, gates, sourceLabel, features)
+    await checkRoadmap(roadmapPath, htmlPath, entries, generatedAt, hash, version, gates, sourceLabel, features, checkResults, options.failOnCheck)
     return
   }
 
   const lock = await acquireLock(worklogDir)
   if (!lock) return
   try {
-    await writeRoadmap(roadmapPath, entries, generatedAt, hash, version, gates, sourceLabel, features)
+    await writeRoadmap(roadmapPath, entries, generatedAt, hash, version, gates, sourceLabel, features, checkResults)
     const counts = countEntries(entries)
     console.log(`wrote ROADMAP: ${counts.total} items (P0 ${counts.P0} / P1 ${counts.P1} / P2 ${counts.P2}, done ${counts.done}) -> ${roadmapPath}`)
     try {

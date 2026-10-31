@@ -73,6 +73,7 @@ whenToUse: 多个 agent 会话并行做一个项目；需要可审计的任务�
 - `{ "feature": "标签" }`：该功能下全部条目完成才算满足；
 - 脚本机械判定，输出 `✅ 达成` 或 `⏳ m/n` 与「还差什么」；
 - 匹配不到任何条目时 `--check` 会 WARN（标题改过？），记得同步改 gates.json。
+- **`check` 判据（常驻约束）**：`{ "check": { "label": "配置键覆盖", "command": "node scripts/check-config-docs.mjs" } }` 每次求值都真跑命令，exit 0 才算满足；`--check`/`--json` 默认跑、`--write` 不跑（显示「未运行」），`--no-checks` 跳过，`--fail-on-check` 让失败影响退出码，`optional: true` 只 WARN；`timeoutMs` 默认 60s。适合「文档与代码一致」「配置键都有文档」这类**永远为真才算合格**的约束。
 - **只用 `match` 胶囊清单**：每个胶囊指向**具体待办标题子串**，不要用 `feature`/功能标签——同功能新增条目（哪怕只是后续跟进项）会让已绿关口回退；`--check` 对 feature 判据输出 WARN。
 - 未达成的关口会在 ROADMAP 的「**待办聚合**」里展开成胶囊表格（未完成在前），后面跟「**下一步 Top**」：未完成 P1 按归属聚合（每组 ≤3、总 ≤12；无 P1 时退化为 P2）。人读视图与 `--json` 的 `gates[].capsules` / `nextUp` 来自同一份计算。
 
