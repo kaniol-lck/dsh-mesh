@@ -38,3 +38,6 @@ jobs:
 
       - name: Path/topology guard
         run: node scripts/check-paths.mjs
+
+      - name: No duplicate tool implementations
+        run: node scripts/check-duplicates.mjs
