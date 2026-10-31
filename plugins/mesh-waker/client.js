@@ -52,6 +52,18 @@ function formatSessionRow(session) {
   }
 }
 
+/** Human label for a task-registry status (pending -> started -> settled, plus terminal). */
+function formatTaskStatus(status) {
+  const labels = {
+    pending: '待执行',
+    started: '进行中',
+    settled: '已完成',
+    cancelled: '已取消',
+    stalled: '停滞',
+  }
+  return labels[String(status ?? '')] ?? String(status ?? '-')
+}
+
 /** POST /mesh/sessions/archive once; injectable fetch keeps this testable without a host. */
 async function archiveSessionRequest(sessionId, fetchImpl, base = 'http://127.0.0.1:8795') {
   const doFetch = fetchImpl ?? fetch
@@ -1102,7 +1114,7 @@ try {
               h('span', { style: { fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.taskId),
               h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.batchId ?? '-'),
               h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.targetTitle ?? task.targetSessionId ?? '-'),
-              h('span', null, task.status),
+              h('span', null, formatTaskStatus(task.status)),
               h('span', null, task.durationMs === null || task.durationMs === undefined ? '-' : task.durationMs + 'ms'),
               h('span', { style: { opacity: 0.75 } }, task.createdAt ? new Date(task.createdAt).toLocaleString() : '-'),
             ),
@@ -2931,5 +2943,5 @@ try {
 // VM test hook: harnesses that evaluate this file without React (see the dynamic-id test)
 // opt in by defining the global, so runtime behaviour and globals stay unchanged.
 if (typeof globalThis !== 'undefined' && typeof globalThis.__meshWakerTestHook === 'function') {
-  globalThis.__meshWakerTestHook({ staleVersionNotice, formatSessionRow, archiveSessionRequest })
+  globalThis.__meshWakerTestHook({ staleVersionNotice, formatSessionRow, formatTaskStatus, archiveSessionRequest })
 }

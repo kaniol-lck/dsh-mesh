@@ -9,6 +9,16 @@
 
 ---
 
+## v0.7.14（2026-10-31，任务状态机补 `started`，运行时能看到进度）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | T-228 跑了 823 秒，期间 `/mesh/tasks` 一直是 `pending` 然后突然 `settled`——owner 拿任务列表验收运行时效果时，看不到「进行中」 |
+| 状态机 | `pending → started → settled`；取消/停滞仍可从 `pending` 或 `started` 发生；`started` 只在目标会话 `turn/start` 且该 turn **确实归属此任务**时写入（沿用现有 `baselineTurn` 语义：queue 要 `turn > baselineTurn`，steer 允许同轮），不制造假状态 |
+| 落盘/API | 任务行新增 `startedAt`（字段初始 `null`）；append-only 追加一条 `status=started` 行；`GET /mesh/tasks` 列表与详情返回 `startedAt`；面板状态列显示「待执行 / 进行中 / 已完成 / 已取消 / 停滞」 |
+| durationMs 口径 | 任务库 `durationMs = settledAt - startedAt`（从未观测到开始的回退到 `createdAt`）；回执自带的 `durationMs` 不变（仍从投递时算）。已写进 README |
+| 测试 | +3（共 112/112）：`pending` → `turn/start` → `started` 且有 `startedAt`；`started` 后 `turn/end` → `settled` 且 `durationMs === settledAt - startedAt`；未等到 `turn/start` 直接 `turn/end` → 明确结算、`startedAt=null`、服务不崩。既有 109 例全绿 |
+
 ## v0.7.13（2026-10-31，设置页五章聚合 + 字段真能改 + 行布局）
 
 | 项 | 内容 |

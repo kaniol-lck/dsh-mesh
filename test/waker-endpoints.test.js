@@ -2425,6 +2425,77 @@ async function main() {
     report('tasks: a task whose turn never starts becomes stalled', ok, `status=${task.status ?? '-'} receipt=${receipt?.status ?? '-'} settledAt=${task.settledAt ?? '-'}`)
   })
 
+  // 110-112. Task state machine: pending -> started -> settled, and the no-start race.
+  await runCase('tasks: turn/start marks a pending task as started', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-started', title: 'start target' }] })
+    h.emit('session/event', { id: 'session-started' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-started' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'start target', text: 'run me', meta: { taskId: 'T-started' } },
+    })
+    const pending = await request(h.base, '/mesh/tasks/T-started')
+    h.emit('session/event', { id: 'session-started' }, { type: 'turn/start', turn: 2 })
+    const started = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-started')
+      return snapshot.json?.task?.status === 'started' ? snapshot : null
+    }, 4000)
+    const task = started?.json?.task ?? {}
+    const ok = pending.json?.task?.status === 'pending' && task.status === 'started' && Number.isFinite(task.startedAt) && task.startedAt > 0
+    report('tasks: turn/start marks a pending task as started', ok, `before=${pending.json?.task?.status ?? '-'} after=${task.status ?? '-'} startedAt=${task.startedAt ?? '-'}`)
+  })
+
+  await runCase('tasks: a started task settles with durationMs measured from startedAt', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-startdur', title: 'duration target' }] })
+    h.emit('session/event', { id: 'session-startdur' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-startdur' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'duration target', text: 'time me', meta: { taskId: 'T-startdur' } },
+    })
+    h.emit('session/event', { id: 'session-startdur' }, { type: 'turn/start', turn: 2 })
+    await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-startdur')
+      return snapshot.json?.task?.status === 'started' ? snapshot : null
+    }, 4000)
+    h.emit('session/event', { id: 'session-startdur' }, { type: 'turn/end', turn: 2, reason: { kind: 'completed' } })
+    const settled = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-startdur')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const task = settled?.json?.task ?? {}
+    const ok =
+      task.status === 'settled' &&
+      Number.isFinite(task.startedAt) &&
+      Number.isFinite(task.settledAt) &&
+      task.durationMs === task.settledAt - task.startedAt
+    report('tasks: a started task settles with durationMs measured from startedAt', ok, `startedAt=${task.startedAt ?? '-'} settledAt=${task.settledAt ?? '-'} durationMs=${task.durationMs ?? '-'} equalsDelta=${task.durationMs === task.settledAt - task.startedAt}`)
+  })
+
+  await runCase('tasks: turn/end without a start settles without inventing startedAt', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-nostart', title: 'race target' }] })
+    h.emit('session/event', { id: 'session-nostart' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-nostart' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'race target', text: 'race me', meta: { taskId: 'T-nostart' } },
+    })
+    h.emit('session/event', { id: 'session-nostart' }, { type: 'turn/end', turn: 2, reason: { kind: 'completed' } })
+    const settled = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-nostart')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const task = settled?.json?.task ?? {}
+    const alive = await request(h.base, '/mesh/status')
+    const ok =
+      task.status === 'settled' &&
+      task.startedAt === null &&
+      Number.isFinite(task.durationMs) &&
+      task.durationMs >= 0 &&
+      alive.status === 200
+    report('tasks: turn/end without a start settles without inventing startedAt', ok, `status=${task.status ?? '-'} startedAt=${task.startedAt === null ? 'null' : task.startedAt} durationMs=${task.durationMs ?? '-'} alive=${alive.status}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

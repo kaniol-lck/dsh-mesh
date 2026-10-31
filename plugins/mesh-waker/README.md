@@ -257,7 +257,7 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 | `GET /mesh/tasks/:id` | 详情：全文 + 回执摘要（`receiptSummary`/`receiptRef`）+ 目标会话 `{sessionId, title, live}` |
 | `DELETE /mesh/tasks/:id` | 仅 `pending` 可取消（→ `cancelled`）；已 settled/stalled 返回 **409**，历史不改写 |
 
-**状态流转**：派活写 `pending`；结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`。`refs[]` 由派活方经 `meta.refs` 传入（只存字符串，waker 不解析 `.worklog`）。
+**状态流转（0.7.14 起含 `started`）**：派活写 `pending` → 目标会话的 `turn/start` 且该 turn 归属此任务时写 `started`（含 `startedAt`）→ 结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`。取消/停滞可以发生在 `pending` 或 `started`。**`durationMs` 口径**：任务库的 `durationMs` 从 `startedAt` 算起（未被观测到开始的从 `createdAt` 算），回执里的 `durationMs` 仍从投递时算。`refs[]` 由派活方经 `meta.refs` 传入（只存字符串，waker 不解析 `.worklog`）。
 
 **面板**：任务面板在「Mesh 信箱」页面顶部标签「派活任务」里（与「信箱」并列）；设置页只保留一行跳转说明。列表列为 `ID / 批次 / 目标会话 / 状态 / 耗时 / 创建时间`，支持状态与目标会话过滤；点行展开正文与回执摘要，提供「打开会话」（宿主 `uiWorkspace.openSession`，不可用时复制会话 id）。顶部统计 `pending N · 今日完成 M · stalled K`（基于当前筛选结果）。入口名可用 `entryLabel` 配置（默认 `Mesh 信箱`）。
 

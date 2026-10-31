@@ -3146,6 +3146,7 @@ export function apply(ctx, config) {
       createdAt: Date.now(),
       deadlineMs: extra.deadlineMs ?? null,
       status: 'pending',
+      startedAt: null,
       settledAt: null,
       durationMs: null,
       receiptRef: null,
@@ -3185,6 +3186,7 @@ export function apply(ctx, config) {
       createdAt: row.createdAt ?? null,
       deadlineMs: row.deadlineMs ?? null,
       status: row.status ?? 'pending',
+      startedAt: row.startedAt ?? null,
       settledAt: row.settledAt ?? null,
       durationMs: row.durationMs ?? null,
       receiptRef: row.receiptRef ?? null,
@@ -3308,11 +3310,13 @@ export function apply(ctx, config) {
     })
     writeReceiptFile(receipt)
     // Registry status mirrors the receipt: not-started is the stall path, everything else
-    // settled. The task -> receipt binding is receiptRef + summary.
+    // settled. Registry durationMs is measured from startedAt when the task was seen
+    // starting (falling back to injection time); the receipt keeps its own duration.
+    const registryStartedAt = Number.isFinite(task.startedAt) ? task.startedAt : task.injectedAt
     updateTaskRow(taskId, {
       status: receipt.status === 'not-started' ? 'stalled' : 'settled',
       settledAt: receipt.endedAt,
-      durationMs: receipt.durationMs,
+      durationMs: Math.max(0, receipt.endedAt - registryStartedAt),
       receiptRef: c.receiptFile,
       receiptSummary: Array.from(receipt.summary ?? '').slice(0, 500).join(''),
     })
@@ -3485,6 +3489,20 @@ export function apply(ctx, config) {
       }
       if (type === 'turn/start') {
         if (turn !== null) turnStartedAt.set(sessionId, Math.max(turn, turnStartedAt.get(sessionId) ?? 0))
+        for (const [taskId, task] of pendingTasks) {
+          if (task.sessionId !== sessionId || task.settled || task.startedAt) continue
+          // Same ownership rule as settlement: a queue task owns a strictly later turn, a
+          // steer task may own the running one. This never invents a start for a turn that
+          // does not belong to the task (that would be a fake progress state).
+          const ownsTurn =
+            task.baselineTurn !== null &&
+            turn !== null &&
+            (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn)
+          if (!ownsTurn) continue
+          task.startedAt = now
+          updateTaskRow(taskId, { status: 'started', startedAt: now })
+          fileLog(`task ${taskId} started turn=${turn} baselineTurn=${task.baselineTurn}`)
+        }
         for (const task of pendingTasks.values()) {
           if (task.sessionId !== sessionId || task.settled) continue
           if (task.baselineTurn === null || (turn !== null && turn > task.baselineTurn)) clearPending(task)
