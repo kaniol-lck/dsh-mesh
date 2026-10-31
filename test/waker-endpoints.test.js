@@ -2796,6 +2796,58 @@ async function main() {
     report('threads: /mesh/threads lists bindings with their task ids', ok, `status=${listed.status} count=${entry?.count ?? '-'} taskIds=${JSON.stringify(entry?.taskIds ?? [])}`)
   })
 
+  // 131-132. A null baselineTurn (no turn knowledge at injection) must not leave a running
+  // task looking pending forever, but a much later turn must NOT be claimed either.
+  await runCase('tasks: a null baseline claims a turn/start inside the window and settles', async (boot) => {
+    const claimLog = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'waker-claim-log-')), 'waker.log')
+    const h = await boot({ seedSessions: [{ id: 'session-nullbase', title: 'null baseline' }], config: { logFile: claimLog } })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'null baseline', text: 'run with unknown baseline', taskId: 'T-CLAIM' })
+    const before = await request(h.base, '/mesh/tasks/T-CLAIM')
+    h.emit('session/event', { id: 'session-nullbase' }, { type: 'turn/start', turn: 1 })
+    const after = await request(h.base, '/mesh/tasks/T-CLAIM')
+    h.emit('session/event', { id: 'session-nullbase' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const settled = await request(h.base, '/mesh/tasks/T-CLAIM')
+    const log = threadLog(claimLog)
+    const ok =
+      before.json?.task?.status === 'pending' &&
+      before.json?.task?.startedAt === null &&
+      after.json?.task?.status === 'started' &&
+      Number.isFinite(after.json?.task?.startedAt) &&
+      settled.json?.task?.status === 'settled' &&
+      /claimed null baseline within 30000ms: turn=1 baselineTurn=0/.test(log)
+    report(
+      'tasks: a null baseline claims a turn/start inside the window and settles',
+      ok,
+      `before=${before.json?.task?.status}/${String(before.json?.task?.startedAt)} after=${after.json?.task?.status}/${String(after.json?.task?.startedAt)} settled=${settled.json?.task?.status}`,
+    )
+  })
+
+  await runCase('tasks: a late turn/start is not claimed when the baseline is null', async (boot) => {
+    const lateLog = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'waker-claim-log-')), 'waker.log')
+    const h = await boot({
+      seedSessions: [{ id: 'session-late', title: 'late turn' }],
+      config: { logFile: lateLog, startedClaimWindowMs: 1000 },
+    })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'late turn', text: 'no turn for a while', taskId: 'T-LATE' })
+    await sleep(1300)
+    h.emit('session/event', { id: 'session-late' }, { type: 'turn/start', turn: 2 })
+    const after = await request(h.base, '/mesh/tasks/T-LATE')
+    const log = threadLog(lateLog)
+    const ok =
+      after.json?.task?.status === 'pending' &&
+      after.json?.task?.startedAt === null &&
+      !/claimed null baseline/.test(log)
+    report(
+      'tasks: a late turn/start is not claimed when the baseline is null',
+      ok,
+      `status=${after.json?.task?.status} startedAt=${String(after.json?.task?.startedAt)} claimedLog=${/claimed null baseline/.test(log)}`,
+    )
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

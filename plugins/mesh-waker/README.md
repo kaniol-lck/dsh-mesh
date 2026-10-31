@@ -223,6 +223,7 @@ npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task --receipt
 | `receiptTo` | 空 | 接收回执的会话：标题（如 `<session-title>`）或 `session-…`；为空则只写文件 |
 | `receiptSummaryChars` | `300` | 摘要按**码点**截断，不会切出半个字符 |
 | `receiptStallMs` | `600000` | 注入后这么久仍无 `turn/start`，判 `not-started` |
+| `startedClaimWindowMs` | `30000` | `baselineTurn=null`（注入时还没有回合信息）时，`turn/start` 距注入不超过此窗口才认领 `started`；超窗保持 pending（不造进度） |
 
 回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode / baselineTurn / settledTurn / injectedDuringTurn`。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。`baselineTurn`/`settledTurn` 是结算诊断：`queue` 注入发生在回合进行中时 `baselineTurn` 等于该回合，只有更晚回合的 `turn/end` 才会结算（`settledTurn > baselineTurn`），`steer` 则同一回合即可。注入给接收方的正文首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`，第二行是摘要。
 

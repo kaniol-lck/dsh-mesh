@@ -9,6 +9,15 @@
 
 ---
 
+## v0.7.22（2026-11-01，`baselineTurn=null` 的任务也能标 `started`）
+
+| 项 | 内容 |
+|---|---|
+| 根因 | `turn/start` 的 `ownsTurn` 要求 `task.baselineTurn !== null`。注入瞬间插件还没有回合信息时 `baselineTurn` 为 null，于是即使回合真的开始了也永远不写 `started`/`startedAt`：任务在 `/mesh/status.pendingTaskList` 与 `/mesh/tasks` 里一直显示 `pending`，而被 task-audit 的「pending 超 30 分钟」判成长尾误报。T-248 期间实测 `turn/start turn=58` 已触发但 `startedAt` 为空 |
+| 修法 | `baselineTurn` 为 null 时给一个保守认领窗口：`turn/start` 距 `task.injectedAt` ≤ `startedClaimWindowMs`（默认 30000，可配置 1000–300000）才认领；认领时把 `baselineTurn` 补记为 `turn - 1`，让结算/后续回合与正常路径一致。超窗不认领（保持「不得凭空造进度」） |
+| 测试 | +2（共 132/132）：null baseline + 5 秒内 `turn/start` → `started` + `startedAt` 非空、`turn/end` 正常 `settled`、日志含 `claimed null baseline … baselineTurn=0`；把窗口设为 1000ms、等 1300ms 后 `turn/start` → 仍 `pending`、`startedAt=null`、日志无认领记录。原 130 例全绿 |
+| 边界 | 未动 `task-audit`（ops 的）与 thread 逻辑（0.7.21）；新增配置 docs 已写入 README 参数表 |
+
 ## v0.7.21（2026-11-01，派活线程身份：`thread` 参数 + 续派 + `/mesh/threads`）
 
 | 项 | 内容 |

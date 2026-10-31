@@ -857,6 +857,10 @@ function normalizeBase(config) {
     receiptTo: c.receiptTo ? String(c.receiptTo).trim() : '',
     receiptSummaryChars: clampInterval(c.receiptSummaryChars, 300, 20, 4000),
     receiptStallMs: clampInterval(c.receiptStallMs, 600000, 1000, 86_400_000),
+    // `baselineTurn` is null when the plugin had no turn knowledge at injection time; a
+    // turn/start arriving within this window still belongs to the task (T-253). Outside the
+    // window the task stays pending: never invent progress.
+    startedClaimWindowMs: clampInterval(c.startedClaimWindowMs, 30000, 1000, 300000),
     // Batch barriers + liveness alerts (contract 2026-10-29): a batch is one notification
     // when everything finished; stalled work is reported early instead of waiting an hour.
     stallQuietMs: clampInterval(c.stallQuietMs, 300000, 1000, 86_400_000),
@@ -3720,13 +3724,25 @@ export function apply(ctx, config) {
         for (const [taskId, task] of pendingTasks) {
           if (task.sessionId !== sessionId || task.settled || task.startedAt) continue
           // Same ownership rule as settlement: a queue task owns a strictly later turn, a
-          // steer task may own the running one. This never invents a start for a turn that
-          // does not belong to the task (that would be a fake progress state).
+          // steer task may own the running one. A null baseline means we had no turn
+          // knowledge at injection (T-253): claim only if this turn starts within the
+          // configured window after injection, then record the baseline so settlement and
+          // later turns behave like the normal path. Outside the window: never invent
+          // progress (the task stays pending/stalled).
+          const withinWindow =
+            Number.isFinite(task.injectedAt) && now - task.injectedAt <= c.startedClaimWindowMs
           const ownsTurn =
-            task.baselineTurn !== null &&
-            turn !== null &&
-            (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn)
+            task.baselineTurn !== null
+              ? turn !== null && (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn)
+              : turn !== null && withinWindow
           if (!ownsTurn) continue
+          if (task.baselineTurn === null) {
+            // A queued task owns strictly later turns; the claim turn itself is the start.
+            task.baselineTurn = turn - 1
+            fileLog(
+              `task ${taskId} claimed null baseline within ${c.startedClaimWindowMs}ms: turn=${turn} baselineTurn=${task.baselineTurn} injectedAgo=${now - task.injectedAt}ms`,
+            )
+          }
           task.startedAt = now
           updateTaskRow(taskId, { status: 'started', startedAt: now })
           fileLog(`task ${taskId} started turn=${turn} baselineTurn=${task.baselineTurn}`)
