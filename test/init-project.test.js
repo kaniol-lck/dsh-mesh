@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -166,3 +166,60 @@ test(
     assert.match(result.stderr, /looked for:/)
   },
 )
+
+function runDrift(dir, extra = []) {
+  return spawnSync(process.execPath, [SCRIPT, '--check-drift', '--dir', dir, ...extra], { encoding: 'utf8' })
+}
+
+function scaffolded() {
+  const dir = tempRepo()
+  assert.equal(run(dir).status, 0)
+  return dir
+}
+
+test('drift: fresh scaffold is clean', () => {
+  const dir = scaffolded()
+  const result = runDrift(dir)
+  assert.equal(result.status, 0, result.stdout + result.stderr)
+  assert.match(result.stdout, /无漂移/)
+})
+
+test('drift: local customization is informational, not a failure', () => {
+  const dir = scaffolded()
+  const file = path.join(dir, 'AGENTS.md')
+  writeFileSync(file, readFileSync(file, 'utf8') + '\n<!-- local tweak -->\n', 'utf8')
+  const result = runDrift(dir)
+  assert.equal(result.status, 0, result.stdout + result.stderr)
+  assert.match(result.stdout, /本地已定制：AGENTS\.md/)
+})
+
+test('drift: changed upstream template is reported as drift', () => {
+  const dir = scaffolded()
+  const scaffoldPath = path.join(dir, '.worklog', 'scaffold.json')
+  const record = JSON.parse(readFileSync(scaffoldPath, 'utf8'))
+  record.templateSha256 = 'deadbeef'.repeat(8)
+  writeFileSync(scaffoldPath, JSON.stringify(record, null, 2), 'utf8')
+  const result = runDrift(dir)
+  assert.equal(result.status, 1, result.stdout + result.stderr)
+  assert.match(result.stdout, /上游模板已变更/)
+})
+
+test('drift: missing scaffold.json cannot be reconciled', () => {
+  const dir = scaffolded()
+  rmSync(path.join(dir, '.worklog', 'scaffold.json'))
+  const result = runDrift(dir)
+  assert.equal(result.status, 2, result.stdout + result.stderr)
+  assert.match(result.stdout, /无版本记录/)
+})
+
+test('drift: --json is machine-readable', () => {
+  const dir = scaffolded()
+  const result = runDrift(dir, ['--json'])
+  assert.equal(result.status, 0, result.stdout + result.stderr)
+  const parsed = JSON.parse(result.stdout)
+  for (const key of ['drift', 'customized', 'stale', 'versionMismatch', 'exitCode']) {
+    assert.ok(key in parsed, `missing ${key}`)
+  }
+  assert.equal(parsed.exitCode, 0)
+  assert.equal(parsed.templateVersion, 'v1')
+})

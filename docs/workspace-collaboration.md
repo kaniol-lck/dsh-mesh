@@ -48,6 +48,26 @@ node <本仓>/scripts/init-project.mjs --dir <项目根> --name "<项目名>" --
 
 `--dry-run` 只看计划；`--force` 覆盖已有文件。
 
+## 版本与漂移检查
+
+模板带版本行（`<!-- workspace-template: v1 (2026-10-31) -->`），只在**规则语义变化**时递增；措辞微调不升。
+
+脚手架生成时会把版本与生成物哈希写进 `.worklog/scaffold.json`（本地文件，随 `.worklog/` 一起 gitignore）。升级模板后，用一条命令对账：
+
+```bash
+node scripts/init-project.mjs --check-drift --dir <项目根> [--json]
+```
+
+| 输出 | 含义 | 退出码 |
+|---|---|---|
+| `DRIFT 上游模板已变更 … 未跟进` | 上游模板变了，本地还没看过 | 1 |
+| `INFO 本地已定制：AGENTS.md` | 本地改过（正常），升级时手工合并 | 不影响 |
+| `WARN 无版本记录 …` | 旧版脚手架生成，无法对账 | 2 |
+| `VERSION 你 v1 / 上游 v2` | 记录版本与当前模板不一致 | 1 |
+| `STALE 包装器与当前生成器不符` | 包装器是旧版脚手架产物 | 1 |
+
+`--json` 输出含 `drift` / `customized` / `stale` / `versionMismatch` / `exitCode`，供协调会话批量对账。
+
 ## 多项目怎么共存
 
 - **共用同一个消息中枢**：每个项目不需要单独部署，节点按需注册；

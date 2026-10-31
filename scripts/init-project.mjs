@@ -11,10 +11,13 @@
  * Usage:
  *   node scripts/init-project.mjs --dir <path> --name <project> [--roles a,b,c]
  *        [--dispatch-url http://127.0.0.1:8795] [--dry-run] [--force]
+ *   node scripts/init-project.mjs --check-drift --dir <workspace> [--json]
  *
- * Existing files are skipped unless --force. Exit codes: 0 ok, 2 bad args/target.
+ * Existing files are skipped unless --force. Exit codes: 0 ok, 2 bad args/target;
+ * --check-drift: 0 no drift, 1 upstream drift, 2 cannot reconcile.
  */
 
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
@@ -34,9 +37,11 @@ Options:
   --dispatch-url <url>  local waker URL noted in the dispatch wrapper (default http://127.0.0.1:8795)
   --dry-run             print the plan, write nothing
   --force               overwrite existing files
+  --check-drift         compare a workspace against this template/generator
+  --json                with --check-drift: machine-readable output
   -h, --help            show this help
 
-Exit codes: 0 ok, 2 bad arguments or target directory.`
+Exit codes: 0 ok / no drift, 1 upstream drift, 2 bad arguments, target, or no scaffold.json.`
 
 function fail(message) {
   console.error(message)
@@ -51,6 +56,8 @@ function parseArgs(argv) {
     dispatchUrl: 'http://127.0.0.1:8795',
     dryRun: false,
     force: false,
+    checkDrift: false,
+    json: false,
   }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -67,6 +74,8 @@ function parseArgs(argv) {
       case '--dispatch-url': options.dispatchUrl = value(); break
       case '--dry-run': options.dryRun = true; break
       case '--force': options.force = true; break
+      case '--check-drift': options.checkDrift = true; break
+      case '--json': options.json = true; break
       case '-h':
       case '--help':
         console.log(USAGE)
@@ -77,7 +86,7 @@ function parseArgs(argv) {
     }
   }
   if (!options.dir) fail(`--dir is required\n\n${USAGE}`)
-  if (!options.name) fail(`--name is required\n\n${USAGE}`)
+  if (!options.checkDrift && !options.name) fail(`--name is required\n\n${USAGE}`)
   options.roles = options.roles.split(',').map((role) => role.trim()).filter(Boolean)
   if (!options.roles.length) fail('--roles must list at least one role')
   return options
@@ -201,8 +210,136 @@ function renderAgents(name, roles) {
     .replaceAll('<角色列表>', roles.join(' / '))
 }
 
+function sha256(text) {
+  return createHash('sha256').update(text).digest('hex')
+}
+
+function isoLocal() {
+  const now = new Date()
+  const pad = (value) => String(value).padStart(2, '0')
+  const offset = -now.getTimezoneOffset()
+  const sign = offset >= 0 ? '+' : '-'
+  const abs = Math.abs(offset)
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`
+}
+
+const WORKLOG_SKILL_DIRS = [
+  'process.env.WORKLOG_SCRIPTS',
+  "path.resolve(here, '..', '..', '..', 'skills', 'worklog', 'scripts')",
+  "path.join(process.env.HOME || process.env.USERPROFILE || '', '.dsh', 'skills', 'worklog', 'scripts')",
+]
+const DISPATCH_DIRS = [
+  'process.env.MESH_DISPATCH_SCRIPT',
+  "path.resolve(here, '..', '..', '..', 'scripts', 'mesh-dispatch.mjs')",
+  "path.join(process.env.HOME || process.env.USERPROFILE || '', '.dsh', 'skills', 'mesh', 'scripts', 'mesh-dispatch.mjs')",
+]
+
+/** Everything generated from the template/generator, keyed by workspace-relative path. */
+function artifacts(options) {
+  const roles = options.roles ?? []
+  return {
+    'AGENTS.md': renderAgents(options.name, roles),
+    'ROADMAP.md': roadmapFile(options.name),
+    '.worklog/bin/roadmap.mjs': forwarder('roadmap', WORKLOG_SKILL_DIRS, 'Set WORKLOG_SCRIPTS to the skill scripts directory to override.'),
+    '.worklog/bin/defects.mjs': forwarder('defects', WORKLOG_SKILL_DIRS, 'Set WORKLOG_SCRIPTS to the skill scripts directory to override.'),
+    '.worklog/bin/dispatch.mjs': forwarder('dispatch', DISPATCH_DIRS, `Optional local helper. Waker URL: ${options.dispatchUrl} (MESH_WAKER_URL).`),
+  }
+}
+
+function templateVersionOf(text) {
+  const match = /workspace-template:\s*(v\d+)/.exec(text)
+  return match ? match[1] : 'unknown'
+}
+
+/** Exit codes: 0 no drift, 1 upstream drift, 2 cannot reconcile. */
+function driftCheck(options) {
+  const root = path.resolve(options.dir)
+  if (!existsSync(root) || !statSync(root).isDirectory()) fail(`target is not a directory: ${root}`)
+  const scaffoldPath = path.join(root, '.worklog', 'scaffold.json')
+  const templateText = readFileSync(TEMPLATE, 'utf8')
+  const upstreamVersion = templateVersionOf(templateText)
+  const result = { dir: root, templateVersion: null, upstreamVersion, versionMismatch: false, drift: [], customized: [], stale: [] }
+
+  if (!existsSync(scaffoldPath)) {
+    result.error = 'no-scaffold'
+    if (options.json) console.log(JSON.stringify({ ...result, exitCode: 2 }, null, 2))
+    else console.log('WARN 无版本记录（旧版脚手架生成）：无法对账，建议手工补 scaffold.json 或重新生成')
+    return 2
+  }
+  let record
+  try {
+    record = JSON.parse(readFileSync(scaffoldPath, 'utf8'))
+  } catch (error) {
+    result.error = 'bad-scaffold'
+    if (options.json) console.log(JSON.stringify({ ...result, exitCode: 2 }, null, 2))
+    else console.log(`WARN scaffold.json 无法解析：${error.message}`)
+    return 2
+  }
+  result.templateVersion = record.templateVersion ?? null
+  result.versionMismatch = Boolean(result.templateVersion && result.templateVersion !== upstreamVersion)
+  const currentTemplateSha = sha256(templateText)
+  const expected = artifacts({ name: record.project ?? 'project', roles: record.roles ?? [], dispatchUrl: record.dispatchUrl ?? 'http://127.0.0.1:8795' })
+  const lines = []
+  if (result.versionMismatch) lines.push(`VERSION 你 ${result.templateVersion} / 上游 ${upstreamVersion}`)
+
+  for (const [rel, recordedSha] of Object.entries(record.files ?? {})) {
+    const file = path.join(root, rel)
+    const localSha = existsSync(file) ? sha256(readFileSync(file)) : null
+    if (localSha !== recordedSha) {
+      result.customized.push(rel)
+      lines.push(`INFO 本地已定制：${rel}（正常，升级时手工合并）`)
+      continue
+    }
+    if (rel === 'AGENTS.md' && currentTemplateSha !== record.templateSha256) {
+      result.drift.push(rel)
+      lines.push(`DRIFT 上游模板已变更（${record.templateVersion} → ${upstreamVersion}?）：${rel} 未跟进`)
+    }
+  }
+  for (const rel of Object.keys(expected)) {
+    if (!rel.startsWith('.worklog/bin/')) continue
+    if (!record.files || record.files[rel] === undefined) continue
+    if (sha256(expected[rel]) === record.files[rel]) continue
+    result.stale.push(rel)
+    lines.push(`STALE 包装器与当前生成器不符（可能是旧版脚手架）：${rel}`)
+  }
+  const driftDetected = result.drift.length > 0 || result.stale.length > 0 || result.versionMismatch
+  const exitCode = driftDetected ? 1 : 0
+  if (options.json) {
+    console.log(JSON.stringify({ ...result, exitCode }, null, 2))
+  } else if (lines.length) {
+    for (const line of lines) console.log(line)
+  } else {
+    console.log('OK 无漂移：模板、包装器与本地文件均与记录一致')
+  }
+  return exitCode
+}
+
+function scaffoldJson(options, generated) {
+  const templateText = readFileSync(TEMPLATE, 'utf8')
+  const files = {}
+  for (const rel of ['AGENTS.md', 'ROADMAP.md', '.worklog/bin/roadmap.mjs', '.worklog/bin/defects.mjs', '.worklog/bin/dispatch.mjs']) {
+    files[rel] = sha256(generated[rel])
+  }
+  return JSON.stringify(
+    {
+      project: options.name,
+      templateVersion: templateVersionOf(templateText),
+      templatePath: 'docs/agents-template.md',
+      templateSha256: sha256(templateText),
+      createdAt: isoLocal(),
+      generator: 'scripts/init-project.mjs',
+      dispatchUrl: options.dispatchUrl,
+      roles: options.roles,
+      files,
+    },
+    null,
+    2,
+  ) + '\n'
+}
+
 function main() {
   const options = parseArgs(process.argv.slice(2))
+  if (options.checkDrift) process.exit(driftCheck(options))
   const root = path.resolve(options.dir)
   if (!existsSync(root) || !statSync(root).isDirectory()) fail(`target is not a directory: ${root}`)
   if (!existsSync(path.join(root, '.git')) && !options.force) {
@@ -212,51 +349,17 @@ function main() {
   const worklog = path.join(root, '.worklog')
   const plan = []
 
+  const generated = artifacts(options)
   const plannedFiles = [
     [path.join(worklog, 'WORKLOG.md'), () => worklogFile(options.name)],
     [path.join(worklog, 'dispatch', 'queue.md'), queueFile],
     [path.join(worklog, 'gates.json'), gatesFile],
-    [path.join(root, 'AGENTS.md'), () => renderAgents(options.name, roles)],
-    [path.join(root, 'ROADMAP.md'), () => roadmapFile(options.name)],
-    [
-      path.join(worklog, 'bin', 'roadmap.mjs'),
-      () =>
-        forwarder(
-          'roadmap',
-          [
-            'process.env.WORKLOG_SCRIPTS',
-            "path.resolve(here, '..', '..', '..', 'skills', 'worklog', 'scripts')",
-            "path.join(process.env.HOME || process.env.USERPROFILE || '', '.dsh', 'skills', 'worklog', 'scripts')",
-          ],
-          'Set WORKLOG_SCRIPTS to the skill scripts directory to override.',
-        ),
-    ],
-    [
-      path.join(worklog, 'bin', 'defects.mjs'),
-      () =>
-        forwarder(
-          'defects',
-          [
-            'process.env.WORKLOG_SCRIPTS',
-            "path.resolve(here, '..', '..', '..', 'skills', 'worklog', 'scripts')",
-            "path.join(process.env.HOME || process.env.USERPROFILE || '', '.dsh', 'skills', 'worklog', 'scripts')",
-          ],
-          'Set WORKLOG_SCRIPTS to the skill scripts directory to override.',
-        ),
-    ],
-    [
-      path.join(worklog, 'bin', 'dispatch.mjs'),
-      () =>
-        forwarder(
-          'dispatch',
-          [
-            'process.env.MESH_DISPATCH_SCRIPT',
-            "path.resolve(here, '..', '..', '..', 'scripts', 'mesh-dispatch.mjs')",
-            "path.join(process.env.HOME || process.env.USERPROFILE || '', '.dsh', 'skills', 'mesh', 'scripts', 'mesh-dispatch.mjs')",
-          ],
-          `Optional local helper. Waker URL: ${options.dispatchUrl} (MESH_WAKER_URL).`,
-        ),
-    ],
+    [path.join(root, 'AGENTS.md'), () => generated['AGENTS.md']],
+    [path.join(root, 'ROADMAP.md'), () => generated['ROADMAP.md']],
+    [path.join(worklog, 'bin', 'roadmap.mjs'), () => generated['.worklog/bin/roadmap.mjs']],
+    [path.join(worklog, 'bin', 'defects.mjs'), () => generated['.worklog/bin/defects.mjs']],
+    [path.join(worklog, 'bin', 'dispatch.mjs'), () => generated['.worklog/bin/dispatch.mjs']],
+    [path.join(worklog, 'scaffold.json'), () => scaffoldJson(options, generated)],
   ]
   for (const role of roles) plannedFiles.push([path.join(worklog, 'todo', `${role}.md`), () => todoFile(role)])
 
