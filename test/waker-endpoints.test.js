@@ -2159,6 +2159,64 @@ async function main() {
     report('status: seams report an attached approval bridge', ok, `seams=${JSON.stringify(status.json?.seams)}`)
   })
 
+  // 98-99. T-220: two tasks injected while the same turn runs must not share one receipt.
+  await runCase('receipt: a second task injected in the same turn waits for its own turn', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-same-turn', title: 'same turn target' }] })
+    h.emit('session/event', { id: 'session-same-turn' }, { type: 'turn/start', turn: 41 })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'same turn target', text: 'task A', meta: { taskId: 'T-same-A' } },
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'same turn target', text: 'task B', meta: { taskId: 'T-same-B' } },
+    })
+    const pending = await request(h.base, '/mesh/status')
+    const rows = pending.json?.pendingTaskList ?? []
+    const rowA = rows.find((row) => row.taskId === 'T-same-A')
+    const rowB = rows.find((row) => row.taskId === 'T-same-B')
+    h.emit('session/event', { id: 'session-same-turn' }, { type: 'assistant/message', turn: 42, message: { content: [{ type: 'text', text: 'turn 42 did task A' }] } })
+    h.emit('session/event', { id: 'session-same-turn' }, { type: 'turn/end', turn: 42, reason: { kind: 'completed' } })
+    const settledA = await waitFor(() => readReceipts(h.receiptsPath).find((receipt) => receipt.taskId === 'T-same-A'), 4000)
+    await sleep(300)
+    const afterFirst = await request(h.base, '/mesh/status')
+    const bAfterFirst = readReceipts(h.receiptsPath).find((receipt) => receipt.taskId === 'T-same-B')
+    const stillPending = (afterFirst.json?.pendingTaskList ?? []).find((row) => row.taskId === 'T-same-B')
+    h.emit('session/event', { id: 'session-same-turn' }, { type: 'turn/start', turn: 43 })
+    h.emit('session/event', { id: 'session-same-turn' }, { type: 'assistant/message', turn: 43, message: { content: [{ type: 'text', text: 'turn 43 did task B' }] } })
+    h.emit('session/event', { id: 'session-same-turn' }, { type: 'turn/end', turn: 43, reason: { kind: 'completed' } })
+    const settledB = await waitFor(() => readReceipts(h.receiptsPath).find((receipt) => receipt.taskId === 'T-same-B'), 4000)
+    const ok =
+      rowA?.injectedAtTurn === 41 &&
+      rowA?.sameTurnInjected === false &&
+      rowA?.baselineTurn === 41 &&
+      rowB?.injectedAtTurn === 41 &&
+      rowB?.sameTurnInjected === true &&
+      rowB?.baselineTurn === 42 &&
+      settledA?.turn === 42 &&
+      bAfterFirst === undefined &&
+      stillPending?.injectedAtTurn === 41 &&
+      settledB?.turn === 43
+    report('receipt: a second task injected in the same turn waits for its own turn', ok, `A(turn=${settledA?.turn ?? '-'} baseline=41) B-after-42=${bAfterFirst ? 'SETTLED' : 'pending'} B-final-turn=${settledB?.turn ?? '-'} pendingB=${stillPending?.taskId ?? '-'}`)
+  })
+
+  await runCase('receipt: a task injected between turns settles on the next turn', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-between', title: 'between turns' }] })
+    h.emit('session/event', { id: 'session-between' }, { type: 'turn/start', turn: 5 })
+    h.emit('session/event', { id: 'session-between' }, { type: 'turn/end', turn: 5, reason: { kind: 'completed' } })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'between turns', text: 'after the turn', meta: { taskId: 'T-between' } },
+    })
+    const pending = await request(h.base, '/mesh/status')
+    const row = (pending.json?.pendingTaskList ?? []).find((entry) => entry.taskId === 'T-between')
+    h.emit('session/event', { id: 'session-between' }, { type: 'turn/start', turn: 6 })
+    h.emit('session/event', { id: 'session-between' }, { type: 'turn/end', turn: 6, reason: { kind: 'completed' } })
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((entry) => entry.taskId === 'T-between'), 4000)
+    const ok = row?.injectedAtTurn === null && row?.sameTurnInjected === false && row?.baselineTurn === 5 && receipt?.turn === 6
+    report('receipt: a task injected between turns settles on the next turn', ok, `injectedAtTurn=${row?.injectedAtTurn ?? '-'} baseline=${row?.baselineTurn ?? '-'} settledTurn=${receipt?.turn ?? '-'}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

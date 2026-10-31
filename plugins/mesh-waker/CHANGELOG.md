@@ -9,15 +9,16 @@
 
 ---
 
-## v0.7.9（2026-10-31，maxInlineBytes 真正生效；接缝与运维错误可见）
+## v0.7.9（2026-10-31，maxInlineBytes 真正生效；接缝与运维错误可见；同轮多任务不再假回执）
 
 | 项 | 内容 |
 |---|---|
+| **假回执复发（0.5.6 同类）** | T-220 是在 T-219 的 turn 41 **进行中**注入的第二个 queue 任务，但两条任务 `baselineTurn` 都记成 41，于是 turn 42 的 `turn/end` 把两条一起结算，T-220 从未执行却收到 `completed`。修法：queue 任务在开放轮内注入时按**同轮队列位次**抬高 baseline（`baselineTurn = openTurn + 排在前面的同轮 queue 任务数`），第二个任务必须等 turn 43；新增 `injectedAtTurn`/`sameTurnInjected` 诊断；位次判断不确定时宁可 pending（由 `receiptStallMs` 报 stall），绝不假回执。`steer` 语义不变 |
 | 文档承诺 vs 实况 | `maxInlineBytes` 此前只在配置里解析、全文没有任何使用点，README 却承诺「超过该大小的正文不再内联」→ 已实现：`renderMessages` 逐条调用 `inlineBodyText(body, c.maxInlineBytes)`，超限时按 UTF-8 字符边界安全截断（`truncateUtf8`，不会切出 U+FFFD），并在末尾追加「…（正文已截断：原文 N 字节，超过 maxInlineBytes=M；完整内容请用 mesh_inbox 或 GET /api/inbox 读取）」；只影响回合内联文本，收件箱原文不变 |
 | 接缝日志 | approval 接缝挂载前后各一行：成功 `approval seam attached (approvalBridge enabled)`、未启用 `approval bridge disabled; approvals stay local`、失败 `approval seam attach failed: <原因>; approvals fall through to the local UI`（user-questions 原有三行不动） |
 | 运维错误进日志 | 注册 wakeUrl 失败（带状态码与 URL）、注册 wake endpoint 抛错（带 URL）、wake 失败（带 conversation/sender）、请求处理失败（带 method/path）四处补齐 `fileLog`，同时保留 `log.warn`；预期降级（`defineTool unavailable`、topic 配置告警）仍保持原级别 |
-| 可观测 | `/mesh/status` 增 `limits: { maxInlineBytes }` 与 `seams: { approval, questions }`（attached/disabled/failed/absent） |
-| 测试 | +4（共 97/97）：9000 字节正文按 4096 截断且不含 U+FFFD、标记含「原文 9000 字节」与 `maxInlineBytes=4096`、多字节边界安全；短正文与空正文逐字节不变；standalone 默认 `seams.approval=disabled/seams.questions=absent/limits.maxInlineBytes=4096`；启用 approvalBridge 后 `seams.approval=attached`。既有 93 例全绿 |
+| 可观测 | `/mesh/status` 增 `limits: { maxInlineBytes }` 与 `seams: { approval, questions }`（attached/disabled/failed/absent）；`pendingTaskList` 增 `injectedAtTurn`/`sameTurnInjected`/`baselineTurn` |
+| 测试 | +6（共 99/99）：同轮先后注入 T-same-A/T-same-B → A 在 turn 42 结算、B 在 turn 42 结束后仍 pending（`sameTurnInjected=true`、`baselineTurn=42`）、turn 43 才结算；跨轮注入 → `injectedAtTurn=null`、baseline=5、turn 6 结算；9000 字节正文按 4096 截断且不含 U+FFFD、标记含「原文 9000 字节」与 `maxInlineBytes=4096`、多字节边界安全；短/空正文逐字节不变；默认 seams disabled/absent + limits 4096；启用 approvalBridge 后 attached。既有 93 例全绿 |
 
 ## v0.7.8（2026-10-31，mesh_dispatch 注册不再静默失败）
 

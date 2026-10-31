@@ -3132,6 +3132,27 @@ export function apply(ctx, config) {
     // mistaken for the task finishing (the T-130 false receipt).
     const openTurn = liveness.get(target.id)?.openTurn ?? null
     const injectedDuringTurn = openTurn !== null
+    const taskMode = mode === 'steer' ? 'steer' : 'queue'
+    // A queue prompt delivered while turn T runs becomes its own later turn, so two tasks
+    // injected inside the same turn must NOT share a baseline: otherwise the first task's
+    // turn/end settles the second one too (T-220: a task that never ran got "completed").
+    // Each same-turn queue task therefore waits one extra turn per earlier queued task;
+    // when the position is unclear this errs toward pending (a stall timer), never a fake
+    // receipt.
+    let baselineTurn = injectedDuringTurn ? openTurn : maxTurnFor(target.id)
+    let sameTurnInjected = false
+    if (injectedDuringTurn && taskMode === 'queue') {
+      const queuedAhead = [...pendingTasks.values()].filter(
+        (pending) =>
+          pending.sessionId === target.id &&
+          !pending.settled &&
+          pending.mode === 'queue' &&
+          pending.injectedDuringTurn === true &&
+          pending.injectedAtTurn === openTurn,
+      ).length
+      baselineTurn = openTurn + queuedAhead
+      sameTurnInjected = queuedAhead > 0
+    }
     // Receipts go back to whoever dispatched the task; receiptTo is only the fallback.
     const requester = resolveRequester(meta?.requester)
     const task = {
@@ -3139,9 +3160,11 @@ export function apply(ctx, config) {
       requester: requester.requester,
       requesterSessionId: requester.sessionId,
       injectedAt: Date.now(),
-      baselineTurn: injectedDuringTurn ? openTurn : maxTurnFor(target.id),
+      baselineTurn,
       injectedDuringTurn,
-      mode: mode === 'steer' ? 'steer' : 'queue',
+      injectedAtTurn: openTurn,
+      sameTurnInjected,
+      mode: taskMode,
       receiptMode,
       batchId,
       settled: false,
@@ -4249,6 +4272,11 @@ export function apply(ctx, config) {
                 requesterSessionId: task.requesterSessionId ?? null,
                 injectedAt: task.injectedAt,
                 receipt: task.receiptMode,
+                // Settlement diagnostics: which turn was running when the task arrived, and
+                // whether it is queued behind another task from that same turn.
+                injectedAtTurn: task.injectedAtTurn ?? null,
+                sameTurnInjected: task.sameTurnInjected === true,
+                baselineTurn: task.baselineTurn ?? null,
               })),
               pendingBatches: batches.size,
               // Queues an operator can act on without reading logs. Local-only status:

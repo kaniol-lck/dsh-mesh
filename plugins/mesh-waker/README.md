@@ -228,7 +228,9 @@ npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task --receipt
 2. requester 解析失败 → 记录 `lastError`（`requester not resolved … falling back to receiptTo`）后回退 `receiptTo`；
 3. 都没有 → 只写文件，`lastError` 说明原因。
 
-batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 requester**；batch 内混有多个 requester 时，其余记日志与回执行（`batch … mixed requesters`）。`/mesh/status` 的 `pendingTaskList` 每行带 `requester`/`requesterSessionId`，`lastReceipt.deliveredTo` 是实际投到的会话 id。
+batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 requester**；batch 内混有多个 requester 时，其余记日志与回执行（`batch … mixed requesters`）。`/mesh/status` 的 `pendingTaskList` 每行带 `requester`/`requesterSessionId`、`injectedAtTurn`/`sameTurnInjected`/`baselineTurn`，`lastReceipt.deliveredTo` 是实际投到的会话 id。
+
+**同一轮内注入多个任务（0.7.9 收紧）**：`queue` 任务的 prompt 各占一个后续回合，所以同一开放轮内先后注入的第二个任务会等到更晚的一轮（`baselineTurn` 按同轮队列位次+1），**不会被第一个任务的 `turn/end` 带走**；位次判断不确定时宁可保持 pending（等 `receiptStallMs` 报 `not-started`），也不发假回执。`steer` 仍按插入当前轮处理。
 
 > 回执只走**本机** inject，绝不推到 hub；`receiptTo` 解析不到时只写文件并置 `lastError`，不会去打扰别的会话。日志与回执里没有 token、密钥。
 
