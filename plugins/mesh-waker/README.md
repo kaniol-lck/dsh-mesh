@@ -168,6 +168,8 @@ dsh plugin --profile web add dsh-mesh-waker
 | `logFile` | `<tmpdir>/mesh-waker.log` | 日志文件；推荐 `~/.dsh/mesh-waker/waker.log`（重启不丢） |
 | `logMaxBytes` | `2097152`（2 MiB） | 超过即滚动为 `<logFile>.1`（只留 1 份历史），下限 1 KiB |
 | `injectHeader` | `true` | 注入正文前加一行 `[TASK …]` 表头；设 `false` 退回逐字投递 |
+| `tasksRetentionDays` | `30` | 任务库保留天数（启动时裁掉更旧的记录） |
+| `tasksMaxRows` | `5000` | 任务库最多保留条数（超量裁最旧） |
 
 ### 信任与权限
 
@@ -234,6 +236,29 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 **同一轮内注入多个任务（0.7.9 收紧）**：`queue` 任务的 prompt 各占一个后续回合，所以同一开放轮内先后注入的第二个任务会等到更晚的一轮（`baselineTurn` 按同轮队列位次+1），**不会被第一个任务的 `turn/end` 带走**；位次判断不确定时宁可保持 pending（等 `receiptStallMs` 报 `not-started`），也不发假回执。`steer` 仍按插入当前轮处理。
 
 > 回执只走**本机** inject，绝不推到 hub；`receiptTo` 解析不到时只写文件并置 `lastError`，不会去打扰别的会话。日志与回执里没有 token、密钥。
+
+## 任务库（0.7.11）
+
+派活的任务正文与生命周期会落盘，事后可查「这单到底要求了什么」，也能把 task → 回执 → 目标会话串起来。
+
+**存储**（`~/.dsh/mesh-waker/`，0600）：
+
+- `tasks.jsonl`：append-only，一行一条；字段 `taskId / batchId / requester / targetSessionId / targetTitle / subject（正文首行 ≤120 字）/ textBytes / createdAt / deadlineMs / status / settledAt / durationMs / receiptRef / receiptSummary / refs[]`；
+- 正文 ≤8 KiB 直接存 `text`；>8 KiB 落 `tasks/<taskId>.md`，jsonl 只记 `textPath`；
+- **保留策略**：`tasksRetentionDays`（默认 30 天）与 `tasksMaxRows`（默认 5000 条），启动时按「超龄或超量」裁最旧的，并压实 jsonl（被裁任务的正文文件一并清理）；
+- **正文隐私**：日志只打 `textBytes` 与 `subject`，**从不打印正文**；列表 API 不含正文，只有详情 API 返回全文。
+
+**API**（仅本机 loopback）：
+
+| 端点 | 用途 |
+|---|---|
+| `GET /mesh/tasks?status=&session=&batch=&limit=&offset=` | 列表（不含正文；默认 `limit=50`、`createdAt` 倒序、返回 `total`；`session` 同时匹配目标会话与 requester） |
+| `GET /mesh/tasks/:id` | 详情：全文 + 回执摘要（`receiptSummary`/`receiptRef`）+ 目标会话 `{sessionId, title, live}` |
+| `DELETE /mesh/tasks/:id` | 仅 `pending` 可取消（→ `cancelled`）；已 settled/stalled 返回 **409**，历史不改写 |
+
+**状态流转**：派活写 `pending`；结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`。`refs[]` 由派活方经 `meta.refs` 传入（只存字符串，waker 不解析 `.worklog`）。
+
+**面板**：设置页「派活任务」区块，列为 `ID / 批次 / 目标会话 / 状态 / 耗时 / 创建时间 / 摘要`，支持状态与目标会话过滤；点行展开正文与回执摘要，提供「打开会话」（宿主 `uiWorkspace.openSession`，不可用时复制会话 id）。顶部统计 `pending N · 今日完成 M · 失败 K`（基于当前筛选结果）。
 
 ## 批次与进度判定（0.5.2）
 

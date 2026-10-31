@@ -693,6 +693,9 @@ function normalizeBase(config) {
     barrierMode: ['file', 'queue', 'wake'].includes(String(c.barrierMode)) ? String(c.barrierMode) : 'wake',
     alertMode: ['file', 'queue', 'wake'].includes(String(c.alertMode)) ? String(c.alertMode) : 'queue',
     batchFile: c.batchFile ? String(c.batchFile) : join(homedir(), '.dsh', 'mesh-waker', 'batches.json'),
+    // Layer-1 task registry retention: rows older than N days or beyond M rows are pruned.
+    tasksRetentionDays: clampInterval(c.tasksRetentionDays, 30, 1, 3650),
+    tasksMaxRows: clampInterval(c.tasksMaxRows, 5000, 50, 200000),
     // Diagnostics: a dedicated log file outside the temp directory survives reboots, and a
     // single rotated copy keeps it bounded without a logging dependency.
     logFile: c.logFile ? String(c.logFile) : undefined,
@@ -3026,6 +3029,174 @@ export function apply(ctx, config) {
     return receipt.summary ? `${first}\n${receipt.summary}` : first
   }
 
+  // ---------------------------------------------------------------- task registry
+  //
+  // Layer-1 task history (0.7.11): every dispatched task is persisted so "what did this
+  // task ask for" can be answered after the fact, and task -> receipt -> session can be
+  // looked up. Bodies stay out of the log (only length + subject are logged).
+
+  const taskRegistryFile = join(homedir(), '.dsh', 'mesh-waker', 'tasks.jsonl')
+  const taskTextDir = join(homedir(), '.dsh', 'mesh-waker', 'tasks')
+  const TASK_INLINE_TEXT_BYTES = 8192
+  const taskRows = new Map()
+
+  function taskSubject(text) {
+    const firstLine = String(text ?? '')
+      .split('\n')
+      .map((line) => line.replace(/\s+/g, ' ').trim())
+      .find((line) => line.length > 0)
+    return Array.from(firstLine ?? '').slice(0, 120).join('')
+  }
+
+  function taskTextPath(taskId) {
+    return join(taskTextDir, `${taskId}.md`)
+  }
+
+  function appendTaskRow(row) {
+    try {
+      mkdirSync(dirname(taskRegistryFile), { recursive: true })
+      appendFileSync(taskRegistryFile, `${JSON.stringify(row)}\n`, { mode: 0o600 })
+      return true
+    } catch (error) {
+      fileLog(`task registry write failed for ${row.taskId}: ${error.message}`)
+      return false
+    }
+  }
+
+  function updateTaskRow(taskId, patch) {
+    const current = taskRows.get(taskId)
+    if (!current) return null
+    const next = { ...current, ...patch }
+    taskRows.set(taskId, next)
+    appendTaskRow(next)
+    return next
+  }
+
+  /** Load + compact tasks.jsonl, dropping rows older than tasksRetentionDays or beyond
+   *  tasksMaxRows. Compaction rewrites the file so pruned rows do not linger forever. */
+  function loadTaskRegistry() {
+    let rows = []
+    try {
+      rows = readFileSync(taskRegistryFile, 'utf8')
+        .split('\n')
+        .filter((line) => line.trim())
+        .map((line) => {
+          try {
+            return JSON.parse(line)
+          } catch {
+            return null
+          }
+        })
+        .filter((row) => row && typeof row === 'object' && row.taskId)
+    } catch {
+      return
+    }
+    const latest = new Map()
+    for (const row of rows) latest.set(String(row.taskId), row)
+    const cutoff = Date.now() - c.tasksRetentionDays * 24 * 60 * 60 * 1000
+    const kept = [...latest.values()]
+      .filter((row) => Number(row.createdAt) >= cutoff)
+      .sort((left, right) => Number(right.createdAt) - Number(left.createdAt))
+      .slice(0, c.tasksMaxRows)
+    taskRows.clear()
+    const keepIds = new Set()
+    for (const row of kept) {
+      taskRows.set(String(row.taskId), row)
+      keepIds.add(String(row.taskId))
+    }
+    try {
+      mkdirSync(dirname(taskRegistryFile), { recursive: true })
+      const temp = `${taskRegistryFile}.tmp`
+      writeFileSync(temp, kept.map((row) => JSON.stringify(row)).join('\n') + (kept.length ? '\n' : ''), { mode: 0o600 })
+      renameSync(temp, taskRegistryFile)
+    } catch (error) {
+      fileLog(`task registry compaction failed: ${error.message}`)
+    }
+    try {
+      for (const name of readdirSync(taskTextDir)) {
+        if (!name.endsWith('.md')) continue
+        const id = name.slice(0, -3)
+        if (!keepIds.has(id)) rmSync(join(taskTextDir, name), { force: true })
+      }
+    } catch {
+      /* no text dir yet */
+    }
+    fileLog(`task registry loaded rows=${taskRows.size}`)
+  }
+
+  /** Persist a dispatched task; bodies over 8 KiB go to tasks/<id>.md (privacy: never logged). */
+  function recordTaskPending(taskId, target, meta, text, extra = {}) {
+    const body = String(text ?? '')
+    const textBytes = Buffer.byteLength(body)
+    const row = {
+      taskId,
+      batchId: extra.batchId ?? null,
+      requester: extra.requester ?? null,
+      targetSessionId: target.id,
+      targetTitle: target.title ?? null,
+      subject: taskSubject(body),
+      textBytes,
+      createdAt: Date.now(),
+      deadlineMs: extra.deadlineMs ?? null,
+      status: 'pending',
+      settledAt: null,
+      durationMs: null,
+      receiptRef: null,
+      refs: Array.isArray(meta?.refs)
+        ? meta.refs
+            .filter((ref) => typeof ref === 'string' && ref.trim())
+            .slice(0, 10)
+            .map((ref) => ref.slice(0, 200))
+        : [],
+    }
+    if (textBytes <= TASK_INLINE_TEXT_BYTES) {
+      row.text = body
+    } else {
+      try {
+        mkdirSync(taskTextDir, { recursive: true })
+        writeFileSync(taskTextPath(taskId), body, { mode: 0o600 })
+        row.textPath = taskTextPath(taskId)
+      } catch (error) {
+        row.text = body.slice(0, TASK_INLINE_TEXT_BYTES)
+        fileLog(`task text file write failed for ${taskId}: ${error.message}`)
+      }
+    }
+    taskRows.set(taskId, row)
+    appendTaskRow(row)
+    fileLog(`task registry pending ${taskId} bytes=${textBytes} subject=${JSON.stringify(row.subject)}`)
+  }
+
+  function taskRowForApi(row, { withText = false } = {}) {
+    const base = {
+      taskId: row.taskId,
+      batchId: row.batchId ?? null,
+      requester: row.requester ?? null,
+      targetSessionId: row.targetSessionId ?? null,
+      targetTitle: row.targetTitle ?? null,
+      subject: row.subject ?? '',
+      textBytes: row.textBytes ?? 0,
+      createdAt: row.createdAt ?? null,
+      deadlineMs: row.deadlineMs ?? null,
+      status: row.status ?? 'pending',
+      settledAt: row.settledAt ?? null,
+      durationMs: row.durationMs ?? null,
+      receiptRef: row.receiptRef ?? null,
+      receiptSummary: row.receiptSummary ?? null,
+      refs: Array.isArray(row.refs) ? row.refs : [],
+      hasTextFile: Boolean(row.textPath),
+    }
+    if (!withText) return base
+    let text = row.text ?? null
+    if (text === null && row.textPath) {
+      try {
+        text = readFileSync(row.textPath, 'utf8')
+      } catch {
+        text = null
+      }
+    }
+    return { ...base, text }
+  }
+
   /** Resolve a requester id/title once; a miss falls back to receiptTo with a loud note. */
   function resolveRequester(raw) {
     const requester = String(raw ?? '').trim()
@@ -3129,6 +3300,15 @@ export function apply(ctx, config) {
       injectedDuringTurn: task.injectedDuringTurn === true,
     })
     writeReceiptFile(receipt)
+    // Registry status mirrors the receipt: not-started is the stall path, everything else
+    // settled. The task -> receipt binding is receiptRef + summary.
+    updateTaskRow(taskId, {
+      status: receipt.status === 'not-started' ? 'stalled' : 'settled',
+      settledAt: receipt.endedAt,
+      durationMs: receipt.durationMs,
+      receiptRef: c.receiptFile,
+      receiptSummary: Array.from(receipt.summary ?? '').slice(0, 500).join(''),
+    })
     lastReceipt = { taskId: receipt.taskId, status: receipt.status, at: receipt.endedAt, deliveredTo: null }
     state.lastReceipt = lastReceipt
     state.pendingTasks = pendingTasks.size
@@ -3138,7 +3318,7 @@ export function apply(ctx, config) {
     return receipt
   }
 
-  function registerPendingTask(target, meta, mode = 'queue') {
+  function registerPendingTask(target, meta, mode = 'queue', text = '') {
     const taskId = String(meta?.taskId ?? '').trim()
     if (!/^[A-Za-z0-9._:-]{1,80}$/.test(taskId)) throw new Error('meta.taskId must match [A-Za-z0-9._:-]{1,80}')
     const requested = String(meta?.receipt ?? '')
@@ -3193,6 +3373,11 @@ export function apply(ctx, config) {
     pendingTasks.set(taskId, task)
     state.pendingTasks = pendingTasks.size
     if (batchId) registerBatchTask(taskId, task, meta)
+    recordTaskPending(taskId, target, meta, text, {
+      batchId,
+      requester: requester.requester,
+      deadlineMs: Number(meta?.deadlineMs) || null,
+    })
     const timer = setTimeout(() => {
       receiptTimers.delete(timer)
       if (task.settled) return
@@ -3218,6 +3403,7 @@ export function apply(ctx, config) {
     clearPending(task)
     pendingTasks.delete(taskId)
     state.pendingTasks = pendingTasks.size
+    updateTaskRow(taskId, { status: 'cancelled', settledAt: Date.now() })
   }
 
   /** Feed the liveness ledger, then settle tasks on turn/end. */
@@ -3805,7 +3991,7 @@ export function apply(ctx, config) {
       : text
     let taskId = null
     try {
-      taskId = registerPendingTask(session, meta, args.mode === 'steer' ? 'steer' : 'queue')
+      taskId = registerPendingTask(session, meta, args.mode === 'steer' ? 'steer' : 'queue', text)
       await promptWithResume(session.id, deliveredText, args.mode === 'steer' ? 'steer' : 'queue')
     } catch (error) {
       if (taskId) cancelPendingTask(taskId)
@@ -3946,6 +4132,7 @@ export function apply(ctx, config) {
   }
 
   // Restore batches before the listener comes up, then poll liveness for early alerts.
+  loadTaskRegistry()
   restoreBatches()
   autoBindTopics()
   batchSweepTimer = setInterval(sweepBatches, Math.max(1000, Math.min(30000, Math.floor(c.waitLongMs / 2))))
@@ -3993,6 +4180,85 @@ export function apply(ctx, config) {
         res.writeHead(500, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: error.message }))
       }
+      return
+    }
+
+    // Task registry API (0.7.11): list without bodies, detail with body, DELETE = cancel.
+    if (path === '/mesh/tasks' && req.method === 'GET') {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const params = url.searchParams
+      const wantedStatus = params.get('status')
+      const wantedSession = params.get('session')
+      const wantedBatch = params.get('batch')
+      const rawLimit = Number(params.get('limit'))
+      const rawOffset = Number(params.get('offset'))
+      const limit = Number.isFinite(rawLimit) ? Math.min(200, Math.max(1, Math.trunc(rawLimit))) : 50
+      const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.trunc(rawOffset)) : 0
+      let rows = [...taskRows.values()]
+      if (wantedStatus) rows = rows.filter((row) => row.status === wantedStatus)
+      if (wantedSession) {
+        rows = rows.filter((row) => row.targetSessionId === wantedSession || row.requester === wantedSession)
+      }
+      if (wantedBatch) rows = rows.filter((row) => row.batchId === wantedBatch)
+      rows.sort((left, right) => Number(right.createdAt) - Number(left.createdAt))
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(
+        JSON.stringify({
+          ok: true,
+          total: rows.length,
+          limit,
+          offset,
+          tasks: rows.slice(offset, offset + limit).map((row) => taskRowForApi(row)),
+        }),
+      )
+      return
+    }
+
+    if (path.startsWith('/mesh/tasks/') && (req.method === 'GET' || req.method === 'DELETE')) {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      let taskId = ''
+      try {
+        taskId = decodeURIComponent(path.slice('/mesh/tasks/'.length))
+      } catch {
+        taskId = ''
+      }
+      const row = taskRows.get(taskId)
+      if (!row) {
+        res.writeHead(404, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: 'task not found' }))
+        return
+      }
+      if (req.method === 'GET') {
+        const target = row.targetSessionId
+          ? {
+              sessionId: row.targetSessionId,
+              title: row.targetTitle ?? null,
+              live: (liveness.get(row.targetSessionId)?.openTurn ?? null) !== null,
+            }
+          : null
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: true, task: taskRowForApi(row, { withText: true }), target }))
+        return
+      }
+      // DELETE only cancels a task that has not settled yet (settled history is immutable).
+      if (row.status !== 'pending') {
+        res.writeHead(409, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: 'only pending tasks can be cancelled', status: row.status }))
+        return
+      }
+      cancelPendingTask(taskId)
+      fileLog(`task ${taskId} cancelled via DELETE`)
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(JSON.stringify({ ok: true, taskId, status: 'cancelled' }))
       return
     }
 
@@ -4246,7 +4512,7 @@ export function apply(ctx, config) {
         // Register before prompting: a very fast turn can end before this request returns.
         let taskId = null
         try {
-          if (meta.taskId) taskId = registerPendingTask(target, meta, mode)
+          if (meta.taskId) taskId = registerPendingTask(target, meta, mode, text)
           await promptWithResume(target.id, deliveredText, mode)
         } catch (error) {
           if (taskId) cancelPendingTask(taskId)

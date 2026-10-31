@@ -9,6 +9,18 @@
 
 ---
 
+## v0.7.11（2026-10-31，层1 任务库：正文落盘 + 可查询索引 + 面板）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | 任务正文不落盘（投递完就没了）、没有 task→回执→会话→产物的索引、跨会话不可见：今天只能靠比 summary 字符串发现 T-220 假回执，也无法回看「这单要求了什么」 |
+| 存储 | `~/.dsh/mesh-waker/tasks.jsonl`（append-only，0600），字段含 `taskId/batchId/requester/targetSessionId/targetTitle/subject/textBytes/createdAt/deadlineMs/status/settledAt/durationMs/receiptRef/receiptSummary/refs[]`；正文 ≤8 KiB 存 `text`，>8 KiB 落 `tasks/<taskId>.md` 只记 `textPath`；`refs[]` 由 `meta.refs` 传入、只存字符串 |
+| 保留 | `tasksRetentionDays`（默认 30）、`tasksMaxRows`（默认 5000）；启动时按超龄/超量裁最旧的并压实 jsonl，同时清理被裁任务的正文文件；日志只打长度与 subject，**从不打印正文** |
+| 写入点 | 两条派活路径（`mesh_dispatch`、`/mesh/inject`）登记 `pending`；结算 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；stall → `stalled`；`DELETE`/批次取消 → `cancelled` |
+| API | `GET /mesh/tasks?status=&session=&batch=&limit=&offset=`（默认 50、createdAt 倒序、`total`；不含正文）、`GET /mesh/tasks/:id`（全文 + 回执摘要 + 目标会话 `{sessionId,title,live}`）、`DELETE /mesh/tasks/:id`（仅 pending → cancelled，已结算返回 409）；全部 loopback-only |
+| 面板 | 设置页「派活任务」：列 `ID/批次/目标会话/状态/耗时/创建时间/摘要`，按状态与目标会话过滤，点行展开正文与回执摘要、「打开会话」（`uiWorkspace.openSession`，不可用时复制 id），顶部 `pending N · 今日完成 M · 失败 K` |
+| 测试 | +6（共 108/108）：派活后列表含 pending/subject/targetSessionId 且列表不含正文；结算后 settled + settledAt/durationMs/receiptRef；DELETE pending→cancelled、DELETE settled→409；9000 字节约 8 KiB 落 `tasks/<id>.md` 且详情返回全文；超龄行启动被裁只留 fresh；status/session 过滤与 `limit/offset/total` 分页正确。既有 102 例全绿 |
+
 ## v0.7.10（2026-10-31，注入正文带上 taskId/batchId 表头）
 
 | 项 | 内容 |

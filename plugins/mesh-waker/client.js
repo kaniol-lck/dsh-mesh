@@ -875,6 +875,9 @@ try {
       const [peerFilter, setPeerFilter] = React.useState('')
       const [maintenanceNote, setMaintenanceNote] = React.useState(null)
       const [sessions, setSessions] = React.useState(null)
+      const [tasks, setTasks] = React.useState(null)
+      const [taskFilter, setTaskFilter] = React.useState({ status: '', session: '' })
+      const [taskDetail, setTaskDetail] = React.useState(null)
 
       const startDrag = (event) => {
         event.preventDefault()
@@ -937,6 +940,7 @@ try {
         } catch {
           /* session list is optional (older host) */
         }
+        void loadTasks()
       }, [])
 
       const archiveSession = async (session) => {
@@ -948,6 +952,48 @@ try {
           setNote('已归档：' + (session.title ?? session.id))
         } catch (error) {
           setNote('归档失败：' + error.message)
+        }
+      }
+
+      // Task registry (0.7.11): list is filterable; detail carries the body + receipt summary.
+      const loadTasks = async (filter = taskFilter) => {
+        const params = new URLSearchParams({ limit: '50' })
+        if (filter?.status) params.set('status', filter.status)
+        if (filter?.session) params.set('session', filter.session.trim())
+        try {
+          setTasks(await json(BASE + '/mesh/tasks?' + params.toString()))
+        } catch (error) {
+          setNote('读取任务库失败：' + error.message)
+        }
+      }
+
+      const openTask = async (taskId) => {
+        if (taskDetail?.task?.taskId === taskId) {
+          setTaskDetail(null)
+          return
+        }
+        try {
+          setTaskDetail(await json(BASE + '/mesh/tasks/' + encodeURIComponent(taskId)))
+        } catch (error) {
+          setNote('读取任务失败：' + error.message)
+        }
+      }
+
+      const openTaskSession = (sessionId) => {
+        if (!sessionId) return
+        if (hostCtx?.uiWorkspace?.openSession) {
+          try {
+            hostCtx.uiWorkspace.openSession(sessionId)
+            return
+          } catch {
+            /* fall through to the clipboard note */
+          }
+        }
+        try {
+          void navigator.clipboard?.writeText(sessionId)
+          setNote('当前宿主导航不可用，已复制会话 id：' + sessionId)
+        } catch {
+          setNote('会话 id：' + sessionId)
         }
       }
 
@@ -1166,6 +1212,96 @@ try {
                 : ' · 暂无回执') +
               (status.pendingTasks ? ` · 等待结算 ${status.pendingTasks}` : '') +
               (status.pendingBatches ? ` · 批次 ${status.pendingBatches}` : ''),
+          ),
+        ),
+        h(
+          Row,
+          {
+            title: '派活任务',
+            description: '任务库（0.7.11）：ID / 批次 / 目标会话 / 状态 / 耗时 / 创建时间 / 摘要；点行看正文、回执摘要与目标会话。',
+          },
+          h(
+            'div',
+            { style: { display: 'grid', gap: 6, minWidth: 340 } },
+            h(
+              'div',
+              { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: 12 } },
+              h(
+                'span',
+                { style: { opacity: 0.8 } },
+                `pending ${(tasks?.tasks ?? []).filter((task) => task.status === 'pending').length} · 今日完成 ${(tasks?.tasks ?? []).filter((task) => task.status === 'settled' && task.settledAt && new Date(task.settledAt).toDateString() === new Date().toDateString()).length} · 失败 ${(tasks?.tasks ?? []).filter((task) => task.status === 'stalled').length}`,
+              ),
+              h(
+                'select',
+                {
+                  style: selectStyle,
+                  value: taskFilter.status,
+                  onChange: (event) => {
+                    const next = { ...taskFilter, status: event.target.value }
+                    setTaskFilter(next)
+                    void loadTasks(next)
+                  },
+                },
+                [
+                  ['', '全部状态'],
+                  ['pending', 'pending'],
+                  ['settled', 'settled'],
+                  ['stalled', 'stalled'],
+                  ['cancelled', 'cancelled'],
+                ].map(([value, label]) => h('option', { key: value, value }, label)),
+              ),
+              h('input', {
+                style: { ...selectStyle, minWidth: 150 },
+                placeholder: '目标会话 id（回车过滤）',
+                value: taskFilter.session,
+                onChange: (event) => setTaskFilter({ ...taskFilter, session: event.target.value }),
+                onKeyDown: (event) => {
+                  if (event.key === 'Enter') void loadTasks()
+                },
+              }),
+            ),
+            h(
+              'div',
+              { style: { display: 'grid', gap: 2, maxHeight: 200, overflowY: 'auto', fontSize: 12 } },
+              (tasks?.tasks ?? []).map((task) =>
+                h(
+                  'div',
+                  {
+                    key: task.taskId,
+                    style: {
+                      display: 'grid',
+                      gridTemplateColumns: '110px 90px 1fr 70px 80px',
+                      gap: 6,
+                      cursor: 'pointer',
+                      padding: '2px 0',
+                      opacity: taskDetail?.task?.taskId === task.taskId ? 1 : 0.85,
+                    },
+                    onClick: () => void openTask(task.taskId),
+                  },
+                  h('span', { style: { fontFamily: 'monospace' } }, task.taskId),
+                  h('span', null, task.batchId ?? '-'),
+                  h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.targetTitle ?? task.targetSessionId ?? '-'),
+                  h('span', null, task.status),
+                  h('span', null, task.durationMs === null || task.durationMs === undefined ? '-' : task.durationMs + 'ms'),
+                ),
+              ),
+              (tasks?.tasks ?? []).length ? null : h('span', { style: { opacity: 0.6 } }, '（暂无任务）'),
+            ),
+            taskDetail?.task
+              ? h(
+                  'div',
+                  { style: { borderTop: '1px solid rgba(120,120,120,0.25)', paddingTop: 6, display: 'grid', gap: 4 } },
+                  h('div', { style: { fontSize: 12, fontWeight: 600 } }, `${taskDetail.task.taskId} · ${taskDetail.task.status} · ${taskDetail.task.createdAt ? new Date(taskDetail.task.createdAt).toLocaleString() : '-'}`),
+                  h('div', { style: { fontSize: 12, opacity: 0.8 } }, '回执：' + (taskDetail.task.receiptSummary ?? taskDetail.task.receiptRef ?? '（无）')),
+                  h('pre', { style: { maxHeight: 180, overflow: 'auto', fontSize: 11, whiteSpace: 'pre-wrap', margin: 0 } }, taskDetail.task.text ?? '（无正文）'),
+                  h(
+                    'div',
+                    { style: { display: 'flex', gap: 8 } },
+                    h('button', { type: 'button', style: styles.button, onClick: () => openTaskSession(taskDetail.task.targetSessionId) }, '打开会话'),
+                    h('button', { type: 'button', style: styles.button, onClick: () => setTaskDetail(null) }, '收起'),
+                  ),
+                )
+              : null,
           ),
         ),
         h(

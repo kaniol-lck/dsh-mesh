@@ -71,7 +71,7 @@ function seedSession(sessionsRoot, { id, title, workspace = 'ws-test' }) {
  * and standalone boots must not touch the network. Pass `config` to boot a hub-mode
  * install (bootstrap / pull) and `writeToken: false` to start with no stored token.
  */
-async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null, archivedIds = [], toolsDelayCalls = 0 } = {}) {
+async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null, archivedIds = [], toolsDelayCalls = 0, tasksSeed = null } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-endpoints-'))
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
@@ -90,6 +90,12 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   if (conversations) fs.writeFileSync(conversationsPath, JSON.stringify(conversations, null, 2))
   const batchesPath = path.join(tmp, 'batches.json')
   if (batches) fs.writeFileSync(batchesPath, JSON.stringify({ savedAt: Date.now(), batches }, null, 2))
+  // Pre-seed the task registry under the throwaway HOME so retention/compaction can be tested.
+  if (Array.isArray(tasksSeed)) {
+    const registryDir = path.join(home, '.dsh', 'mesh-waker')
+    fs.mkdirSync(registryDir, { recursive: true })
+    fs.writeFileSync(path.join(registryDir, 'tasks.jsonl'), tasksSeed.map((row) => JSON.stringify(row)).join('\n') + (tasksSeed.length ? '\n' : ''))
+  }
 
   const state = {
     prompts: [],
@@ -2274,6 +2280,130 @@ async function main() {
       .map((prompt) => promptText(prompt).split('\n')[0])
     const ok = lines.length === 2 && /^\[TASK T-batch-1 · BATCH B-shared · FROM unknown\]/.test(lines[0]) && /^\[TASK T-batch-2 · BATCH B-shared · FROM unknown\]/.test(lines[1])
     report('inject: batch members share BATCH but get their own TASK header', ok, `headers=${JSON.stringify(lines)}`)
+  })
+
+  // 103-108. Layer-1 task registry: persistence, settlement, cancellation, long bodies,
+  // retention compaction, filters/pagination.
+  const seededTask = (taskId, patch = {}) => ({
+    taskId,
+    batchId: null,
+    requester: null,
+    targetSessionId: 'session-seed',
+    targetTitle: 'seed target',
+    subject: `subject of ${taskId}`,
+    textBytes: 10,
+    createdAt: Date.now() - 60 * 1000,
+    deadlineMs: null,
+    status: 'pending',
+    settledAt: null,
+    durationMs: null,
+    receiptRef: null,
+    refs: [],
+    text: 'body',
+    ...patch,
+  })
+
+  await runCase('tasks: a dispatched task is listed as pending with a subject', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-taskreg', title: 'task target' }] })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'task target', text: '第一行摘要行\n第二行细节', meta: { taskId: 'T-reg-1', batchId: 'B-reg' } },
+    })
+    const listed = await request(h.base, '/mesh/tasks')
+    const row = (listed.json?.tasks ?? []).find((task) => task.taskId === 'T-reg-1')
+    const ok =
+      listed.json?.total === 1 &&
+      row?.status === 'pending' &&
+      row?.subject === '第一行摘要行' &&
+      row?.targetSessionId === 'session-taskreg' &&
+      row?.batchId === 'B-reg' &&
+      row?.text === undefined &&
+      row?.hasTextFile === false
+    report('tasks: a dispatched task is listed as pending with a subject', ok, `total=${listed.json?.total} status=${row?.status ?? '-'} subject=${JSON.stringify(row?.subject ?? '')} hasBodyInList=${row?.text !== undefined}`)
+  })
+
+  await runCase('tasks: settlement records settledAt, durationMs and the receipt summary', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-tasksettle', title: 'settle target' }] })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'settle target', text: 'settle me', meta: { taskId: 'T-reg-2' } },
+    })
+    h.emit('session/event', { id: 'session-tasksettle' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-tasksettle' }, { type: 'assistant/message', turn: 1, message: { content: [{ type: 'text', text: 'done body' }] } })
+    h.emit('session/event', { id: 'session-tasksettle' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const detail = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-reg-2')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const task = detail?.json?.task ?? {}
+    const ok = task.status === 'settled' && Number.isFinite(task.settledAt) && task.settledAt > 0 && Number.isFinite(task.durationMs) && task.durationMs >= 0 && task.receiptRef !== null
+    report('tasks: settlement records settledAt, durationMs and the receipt summary', ok, `status=${task.status ?? '-'} settledAt=${task.settledAt ?? '-'} durationMs=${task.durationMs ?? '-'} summary=${JSON.stringify(task.receiptSummary ?? '')}`)
+  })
+
+  await runCase('tasks: DELETE cancels a pending task but refuses a settled one', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-taskdel', title: 'delete target' }] })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'delete target', text: 'cancel me', meta: { taskId: 'T-reg-cancel' } } })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'delete target', text: 'keep me', meta: { taskId: 'T-reg-keep' } } })
+    const cancelled = await request(h.base, '/mesh/tasks/T-reg-cancel', { method: 'DELETE' })
+    const cancelledDetail = await request(h.base, '/mesh/tasks/T-reg-cancel')
+    h.emit('session/event', { id: 'session-taskdel' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-taskdel' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-reg-keep')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const refused = await request(h.base, '/mesh/tasks/T-reg-keep', { method: 'DELETE' })
+    const ok = cancelled.status === 200 && cancelledDetail.json?.task?.status === 'cancelled' && refused.status === 409 && refused.json?.ok === false
+    report('tasks: DELETE cancels a pending task but refuses a settled one', ok, `cancel=${cancelled.status} status=${cancelledDetail.json?.task?.status ?? '-'} settledDelete=${refused.status}`)
+  })
+
+  await runCase('tasks: a body over 8 KiB goes to tasks/<id>.md and is returned by the detail API', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-taskbig', title: 'big target' }] })
+    const big = '长'.repeat(3000) // 9000 UTF-8 bytes
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'big target', text: big, meta: { taskId: 'T-reg-big' } } })
+    const listed = await request(h.base, '/mesh/tasks')
+    const row = (listed.json?.tasks ?? []).find((task) => task.taskId === 'T-reg-big')
+    const detail = await request(h.base, '/mesh/tasks/T-reg-big')
+    const ok = row?.hasTextFile === true && row?.text === undefined && detail.json?.task?.text === big && detail.json?.task?.textBytes === 9000
+    report('tasks: a body over 8 KiB goes to tasks/<id>.md and is returned by the detail API', ok, `hasTextFile=${row?.hasTextFile} textBytes=${detail.json?.task?.textBytes ?? '-'} exactBody=${detail.json?.task?.text === big}`)
+  })
+
+  await runCase('tasks: retention drops rows older than tasksRetentionDays at startup', async (boot) => {
+    const now = Date.now()
+    const h = await boot({
+      tasksSeed: [
+        seededTask('T-old', { createdAt: now - 40 * 24 * 60 * 60 * 1000, status: 'settled', settledAt: now - 40 * 24 * 60 * 60 * 1000 }),
+        seededTask('T-fresh', { createdAt: now - 60 * 1000 }),
+      ],
+    })
+    const listed = await request(h.base, '/mesh/tasks')
+    const ids = (listed.json?.tasks ?? []).map((task) => task.taskId)
+    const ok = listed.json?.total === 1 && ids.includes('T-fresh') && !ids.includes('T-old')
+    report('tasks: retention drops rows older than tasksRetentionDays at startup', ok, `total=${listed.json?.total} ids=${ids.join(',')}`)
+  })
+
+  await runCase('tasks: list filters by status/session and pages with total', async (boot) => {
+    const now = Date.now()
+    const h = await boot({
+      tasksSeed: [
+        seededTask('T-a', { status: 'pending', targetSessionId: 'session-a', createdAt: now - 3000 }),
+        seededTask('T-b', { status: 'settled', targetSessionId: 'session-b', createdAt: now - 2000, settledAt: now - 1000, durationMs: 1000 }),
+        seededTask('T-c', { status: 'settled', targetSessionId: 'session-b', createdAt: now - 1000, settledAt: now - 500, durationMs: 500 }),
+      ],
+    })
+    const byStatus = await request(h.base, '/mesh/tasks?status=pending')
+    const bySession = await request(h.base, '/mesh/tasks?session=session-b')
+    const page = await request(h.base, '/mesh/tasks?limit=1&offset=1')
+    const ok =
+      byStatus.json?.total === 1 &&
+      byStatus.json?.tasks?.[0]?.taskId === 'T-a' &&
+      bySession.json?.total === 2 &&
+      page.json?.total === 3 &&
+      page.json?.limit === 1 &&
+      page.json?.offset === 1 &&
+      page.json?.tasks?.length === 1 &&
+      page.json?.tasks?.[0]?.taskId === 'T-b'
+    report('tasks: list filters by status/session and pages with total', ok, `pending=${byStatus.json?.total} sessionB=${bySession.json?.total} pageTotal=${page.json?.total} pageId=${page.json?.tasks?.[0]?.taskId ?? '-'}`)
   })
 
   const failed = results.filter((result) => !result.ok)
