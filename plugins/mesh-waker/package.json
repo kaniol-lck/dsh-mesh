@@ -1,6 +1,6 @@
 {
   "name": "dsh-mesh-waker",
-  "version": "0.7.16",
+  "version": "0.7.17",
   "description": "DSH client for dsh-mesh: pulls the hub inbox with claims (no inbound port needed), turns mail into real session turns, bootstraps itself from hubUrl + joinCode, and still works standalone for local multi-session coordination.",
   "type": "module",
   "bin": {

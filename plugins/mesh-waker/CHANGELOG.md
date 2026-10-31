@@ -9,6 +9,16 @@
 
 ---
 
+## v0.7.17（2026-10-31，「打开会话」真的能跳转）
+
+| 项 | 内容 |
+|---|---|
+| 根因 | client 插件的 `inject` 只声明了 `slots`，Cordis 插件上下文里没有 `uiWorkspace` 属性 → 任务详情里 `hostCtx?.uiWorkspace?.openSession` 永远 falsy，按钮一直静默走「复制会话 id」分支（owner 点了毫无反应）。宿主实现（asar 静态核对）确认 `UiWorkspaceService.openSession(target) { this.replaceMain(target, signal, 'reveal') }` 是**导航**语义，可用 |
+| 修法 | `inject: ['slots', 'uiWorkspace']` 声明依赖；`openSession(taskId, sessionId)` 同时兼容 `hostCtx.uiWorkspace` 与 `hostCtx.get('uiWorkspace')`，`await` 调用并给出可见反馈：「已切换到会话 …（若主界面未切换：可能已归档或不属于当前工作区）」；异常/无 API 时显示明确提示，不再无声 |
+| 退路 | 详情操作区新增「复制会话 id」「复制任务标记（`[TASK T-xxx]`）」两个次按钮；无会话 id、无导航 API、调用抛错三种情况都有可见文案 |
+| 探测结论 | ① `uiWorkspace.openSession` 可用（实现为 replaceMain reveal，宿主文档写明同步替换 mainView 并返回 Conversation）；② 无会话深链（GUI 状态存 `dsh.sessions.current`，asar 里没有 `#/session` 路由，PDF.js 的 pushState 与业务无关）；③ `openWorkspace/startSession` 可用但语义是「打开工作区空白会话/新建」，不用于会话跳转，故未采用 |
+| 测试 | +1（共 121/121）：静态断言 client bundle 的 `inject` 含 `uiWorkspace`、handler 同时含导航与复制退路。既有 120 例全绿 |
+
 ## v0.7.16（2026-10-31，派活任务面板视觉/交互重做）
 
 | 项 | 内容 |

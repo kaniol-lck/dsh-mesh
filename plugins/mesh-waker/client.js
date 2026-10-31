@@ -1093,22 +1093,34 @@ try {
         }
       }
 
-      const openSession = (sessionId) => {
-        if (!sessionId) return
-        if (hostCtx && hostCtx.uiWorkspace && hostCtx.uiWorkspace.openSession) {
+      const copyText = async (text, label) => {
+        try {
+          await navigator.clipboard.writeText(text)
+          setNote('已复制' + label + '：' + text)
+        } catch {
+          setNote('复制失败，请手动选择' + label + '：' + text)
+        }
+      }
+
+      const openSession = async (taskId, sessionId) => {
+        if (!sessionId) {
+          setNote('该任务没有目标会话 id（batch/任务记录不完整）')
+          return
+        }
+        // uiWorkspace must be declared in this plugin's `inject` list; without that it is
+        // undefined on ctx and the old code silently fell through to a clipboard write.
+        const api = hostCtx?.uiWorkspace ?? (typeof hostCtx?.get === 'function' ? hostCtx.get('uiWorkspace') : undefined)
+        if (api && typeof api.openSession === 'function') {
           try {
-            hostCtx.uiWorkspace.openSession(sessionId)
+            await api.openSession(sessionId)
+            setNote('已切换到会话 ' + sessionId + '（若主界面未切换：该会话可能已归档或不属于当前工作区）')
             return
-          } catch {
-            /* fall through to the clipboard note */
+          } catch (error) {
+            setNote('打开会话失败：' + error.message + '（可复制会话 id 或任务标记手动定位）')
+            return
           }
         }
-        try {
-          void navigator.clipboard.writeText(sessionId)
-          setNote('宿主未暴露页面导航，已复制会话 id：' + sessionId)
-        } catch {
-          setNote('会话 id：' + sessionId)
-        }
+        setNote('宿主未提供会话导航（uiWorkspace 不可用）；请从左侧边栏切换，或复制会话 id / [TASK ' + taskId + '] 标记辅助定位')
       }
 
       const rows = (tasks && tasks.tasks) || []
@@ -1272,7 +1284,17 @@ try {
                 h('span', null, '正文：' + selected.textBytes + ' B'),
               ),
               h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-                h('button', { type: 'button', style: buttonSecondary, onClick: () => openSession(selected.targetSessionId) }, '打开会话'),
+                h('button', { type: 'button', style: buttonPrimary, onClick: () => void openSession(selected.taskId, selected.targetSessionId) }, '打开会话'),
+                h(
+                  'button',
+                  { type: 'button', style: buttonSecondary, onClick: () => void copyText(selected.targetSessionId || '', '会话 id') },
+                  '复制会话 id',
+                ),
+                h(
+                  'button',
+                  { type: 'button', style: buttonSecondary, onClick: () => void copyText('[TASK ' + selected.taskId + ']', '任务标记') },
+                  '复制任务标记',
+                ),
                 selected.status === 'pending'
                   ? h('button', { type: 'button', style: buttonDanger, onClick: () => void cancelTask(selected.taskId) }, '取消任务')
                   : null,
@@ -3042,7 +3064,9 @@ try {
     }
 
     return {
-      inject: ['slots'],
+      // uiWorkspace is a declared dependency: without it ctx.uiWorkspace is undefined and
+      // "open session" silently degrades to a clipboard write (the 2026-10-31 dead button).
+      inject: ['slots', 'uiWorkspace'],
       apply(ctx) {
         hostCtx = ctx
         // One-shot probe (0.7.12): what can the host's uiWorkspace actually do? Navigation

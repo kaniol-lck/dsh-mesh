@@ -2606,6 +2606,12 @@ async function main() {
     report('client: groupTasksByBatch groups by batch, keeps ungrouped last and sorts inside', ok, `groups=${groups.map((group) => group.label + ':' + group.total).join(',')} lateDuration=${late?.durationMs}`)
   })
 
+  await runCase('client: the plugin declares uiWorkspace so the open-session button can navigate', async () => {
+    const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
+    const ok = /inject:\s*\[[^\]]*'uiWorkspace'/.test(source) && source.includes("hostCtx?.uiWorkspace") && source.includes('复制任务标记')
+    report('client: the plugin declares uiWorkspace so the open-session button can navigate', ok, `declared=${/inject:\s*\[[^\]]*'uiWorkspace'/.test(source)} handler=${source.includes('hostCtx?.uiWorkspace')}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
