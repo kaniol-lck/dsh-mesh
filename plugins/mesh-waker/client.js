@@ -1080,7 +1080,7 @@ try {
             {
               style: {
                 display: 'grid',
-                gridTemplateColumns: '120px 100px minmax(120px, 1fr) 80px 80px 150px',
+                gridTemplateColumns: '110px 90px minmax(100px, 0.9fr) minmax(140px, 1.2fr) 70px 70px 140px',
                 gap: 8,
                 padding: '4px 6px',
                 opacity: 0.65,
@@ -1090,6 +1090,7 @@ try {
             h('span', null, 'ID'),
             h('span', null, '批次'),
             h('span', null, '目标会话'),
+            h('span', null, '摘要'),
             h('span', null, '状态'),
             h('span', null, '耗时'),
             h('span', null, '创建时间'),
@@ -1101,7 +1102,7 @@ try {
                 key: task.taskId,
                 style: {
                   display: 'grid',
-                  gridTemplateColumns: '120px 100px minmax(120px, 1fr) 80px 80px 150px',
+                  gridTemplateColumns: '110px 90px minmax(100px, 0.9fr) minmax(140px, 1.2fr) 70px 70px 140px',
                   gap: 8,
                   padding: '4px 6px',
                   cursor: 'pointer',
@@ -1114,6 +1115,11 @@ try {
               h('span', { style: { fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.taskId),
               h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.batchId ?? '-'),
               h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.targetTitle ?? task.targetSessionId ?? '-'),
+              h(
+                'span',
+                { title: task.subject || '(未命名任务)', style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                task.subject || '(未命名任务)',
+              ),
               h('span', null, formatTaskStatus(task.status)),
               h('span', null, task.durationMs === null || task.durationMs === undefined ? '-' : task.durationMs + 'ms'),
               h('span', { style: { opacity: 0.75 } }, task.createdAt ? new Date(task.createdAt).toLocaleString() : '-'),

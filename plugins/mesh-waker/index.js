@@ -443,6 +443,10 @@ export const MESH_DISPATCH_TOOL = {
       description:
         'Session id or title that receives the receipt (the dispatcher). Usually set by the CLI; the tool handler also uses the caller session when the host exposes it.',
     },
+    subject: {
+      type: 'string',
+      description: 'Readable task title for the registry/panel (≤120 chars). Omit to derive one from the first line of text.',
+    },
     createIfMissing: {
       type: 'boolean',
       description: 'Create a session titled with target when it does not resolve (default false).',
@@ -524,6 +528,65 @@ export function inlineBodyText(body, maxBytes) {
   if (!Number.isFinite(limit) || limit <= 0 || total <= limit) return value
   const kept = truncateUtf8(value, limit)
   return `${kept}\n…（正文已截断：原文 ${total} 字节，超过 maxInlineBytes=${limit}；完整内容请用 mesh_inbox 或 GET /api/inbox 读取）`
+}
+
+const TASK_SUBJECT_MAX = 120
+
+function normalizeSubjectText(value) {
+  return String(value ?? '')
+    .replace(/\*\*/g, '')
+    .replace(/__/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * Readable task title from a dispatch body. Explicit `meta.subject` wins; otherwise the
+ * first meaningful line is cleaned: prefer the emphasised segment (the human-written
+ * title), drop wrappers like `任务（协调会话，…）：` / `【…】`, strip Markdown emphasis and
+ * cut at a sentence end. Returns '' when nothing readable is left (the panel shows a
+ * placeholder; the API stores no invented title).
+ */
+export function cleanTaskSubject(text) {
+  const lines = String(text ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+  const first = lines.find((line) => line.length > 0)
+  if (!first) return ''
+  const cleanLine = (line) => {
+    let candidate = normalizeSubjectText(line)
+      .replace(/^任务（[^）]{0,80}）\s*[:：]\s*/, '')
+      .replace(/^任务\s*[:：]\s*/, '')
+      .replace(/^【[^】]{0,80}】\s*/, '')
+      .replace(/^\[[^\]]{0,80}\]\s*/, '')
+    const sentenceEnd = candidate.search(/——|。/)
+    if (sentenceEnd > 0) candidate = candidate.slice(0, sentenceEnd)
+    const colon = candidate.search(/[:：]/)
+    if (colon >= 8) candidate = candidate.slice(0, colon)
+    candidate = candidate.trim()
+    if (!candidate || /^[\s\p{P}\p{S}]+$/u.test(candidate)) return ''
+    return candidate
+  }
+  // A real emphasis segment (not a one-word decorative marker) is the intended title.
+  const boldMatch = first.match(/\*\*([^*]{2,})\*\*/)
+  const boldTitle = boldMatch ? normalizeSubjectText(boldMatch[1]) : ''
+  let candidate = ''
+  if (boldTitle && Array.from(boldTitle).length >= 4 && !/^[\s\p{P}\p{S}]+$/u.test(boldTitle)) candidate = boldTitle
+  if (!candidate) candidate = cleanLine(first)
+  if (!candidate && boldTitle) candidate = boldTitle
+  if (!candidate) {
+    // First line was only markup/decoration: fall back to the next meaningful line.
+    const rest = lines.filter((line) => line.length > 0).slice(1).join(' ')
+    return rest ? cleanTaskSubject(rest) : ''
+  }
+  return Array.from(candidate).slice(0, TASK_SUBJECT_MAX).join('')
+}
+
+/** Explicit subject (trimmed, ≤120) or the cleaned first line of the body. */
+export function resolveTaskSubject(explicit, text) {
+  const chosen = normalizeSubjectText(explicit)
+  if (chosen) return Array.from(chosen).slice(0, TASK_SUBJECT_MAX).join('')
+  return cleanTaskSubject(text)
 }
 
 /**
@@ -3047,14 +3110,6 @@ export function apply(ctx, config) {
   const TASK_INLINE_TEXT_BYTES = 8192
   const taskRows = new Map()
 
-  function taskSubject(text) {
-    const firstLine = String(text ?? '')
-      .split('\n')
-      .map((line) => line.replace(/\s+/g, ' ').trim())
-      .find((line) => line.length > 0)
-    return Array.from(firstLine ?? '').slice(0, 120).join('')
-  }
-
   function taskTextPath(taskId) {
     return join(taskTextDir, `${taskId}.md`)
   }
@@ -3141,7 +3196,7 @@ export function apply(ctx, config) {
       requester: extra.requester ?? null,
       targetSessionId: target.id,
       targetTitle: target.title ?? null,
-      subject: taskSubject(body),
+      subject: resolveTaskSubject(meta?.subject, body),
       textBytes,
       createdAt: Date.now(),
       deadlineMs: extra.deadlineMs ?? null,
@@ -4007,6 +4062,7 @@ export function apply(ctx, config) {
     const meta = {
       taskId: resolved.taskId,
       ...(requester ? { requester } : {}),
+      ...(args.subject ? { subject: String(args.subject) } : {}),
       ...(resolved.batchId ? { batchId: resolved.batchId } : {}),
       ...(args.receipt ? { receipt: String(args.receipt) } : {}),
       ...(resolved.deadlineMs ? { deadlineMs: resolved.deadlineMs } : {}),
@@ -4530,6 +4586,9 @@ export function apply(ctx, config) {
         // The dispatcher names itself so the receipt returns to it, not to receiptTo.
         const requester = String(draft.requester ?? meta.requester ?? '').trim()
         if (requester && !meta.requester) meta.requester = requester
+        // CLI/HTTP callers may pass the readable title at the top level or inside meta.
+        const subject = String(draft.subject ?? meta.subject ?? '').trim()
+        if (subject && !meta.subject) meta.subject = subject
         const batchId = meta.batchId ? String(meta.batchId).trim() : null
         const deliveredText = c.injectHeader
           ? withTaskHeader(text, { taskId: meta.taskId ? String(meta.taskId) : '-', batchId, requester })

@@ -2496,6 +2496,65 @@ async function main() {
     report('tasks: turn/end without a start settles without inventing startedAt', ok, `status=${task.status ?? '-'} startedAt=${task.startedAt === null ? 'null' : task.startedAt} durationMs=${task.durationMs ?? '-'} alive=${alive.status}`)
   })
 
+  // 113-117. Readable task titles: explicit meta.subject wins; inferred subjects are cleaned.
+  await runCase('tasks: the subject cleaner prefers the emphasised title and drops wrappers', async () => {
+    const { cleanTaskSubject } = await import(pathToFileURL(ENTRY).href)
+    const sample = '任务（协调会话，**设置页第 1 步：信息架构 + 让它真能改**）：把设置页按功能章节聚合，并把现有可写项做成可编辑控件。'
+    const cleaned = cleanTaskSubject(sample)
+    const plain = cleanTaskSubject('修复 waker 的 mesh_ask 超时')
+    const ok = cleaned === '设置页第 1 步：信息架构 + 让它真能改' && plain === '修复 waker 的 mesh_ask 超时'
+    report('tasks: the subject cleaner prefers the emphasised title and drops wrappers', ok, `cleaned=${JSON.stringify(cleaned)} plain=${JSON.stringify(plain)}`)
+  })
+
+  await runCase('tasks: the subject cleaner strips markdown and falls back to later lines', async () => {
+    const { cleanTaskSubject } = await import(pathToFileURL(ENTRY).href)
+    const marked = cleanTaskSubject('**修复** 回执路由')
+    const fallback = cleanTaskSubject('\n\n---\n第二行才是标题')
+    const empty = cleanTaskSubject('***\n---')
+    const ok = marked === '修复 回执路由' && fallback === '第二行才是标题' && empty === ''
+    report('tasks: the subject cleaner strips markdown and falls back to later lines', ok, `marked=${JSON.stringify(marked)} fallback=${JSON.stringify(fallback)} empty=${JSON.stringify(empty)}`)
+  })
+
+  await runCase('tasks: an explicit subject wins, is trimmed and capped at 120 chars', async () => {
+    const { resolveTaskSubject } = await import(pathToFileURL(ENTRY).href)
+    const explicit = resolveTaskSubject('  我的标题  ', '正文第一行不应生效')
+    const long = resolveTaskSubject('长'.repeat(200), 'x')
+    const ok = explicit === '我的标题' && Array.from(long).length === 120
+    report('tasks: an explicit subject wins, is trimmed and capped at 120 chars', ok, `explicit=${JSON.stringify(explicit)} longLen=${Array.from(long).length}`)
+  })
+
+  await runCase('tasks: meta.subject is stored and listed as the task subject', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-subject', title: 'subject target' }] })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: {
+        title: 'subject target',
+        text: '任务（协调会话，**正文里的假标题**）：正文说明',
+        meta: { taskId: 'T-subject-explicit', subject: '  真正可读的任务标题  ' },
+      },
+    })
+    const listed = await request(h.base, '/mesh/tasks')
+    const row = (listed.json?.tasks ?? []).find((task) => task.taskId === 'T-subject-explicit')
+    const ok = row?.subject === '真正可读的任务标题'
+    report('tasks: meta.subject is stored and listed as the task subject', ok, `subject=${JSON.stringify(row?.subject ?? '')}`)
+  })
+
+  await runCase('tasks: without meta.subject the stored subject is the cleaned first line', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-subject2', title: 'subject target 2' }] })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: {
+        title: 'subject target 2',
+        text: '任务（协调会话，**清理后的标题**）：正文说明\n第二行细节',
+        meta: { taskId: 'T-subject-inferred' },
+      },
+    })
+    const listed = await request(h.base, '/mesh/tasks')
+    const row = (listed.json?.tasks ?? []).find((task) => task.taskId === 'T-subject-inferred')
+    const ok = row?.subject === '清理后的标题'
+    report('tasks: without meta.subject the stored subject is the cleaned first line', ok, `subject=${JSON.stringify(row?.subject ?? '')}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

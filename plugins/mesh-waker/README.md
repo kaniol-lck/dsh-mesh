@@ -378,6 +378,7 @@ tail -n 2 ~/.dsh/mesh-waker/receipts.jsonl
 | `batchId` | `--batch [id]` | 同批次 barrier：全部结束只回执一次 |
 | `receipt` | `--receipt` | `file`/`queue`/`wake`，覆盖插件默认 |
 | `deadline` | `--deadline` | `30m`/`2h`/`600s`，默认 `batchDeadlineMs` |
+| `subject` | `--subject` | 任务库/面板显示的可读标题（≤120 字）；省略时由正文首行清洗（优先加粗片段、去掉 `任务（…）：`/`【…】` 前缀与 `**`） |
 
 工具描述里明确写了：投递后**不要轮询等待**，插件会在回合结束时写回执；要「全部完成再叫我」就用同一个 `batchId`。
 
