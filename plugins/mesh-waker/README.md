@@ -76,6 +76,8 @@ dsh plugin --profile web add dsh-mesh-waker
 | `pollBusyIntervalMs` | `5000` | 拉到消息后的快档间隔 |
 | `pollIdleIntervalMs` | `60000` | 连续 3 次空轮询后的慢档间隔 |
 | `claimTtlMs` | `300000` | claim 租约；puller 崩溃后由中枢自动回收 |
+| `logFile` | `<tmpdir>/mesh-waker.log` | 日志文件；推荐 `~/.dsh/mesh-waker/waker.log`（重启不丢） |
+| `logMaxBytes` | `2097152`（2 MiB） | 超过即滚动为 `<logFile>.1`（只留 1 份历史），下限 1 KiB |
 
 **激活矩阵**：
 
@@ -163,7 +165,7 @@ HTTP（loopback）：`GET /mesh/batches`、`GET /mesh/batches/<id>`（含每个�
 
 | 端点 | 作用 |
 |---|---|
-| `GET /mesh/sessions` | 列出本机会话（最多 80 条，按最后活动排序）：`id` / `title` / `cwd` / `workspace` / `last_active` / `live` / `archived`；加 `?live=1` 只返回未归档会话 |
+| `GET /mesh/sessions` | 列出本机会话（按最后活动排序）：`id` / `title` / `cwd` / `workspace` / `last_active` / `live` / `archived`。分页参数 `limit`（默认 80，夹取到 1–500）、`offset`（默认 0）、`archived`（`1`/`0`/省略）、`cwd`（精确匹配）、`q`（标题子串，大小写不敏感）；响应含 `{ ok, total, limit, offset, sessions }`，`total` 是过滤后总数。`?live=1` 仍只返回未归档会话 |
 | `POST /mesh/inject` | 向已有会话投一轮任务：按 `session`（完整 id）→ 精确标题 → 标题唯一子串寻址；歧义或找不到返回 400。`mode` 为 `queue`（默认，等当前回合）或 `steer`（打断当前回合） |
 | `POST /mesh/sessions/create` | 新建会话并绑定工作区，可选首轮 `prompt`；返回 `sessionId` / `workspaceId` / `workspacePath` / `prompted` |
 | `POST /mesh/sessions/archive` | 归档会话：日志保留、侧栏隐藏；存活的会话会被宿主拒绝（`workspace/session-active`） |
@@ -333,6 +335,18 @@ mesh_ask({
 | `pendingApprovals` | `[{conversation, askedAt, expiresAt, preview, toolName}]` | 正在等待决定的审批请求；`preview` 形如 `bash · <摘要>`；无则为 `[]` |
 
 两个字段都只在本机 status 输出里；`conversation` 可以直接用来在收件箱里定位原消息（问题/审批消息本身仍按各自桥的隔离规则处理）。
+
+## 日志与取证（0.7.5）
+
+- **路径**：默认 `<tmpdir>/mesh-waker.log`（重启/清临时目录会丢）；生产建议 `logFile: ~/.dsh/mesh-waker/waker.log`。
+- **滚动**：单文件超过 `logMaxBytes`（默认 2 MiB）时改名为 `<logFile>.1`，新文件从空开始；只保留 1 份历史，不引第三方库。
+- **状态**：`/mesh/status` 的 `logFile` / `logBytes` 可直接确认「插件在写、写在哪、多大」。
+- **定位重复报错**：
+
+```bash
+grep -c "pull failed" ~/.dsh/mesh-waker/waker.log     # 同类错误出现次数
+tail -n 50 ~/.dsh/mesh-waker/waker.log                # 最近上下文
+```
 
 ## 依赖
 

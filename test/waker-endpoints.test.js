@@ -1777,6 +1777,122 @@ async function main() {
     }
   })
 
+  // 75-79. /mesh/sessions pagination and filters (no more hard 80 cap).
+  await runCase('sessions: default page reports total/limit/offset', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-page-a', title: 'alpha one' },
+        { id: 'session-page-b', title: 'beta two' },
+        { id: 'session-page-c', title: 'gamma three' },
+      ],
+    })
+    const listed = await request(h.base, '/mesh/sessions')
+    const body = listed.json ?? {}
+    const ok = body.ok === true && body.total === 3 && body.limit === 80 && body.offset === 0 && body.sessions.length === 3
+    report('sessions: default page reports total/limit/offset', ok, `total=${body.total} limit=${body.limit} offset=${body.offset} sessions=${body.sessions?.length}`)
+  })
+
+  await runCase('sessions: limit/offset returns the requested window', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-win-a', title: 'first' },
+        { id: 'session-win-b', title: 'second' },
+        { id: 'session-win-c', title: 'third' },
+      ],
+    })
+    const full = await request(h.base, '/mesh/sessions')
+    const windowed = await request(h.base, '/mesh/sessions?limit=1&offset=1')
+    const expected = full.json?.sessions?.[1]?.id
+    const ok = windowed.json?.total === 3 && windowed.json?.limit === 1 && windowed.json?.offset === 1 && windowed.json?.sessions?.length === 1 && windowed.json.sessions[0].id === expected
+    report('sessions: limit/offset returns the requested window', ok, `expected=${expected ?? '-'} got=${windowed.json?.sessions?.[0]?.id ?? '-'} limit=${windowed.json?.limit} offset=${windowed.json?.offset}`)
+  })
+
+  await runCase('sessions: archived filter selects only archived sessions', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-arch-live', title: 'live one' },
+        { id: 'session-arch-old', title: 'archived one' },
+      ],
+      archivedIds: ['session-arch-old'],
+    })
+    const archived = await request(h.base, '/mesh/sessions?archived=1')
+    const active = await request(h.base, '/mesh/sessions?archived=0')
+    const ok =
+      archived.json?.total === 1 &&
+      archived.json?.sessions?.[0]?.id === 'session-arch-old' &&
+      active.json?.total === 1 &&
+      active.json?.sessions?.[0]?.id === 'session-arch-live'
+    report('sessions: archived filter selects only archived sessions', ok, `archived=${archived.json?.total} active=${active.json?.total}`)
+  })
+
+  await runCase('sessions: q filters by title substring, case-insensitively', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-q-a', title: 'Alpha One' },
+        { id: 'session-q-b', title: 'beta two' },
+      ],
+    })
+    const matched = await request(h.base, '/mesh/sessions?q=alp')
+    const ok = matched.json?.total === 1 && matched.json?.sessions?.[0]?.id === 'session-q-a'
+    report('sessions: q filters by title substring, case-insensitively', ok, `total=${matched.json?.total} id=${matched.json?.sessions?.[0]?.id ?? '-'}`)
+  })
+
+  await runCase('sessions: limit is clamped to 1..500', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-clamp-a', title: 'one' }] })
+    const low = await request(h.base, '/mesh/sessions?limit=0')
+    const high = await request(h.base, '/mesh/sessions?limit=999')
+    const ok = low.json?.limit === 1 && low.json?.sessions?.length === 1 && high.json?.limit === 500
+    report('sessions: limit is clamped to 1..500', ok, `lowLimit=${low.json?.limit} highLimit=${high.json?.limit}`)
+  })
+
+  // 80-82. Dedicated log file with size-based rotation.
+  await runCase('logging: logFile config receives lines and status reports size', async (boot) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-log-'))
+    const logFile = path.join(tmp, 'waker.log')
+    let h = null
+    try {
+      h = await boot({ seedSessions: [{ id: 'session-log-a', title: 'log target' }], config: { logFile } })
+      await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'log target', text: 'write a log line' } })
+      await waitFor(() => fs.existsSync(logFile) && fs.readFileSync(logFile, 'utf8').includes('injected'), 5000)
+      const status = await request(h.base, '/mesh/status')
+      const size = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0
+      const ok = fs.existsSync(logFile) && size > 0 && status.json?.logFile === logFile && status.json?.logBytes === size
+      report('logging: logFile config receives lines and status reports size', ok, `exists=${fs.existsSync(logFile)} bytes=${status.json?.logBytes} statusFile=${status.json?.logFile}`)
+    } finally {
+      if (h) h.close()
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('logging: exceeding logMaxBytes rotates to .1 and starts empty', async (boot) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-log-'))
+    const logFile = path.join(tmp, 'waker.log')
+    fs.writeFileSync(logFile, 'x'.repeat(3000))
+    let h = null
+    try {
+      h = await boot({
+        seedSessions: [{ id: 'session-log-rot', title: 'rotate target' }],
+        config: { logFile, logMaxBytes: 1024 },
+      })
+      await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'rotate target', text: 'trigger rotation' } })
+      await waitFor(() => fs.existsSync(`${logFile}.1`), 5000)
+      const rotatedSize = fs.existsSync(`${logFile}.1`) ? fs.statSync(`${logFile}.1`).size : 0
+      const current = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+      const ok = rotatedSize === 3000 && current.includes('injected') && Buffer.byteLength(current) < 1024
+      report('logging: exceeding logMaxBytes rotates to .1 and starts empty', ok, `rotatedBytes=${rotatedSize} currentBytes=${Buffer.byteLength(current)} currentHasLine=${current.includes('injected')}`)
+    } finally {
+      if (h) h.close()
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('logging: status exposes logFile and logBytes fields', async (boot) => {
+    const h = await boot({})
+    const status = await request(h.base, '/mesh/status')
+    const ok = typeof status.json?.logFile === 'string' && status.json.logFile.length > 0 && typeof status.json?.logBytes === 'number'
+    report('logging: status exposes logFile and logBytes fields', ok, `logFile=${status.json?.logFile} logBytes=${status.json?.logBytes}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

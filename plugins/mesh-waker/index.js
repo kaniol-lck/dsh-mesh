@@ -17,8 +17,7 @@
  *    normal session-start inbox check picks it up later.
  */
 import { createServer } from 'node:http'
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { statSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir, networkInterfaces, homedir, hostname } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -70,13 +69,42 @@ export const inject = ['sessionController', 'agents', 'workspaceRegistry', 'conf
 const WINDOW_MS = 120_000
 const MAX_BODY = 16 * 1024
 const LOG_FILE = process.env.MESH_WAKER_LOG || join(tmpdir(), 'mesh-waker.log')
+const LOG_MAX_BYTES_DEFAULT = 2 * 1024 * 1024
+// The file logger is configured from the plugin config in apply(); before that it keeps the
+// historical tmp default so early start-up lines are never lost.
+let logTarget = LOG_FILE
+let logMaxBytes = LOG_MAX_BYTES_DEFAULT
+let logBytes = 0
 /** This bundle's own patch file: the persistence fallback when the Loader's config editor
  *  does not expose bundle rows (it currently only lists rows it authored). */
 const PATCH_PATH = fileURLToPath(new URL('./cordis.patch.yml', import.meta.url))
 
+function configureLog(file, maxBytes) {
+  if (file) logTarget = String(file)
+  if (Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0) logMaxBytes = Number(maxBytes)
+  try {
+    logBytes = statSync(logTarget).size
+  } catch {
+    logBytes = 0
+  }
+}
+
+function rotateLog() {
+  try {
+    renameSync(logTarget, `${logTarget}.1`)
+  } catch {
+    /* a failed rename must not drop the line we are about to write */
+  }
+  logBytes = 0
+}
+
 function fileLog(message) {
   try {
-    appendFileSync(LOG_FILE, `${new Date().toISOString()} ${message}\n`)
+    const line = `${new Date().toISOString()} ${message}\n`
+    const size = Buffer.byteLength(line)
+    if (logMaxBytes > 0 && logBytes > 0 && logBytes + size > logMaxBytes) rotateLog()
+    appendFileSync(logTarget, line)
+    logBytes += size
   } catch {
     /* logging must never break the wake path */
   }
@@ -461,6 +489,32 @@ export function previewText(text, max = 80) {
     .slice(0, max)
 }
 
+export const SESSION_PAGE_DEFAULT = 80
+export const SESSION_PAGE_MAX = 500
+
+/**
+ * Filter + page the local session list for GET /mesh/sessions.
+ * `archived`: '1' only archived, '0' only active, anything else no filter.
+ * `limit` is clamped to 1..SESSION_PAGE_MAX (default 80); `offset` to >= 0.
+ * `q` is a case-insensitive title substring; `cwd` is an exact match.
+ */
+export function paginateSessions(sessions, query = {}) {
+  const rawLimit = query.limit === undefined || query.limit === null || query.limit === '' ? NaN : Number(query.limit)
+  const rawOffset = query.offset === undefined || query.offset === null || query.offset === '' ? NaN : Number(query.offset)
+  const limit = Number.isFinite(rawLimit) ? Math.min(SESSION_PAGE_MAX, Math.max(1, Math.trunc(rawLimit))) : SESSION_PAGE_DEFAULT
+  const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.trunc(rawOffset)) : 0
+  let filtered = Array.isArray(sessions) ? sessions : []
+  if (query.archived === '1' || query.archived === '0') {
+    const want = query.archived === '1'
+    filtered = filtered.filter((session) => session.archived === want)
+  }
+  const cwd = typeof query.cwd === 'string' && query.cwd.trim() ? query.cwd.trim() : ''
+  if (cwd) filtered = filtered.filter((session) => session.cwd === cwd)
+  const needle = typeof query.q === 'string' ? query.q.trim().toLowerCase() : ''
+  if (needle) filtered = filtered.filter((session) => String(session.title ?? '').toLowerCase().includes(needle))
+  return { total: filtered.length, limit, offset, sessions: filtered.slice(offset, offset + limit) }
+}
+
 function normalizeBase(config) {
   const c = config ?? {}
   // Secrets may be inlined (older configs) or, preferably, read from owner-only files so
@@ -585,6 +639,10 @@ function normalizeBase(config) {
     barrierMode: ['file', 'queue', 'wake'].includes(String(c.barrierMode)) ? String(c.barrierMode) : 'wake',
     alertMode: ['file', 'queue', 'wake'].includes(String(c.alertMode)) ? String(c.alertMode) : 'queue',
     batchFile: c.batchFile ? String(c.batchFile) : join(homedir(), '.dsh', 'mesh-waker', 'batches.json'),
+    // Diagnostics: a dedicated log file outside the temp directory survives reboots, and a
+    // single rotated copy keeps it bounded without a logging dependency.
+    logFile: c.logFile ? String(c.logFile) : undefined,
+    logMaxBytes: clampInterval(c.logMaxBytes, LOG_MAX_BYTES_DEFAULT, 1024, 100 * 1024 * 1024),
     permissionPresetByTrust: {
       strict: 'read-only',
       normal: 'workspace-write',
@@ -615,6 +673,8 @@ function lanAddress() {
 export function apply(ctx, config) {
   let c = normalize(config)
   const log = ctx.logger ?? console
+  // Point the file logger at the configured path before anything else logs.
+  configureLog(c.logFile, c.logMaxBytes)
 
   // Activation matrix (contract 2026-10-29, section 3). The local endpoints never need the
   // hub, so "no credentials" degrades to standalone instead of making the whole plugin
@@ -1018,7 +1078,10 @@ export function apply(ctx, config) {
       }
     }
     found.sort((left, right) => right.mtime - left.mtime)
-    return found.slice(0, 80)
+    // No hard 80-cap here: pagination is a route concern, and callers such as title
+    // resolution must still see older sessions. A generous safety cap avoids pathological
+    // directories.
+    return found.slice(0, 5000)
   }
 
   function sessionMeta(entry) {
@@ -3657,11 +3720,20 @@ export function apply(ctx, config) {
       }
       try {
         const url = new URL(req.url ?? '/', 'http://localhost')
+        const params = url.searchParams
         const sessions = listLocalSessions()
-        // live=1 is the panel/script convenience filter: drop archived sessions.
-        const listed = url.searchParams.get('live') === '1' ? sessions.filter((session) => !session.archived) : sessions
+        // live=1 is the panel/script convenience filter: drop archived sessions first, then
+        // page. It is independent from the archived=0|1 parameter.
+        const visible = params.get('live') === '1' ? sessions.filter((session) => !session.archived) : sessions
+        const page = paginateSessions(visible, {
+          limit: params.has('limit') ? params.get('limit') : undefined,
+          offset: params.has('offset') ? params.get('offset') : undefined,
+          archived: params.get('archived'),
+          cwd: params.get('cwd'),
+          q: params.get('q'),
+        })
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-        res.end(JSON.stringify({ ok: true, sessions: listed }))
+        res.end(JSON.stringify({ ok: true, total: page.total, limit: page.limit, offset: page.offset, sessions: page.sessions }))
       } catch (error) {
         res.writeHead(500, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: error.message }))
@@ -3971,6 +4043,15 @@ export function apply(ctx, config) {
               receiptFile: c.receiptFile,
               batchFile: c.batchFile,
               barrierMode: c.barrierMode,
+              // Diagnostics: where the plugin writes and how big the file is right now.
+              logFile: logTarget,
+              logBytes: (() => {
+                try {
+                  return statSync(logTarget).size
+                } catch {
+                  return 0
+                }
+              })(),
               ...state,
               throttled: throttleSummary(),
               historyCached: history.size,

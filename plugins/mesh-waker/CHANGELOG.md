@@ -5,9 +5,17 @@
 > **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
 > `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留 + 分页/日志）。
 
 ---
+
+## v0.7.5（2026-10-31，/mesh/sessions 分页过滤 + 独立日志文件与滚动）
+
+| 项 | 内容 |
+|---|---|
+| 分页 | `discoverSessions()` 不再固定 `slice(0,80)`（上限放到 5000 防病态目录）；`GET /mesh/sessions` 支持 `limit`（默认 80，夹取 1–500）、`offset`（默认 0）、`archived`（1/0/省略）、`cwd`（精确）、`q`（标题子串、大小写不敏感）；响应为 `{ok,total,limit,offset,sessions}`，`total` 是过滤后总数；无参数时仍是前 80 条（多出三个元数据字段）；`?live=1` 语义不变（先过滤未归档再分页） |
+| 日志 | 新增 `logFile`（默认 `<tmpdir>/mesh-waker.log`，推荐 `~/.dsh/mesh-waker/waker.log`）与 `logMaxBytes`（默认 2 MiB，下限 1 KiB）；`fileLog` 在写入前按大小滚动为 `<logFile>.1`（只留 1 份，无第三方库）；`/mesh/status` 增 `logFile`/`logBytes` |
+| 测试 | +8（共 82/82）：默认页 `total=3 limit=80 offset=0`；`limit=1&offset=1` 与全量切片一致；`archived=1/0` 各命中；`q=alp` 大小写不敏感命中 1 条；`limit=0`→1、`limit=999`→500；自定义 `logFile` 收到 `injected` 行且 status 的 `logFile/logBytes` 与之相符；预置 3000B 日志 + `logMaxBytes=1024` 触发 `.1`（3000B）且新文件从空开始并含新行；status 两字段存在。既有 74 例全绿 |
 
 ## v0.7.4（2026-10-31，修 exports：loader 读不到清单）
 
