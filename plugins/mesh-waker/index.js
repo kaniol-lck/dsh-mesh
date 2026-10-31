@@ -437,7 +437,7 @@ export const MESH_DISPATCH_TOOL = {
     'requester names the session that should receive the receipt (usually passed by the CLI; models may omit it).',
   parameters: {
     target: { type: 'string', required: true, description: 'Session id, full title, or a unique title substring.' },
-    text: { type: 'string', required: true, description: 'Task text, delivered verbatim (max 64 KiB).' },
+    text: { type: 'string', required: true, description: 'Task text, delivered verbatim after a one-line [TASK …] header (max 64 KiB).' },
     requester: {
       type: 'string',
       description:
@@ -524,6 +524,23 @@ export function inlineBodyText(body, maxBytes) {
   if (!Number.isFinite(limit) || limit <= 0 || total <= limit) return value
   const kept = truncateUtf8(value, limit)
   return `${kept}\n…（正文已截断：原文 ${total} 字节，超过 maxInlineBytes=${limit}；完整内容请用 mesh_inbox 或 GET /api/inbox 读取）`
+}
+
+/**
+ * One machine-readable header line prepended to an injected prompt, so the receiving session
+ * knows which task/batch it is running without guessing from prose. The body after the blank
+ * line stays byte-for-byte unchanged.
+ */
+export function withTaskHeader(text, { taskId, batchId, requester, now = new Date() } = {}) {
+  const pad = (value) => String(value).padStart(2, '0')
+  const offset = -now.getTimezoneOffset()
+  const sign = offset >= 0 ? '+' : '-'
+  const abs = Math.abs(offset)
+  const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`
+  const task = taskId || '-'
+  const batch = batchId || '-'
+  const from = requester || 'unknown'
+  return `[TASK ${task} · BATCH ${batch} · FROM ${from}] ${stamp}\n\n${text}`
 }
 
 export const SESSION_PAGE_DEFAULT = 80
@@ -680,6 +697,9 @@ function normalizeBase(config) {
     // single rotated copy keeps it bounded without a logging dependency.
     logFile: c.logFile ? String(c.logFile) : undefined,
     logMaxBytes: clampInterval(c.logMaxBytes, LOG_MAX_BYTES_DEFAULT, 1024, 100 * 1024 * 1024),
+    // Tell the receiving session which task/batch it is running (one header line). Off
+    // restores byte-identical delivery.
+    injectHeader: c.injectHeader !== false,
     permissionPresetByTrust: {
       strict: 'read-only',
       normal: 'workspace-write',
@@ -3780,16 +3800,19 @@ export function apply(ctx, config) {
       ...(args.receipt ? { receipt: String(args.receipt) } : {}),
       ...(resolved.deadlineMs ? { deadlineMs: resolved.deadlineMs } : {}),
     }
+    const deliveredText = c.injectHeader
+      ? withTaskHeader(text, { taskId: meta.taskId, batchId: meta.batchId, requester })
+      : text
     let taskId = null
     try {
       taskId = registerPendingTask(session, meta, args.mode === 'steer' ? 'steer' : 'queue')
-      await promptWithResume(session.id, text, args.mode === 'steer' ? 'steer' : 'queue')
+      await promptWithResume(session.id, deliveredText, args.mode === 'steer' ? 'steer' : 'queue')
     } catch (error) {
       if (taskId) cancelPendingTask(taskId)
       throw error
     }
     fileLog(
-      `mesh_dispatch: ${text.length} chars -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession}`,
+      `mesh_dispatch: ${text.length} chars (delivered ${deliveredText.length}) -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession} header=${c.injectHeader}`,
     )
     return {
       ok: true,
@@ -4217,16 +4240,19 @@ export function apply(ctx, config) {
         const requester = String(draft.requester ?? meta.requester ?? '').trim()
         if (requester && !meta.requester) meta.requester = requester
         const batchId = meta.batchId ? String(meta.batchId).trim() : null
+        const deliveredText = c.injectHeader
+          ? withTaskHeader(text, { taskId: meta.taskId ? String(meta.taskId) : '-', batchId, requester })
+          : text
         // Register before prompting: a very fast turn can end before this request returns.
         let taskId = null
         try {
           if (meta.taskId) taskId = registerPendingTask(target, meta, mode)
-          await promptWithResume(target.id, text, mode)
+          await promptWithResume(target.id, deliveredText, mode)
         } catch (error) {
           if (taskId) cancelPendingTask(taskId)
           throw error
         }
-        fileLog(`injected ${text.length} chars into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}`)
+        fileLog(`injected ${text.length} chars (delivered ${deliveredText.length}) into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''} header=${c.injectHeader}`)
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: true, sessionId: target.id, title: target.title, mode, taskId, batchId: taskId ? batchId : null }))
       } catch (error) {

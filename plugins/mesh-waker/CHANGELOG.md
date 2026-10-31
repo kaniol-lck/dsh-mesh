@@ -9,6 +9,15 @@
 
 ---
 
+## v0.7.10（2026-10-31，注入正文带上 taskId/batchId 表头）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | `promptWithResume` 原样投递派活正文，`taskId` 只存在于 waker 回执元数据里：目标会话不知道「我这一单叫 T-220」，无法在自己的账本/WORKLOG 里引用；假回执时也无法自查处理过哪几单 |
+| 做法 | 新增 `withTaskHeader()`：投递前在正文前加**一行** `[TASK <taskId> · BATCH <batchId 或 -> · FROM <requester 或 unknown>] <本地 ISO 时间>`，空行后是**逐字不变**的原文；工具路径（`mesh_dispatch`）与 HTTP 路径（`/mesh/inject`）都生效；新配置 `injectHeader`（默认 `true`，设 `false` 退回零差异投递）；表头不参与 `maxBytes` 校验；taskId 缺失时写 `-`，不阻断投递 |
+| 文档 | `MESH_DISPATCH_TOOL` 的 `text` 描述改为「delivered verbatim after a one-line [TASK …] header」；README 的 `text` 行与「多会话分工」补说明（账本可直接引用该 ID） |
+| 测试 | +3（共 102/102）：默认配置表头前缀 `[TASK T-hdr · BATCH B-hdr · FROM worker]` + 时间行 + 原文逐字出现在其后；`injectHeader:false` 时投递文本与原文**完全相等**；同 batch 两单表头 BATCH 相同、TASK 各自不同。既有 99 例全绿 |
+
 ## v0.7.9（2026-10-31，maxInlineBytes 真正生效；接缝与运维错误可见；同轮多任务不再假回执）
 
 | 项 | 内容 |

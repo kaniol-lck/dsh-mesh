@@ -2217,6 +2217,61 @@ async function main() {
     report('receipt: a task injected between turns settles on the next turn', ok, `injectedAtTurn=${row?.injectedAtTurn ?? '-'} baseline=${row?.baselineTurn ?? '-'} settledTurn=${receipt?.turn ?? '-'}`)
   })
 
+  // 100-102. Injections carry a one-line [TASK …] header; the body itself stays verbatim.
+  const promptText = (prompt) => (prompt.content ?? []).map((part) => part.text ?? '').join('')
+
+  await runCase('inject: a [TASK …] header names the task and keeps the body verbatim', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-hdr', title: 'header target' }] })
+    const original = '第一行原文\n第二行原文 与 ≤64 KiB 无关'
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: {
+        title: 'header target',
+        text: original,
+        meta: { taskId: 'T-hdr', batchId: 'B-hdr' },
+        requester: 'worker',
+      },
+    })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-hdr'), 4000)
+    const text = promptText(delivered ?? {})
+    const header = '[TASK T-hdr · BATCH B-hdr · FROM worker] '
+    const ok =
+      text.startsWith(header) &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+-]\d{2}:\d{2}\n\n/.test(text.slice(header.length)) &&
+      text.endsWith(original) &&
+      text.slice(text.length - original.length) === original
+    report('inject: a [TASK …] header names the task and keeps the body verbatim', ok, `firstLine=${JSON.stringify(text.split('\n')[0])} verbatim=${text.endsWith(original)}`)
+  })
+
+  await runCase('inject: injectHeader=false delivers the body byte-identically', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-nohdr', title: 'no header' }], config: { injectHeader: false } })
+    const original = '逐字原文\n第二行也不变'
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'no header', text: original, meta: { taskId: 'T-nohdr', batchId: 'B-nohdr' } },
+    })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-nohdr'), 4000)
+    const text = promptText(delivered ?? {})
+    const ok = text === original
+    report('inject: injectHeader=false delivers the body byte-identically', ok, `identical=${text === original} head=${JSON.stringify(text.slice(0, 30))}`)
+  })
+
+  await runCase('inject: batch members share BATCH but get their own TASK header', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-batchhdr', title: 'batch header' }] })
+    for (const taskId of ['T-batch-1', 'T-batch-2']) {
+      await request(h.base, '/mesh/inject', {
+        method: 'POST',
+        body: { title: 'batch header', text: `body of ${taskId}`, meta: { taskId, batchId: 'B-shared' } },
+      })
+    }
+    await waitFor(() => h.state.prompts.filter((prompt) => prompt.sessionId === 'session-batchhdr').length === 2, 4000)
+    const lines = h.state.prompts
+      .filter((prompt) => prompt.sessionId === 'session-batchhdr')
+      .map((prompt) => promptText(prompt).split('\n')[0])
+    const ok = lines.length === 2 && /^\[TASK T-batch-1 · BATCH B-shared · FROM unknown\]/.test(lines[0]) && /^\[TASK T-batch-2 · BATCH B-shared · FROM unknown\]/.test(lines[1])
+    report('inject: batch members share BATCH but get their own TASK header', ok, `headers=${JSON.stringify(lines)}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
