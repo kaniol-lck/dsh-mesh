@@ -183,6 +183,10 @@ try {
     check('allowlisted agent can read the private board key', aliceRead.status === 200, `HTTP ${aliceRead.status}`)
     const adminBoard = await (await admin('/api/admin/board', { method: 'GET' })).json()
     check('admin sees private board keys', (adminBoard.entries || []).some((entry) => entry.key === 'board/private'), 'admin sees all')
+    const boardLog = await (await fetch(`${BASE}/api/board/log?key=cas/smoke`, { headers: { authorization: `Bearer ${aliceToken}` } })).json()
+    check('board log lists changes', (boardLog.entries || []).length >= 2, `${boardLog.count} entries`)
+    const bobPrivateLog = await (await fetch(`${BASE}/api/board/log?key=board/private`, { headers: { authorization: `Bearer ${bobToken}` } })).json()
+    check('board log hides invisible keys', bobPrivateLog.count === 0, `${bobPrivateLog.count} entries`)
   }
 
   // A closing message is delivered and readable, but must not wake the recipient.
@@ -308,6 +312,8 @@ try {
     })
     const putBody = await put.json().catch(() => ({}))
     check('blob upload accepted with matching sha256', put.status === 201 && putBody.sha256 === sha, `HTTP ${put.status}`)
+    const putMeta = await fetch(`${BASE}/api/blob/${putBody.id}/meta`, { headers: { authorization: `Bearer ${aliceToken}` } })
+    check('blob metadata is readable by its uploader', putMeta.status === 200, `HTTP ${putMeta.status}`)
 
     const get = await fetch(`${BASE}/api/blob/${putBody.id}`, { headers: { authorization: `Bearer ${bobToken}` } })
     const got = Buffer.from(await get.arrayBuffer())
@@ -347,6 +353,10 @@ try {
     const initBody = await initRes.json()
     const half = Math.floor(big.length / 2)
     const chunkHeaders = { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/octet-stream' }
+    const badOffset = await fetch(`${BASE}${initBody.chunk_url}?offset=12345`, {
+      method: 'PUT', headers: chunkHeaders, body: Buffer.from('x'),
+    })
+    check('chunk offset mismatch is 409', badOffset.status === 409, `HTTP ${badOffset.status}`)
     const part1 = await fetch(`${BASE}${initBody.chunk_url}`, { method: 'PUT', headers: chunkHeaders, body: big.subarray(0, half) })
     const part2 = await fetch(`${BASE}${initBody.chunk_url}?offset=${half}`, {
       method: 'PUT', headers: chunkHeaders, body: big.subarray(half),
@@ -789,6 +799,48 @@ try {
     starUpdate.status === 200 && starInbox.status === 200 && starSend.status === 201,
     `update ${starUpdate.status}, inbox ${starInbox.status}, send ${starSend.status}`,
   )
+
+  const cidrUpdate = await admin('/console/agents/update', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'reader', scopes: ['read'], allowed_cidrs: '10.9.0.0/16' }),
+  })
+  const cidrBlocked = await fetch(`${BASE}/api/inbox`, { headers: { authorization: `Bearer ${readerToken}` } })
+  check(
+    'allowed_cidrs blocks a non-matching source',
+    cidrUpdate.status === 200 && cidrBlocked.status === 403,
+    `HTTP ${cidrBlocked.status}`,
+  )
+  await admin('/console/agents/update', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'reader', scopes: ['read'], allowed_cidrs: '' }),
+  })
+}
+
+// --- message hints: interrupt / delivery_mode --------------------------------
+{
+  const hintToken = await mint('hint-target')
+  await fetch(`${BASE}/api/send`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ to: 'hint-target', body: 'steer this', interrupt: true, delivery: 'steer' }),
+  })
+  const hintInbox = await (await fetch(`${BASE}/api/inbox?unread=1`, { headers: { authorization: `Bearer ${hintToken}` } })).json()
+  const hintRow = (hintInbox.messages || [])[0]
+  check('interrupt hint is stored', hintRow?.interrupt === 1, String(hintRow?.interrupt))
+  check('delivery_mode hint is stored', hintRow?.delivery_mode === 'steer', String(hintRow?.delivery_mode))
+}
+
+// --- plugin version drift detection ------------------------------------------
+{
+  const driftToken = await mint('drift-node')
+  await fetch(`${BASE}/api/register`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${driftToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ host: 'drift-host', plugin: { name: 'drift-plugin', version: '0.0.1', platform: 'test' } }),
+  })
+  const status = await (await fetch(`${BASE}/api/status`, { headers: { authorization: `Bearer ${aliceToken}` } })).json()
+  check('plugin version is reported', (status.plugin_versions || []).some((row) => row.version === '0.0.1'), JSON.stringify(status.plugin_versions))
+  check('outdated plugin is flagged', (status.outdated || []).some((row) => row.name === 'drift-node'), `${(status.outdated || []).length} outdated`)
 }
 
 // --- expiring tokens: issuance and enforcement --------------------------------
@@ -950,6 +1002,33 @@ check('revocation blocks the agent', revoked.status === 401, `HTTP ${revoked.sta
     'purge=1 deletes the agent row',
     purged.purged === true && !afterPurge.agents.some((row) => row.name === 'purge-me'),
   )
+}
+
+// --- console auth: login cookie, CSRF, read-only role ------------------------
+{
+  const login = await fetch(`${BASE}/console/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ token: adminToken }),
+    redirect: 'manual',
+  })
+  const cookie = String(login.headers.get('set-cookie') ?? '').split(';')[0]
+  check('console login issues a session cookie', login.status === 303 && cookie.startsWith('mesh_console='), `HTTP ${login.status}`)
+  const page = await (await fetch(`${BASE}/console`, { headers: { cookie } })).text()
+  const csrf = /const CSRF = "([^"]+)"/.exec(page)?.[1]
+  const payload = JSON.stringify({ name: 'reader', scopes: ['read'], allowed_cidrs: '' })
+  const withoutCsrf = await fetch(`${BASE}/console/agents/update`, {
+    method: 'POST',
+    headers: { cookie, 'content-type': 'application/json' },
+    body: payload,
+  })
+  check('console mutation without CSRF is 403', withoutCsrf.status === 403, `HTTP ${withoutCsrf.status}`)
+  const withCsrf = await fetch(`${BASE}/console/agents/update`, {
+    method: 'POST',
+    headers: { cookie, 'content-type': 'application/json', 'x-mesh-csrf': csrf ?? '' },
+    body: payload,
+  })
+  check('console mutation with CSRF succeeds', withCsrf.status === 200, `HTTP ${withCsrf.status}`)
 }
 
 // --- audit trail ------------------------------------------------------------

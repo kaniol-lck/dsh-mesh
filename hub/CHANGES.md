@@ -4,11 +4,21 @@ v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审�
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 99/99，wake push 用例打印 `SKIP`；设置后 107/107）、`node --test test/*.test.mjs`（4/4；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 111/111，wake push 用例打印 `SKIP`；设置后 119/119）、`node --test test/*.test.mjs`（6/6；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
 > **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；补丁进入 0.7.12（见下条）。
 
 ---
+
+## v0.7.20（2026-10-31，smoke 覆盖收口 + 部署变量补齐；无行为变更）
+
+| 项 | 内容 |
+|---|---|
+| smoke 覆盖 | 新增 12 例：控制台登录/CSRF/成功写入、`allowed_cidrs` 拒绝非匹配来源、`interrupt`/`delivery_mode` 落库、board log 列表与不可见 key 过滤、blob `/meta`、chunk `offset` 409、plugin 版本上报与 outdated 标记；107→119 |
+| node:test | 新增 `hub/test/limits.test.mjs`（`MESH_MAX_SESSIONS` 上限 + 空闲会话回收）与只读控制台角色 403；4→6 |
+| 配置补齐 | `hub/server.mjs` 的 38 个 `process.env.MESH_*` 全部进入 `.env.example` 与 `docker-compose.yml`（此前分别缺 27/22 个）；每个变量注明用途/默认值/是否必需；compose 用 `${VAR:-default}` 透传 |
+| 无法自动化 | `/api/enroll` 注册码过期（10 分钟固定 TTL，无测试用 env）；单次消费已覆盖。手工步骤：生成 code → 等 10 分钟 → `POST /api/enroll` 应 401 |
+| 验证 | smoke 无 `MESH_WAKE_SECRET` 111/111、设置后 119/119；`node --test test/*.test.mjs` 6/6 |
 
 ## v0.7.19（2026-10-31，未读不丢 + 黑板 CAS/可见性）
 

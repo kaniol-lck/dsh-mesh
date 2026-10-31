@@ -123,6 +123,25 @@ test('explicit MESH_CONSOLE_ALLOW widens console and admin sources', async (t) =
   assert.equal(adminResponse.status, 200)
 })
 
+test('view console role cannot mutate agents', async (t) => {
+  const hub = await startHub()
+  t.after(() => hub.stop())
+  const login = await fetch(`${hub.base}/console/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ token: VIEW }),
+    redirect: 'manual',
+  })
+  const cookie = String(login.headers.get('set-cookie') ?? '').split(';')[0]
+  const response = await fetch(`${hub.base}/console/agents/update`, {
+    method: 'POST',
+    headers: { cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'view-test', scopes: ['read'], allowed_cidrs: '' }),
+  })
+  assert.equal(login.status, 303)
+  assert.equal(response.status, 403, 'view role must not mutate agents')
+})
+
 test('legacy empty-scopes rows warn at startup but keep working', async () => {
   const first = await startHub()
   const dir = first.dir

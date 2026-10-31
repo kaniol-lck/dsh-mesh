@@ -46,6 +46,8 @@ docker logs dsh-mesh | head -20
 构建默认从 `https://registry.npmmirror.com` 装依赖；若你的网络能直连官方源，可覆盖：
 `docker build --build-arg NPM_REGISTRY=https://registry.npmjs.org .`。
 
+完整变量清单见 [.env.example](.env.example)（`hub/server.mjs` 里全部 38 个 `MESH_*`，每个都标注用途、默认值与是否必需）；`docker-compose.yml` 会把它们透传给容器。
+
 只想先跑局域网（不加密）就这样够了。要跨网络访问，再加 TLS：
 
 ```bash

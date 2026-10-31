@@ -18,22 +18,63 @@ services:
         max-size: "10m"
         max-file: "3"
     environment:
-      MESH_HOST: 0.0.0.0
-      MESH_PORT: 8790
-      MESH_AUTH_MODE: token
+      # --- 监听与数据目录 ---------------------------------------------------
+      MESH_HOST: ${MESH_HOST:-0.0.0.0}
+      MESH_PORT: ${MESH_PORT:-8790}
+      MESH_DATA_DIR: ${MESH_DATA_DIR:-/app/data}
+      # token（默认）或 open；open 仅限完全可信局域网
+      MESH_AUTH_MODE: ${MESH_AUTH_MODE:-token}
+
+      # --- 鉴权与来源（可选）------------------------------------------------
       # 必填：在 .env 里设置一个长随机串
       MESH_ADMIN_TOKEN: ${MESH_ADMIN_TOKEN:?set MESH_ADMIN_TOKEN in .env}
-      # 启用 TLS 时在 .env 里指向容器内路径；留空则以 HTTP 提供服务
-      MESH_TLS_CERT: ${MESH_TLS_CERT:-}
-      MESH_TLS_KEY: ${MESH_TLS_KEY:-}
+      # 控制台只读令牌；留空则回退到 MESH_ADMIN_TOKEN
+      MESH_VIEW_TOKEN: ${MESH_VIEW_TOKEN:-}
+      # 控制台与 /api/admin 的允许来源；留空 = 仅 loopback
+      MESH_CONSOLE_ALLOW: ${MESH_CONSOLE_ALLOW:-}
+      # 仅当自己控制的反代透传 X-Forwarded-For 时设为 1
+      MESH_TRUST_PROXY: ${MESH_TRUST_PROXY:-0}
+
+      # --- 在线判定、消息与未读 ---------------------------------------------
       MESH_ONLINE_TTL_MS: ${MESH_ONLINE_TTL_MS:-120000}
       MESH_MESSAGE_TTL_MS: ${MESH_MESSAGE_TTL_MS:-604800000}
-      # 资源上限：常驻进程不允许无界增长，默认值见 README「六、环境变量」
+      MESH_PURGE_INTERVAL_MS: ${MESH_PURGE_INTERVAL_MS:-3600000}
+      MESH_MAX_UNREAD_MESSAGES: ${MESH_MAX_UNREAD_MESSAGES:-0}
+
+      # --- 请求体与内容上限 -------------------------------------------------
       MESH_MAX_BODY_BYTES: ${MESH_MAX_BODY_BYTES:-1048576}
       MESH_MAX_MESSAGE_BYTES: ${MESH_MAX_MESSAGE_BYTES:-65536}
       MESH_MAX_BOARD_BYTES: ${MESH_MAX_BOARD_BYTES:-65536}
+
+      # --- blob 通道 --------------------------------------------------------
+      MESH_MAX_BLOB_BYTES: ${MESH_MAX_BLOB_BYTES:-67108864}
+      MESH_MAX_BLOB_CHUNK_BYTES: ${MESH_MAX_BLOB_CHUNK_BYTES:-8388608}
+      MESH_MAX_BLOB_TOTAL_BYTES: ${MESH_MAX_BLOB_TOTAL_BYTES:-2147483648}
+      MESH_BLOB_TTL_MS: ${MESH_BLOB_TTL_MS:-86400000}
+
+      # --- MCP 会话与日志 ---------------------------------------------------
       MESH_SESSION_IDLE_MS: ${MESH_SESSION_IDLE_MS:-1800000}
+      MESH_MCP_SESSION_TTL_MS: ${MESH_MCP_SESSION_TTL_MS:-604800000}
+      MESH_MCP_LENIENT_SESSION: ${MESH_MCP_LENIENT_SESSION:-0}
       MESH_MAX_SESSIONS: ${MESH_MAX_SESSIONS:-128}
       MESH_LOG_TTL_MS: ${MESH_LOG_TTL_MS:-2592000000}
       MESH_LOG_MAX_ROWS: ${MESH_LOG_MAX_ROWS:-20000}
+
+      # --- 唤醒与 relay（可选）----------------------------------------------
+      MESH_WAKE_SECRET: ${MESH_WAKE_SECRET:-}
+      MESH_WAKE_TIMEOUT_MS: ${MESH_WAKE_TIMEOUT_MS:-3000}
+      MESH_WAKE_DEBOUNCE_MS: ${MESH_WAKE_DEBOUNCE_MS:-2000}
+      MESH_RELAY_TARGET: ${MESH_RELAY_TARGET:-127.0.0.1:18642}
+      MESH_RELAY_API_KEY: ${MESH_RELAY_API_KEY:-}
+      MESH_RELAY_MODEL: ${MESH_RELAY_MODEL:-deepseek/deepseek-v4.1-flash}
+      MESH_RELAY_TIMEOUT_MS: ${MESH_RELAY_TIMEOUT_MS:-180000}
+
+      # --- TLS / 对外 URL（可选）--------------------------------------------
+      MESH_TLS_CERT: ${MESH_TLS_CERT:-}
+      MESH_TLS_KEY: ${MESH_TLS_KEY:-}
+      MESH_TLS_CA_FILE: ${MESH_TLS_CA_FILE:-}
+      MESH_PUBLIC_URL: ${MESH_PUBLIC_URL:-}
+
+      # --- 其他 -------------------------------------------------------------
       MESH_PRINT_ADMIN_TOKEN: ${MESH_PRINT_ADMIN_TOKEN:-0}
+      MESH_MIN_WAKER: ${MESH_MIN_WAKER:-0.4.0}
