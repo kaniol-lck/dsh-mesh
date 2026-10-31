@@ -433,11 +433,16 @@ export const MESH_DISPATCH_TOOL = {
     'Dispatch a task text into another local DSH session (same machine, no hub). target = session id, full title, or a unique title substring. ' +
     'Returns immediately with taskId; do NOT poll or wait for the result — the waker writes a receipt when that turn ends (file by default). ' +
     'Pass the same batchId for several tasks to get exactly one aggregate notice after all of them finish (batch barrier). ' +
+    'Pass a thread id to group follow-ups: once bound, a later dispatch may omit target and goes to the same session. ' +
     'Set createIfMissing:true to create the session when target does not resolve. ' +
     'requester names the session that should receive the receipt (usually passed by the CLI; models may omit it).',
   parameters: {
-    target: { type: 'string', required: true, description: 'Session id, full title, or a unique title substring.' },
+    target: { type: 'string', description: 'Session id, full title, or a unique title substring. Required unless a known `thread` is given.' },
     text: { type: 'string', required: true, description: 'Task text, delivered verbatim after a one-line [TASK …] header (max 64 KiB).' },
+    thread: {
+      type: 'string',
+      description: 'Optional follow-up thread id (≤128 bytes, e.g. TH-1). A known thread lets you omit target and keeps binding follow-ups to the same session.',
+    },
     requester: {
       type: 'string',
       description:
@@ -457,7 +462,7 @@ export const MESH_DISPATCH_TOOL = {
     receipt: { type: 'string', enum: ['file', 'queue', 'wake'], description: 'Override the plugin receipt mode.' },
     deadline: { type: 'string', description: 'Batch deadline such as 30m / 2h / 600s.' },
   },
-  required: ['target', 'text'],
+  required: ['text'],
 }
 
 /**
@@ -678,6 +683,19 @@ export function resolveTaskSubject(explicit, text) {
   const chosen = normalizeSubjectText(explicit)
   if (chosen) return Array.from(chosen).slice(0, TASK_SUBJECT_MAX).join('')
   return cleanTaskSubject(text)
+}
+
+/**
+ * Thread ids group follow-up dispatches. Trimmed; max 128 UTF-8 bytes; null when empty.
+ * A malformed value throws instead of silently dropping the identity.
+ */
+export function normalizeThread(value) {
+  const thread = String(value ?? '').trim()
+  if (!thread) return null
+  const bytes = new TextEncoder().encode(thread)
+  if (bytes.length > 128) throw new Error('thread must be at most 128 UTF-8 bytes')
+  if (/[\u0000-\u001f]/.test(thread)) throw new Error('thread must not contain control characters')
+  return thread
 }
 
 /**
@@ -3201,6 +3219,67 @@ export function apply(ctx, config) {
   const TASK_INLINE_TEXT_BYTES = 8192
   const taskRows = new Map()
 
+  // ---------------------------------------------------------------- thread registry
+  //
+  // A thread is the "this is the same line of work" identity added in 0.7.21: follow-up
+  // dispatches can omit target and resolve it from here. Only successful deliveries bind.
+
+  const threadsFile = join(homedir(), '.dsh', 'mesh-waker', 'threads.json')
+  const threadRows = new Map()
+
+  function loadThreads() {
+    try {
+      const raw = JSON.parse(readFileSync(threadsFile, 'utf8'))
+      const entries = raw && typeof raw === 'object' && raw.threads && typeof raw.threads === 'object' ? raw.threads : raw
+      for (const [thread, value] of Object.entries(entries ?? {})) {
+        if (!value || typeof value !== 'object') continue
+        threadRows.set(String(thread), {
+          targetSessionId: value.targetSessionId == null ? null : String(value.targetSessionId),
+          targetTitle: value.targetTitle == null ? null : String(value.targetTitle),
+          lastTaskId: value.lastTaskId == null ? null : String(value.lastTaskId),
+          count: Number.isFinite(Number(value.count)) ? Number(value.count) : 0,
+          updatedAt: Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : 0,
+        })
+      }
+    } catch {
+      /* first run: no threads yet */
+    }
+    fileLog(`thread registry loaded threads=${threadRows.size}`)
+  }
+
+  function saveThreads() {
+    try {
+      mkdirSync(dirname(threadsFile), { recursive: true })
+      const temp = `${threadsFile}.tmp`
+      const payload = Object.fromEntries([...threadRows.entries()].sort(([left], [right]) => left.localeCompare(right)))
+      writeFileSync(temp, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
+      renameSync(temp, threadsFile)
+      return true
+    } catch (error) {
+      fileLog(`thread registry write failed: ${error.message}`)
+      return false
+    }
+  }
+
+  /** Bind (or re-bind) a thread after a successful delivery and persist it. */
+  function bindThread(thread, target, taskId) {
+    const previous = threadRows.get(thread)
+    const rebound = Boolean(previous && previous.targetSessionId && previous.targetSessionId !== target.id)
+    threadRows.set(thread, {
+      targetSessionId: target.id,
+      targetTitle: target.title ?? null,
+      lastTaskId: taskId ?? previous?.lastTaskId ?? null,
+      count: (previous?.count ?? 0) + 1,
+      updatedAt: Date.now(),
+    })
+    saveThreads()
+    if (rebound) {
+      fileLog(`thread ${thread} rebound: ${previous.targetSessionId} -> ${target.id} (${target.title ?? 'no title'}) task=${taskId ?? '-'}`)
+    } else {
+      fileLog(`thread ${thread} bound to ${target.id} (${target.title ?? 'no title'}) count=${threadRows.get(thread).count} task=${taskId ?? '-'}`)
+    }
+  }
+
   function taskTextPath(taskId) {
     return join(taskTextDir, `${taskId}.md`)
   }
@@ -3284,6 +3363,7 @@ export function apply(ctx, config) {
     const row = {
       taskId,
       batchId: extra.batchId ?? null,
+      thread: extra.thread ?? null,
       requester: extra.requester ?? null,
       targetSessionId: target.id,
       targetTitle: target.title ?? null,
@@ -3324,6 +3404,7 @@ export function apply(ctx, config) {
     const base = {
       taskId: row.taskId,
       batchId: row.batchId ?? null,
+      thread: row.thread ?? null,
       requester: row.requester ?? null,
       targetSessionId: row.targetSessionId ?? null,
       targetTitle: row.targetTitle ?? null,
@@ -3532,6 +3613,7 @@ export function apply(ctx, config) {
     if (batchId) registerBatchTask(taskId, task, meta)
     recordTaskPending(taskId, target, meta, text, {
       batchId,
+      thread: normalizeThread(meta?.thread),
       requester: requester.requester,
       deadlineMs: Number(meta?.deadlineMs) || null,
     })
@@ -4114,9 +4196,22 @@ export function apply(ctx, config) {
     }
     const callerSession = callerSessionFrom(extra)
     const requester = callerSession || String(args.requester ?? '').trim()
-    const target = String(args.target ?? '').trim()
+    const thread = normalizeThread(args.thread)
+    const explicitTarget = String(args.target ?? '').trim()
+    let target = explicitTarget
+    if (thread && !target) {
+      const known = threadRows.get(thread)
+      if (!known) {
+        const knownThreads = [...threadRows.keys()].sort()
+        throw new Error(
+          `unknown thread "${thread}"; pass target to create it${knownThreads.length ? ` (known threads: ${knownThreads.join(', ')})` : ' (no threads registered yet)'}`,
+        )
+      }
+      target = known.targetSessionId || known.targetTitle || ''
+      if (!target) throw new Error(`thread "${thread}" has no target session recorded; pass target to re-bind it`)
+    }
     const text = String(args.text ?? '')
-    if (!target) throw new Error('target is required (session id, full title, or a unique title substring)')
+    if (!target) throw new Error('target is required unless a known thread is given (pass target, or thread with a known binding)')
     if (!text.trim()) throw new Error('text is required')
     if (text.length > 64 * 1024) throw new Error('text is too large (max 64 KiB)')
     let session = null
@@ -4124,6 +4219,9 @@ export function apply(ctx, config) {
     try {
       session = resolveLocalSession({ session: target, title: target })
     } catch (error) {
+      if (!explicitTarget) {
+        throw new Error(`thread "${thread}" target is unavailable (${target}): ${error.message}; pass target to re-bind it`)
+      }
       if (args.createIfMissing !== true) {
         throw new Error(
           `找不到会话 "${target}"；可用 list_local_sessions 查看，或设 createIfMissing:true 新建（${error.message}）`,
@@ -4137,6 +4235,7 @@ export function apply(ctx, config) {
       taskId: resolved.taskId,
       ...(requester ? { requester } : {}),
       ...(args.subject ? { subject: String(args.subject) } : {}),
+      ...(thread ? { thread } : {}),
       ...(resolved.batchId ? { batchId: resolved.batchId } : {}),
       ...(args.receipt ? { receipt: String(args.receipt) } : {}),
       ...(resolved.deadlineMs ? { deadlineMs: resolved.deadlineMs } : {}),
@@ -4152,8 +4251,9 @@ export function apply(ctx, config) {
       if (taskId) cancelPendingTask(taskId)
       throw error
     }
+    if (thread) bindThread(thread, session, taskId)
     fileLog(
-      `mesh_dispatch: ${text.length} chars (delivered ${deliveredText.length}) -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession} header=${c.injectHeader}`,
+      `mesh_dispatch: ${text.length} chars (delivered ${deliveredText.length}) -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''}${thread ? ` thread=${thread}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession} header=${c.injectHeader}${explicitTarget ? ' explicit-target' : thread ? ' via-thread' : ''}`,
     )
     return {
       ok: true,
@@ -4161,6 +4261,7 @@ export function apply(ctx, config) {
       title: session.title ?? null,
       taskId,
       batchId: meta.batchId ?? null,
+      thread: thread ?? null,
       requester: requester || null,
       mode: args.mode === 'steer' ? 'steer' : 'queue',
       created: createdSession,
@@ -4272,6 +4373,7 @@ export function apply(ctx, config) {
   // consumed by the pull loop; the tool waits for one inbox reply or reports unanswered.
   // Restore batches before the listener comes up, then poll liveness for early alerts.
   loadTaskRegistry()
+  loadThreads()
   restoreBatches()
   autoBindTopics()
   batchSweepTimer = setInterval(sweepBatches, Math.max(1000, Math.min(30000, Math.floor(c.waitLongMs / 2))))
@@ -4323,6 +4425,33 @@ export function apply(ctx, config) {
     }
 
     // Task registry API (0.7.11): list without bodies, detail with body, DELETE = cancel.
+    if (path === '/mesh/threads' && req.method === 'GET') {
+      // Threads are the "same line of work" identity: each entry is the current binding
+      // plus every task that carried the id (derived from the task registry).
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const threads = [...threadRows.entries()]
+        .map(([thread, value]) => ({
+          thread,
+          targetSessionId: value.targetSessionId ?? null,
+          targetTitle: value.targetTitle ?? null,
+          count: value.count ?? 0,
+          lastTaskId: value.lastTaskId ?? null,
+          updatedAt: value.updatedAt ?? null,
+          taskIds: [...taskRows.values()]
+            .filter((row) => row.thread === thread)
+            .sort((left, right) => Number(left.createdAt) - Number(right.createdAt))
+            .map((row) => row.taskId),
+        }))
+        .sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0))
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(JSON.stringify({ ok: true, total: threads.length, threads }))
+      return
+    }
+
     if (path === '/mesh/tasks' && req.method === 'GET') {
       if (!fromLoopback(req)) {
         res.writeHead(403, { 'content-type': 'application/json' })
@@ -4638,7 +4767,6 @@ export function apply(ctx, config) {
         const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
         const text = String(draft.text ?? '').trim()
         if (!text) throw new Error('text is required')
-        const target = resolveLocalSession(draft)
         const mode = draft.mode === 'steer' ? 'steer' : 'queue'
         const meta = draft.meta && typeof draft.meta === 'object' ? draft.meta : {}
         // The dispatcher names itself so the receipt returns to it, not to receiptTo.
@@ -4647,6 +4775,23 @@ export function apply(ctx, config) {
         // CLI/HTTP callers may pass the readable title at the top level or inside meta.
         const subject = String(draft.subject ?? meta.subject ?? '').trim()
         if (subject && !meta.subject) meta.subject = subject
+        const thread = normalizeThread(draft.thread ?? meta.thread ?? '')
+        if (thread) meta.thread = thread
+        const explicitTarget = Boolean(String(draft.session ?? draft.title ?? '').trim())
+        let target
+        if (!explicitTarget) {
+          if (!thread) throw new Error('session/title is required unless a known thread is given')
+          const known = threadRows.get(thread)
+          if (!known) {
+            const knownThreads = [...threadRows.keys()].sort()
+            throw new Error(
+              `unknown thread "${thread}"; pass session/title to create it${knownThreads.length ? ` (known threads: ${knownThreads.join(', ')})` : ' (no threads registered yet)'}`,
+            )
+          }
+          target = resolveLocalSession({ session: known.targetSessionId, title: known.targetTitle })
+        } else {
+          target = resolveLocalSession(draft)
+        }
         const batchId = meta.batchId ? String(meta.batchId).trim() : null
         const deliveredText = c.injectHeader
           ? withTaskHeader(text, { taskId: meta.taskId ? String(meta.taskId) : '-', batchId, requester })
@@ -4660,9 +4805,10 @@ export function apply(ctx, config) {
           if (taskId) cancelPendingTask(taskId)
           throw error
         }
-        fileLog(`injected ${text.length} chars (delivered ${deliveredText.length}) into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''} header=${c.injectHeader}`)
+        if (thread) bindThread(thread, target, taskId)
+        fileLog(`injected ${text.length} chars (delivered ${deliveredText.length}) into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}${thread ? ` thread=${thread}` : ''}${explicitTarget ? '' : ' via-thread'} header=${c.injectHeader}`)
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-        res.end(JSON.stringify({ ok: true, sessionId: target.id, title: target.title, mode, taskId, batchId: taskId ? batchId : null }))
+        res.end(JSON.stringify({ ok: true, sessionId: target.id, title: target.title, mode, taskId, batchId: taskId ? batchId : null, thread: thread ?? null }))
       } catch (error) {
         res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: false, error: error.message }))

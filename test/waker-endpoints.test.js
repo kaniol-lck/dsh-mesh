@@ -257,6 +257,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
     base,
     state,
     seeded,
+    home,
     sessionsRoot,
     tokenDir,
     tokenFile,
@@ -1075,10 +1076,12 @@ async function main() {
     const params = MESH_DISPATCH_TOOL.parameters
     const ok =
       MESH_DISPATCH_TOOL.name === 'mesh_dispatch' &&
-      params.target?.required === true &&
+      params.target?.required !== true &&
       params.text?.required === true &&
-      MESH_DISPATCH_TOOL.required.join(',') === 'target,text' &&
+      params.thread?.type === 'string' &&
+      MESH_DISPATCH_TOOL.required.join(',') === 'text' &&
       /batchId/.test(MESH_DISPATCH_TOOL.description) &&
+      /thread/.test(MESH_DISPATCH_TOOL.description) &&
       /不要轮询|do NOT poll/i.test(MESH_DISPATCH_TOOL.description)
     report('mesh_dispatch: tool metadata and schema', ok, `name=${MESH_DISPATCH_TOOL.name} required=${MESH_DISPATCH_TOOL.required.join(',')}`)
   })
@@ -2660,6 +2663,137 @@ async function main() {
       /type arrays are not supported/.test(text) &&
       /anyOf is not supported/.test(text)
     report('tools: validateToolSchema rejects a type array with the host wording', ok, `ok=${result.ok} issues=${JSON.stringify(result.issues)}`)
+  })
+
+  // 126-130. Thread identity (0.7.21): follow-ups resolve their target from the binding.
+  const threadSeeds = [{ id: 'session-ops', title: 'mesh · ops' }, { id: 'session-other', title: 'mesh · other' }]
+  const readTaskRows = (h) =>
+    fs
+      .readFileSync(path.join(h.home, '.dsh', 'mesh-waker', 'tasks.jsonl'), 'utf8')
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => JSON.parse(line))
+  const readThreadsFile = (h) => JSON.parse(fs.readFileSync(path.join(h.home, '.dsh', 'mesh-waker', 'threads.json'), 'utf8'))
+  // The default log target rotates at 2 MiB and the suite writes more than that, so these
+  // cases pin their own logFile and read the rotated copy together with the current one.
+  const threadLog = (file) => {
+    let text = ''
+    try {
+      text += fs.readFileSync(`${file}.1`, 'utf8')
+    } catch {
+      /* no rotation yet */
+    }
+    return text + fs.readFileSync(file, 'utf8')
+  }
+
+  await runCase('threads: a follow-up without target resolves from the thread binding', async (boot) => {
+    const threadLogFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'waker-thread-log-')), 'waker.log')
+    const h = await boot({ seedSessions: threadSeeds, config: { logFile: threadLogFile } })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'mesh · ops', text: 'thread first task', thread: 'TH-1', taskId: 'T-TH-1' }, { sessionId: 'session-coord' })
+    await tool.execute({ thread: 'TH-1', text: 'thread follow-up', taskId: 'T-TH-2' }, { sessionId: 'session-coord' })
+    const prompts = h.state.prompts.filter((prompt) => prompt.sessionId === 'session-ops')
+    const rows = readTaskRows(h)
+    const first = rows.find((row) => row.taskId === 'T-TH-1')
+    const second = rows.find((row) => row.taskId === 'T-TH-2')
+    const log = threadLog(threadLogFile)
+    const ok =
+      prompts.length === 2 &&
+      first?.thread === 'TH-1' &&
+      second?.thread === 'TH-1' &&
+      first?.targetSessionId === 'session-ops' &&
+      second?.targetSessionId === 'session-ops' &&
+      first?.requester === 'session-coord' &&
+      second?.requester === 'session-coord' &&
+      /-> session-ops \(mesh · ops\) task=T-TH-2 thread=TH-1/.test(log) &&
+      /via-thread/.test(log)
+    report(
+      'threads: a follow-up without target resolves from the thread binding',
+      ok,
+      `prompts=${prompts.length} thread1=${first?.thread} thread2=${second?.thread} log=${(log.match(/task=T-TH-2[^\n]*/) ?? ['-'])[0]}`,
+    )
+  })
+
+  await runCase('threads: an unknown thread fails loudly and never delivers', async (boot) => {
+    const threadLogFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'waker-thread-log-')), 'waker.log')
+    const h = await boot({ seedSessions: threadSeeds, config: { logFile: threadLogFile } })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    // Bind one known thread first so the error has a list to name.
+    await tool.execute({ target: 'mesh · ops', text: 'known thread', thread: 'TH-KNOWN', taskId: 'T-TH-KNOWN' }, { sessionId: 'session-coord' })
+    let message = ''
+    try {
+      await tool.execute({ thread: 'TH-NOT-EXIST', text: 'must not be delivered', taskId: 'T-TH-BAD' }, { sessionId: 'session-coord' })
+    } catch (error) {
+      message = String(error && error.message ? error.message : error)
+    }
+    const log = threadLog(threadLogFile)
+    const delivered = h.state.prompts.some((prompt) => JSON.stringify(prompt).includes('must not be delivered'))
+    const ok =
+      /unknown thread "TH-NOT-EXIST"/.test(message) &&
+      /known threads: TH-KNOWN/.test(message) &&
+      h.state.prompts.length === 1 &&
+      delivered === false &&
+      !/T-TH-BAD/.test(log)
+    report('threads: an unknown thread fails loudly and never delivers', ok, `error=${JSON.stringify(message)} prompts=${h.state.prompts.length}`)
+  })
+
+  await runCase('threads: a dispatch without thread keeps the legacy null thread field', async (boot) => {
+    const threadLogFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'waker-thread-log-')), 'waker.log')
+    const h = await boot({ seedSessions: threadSeeds, config: { logFile: threadLogFile } })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'mesh · ops', text: 'legacy dispatch', taskId: 'T-plain' }, { sessionId: 'session-coord' })
+    const row = readTaskRows(h).find((entry) => entry.taskId === 'T-plain')
+    let threadsExist = true
+    try {
+      readThreadsFile(h)
+    } catch {
+      threadsExist = false
+    }
+    const ok = row?.thread === null && row?.subject?.length > 0 && !threadsExist
+    report('threads: a dispatch without thread keeps the legacy null thread field', ok, `thread=${String(row?.thread)} threadsFile=${threadsExist}`)
+  })
+
+  await runCase('threads: an explicit target re-binds the thread and logs it', async (boot) => {
+    const threadLogFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'waker-thread-log-')), 'waker.log')
+    const h = await boot({ seedSessions: threadSeeds, config: { logFile: threadLogFile } })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'mesh · ops', text: 'bind to ops', thread: 'TH-2', taskId: 'T-TH-3' }, { sessionId: 'session-coord' })
+    await tool.execute({ target: 'mesh · other', text: 'rebind to other', thread: 'TH-2', taskId: 'T-TH-4' }, { sessionId: 'session-coord' })
+    const binding = readThreadsFile(h)['TH-2']
+    const log = threadLog(threadLogFile)
+    const rebindLine = (log.match(/thread TH-2 rebound:[^\n]*/) ?? ['-'])[0]
+    const ok =
+      binding?.targetSessionId === 'session-other' &&
+      binding?.targetTitle === 'mesh · other' &&
+      binding?.count === 2 &&
+      binding?.lastTaskId === 'T-TH-4' &&
+      /thread TH-2 rebound: session-ops -> session-other/.test(log)
+    report('threads: an explicit target re-binds the thread and logs it', ok, `target=${binding?.targetSessionId ?? '-'} count=${binding?.count ?? '-'} log=${rebindLine}`)
+  })
+
+  await runCase('threads: /mesh/threads lists bindings with their task ids', async (boot) => {
+    const threadLogFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'waker-thread-log-')), 'waker.log')
+    const h = await boot({ seedSessions: threadSeeds, config: { logFile: threadLogFile } })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'mesh · ops', text: 'one', thread: 'TH-3', taskId: 'T-TH-5' }, { sessionId: 'session-coord' })
+    await tool.execute({ thread: 'TH-3', text: 'two', taskId: 'T-TH-6' }, { sessionId: 'session-coord' })
+    const listed = await request(h.base, '/mesh/threads')
+    const entry = listed.json?.threads?.find((row) => row.thread === 'TH-3')
+    const ok =
+      listed.status === 200 &&
+      listed.json?.ok === true &&
+      entry?.count === 2 &&
+      entry?.targetTitle === 'mesh · ops' &&
+      entry?.targetSessionId === 'session-ops' &&
+      entry?.lastTaskId === 'T-TH-6' &&
+      Array.isArray(entry?.taskIds) &&
+      entry.taskIds.join(',') === 'T-TH-5,T-TH-6'
+    report('threads: /mesh/threads lists bindings with their task ids', ok, `status=${listed.status} count=${entry?.count ?? '-'} taskIds=${JSON.stringify(entry?.taskIds ?? [])}`)
   })
 
   const failed = results.filter((result) => !result.ok)

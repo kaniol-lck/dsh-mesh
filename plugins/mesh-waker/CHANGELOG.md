@@ -9,6 +9,19 @@
 
 ---
 
+## v0.7.21（2026-11-01，派活线程身份：`thread` 参数 + 续派 + `/mesh/threads`）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | 派活是一次性注入，同一件事补一句只能新开一单，worker 看到两条互不相关的任务；协调会话 10 小时派 12 单里至少 3 组本属同一线索，全靠人脑记 |
+| `thread` 参数 | `mesh_dispatch` 新增可选 `thread`（≤128 UTF-8 字节，`normalizeThread()` 校验）；`target` 从必填改为「target 或已知 thread 二选一」，不传 thread 时行为完全不变（`required` 数组只剩 `text`） |
+| 任务记录 | `tasks.jsonl` / `GET /mesh/tasks` 每条新增 `thread`（未传为 `null`）；任务详情同样返回 |
+| 绑定文件 | `~/.dsh/mesh-waker/threads.json`（0600，原子写）：`{ "TH-1": { targetSessionId, targetTitle, lastTaskId, count, updatedAt } }`；只在**成功投递**后写，失败不写 |
+| 续派 | 不传 `target` 时从 `threads.json` 解析目标并投递；未知 thread **直接报错**并列出已知 thread（`unknown thread "TH-x"; pass target to create it (known threads: …)`），不猜、不回落到默认会话；显式 `target` 以 target 为准并**重新绑定**，日志写 `thread TH-x rebound: <old> -> <new>` |
+| `GET /mesh/threads` | loopback-only，返回 `{ ok, total, threads: [{ thread, targetSessionId, targetTitle, count, lastTaskId, updatedAt, taskIds[] }] }`，`taskIds` 从任务库派生（按 createdAt 升序） |
+| 回执 | 沿用原 `requester` 机制，未改动；续派任务仍回执给派活方 |
+| 测试 | +5（共 130/130）：续派命中（两条都进同一会话、thread 落库、requester 正确、日志含 `via-thread`）；未知 thread 报错且零投递；不传 thread 保持 `thread: null` 且不建 threads.json；显式 target 改绑并写日志；`/mesh/threads` 输出形状（count/targetTitle/taskIds）。原 125 例全绿 |
+
 ## v0.7.20（2026-10-31，修 output schema 的 type 数组，mesh_dispatch 才能注册；**需重启宿主生效**）
 
 | 项 | 内容 |

@@ -244,7 +244,7 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 **存储**（`~/.dsh/mesh-waker/`，0600）：
 
-- `tasks.jsonl`：append-only，一行一条；字段 `taskId / batchId / requester / targetSessionId / targetTitle / subject（正文首行 ≤120 字）/ textBytes / createdAt / deadlineMs / status / settledAt / durationMs / receiptRef / receiptSummary / refs[]`；
+- `tasks.jsonl`：append-only，一行一条；字段 `taskId / batchId / thread / requester / targetSessionId / targetTitle / subject（正文首行 ≤120 字）/ textBytes / createdAt / deadlineMs / status / startedAt / settledAt / durationMs / receiptRef / receiptSummary / refs[]`；
 - 正文 ≤8 KiB 直接存 `text`；>8 KiB 落 `tasks/<taskId>.md`，jsonl 只记 `textPath`；
 - **保留策略**：`tasksRetentionDays`（默认 30 天）与 `tasksMaxRows`（默认 5000 条），启动时按「超龄或超量」裁最旧的，并压实 jsonl（被裁任务的正文文件一并清理）；
 - **正文隐私**：日志只打 `textBytes` 与 `subject`，**从不打印正文**；列表 API 不含正文，只有详情 API 返回全文。
@@ -256,6 +256,9 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 | `GET /mesh/tasks?status=&session=&batch=&limit=&offset=` | 列表（不含正文；默认 `limit=50`、`createdAt` 倒序、返回 `total`；`session` 同时匹配目标会话与 requester） |
 | `GET /mesh/tasks/:id` | 详情：全文 + 回执摘要（`receiptSummary`/`receiptRef`）+ 目标会话 `{sessionId, title, live}` |
 | `DELETE /mesh/tasks/:id` | 仅 `pending` 可取消（→ `cancelled`）；已 settled/stalled 返回 **409**，历史不改写 |
+| `GET /mesh/threads` | 线程列表：`{ thread, targetSessionId, targetTitle, count, lastTaskId, updatedAt, taskIds[] }`（`taskIds` 从任务库派生，按 createdAt 升序） |
+
+**线程（0.7.21）**：派活可带 `thread`（≤128 字节）把后续补丁归到同一线索。绑定写在 `~/.dsh/mesh-waker/threads.json`（0600，只在成功投递后更新）：`{ "TH-1": { targetSessionId, targetTitle, lastTaskId, count, updatedAt } }`。之后 `mesh_dispatch({ thread, text })` **可省略 `target`**，按绑定投递；未知 thread 直接报错并列出已知项（不猜、不回落到默认会话）；显式传 `target` 时以 target 为准并**改绑**该线程（日志 `thread TH-x rebound: old -> new`）。回执仍按 `requester` 返回派活方。
 
 **状态流转（0.7.14 起含 `started`）**：派活写 `pending` → 目标会话的 `turn/start` 且该 turn 归属此任务时写 `started`（含 `startedAt`）→ 结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`。取消/停滞可以发生在 `pending` 或 `started`。**`durationMs` 口径**：任务库的 `durationMs` 从 `startedAt` 算起（未被观测到开始的从 `createdAt` 算），回执里的 `durationMs` 仍从投递时算。`refs[]` 由派活方经 `meta.refs` 传入（只存字符串，waker 不解析 `.worklog`）。
 
@@ -383,6 +386,7 @@ tail -n 2 ~/.dsh/mesh-waker/receipts.jsonl
 | `receipt` | `--receipt` | `file`/`queue`/`wake`，覆盖插件默认 |
 | `deadline` | `--deadline` | `30m`/`2h`/`600s`，默认 `batchDeadlineMs` |
 | `subject` | `--subject` | 任务库/面板显示的可读标题（≤120 字）；省略时由正文首行清洗（优先加粗片段、去掉 `任务（…）：`/`【…】` 前缀与 `**`） |
+| `thread` | `--thread` | 线索 id（≤128 字节，如 `TH-1`）：已知 thread 可省略 `target`，后续补丁续派到同一会话；显式 target 会改绑 |
 
 工具描述里明确写了：投递后**不要轮询等待**，插件会在回合结束时写回执；要「全部完成再叫我」就用同一个 `batchId`。
 
