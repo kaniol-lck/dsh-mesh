@@ -9,6 +9,16 @@
 
 ---
 
+## v0.7.20（2026-10-31，修 output schema 的 type 数组，mesh_dispatch 才能注册；**需重启宿主生效**）
+
+| 项 | 内容 |
+|---|---|
+| 根因 | `/mesh/status.toolsError` 原文：`dispatch: unsupported JSON schema: schema.properties.title.type must be a single type string (type arrays are not supported); schema.properties.batchId.type …`。宿主只接受**单标量 type**、`oneOf`、object properties/required、array items、标量 enum/const 与注解，`type: ['string','null']` 虽合法但不在子集内 → `defineTool` 抛错，重试 5 次也只是重试同一个非法定义 |
+| 修法 | `DISPATCH_OUTPUT.title/batchId` 改为宿主支持的 `oneOf: [{type:'string'},{type:'null'}]`（宿主子集明确支持 exact-one `oneOf`）；`ASK_OUTPUT` 本就没有 type 数组，保持不变；两个 output schema 从 apply 内提升到模块级并导出，便于测试 |
+| 防复发 | 新增导出纯函数 `validateToolSchema(definition)`，按宿主子集校验（禁止 type 数组、禁止 anyOf 等子集外关键字、要求 object root 等），返回 `{ok, issues}`；测试对 dispatch/ask 两个定义各跑一遍，并断言 type 数组/anyOf 被拒且错误措辞含 `type arrays are not supported` |
+| 验证 | 重启宿主后预期：`/mesh/status.tools.dispatch=true`、`toolsError=null`，日志出现 `registered tool mesh_dispatch`（本单未重启，协调会话负责） |
+| 测试 | +2（共 125/125）：两个 output schema 通过宿主子集校验；`type: ['string','null']` 与 `anyOf` 被 `validateToolSchema` 拒绝。既有 123 例全绿 |
+
 ## v0.7.19（2026-10-31，两个「打开任务面板」入口真跳转；**需重启宿主生效**）
 
 | 项 | 内容 |

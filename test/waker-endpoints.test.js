@@ -2633,6 +2633,35 @@ async function main() {
     report('client: both task-panel buttons navigate through layout.selectPanel', ok, `selectPanel=${/selectPanel\('mesh-inbox'\)/.test(source)} layoutInject=${inject.includes('@deepseek-ai/dsh-client-ui-layout')} entryPoints=${entryPoints}`)
   })
 
+  // 124-125. Host schema subset guard (T-236): type arrays silently block registration.
+  await runCase('tools: both output schemas pass the host JSON Schema subset', async () => {
+    const { DISPATCH_OUTPUT, ASK_OUTPUT, validateToolSchema } = await import(pathToFileURL(ENTRY).href)
+    const dispatch = validateToolSchema(DISPATCH_OUTPUT)
+    const ask = validateToolSchema(ASK_OUTPUT)
+    const ok = dispatch.ok === true && ask.ok === true
+    report('tools: both output schemas pass the host JSON Schema subset', ok, `dispatch=${dispatch.ok ? 'ok' : dispatch.issues.join('; ')} ask=${ask.ok ? 'ok' : ask.issues.join('; ')}`)
+  })
+
+  await runCase('tools: validateToolSchema rejects a type array with the host wording', async () => {
+    const { validateToolSchema } = await import(pathToFileURL(ENTRY).href)
+    const bad = {
+      schema: {
+        type: 'object',
+        properties: {
+          title: { type: ['string', 'null'] },
+          extra: { anyOf: [{ type: 'string' }] },
+        },
+      },
+    }
+    const result = validateToolSchema(bad)
+    const text = result.issues.join('; ')
+    const ok =
+      result.ok === false &&
+      /type arrays are not supported/.test(text) &&
+      /anyOf is not supported/.test(text)
+    report('tools: validateToolSchema rejects a type array with the host wording', ok, `ok=${result.ok} issues=${JSON.stringify(result.issues)}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

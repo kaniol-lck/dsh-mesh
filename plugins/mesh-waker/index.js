@@ -479,6 +479,97 @@ export const MESH_ASK_TOOL = {
 }
 
 /**
+ * The host enforces a JSON Schema subset: one scalar `type`, `oneOf`, object
+ * `properties`/`required`/boolean `additionalProperties`, array `items`, scalar
+ * `enum`/`const`, plus annotations. `type: ['string', 'null']` is valid JSON Schema but
+ * NOT in that subset — it silently kept mesh_dispatch from ever registering (T-236).
+ */
+export const DISPATCH_OUTPUT = {
+  schema: {
+    type: 'object',
+    properties: {
+      ok: { type: 'boolean' },
+      sessionId: { type: 'string' },
+      title: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      taskId: { type: 'string' },
+      batchId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      mode: { type: 'string' },
+      created: { type: 'boolean' },
+    },
+    required: ['ok', 'sessionId', 'taskId', 'mode', 'created'],
+  },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+}
+
+export const ASK_OUTPUT = {
+  schema: {
+    type: 'object',
+    properties: {
+      status: { type: 'string' },
+      answer: { type: 'string' },
+      by: { type: 'string' },
+      ms: { type: 'number' },
+      questionId: { type: 'string' },
+      timeoutSeconds: { type: 'number' },
+    },
+    required: ['status', 'questionId'],
+  },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+}
+
+const TOOL_SCHEMA_CONSTRAINTS = new Set(['type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const'])
+const TOOL_SCHEMA_ANNOTATIONS = new Set(['description', 'title', 'default', 'examples'])
+const TOOL_SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'])
+
+/**
+ * Validate a tool output definition against the host's enforced JSON Schema subset.
+ * Returns `{ ok, issues }`; this is the guard test that would have caught T-236
+ * (`type: ['string','null']` is rejected by the host, not by JSON Schema).
+ */
+export function validateToolSchema(definition, path = 'schema') {
+  const issues = []
+  const walk = (node, at) => {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) {
+      issues.push(`${at} must be a schema object`)
+      return
+    }
+    for (const key of Object.keys(node)) {
+      if (!TOOL_SCHEMA_CONSTRAINTS.has(key) && !TOOL_SCHEMA_ANNOTATIONS.has(key)) {
+        issues.push(`${at}.${key} is not supported by the host schema subset`)
+      }
+    }
+    if (node.type !== undefined) {
+      if (Array.isArray(node.type)) {
+        issues.push(`${at}.type must be a single type string (type arrays are not supported)`)
+      } else if (!TOOL_SCHEMA_TYPES.has(node.type)) {
+        issues.push(`${at}.type must be one of ${[...TOOL_SCHEMA_TYPES].join(', ')}`)
+      }
+    }
+    if (node.oneOf !== undefined) {
+      if (!Array.isArray(node.oneOf) || node.oneOf.length === 0) issues.push(`${at}.oneOf must be a non-empty array`)
+      else node.oneOf.forEach((child, index) => walk(child, `${at}.oneOf[${index}]`))
+    }
+    if (node.properties !== undefined) {
+      if (!node.properties || typeof node.properties !== 'object' || Array.isArray(node.properties)) {
+        issues.push(`${at}.properties must be an object`)
+      } else {
+        for (const [key, child] of Object.entries(node.properties)) walk(child, `${at}.properties.${key}`)
+      }
+    }
+    if (node.items !== undefined) walk(node.items, `${at}.items`)
+    if (node.additionalProperties !== undefined && typeof node.additionalProperties !== 'boolean') {
+      issues.push(`${at}.additionalProperties must be a boolean`)
+    }
+    if (node.required !== undefined && !Array.isArray(node.required)) issues.push(`${at}.required must be an array`)
+  }
+  walk(definition && definition.schema, path)
+  if (!definition || !definition.schema || definition.schema.type !== 'object') {
+    issues.push(`${path} must be an object-rooted schema for tool output`)
+  }
+  return { ok: issues.length === 0, issues }
+}
+
+/**
  * Map one inbox reply body to an ApprovalOutcome. A reply that contains both an approval
  * and a rejection word fails closed: unattended approvals must never be widened by a
  * confusing message.
@@ -3975,23 +4066,6 @@ export function apply(ctx, config) {
   // @deepseek-ai/dsh-tools is a host peer dependency that a linked install may not resolve,
   // in which case the same definition is registered with a plain JSON Schema.
 
-  const DISPATCH_OUTPUT = {
-    schema: {
-      type: 'object',
-      properties: {
-        ok: { type: 'boolean' },
-        sessionId: { type: 'string' },
-        title: { type: ['string', 'null'] },
-        taskId: { type: 'string' },
-        batchId: { type: ['string', 'null'] },
-        mode: { type: 'string' },
-        created: { type: 'boolean' },
-      },
-      required: ['ok', 'sessionId', 'taskId', 'mode', 'created'],
-    },
-    render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
-  }
-
   async function createDispatchTarget(title) {
     const name = String(title ?? '').trim().slice(0, 60)
     if (!name) throw new Error('createIfMissing needs a non-empty target to use as the title')
@@ -4196,22 +4270,6 @@ export function apply(ctx, config) {
   // mesh_ask (0.7.0): same registration path as mesh_dispatch — defineTool when the host
   // package resolves, otherwise the same JSON Schema definition. Question traffic is
   // consumed by the pull loop; the tool waits for one inbox reply or reports unanswered.
-  const ASK_OUTPUT = {
-    schema: {
-      type: 'object',
-      properties: {
-        status: { type: 'string' },
-        answer: { type: 'string' },
-        by: { type: 'string' },
-        ms: { type: 'number' },
-        questionId: { type: 'string' },
-        timeoutSeconds: { type: 'number' },
-      },
-      required: ['status', 'questionId'],
-    },
-    render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
-  }
-
   // Restore batches before the listener comes up, then poll liveness for early alerts.
   loadTaskRegistry()
   restoreBatches()
