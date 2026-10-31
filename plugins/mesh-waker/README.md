@@ -263,6 +263,8 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 「打开会话」依赖宿主 `uiWorkspace`：`package.json` 的 `dsh.client.inject` 必须包含 `@deepseek-ai/dsh-client-ui-workspace`（它提供 uiWorkspace 服务），client 运行时 `inject` 同时声明 `uiWorkspace`——**两者缺一，`ctx.uiWorkspace` 都是 undefined**。改完包声明后**需要重启宿主**才生效。target 直接传裸 session id（宿主 `replaceMain(summary.id, …)` 同样如此）；成功会切到该会话并提示；会话已归档/跨工作区或宿主无导航时显示明确提示，并提供「复制会话 id」「复制任务标记 `[TASK T-xxx]`」两个退路。控件挂载/点击时会在控制台打印一次 `[mesh-waker] uiWorkspace …` 与 `openSession target` 便于排查。
 
+两个「打开任务面板」入口（右栏 tab 的服务行、设置页「任务与回执」）走宿主 `ctx.layout.selectPanel('mesh-inbox')` 切主视图，并用共享 tab store 让页面直接落在「派活任务」标签；`dsh.client.inject` 因此还要包含 `@deepseek-ai/dsh-client-ui-layout`、运行时 `inject` 声明 `layout`（同样需重启生效）。导航不可用/切换失败时，按钮旁边会显示明确提示（右栏还带「复制入口」）。
+
 ## 设置页（0.7.13）
 
 设置页按功能分五章、每章可折叠：**接入**（中枢登记/控制台/唤醒端口/接入向导占位）、**唤醒行为**（信任级别、投递方式、`maxWakes`、`resetAfterHours`、启动补收、投递模式、发送方指定、按设备信任）、**界面**（`entryLabel`、收件箱目录、本机会话归档）、**任务与回执**（回执状态、任务库保留策略、去任务面板）、**维护**（本地缓存、清缓存、轮换令牌、右栏状态）。

@@ -9,6 +9,17 @@
 
 ---
 
+## v0.7.19（2026-10-31，两个「打开任务面板」入口真跳转；**需重启宿主生效**）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | 右栏 tab 与设置页的「打开任务面板/去任务面板」点了毫无反应：前者只静默写剪贴板，后者只 `setNote` 且该区域不渲染 note |
+| 探测 | 宿主 `ctx.layout` 提供 `selectPanel(id)`（`main` 槽位注册表的 key 选择，宿主文档原文：`selectPanel(id)` checks the live `main` registry before changing selection; `beginNavigation()` returns an abort signal…）；我们的 main 面板 key 是 `mesh-inbox` |
+| 方案 1（采用） | 新增共享 tab store（`inboxTab` + `subscribeInboxTab`）与 `requestTasksPanel()`：先置任务 tab，再 `ctx.layout.selectPanel('mesh-inbox')`；返回 `ok / failed / no-layout`。右栏按钮与设置页按钮都调用它，并根据结果在**按钮附近**渲染可见反馈（右栏组件内 feedback 行、设置页 note 行） |
+| 依赖 | client 运行时 `inject` 增加 `layout`；`dsh.client.inject` 增加 `@deepseek-ai/dsh-client-ui-layout`（仍**需重启宿主**才生效） |
+| 兜底 | 右栏额外提供「复制入口」按钮并显示复制结果；`no-layout`/`failed` 两种情况文案明确写出「宿主导航不可用/切换失败」，不再无声 |
+| 测试 | +1（共 123/123）：静态断言 `selectPanel('mesh-inbox')`、`layout` 注入、package inject 含 ui-layout、两个入口都调用 `requestTasksPanel`（≥3 处引用）。既有 122 例全绿 |
+
 ## v0.7.18（2026-10-31，声明 ui-workspace 依赖，「打开会话」真跳转；**需重启宿主生效**）
 
 | 项 | 内容 |

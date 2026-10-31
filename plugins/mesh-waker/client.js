@@ -1010,6 +1010,42 @@ try {
     // jump line all read it from /mesh/status (config.entryLabel).
     let meshEntryLabel = 'Mesh 信箱'
 
+    // Main-page tab selection shared by the page itself and the two "open task panel" entry
+    // points. ctx.layout.selectPanel('mesh-inbox') switches the window to our main panel, and
+    // this store tells the already-mounted page which tab to show.
+    let inboxTab = 'inbox'
+    const inboxTabListeners = new Set()
+
+    function setInboxTab(next) {
+      inboxTab = next === 'tasks' ? 'tasks' : 'inbox'
+      for (const listener of inboxTabListeners) {
+        try {
+          listener(inboxTab)
+        } catch {
+          /* a broken listener must not break navigation */
+        }
+      }
+    }
+
+    function subscribeInboxTab(listener) {
+      inboxTabListeners.add(listener)
+      return () => inboxTabListeners.delete(listener)
+    }
+
+    /** Try to open the inbox page on its task tab. Returns 'ok' | 'no-layout' | 'failed'. */
+    function requestTasksPanel() {
+      setInboxTab('tasks')
+      const layout = hostCtx?.layout ?? (typeof hostCtx?.get === 'function' ? hostCtx.get('layout') : undefined)
+      if (!layout || typeof layout.selectPanel !== 'function') return 'no-layout'
+      try {
+        layout.selectPanel('mesh-inbox')
+        return 'ok'
+      } catch (error) {
+        console.info('[mesh-waker] selectPanel(mesh-inbox) failed', String(error && error.message ? error.message : error))
+        return 'failed'
+      }
+    }
+
     function useEntryLabel() {
       const [label, setLabel] = React.useState(meshEntryLabel)
       React.useEffect(() => {
@@ -1336,6 +1372,7 @@ try {
     /** Compact task summary for the right sidebar tab (entry point next to the mailbox). */
     function TaskTabSummary() {
       const [counts, setCounts] = React.useState(null)
+      const [feedback, setFeedback] = React.useState(null)
       const entryLabel = useEntryLabel()
       React.useEffect(() => {
         let alive = true
@@ -1349,26 +1386,48 @@ try {
           alive = false
         }
       }, [])
+
+      const openTasks = () => {
+        const result = requestTasksPanel()
+        if (result === 'ok') setFeedback('已切换到「' + entryLabel + '」→「派活任务」')
+        else if (result === 'failed') setFeedback('切换失败：宿主拒绝了 selectPanel；请从左侧边栏打开「' + entryLabel + '」→「派活任务」')
+        else setFeedback('宿主导航不可用；请从左侧边栏打开「' + entryLabel + '」→「派活任务」')
+      }
+
+      const copyEntry = async () => {
+        const text = entryLabel + ' → 派活任务'
+        try {
+          await navigator.clipboard.writeText(text)
+          setFeedback('已复制入口：' + text)
+        } catch {
+          setFeedback('复制失败，入口路径：' + text)
+        }
+      }
+
       return h(
         'div',
-        { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px', borderBottom: '0.5px solid var(--dsw-alias-border-l3)', fontSize: 11 } },
-        h('span', { style: { opacity: 0.8 } }, '派活任务：' + (counts === null ? '…' : counts) + ' 条待办/进行中'),
+        { style: { display: 'flex', flexDirection: 'column', gap: 2, padding: '4px 8px', borderBottom: '0.5px solid var(--dsw-alias-border-l3)', fontSize: 11 } },
         h(
-          'button',
-          {
-            type: 'button',
-            style: { ...buttonSecondary, marginLeft: 'auto', padding: '2px 8px', fontSize: 11 },
-            title: '打开 ' + entryLabel + ' 页面的「派活任务」标签',
-            onClick: () => {
-              try {
-                void navigator.clipboard.writeText(entryLabel + ' → 派活任务')
-              } catch {
-                /* clipboard is best effort */
-              }
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 } },
+          h('span', { style: { opacity: 0.8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, '派活任务：' + (counts === null ? '…' : counts) + ' 条待办/进行中'),
+          h(
+            'button',
+            {
+              type: 'button',
+              style: { ...buttonPrimary, marginLeft: 'auto', padding: '2px 8px', fontSize: 11 },
+              title: '打开 ' + entryLabel + ' 页面的「派活任务」标签',
+              onClick: openTasks,
             },
-          },
-          '打开任务面板',
+            '打开任务面板',
+          ),
+          h(
+            'button',
+            { type: 'button', style: { ...buttonSecondary, padding: '2px 8px', fontSize: 11 }, title: '复制入口路径', onClick: () => void copyEntry() },
+            '复制入口',
+          ),
         ),
+        feedback ? h('div', { style: { opacity: 0.75, lineHeight: '16px' } }, feedback) : null,
       )
     }
 
@@ -1965,11 +2024,16 @@ try {
               'button',
               {
                 type: 'button',
-                style: styles.button,
-                onClick: () =>
-                  setNote(
-                    '请从左侧边栏打开「' + entryLabel + '」→ 顶部「派活任务」；宿主未暴露主页面导航 API（uiWorkspace 只有 startSession/openSession/openWorkspace 等）。',
-                  ),
+                style: buttonPrimary,
+                onClick: () => {
+                  // ctx.layout.selectPanel('mesh-inbox') switches the window to our main panel;
+                  // the shared tab store makes the page open on 「派活任务」. Every outcome
+                  // leaves a visible note right under this row.
+                  const result = requestTasksPanel()
+                  if (result === 'ok') setNote('已打开「' + entryLabel + '」→「派活任务」')
+                  else if (result === 'failed') setNote('切换失败：宿主拒绝了 selectPanel；请从左侧边栏打开「' + entryLabel + '」→「派活任务」')
+                  else setNote('宿主导航不可用；请从左侧边栏打开「' + entryLabel + '」→「派活任务」')
+                },
               },
               '去任务面板',
             ),
@@ -2252,7 +2316,14 @@ try {
     /** The main-slot inbox page: same data as the settings block, full width. */
     function MeshInboxPage() {
       const entryLabel = useEntryLabel()
-      const [view, setView] = React.useState('inbox')
+      const [view, setViewState] = React.useState(inboxTab)
+
+      React.useEffect(() => subscribeInboxTab((next) => setViewState(next)), [])
+
+      const setView = (next) => {
+        setViewState(next)
+        setInboxTab(next)
+      }
       const [list, setList] = React.useState([])
       const [active, setActive] = React.useState(null)
       const [thread, setThread] = React.useState([])
@@ -3082,7 +3153,8 @@ try {
     return {
       // uiWorkspace is a declared dependency: without it ctx.uiWorkspace is undefined and
       // "open session" silently degrades to a clipboard write (the 2026-10-31 dead button).
-      inject: ['slots', 'uiWorkspace'],
+      // `layout` provides selectPanel(id), which is how a plugin switches the main view.
+      inject: ['slots', 'uiWorkspace', 'layout'],
       apply(ctx) {
         hostCtx = ctx
         // One-shot probe (0.7.12): what can the host's uiWorkspace actually do? Navigation

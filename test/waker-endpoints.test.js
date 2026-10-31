@@ -2619,6 +2619,20 @@ async function main() {
     report('client: package.json injects the ui-workspace client package', ok, `inject=${inject.join(',')}`)
   })
 
+  await runCase('client: both task-panel buttons navigate through layout.selectPanel', async () => {
+    const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
+    const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'package.json'), 'utf8'))
+    const inject = pkg?.dsh?.client?.inject ?? []
+    const entryPoints = (source.match(/requestTasksPanel\(\)/g) ?? []).length
+    const ok =
+      /selectPanel\('mesh-inbox'\)/.test(source) &&
+      /inject:\s*\[[^\]]*'layout'/.test(source) &&
+      inject.includes('@deepseek-ai/dsh-client-ui-layout') &&
+      entryPoints >= 3 &&
+      source.includes('宿主导航不可用')
+    report('client: both task-panel buttons navigate through layout.selectPanel', ok, `selectPanel=${/selectPanel\('mesh-inbox'\)/.test(source)} layoutInject=${inject.includes('@deepseek-ai/dsh-client-ui-layout')} entryPoints=${entryPoints}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
