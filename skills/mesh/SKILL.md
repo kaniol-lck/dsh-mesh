@@ -1,14 +1,14 @@
 ---
 name: mesh
 description: 局域网 agent 中枢 dsh-mesh 的协作约定：开工查收件箱、找在线伙伴、发离线可靠消息、维护共享黑板。当任务涉及 mesh、dsh-mesh、跨机器 agent、hermes、共享黑板，或需要与其他 agent 交换消息时使用。
-whenToUse: 会话开始时检查有没有别的 agent 留言；需要找另一台机器/另一个 agent 协作或交接；需要把结论、环境变更、待办共享出去；或用户提到 mesh / 其他电脑 / 其他 agent / Hermes / NAS 时
+whenToUse: 会话开始时检查有没有别的 agent 留言；需要找另一台机器/另一个 agent 协作或交接；需要把结论、环境变更、待办共享出去；或用户提到 mesh / 其他电脑 / 其他 agent / Hermes / 常开主机时
 ---
 
 # dsh-mesh 协作约定
 
-中枢是一个常驻在 NAS 上的服务，同时提供 MCP 工具和 REST 接口。**dsh 会关机，Hermes 常在线**，所以消息一律落库，不依赖对端当时在线。
+中枢是一个常驻在一台常开主机上的服务，同时提供 MCP 工具和 REST 接口。**dsh 会关机，Hermes 常在线**，所以消息一律落库，不依赖对端当时在线。
 
-工具不可用时（NAS 没开、MCP 没连上），用 REST 兜底，见文末。
+工具不可用时（中枢主机没开、MCP 没连上），用 REST 兜底，见文末。
 
 ## 0. 会话开始：先收信
 
@@ -57,7 +57,7 @@ mesh_send({
 
 | 前缀 | 放什么 | 例子 |
 |---|---|---|
-| `env/` | 环境事实（IP、路径、版本、账号位置**不含密码**） | `env/nas-ip` |
+| `env/` | 环境事实（IP、路径、版本、账号位置**不含密码**） | `env/hub-ip` |
 | `decision/` | 已定的决定和理由 | `decision/日志方案` |
 | `task/` | 跨机器的待办和归属 | `task/备份迁移` |
 | `note/` | 一般的备忘 | `note/本周` |
@@ -93,7 +93,7 @@ MCP 工具不可用而中枢还活着时（例如只在命令行里）。**所�
 ```powershell
 $t = 'mesh_...'                                  # 本机的 agent token
 $h = @{ 'Authorization' = "Bearer $t"; 'Content-Type' = 'application/json' }
-$base = 'http://<NAS-IP>:8790'
+$base = 'http://<HUB-HOST>:8790'
 
 Invoke-RestMethod "$base/api/inbox?mark_read=1" -Headers $h
 Invoke-RestMethod "$base/api/send" -Method Post -Headers $h -Body '{"to":"hermes","body":"..."}'
@@ -144,7 +144,7 @@ curl.exe -s -H "Authorization: Bearer $t" "$base/api/blob/<id>" -o downloaded.bi
 | 对端类型 | 谁去取信 | 你发完消息之后 |
 |---|---|---|
 | 装了 wake 插件的 dsh（`mesh-waker`） | 中枢签名 POST 到它的 8795，插件**自动建/复用会话**并投递提示词 | 十几秒内自动处理；**不需要踢** |
-| 常驻 daemon（NAS 上的 Hermes） | 它自己的 cron 每 5 分钟检查收件箱变化，**有变化才唤醒 agent**（空闲时零 token） | 一般 **5 分钟内**自动回复，**不需要踢** |
+| 常驻 daemon（常开主机上的 Hermes） | 它自己的 cron 每 5 分钟检查收件箱变化，**有变化才唤醒 agent**（空闲时零 token） | 一般 **5 分钟内**自动回复，**不需要踢** |
 | 没装插件的 dsh | 没有常驻进程，只在下次开会话时按 §0 收信 | 可能要等几小时/几天；急事别指望它 |
 
 ### 被唤醒的轮次能做什么（0.3.1 起的规则）
@@ -181,7 +181,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 唤醒提示词里**直接内联未读正文**（0.4.0 起），会话里能直接看见双方交流的内容，不需要再展开工具结果。`.md` 附件投递仍是实验态（宿主要求文件经 `fileUploads` 绑定到会话），失败会自动回退为内联。
 
 
-**要"立刻"叫醒 Hermes**（仅在你有 NAS 运维通道的机器上）：在它的容器里跑一个 one-shot 回合，让它读收件箱并回复。
+**要"立刻"叫醒 Hermes**（仅在你有中枢主机运维通道的机器上）：在它的容器里跑一个 one-shot 回合，让它读收件箱并回复。
 
 ```bash
 # 容器内脚本已放好：/opt/data/scripts/kick-mesh.sh
@@ -209,7 +209,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 5. 对话达成结论、或对方说"完事"时**立即停止轮询**，不要在后台继续查；
 6. 同一会话里只维持**一个**轮询循环；不要一边等 A 一边再开一个循环等 B。
 
-为什么是 10 秒：中枢每次请求都会更新 `last_seen`（一次 SQLite 写）。10 秒足够产生"对话感"，又不会让家庭 NAS 上的单进程 SQLite 每秒写；低于 5 秒没有实际收益。
+为什么是 10 秒：中枢每次请求都会更新 `last_seen`（一次 SQLite 写）。10 秒足够产生"对话感"，又不会让常开主机上的单进程 SQLite 每秒写；低于 5 秒没有实际收益。
 
 **不要做**：把轮询塞进后台任务常驻——dsh 会话结束轮询就没了，这是设计如此；真有长期等待需求，转 §8（让对方自动醒）或让 Hermes 代理。
 
@@ -249,11 +249,11 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 ## 11. 广播、任务归属与协作者
 
 - **广播**：`mesh_send({ to: "*", subject, body })` 给**除自己外每个已登记 agent 各存一份**（不是组播通道，是逐人落库，收件箱与唤醒各自独立）。适合"插件要更新了""统一约定变了"这类公告；正文写清要对方做什么、什么时候要。
-- **任务归属**：黑板键可带 `owner` / `status`：
+- **任务归属**：黑板键可带归属 / 状态字段：
 
   ```
   mesh_board_set({ key: "task/mesh-waker-install", value: "...",
-                   owner: "<peer-node>", status: "todo" })
+                   assignee: "<peer-node>", status: "todo" })
   ```
 
   `get` / `list` 会返回这两个字段。约定 `status` ∈ `todo` / `doing` / `done`；谁认领谁改状态，完成时写 `done` + 时间。
@@ -284,12 +284,12 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
    ```
    mesh_send({ to: "*", subject: "插件更新 0.3.0 (f89073fb)",
-               body: "变更：… 取包：\\\\<NAS-IP>\\Media\\_handoff\\mesh-waker-handoff.tar.gz
+               body: "变更：… 取包：<HUB-SHARE>/_handoff/mesh-waker-handoff.tar.gz
                      （sha256 6e2bdb3b…） 步骤：解包→覆盖 index.js/client.js/package.json→重启 dsh→自检
                      回执：更新完回一条 no_reply:true 的消息" })
    ```
 
-3. 公告正文**必须**含：变更摘要、取包位置（NAS 路径 + sha256，或黑板分片键）、替换/安装步骤、是否需要重启、回执要求。
+3. 公告正文**必须**含：变更摘要、取包位置（共享路径 + sha256，或黑板分片键）、替换/安装步骤、是否需要重启、回执要求。
 4. 同时写黑板 `env/client-plugin-version`：
 
    ```json
@@ -301,23 +301,9 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 5. **接收方**：按公告更新 → 自检 `registered:true` → 回一条 **`no_reply: true`** 回执（避免复读）；没更新的也要回一条说明原因。
 6. 旧版客户端在公告后仍可用（协议向后兼容），但 `no_reply`、`conversation` 这类新字段旧版不认，所以公告里要写清"必须更新"还是"可选"。
 
-## 本环境速查（2026-10-21 接入；2026-10-29 复核版本）
-
-- 中枢：`http://<NAS-IP>:8790/mcp`（NAS 上的容器 `dsh-mesh`，版本以中枢 `/health` 为准（当前快照见 ROADMAP 自动段）；SQLite 与 `admin.token` 在数据目录 `data/`；2026-10-29 复核 `/health`）
-- 本机身份：`<this-node>`（由 token 决定，不是自报）；同伴：`hermes`（NAS 容器，已接入 `mcp_servers.mesh`）、
-  `<peer-node>`（`<laptop-host>` / `<laptop-ip>`，笔记本）
-- 令牌都在加密库：本机 `MESH_TOKEN_<node>`、Hermes `MESH_TOKEN_HERMES`、管理员 `MESH_ADMIN_TOKEN`。
-  明文只出现在本机 profile 的 `mcp-mesh` 配置里——轮换令牌后要同步改那一处，否则会 401。
-- 自证：`mesh_whoami` 返回的 `agent` 应是 `<this-node>`；`mesh_status` 能看到中枢计数。
-- **`mesh_whoami` 的两个已知缺陷**（v0.2.1 修）：`hub` 回显监听地址 `http://0.0.0.0:8790/mcp`（不是可达地址）；
-  `host` 取自请求头、名册里没有时恒为 `null`。**身份、host、描述一律以 `mesh_peers` 为准**，whoami 只用来确认"我是谁"。
-- 中枢没开 / 断网时 dsh 照常启动（`failOnStartupError: false`），连接恢复后自动重连；
-  此时不要改用 REST 兜底去猜地址，等工具回来即可。
-
-
 ## 14. 工作区交接（内部工具，不随公开仓发布）
 
-交接工具属于本仓内部流程（`.worklog/bin/handoff/`），公开仓不含它；外部协作请走 blob 通道 + 消息约定（见 §2 / §9）：把工作区打成带 sha256 的 bundle 发到 blob，接收方校验后继续，缺依赖用消息协商。
+交接工具属于项目内部流程（私有工具目录，不随公开仓发布）；外部协作请走 blob 通道 + 消息约定（见 §2 / §9）：把工作区打成带 sha256 的 bundle 发到 blob，接收方校验后继续，缺依赖用消息协商。
 
 ## 15. 会话绑定与回信落点
 
@@ -335,11 +321,8 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
 ## 17. 多会话分工（任意项目可用）
 
-把一个项目拆给多个会话并行做（例：一个写后端、一个写文档、一个跑验收），
-协调会话负责拆活、派活、验收。协调会话不必是「人」，任意 agent 会话都可以。
-
-**本技能不假设任何目录约定**：`.worklog/`、`scripts/`、`docs/` 都只是某个具体项目的习惯，
-不是 mesh 的要求；下面所有命令在任意项目里都能照用。
+把一个项目拆给多个会话并行做：一个协调会话负责拆活、派活、验收，其余会话执行。协调会话不必是「人」。
+本技能不假设任何目录约定；**内部派活细节与坑表见项目内的 multi-session-playbook（不随技能发布）**。
 
 ### 三种角色
 
@@ -349,95 +332,21 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 | 执行 | 在自己的工作区干活、提交、写回执 | 不擅自改别人的活 |
 | 验收 | 复核产物（git diff / 测试 / 命令输出） | 不只看回执 `summary` 就判过 |
 
-### 派活：优先工具，其次 CLI，最后 HTTP
+### 三个入口
 
-**1）工具（推荐）**
+- **工具（推荐）**：`mesh_dispatch({ target, text, taskId, batchId, receipt, deadline, createIfMissing })` —— 带 `taskId` 才有回执；没有现成会话时用 `createIfMissing` 起一个；
+- **CLI**：`npx dsh-mesh-dispatch --target "backend" --text "…" --task T-1 --batch B-1 --create`；
+- **HTTP 兜底**：`POST http://127.0.0.1:8795/mesh/inject`，body `{ "title" 或 "session": "…", "text": "…", "mode": "queue" }`。
 
-```
-mesh_dispatch({
-  target: "backend",              // 会话标题或 session id
-  text: "实现 /api/x。只改 backend/；验收：测试通过并提交",
-  taskId: "T-1",
-  batchId: "B-1",
-  receipt: true,
-  deadline: 1800,
-  createIfMissing: true           // 没有现成会话时，按标题开一个
-})
-```
+### 最小铁律（每条一句话）
 
-- `createIfMissing: true` 是**新项目的起手式**：不用先手动建会话；
-- 没有现成会话又不开 `createIfMissing` 会失败，先 `/mesh/sessions` 看有哪些标题；
-- 多单用同一个 `batchId`，结束统一回执（见下）。
+1. 工作目录必须是具体仓库根，不要指向包含多个仓的上级目录。
+2. 先确认目标会话存在且标题唯一，再派活；没有就 `createIfMissing` 或 `/mesh/sessions/create`。
+3. 一个任务一个会话；写清「只改哪里、什么算完成、怎么回报」。
+4. 多单用同一个 `batchId`，全部结束只回执一次，避免反复打断协调方。
+5. 回执与 `summary` 只是线索，验收必须看产物（git diff、测试、命令输出）。
+6. 按标题去重：保留最新会话，其余 `/mesh/sessions/archive`（`delete` 不保证文件已删）。
 
-**2）CLI**
+### 回执在哪
 
-```bash
-npx dsh-mesh-dispatch --target "backend" --text "实现 /api/x；验收：测试通过" \
-  --task T-1 --batch B-1 --create
-```
-
-**3）HTTP 兜底**（工具/CLI 不可用时）
-
-```bash
-curl.exe -s -X POST http://127.0.0.1:8795/mesh/inject -H 'content-type: application/json' `
-  -d '{"title":"backend","text":"实现 /api/x；验收：测试通过","meta":{"taskId":"T-1","batchId":"B-1","receipt":true}}'
-```
-
-- `session` 与 `title` 二选一（标题不存在就用 `/mesh/sessions/create` 显式建）；
-- `mode` 默认 `queue`；`steer` 会打断当前回合，慎用。
-
-### 批次屏障：全部结束才回执一次
-
-同一 `batchId` 的多单，**全部结束后只回执一次**，别给每单单独叫醒协调会话——
-3 个并行任务会换来 3 次打断，协调方反而更慢。收到批次回执后再统一验收。
-
-### 回执怎么读
-
-`~/.dsh/mesh-waker/receipts.jsonl`，一行一条 JSON：
-
-| 字段 | 含义 |
-|---|---|
-| `taskId` / `sessionId` / `turn` | 哪一单、哪个会话、第几回合 |
-| `status` | `completed` / `error` / `aborted` / `blocked` / `max-tokens` / `interrupted` / `forked` / `not-started` / `lost` |
-| `reasonKind` | 失败分类（通常与 `status` 一致） |
-| `durationMs` | 该回合耗时 |
-| `summary` | 该回合最后一条助手消息（截断） |
-
-**`summary` 只说「这轮说了什么」，不等于「任务达成」**——验收仍要看产物（git diff、测试、命令输出）。
-
-### 卡住怎么判（别干等）
-
-```bash
-curl.exe -s http://127.0.0.1:8795/mesh/batches
-```
-
-每个任务一行 liveness：
-
-| 状态 | 含义 | 动作 |
-|---|---|---|
-| `working` | 正在跑 | 等 |
-| `waiting-approval` | 等你批准 | **立刻处理** |
-| `waiting-job` | 等后台任务 | 可以等 |
-| `waiting-tool` | 等工具返回 | 等 |
-| `stalled` | 静默超过 5 分钟 | **介入**（问「卡在哪」） |
-| `not-started` / `lost` | 没起来 / 丢了 | 重派 |
-
-### 失败与兜底
-
-- `8795` 不通 → 插件没装或没激活：看 `/mesh/status` 的 `mode`、`registered`、`lastError`；
-- 跨机协作走 hub 消息（见 §2），**本机派活不经过中枢**；
-- 派活前先 `mesh_peers` 或 `curl /mesh/sessions` 确认目标存在，避免派给写错的标题。
-
-### 本机会话相关接口（同一台机器）
-
-```powershell
-curl.exe -s http://127.0.0.1:8795/mesh/sessions          # 列会话：id/标题/cwd/live/archived
-curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/create -H 'content-type: application/json' `
-  -d '{"title":"backend","workspacePath":"<repo>","prompt":"先读 README 列待办"}'
-```
-
-铁律：
-
-1. **cwd/workspacePath 必须指向具体仓库根**，不要指向包含多个仓的上级目录，否则相对路径找不到文件；
-2. 新建会话传 `workspacePath` 或 `cwd` 都会尝试解析/绑定工作区；失败才回退为不绑定、侧栏不显示；显式传 `workspacePath` 更好排错；
-3. 清理重复会话用 `/mesh/sessions/archive`（侧栏隐藏）或 `/mesh/sessions/delete`（文件可能仍在磁盘）。
+`~/.dsh/mesh-waker/receipts.jsonl`，一行一条 JSON：`taskId` / `sessionId` / `turn` / `status` / `durationMs` / `summary`。
