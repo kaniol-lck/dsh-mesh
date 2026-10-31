@@ -1115,6 +1115,49 @@ export function apply(ctx, config) {
     return new Set()
   }
 
+  /**
+   * The host archive set has no removal API for plugins (probed 2026-10-31: the
+   * dsh-workspace registry exposes archiveSession/deleteKnown, while unarchiveSession only
+   * exists on the workspace-controller command surface). Deleting an archived session
+   * therefore leaves its id in the host set forever; keep a local tombstone list and
+   * subtract it from what /mesh/sessions reports.
+   */
+  const tombstoneFile = join(homedir(), '.dsh', 'mesh-waker', 'archived-tombstones.json')
+  const archivedTombstones = (() => {
+    try {
+      const raw = JSON.parse(readFileSync(tombstoneFile, 'utf8'))
+      return new Set(Array.isArray(raw) ? raw.map(String) : [])
+    } catch {
+      return new Set()
+    }
+  })()
+
+  function saveArchivedTombstones() {
+    try {
+      mkdirSync(dirname(tombstoneFile), { recursive: true })
+      writeFileSync(tombstoneFile, JSON.stringify([...archivedTombstones], null, 2), { mode: 0o600 })
+    } catch (error) {
+      fileLog(`saving archived tombstones failed: ${error.message}`)
+    }
+  }
+
+  function rememberDeletedArchived(sessionId) {
+    try {
+      if (!archivedSessionIds().has(sessionId)) return
+      archivedTombstones.add(sessionId)
+      saveArchivedTombstones()
+      fileLog(`archived tombstone ${sessionId} (host has no unarchive API)`)
+    } catch (error) {
+      fileLog(`archived tombstone failed for ${sessionId}: ${error.message}`)
+    }
+  }
+
+  function clearArchivedTombstone(sessionId) {
+    if (!archivedTombstones.has(sessionId)) return
+    archivedTombstones.delete(sessionId)
+    saveArchivedTombstones()
+  }
+
   function listLocalSessions() {
     const archived = archivedSessionIds()
     return discoverSessions().map((entry) => {
@@ -1126,7 +1169,7 @@ export function apply(ctx, config) {
         workspace: entry.workspace,
         last_active: entry.mtime,
         live: isLive(entry.id),
-        archived: archived.has(entry.id),
+        archived: archived.has(entry.id) && !archivedTombstones.has(entry.id),
         known: (() => {
           try {
             const check = ctx.workspaceRegistry?.sessionKnown
@@ -3844,6 +3887,8 @@ export function apply(ctx, config) {
         if (existsSync(directory)) throw new Error(`removing ${directory} did not take effect`)
         delete sessionIndex[id]
         saveSessionIndex()
+        // The host archive set cannot forget an id; hide it locally after deletion.
+        rememberDeletedArchived(id)
         fileLog(`deleted local session ${id} dir=${directory} live=${stop.live} bindings=${bindingsDropped}`)
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(
@@ -3877,6 +3922,7 @@ export function apply(ctx, config) {
         const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
         const target = resolveLocalSession(draft)
         await ctx.workspaceRegistry.archiveSession(target.id)
+        clearArchivedTombstone(target.id)
         fileLog(`archived local session ${target.id} (${target.title ?? 'no title'})`)
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: true, sessionId: target.id, title: target.title }))

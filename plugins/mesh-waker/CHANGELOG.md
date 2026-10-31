@@ -5,9 +5,17 @@
 > **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
 > `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留 + 分页/日志）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留 + 分页/日志 + 归档面板/残留清理）。
 
 ---
+
+## v0.7.6（2026-10-31，归档态可见与可操作；删除后清理残留归档 id）
+
+| 项 | 内容 |
+|---|---|
+| 面板 | 设置页新增「本机会话」列表（数据来自 `/mesh/sessions`）：`archived` 行置灰（`opacity 0.55`）并显示「已归档」标签、不提供归档按钮；活跃行有「归档」按钮（`POST /mesh/sessions/archive`，成功后刷新列表）。**删除仍只走 CLI**，面板不提供，避免误删会话目录；`staleVersionNotice` 逻辑未动 |
+| 残留 id | 宿主探测（2026-10-31）：`dsh-workspace` 的 `ctx.workspaceRegistry` 有 `archiveSession`/`deleteKnown`/`archivedSessionIds`，**没有** unarchive/移除 API（`unarchiveSession` 只存在于 workspace-controller 的命令/远程面，插件不可见）。修法：waker 自维护 tombstone 文件 `~/.dsh/mesh-waker/archived-tombstones.json`（0600），删除已归档会话时记入、上报归档列表时减掉；该 id 被重新归档时自动清除 tombstone |
+| 测试 | +3（共 85/85）：`formatSessionRow`（archived=true → `已归档`/disabled/0.55；false → 空标签/可操作）；`archiveSessionRequest` 用 stub fetch 断言恰好一次 `POST /mesh/sessions/archive` 且 body 带 session id；删除已归档会话后重播同 id，`archived=1` 不再包含它且默认列表 `archived=false`。既有 82 例全绿 |
 
 ## v0.7.5（2026-10-31，/mesh/sessions 分页过滤 + 独立日志文件与滚动）
 

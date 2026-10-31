@@ -348,6 +348,18 @@ grep -c "pull failed" ~/.dsh/mesh-waker/waker.log     # 同类错误出现次数
 tail -n 50 ~/.dsh/mesh-waker/waker.log                # 最近上下文
 ```
 
+## 面板操作（0.7.6）
+
+设置页「本机会话」列表（数据来自 `GET /mesh/sessions`）：
+
+- **归档可见**：`archived: true` 的行置灰（opacity 0.55）并显示「已归档」标签，不给归档按钮；
+- **归档操作**：活跃会话行有「归档」按钮，调 `POST /mesh/sessions/archive`，成功后刷新列表；
+- **删除只走 CLI**：面板**不提供删除**，避免误删会话目录。需要删除时用
+  `curl.exe -s -X POST http://127.0.0.1:8795/mesh/sessions/delete -H 'content-type: application/json' -d '{"session":"session-…"}'`
+  （标题寻址也支持，歧义会 400 并列候选）。
+
+**已知限制（宿主无归档移除 API）**：插件可见的 `ctx.workspaceRegistry` 只有 `archiveSession` / `deleteKnown` / `archivedSessionIds`，没有 unarchive 或从归档集合删除 id 的接口（`unarchiveSession` 只在 workspace-controller 的命令/远程面，插件拿不到）。因此删除一个**已归档**会话后，宿主归档集合里会永久留着那个 id；waker 用本地 tombstone（`~/.dsh/mesh-waker/archived-tombstones.json`，0600）在 `/mesh/sessions` 输出里把它减掉——删除后归档视图不再显示该 id；若同一 id 被重新归档，tombstone 自动清除。
+
 ## 依赖
 
 中枢本体见 [hub/](https://github.com/kaniol-lck/dsh-mesh/tree/main/hub)，Docker 一条命令即可起：

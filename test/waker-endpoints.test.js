@@ -13,6 +13,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { randomUUID } = require('node:crypto')
 const { pathToFileURL } = require('node:url')
+const vm = require('node:vm')
 
 const REPO = path.join(__dirname, '..')
 const ENTRY = path.join(REPO, 'plugins', 'mesh-waker', 'index.js')
@@ -370,6 +371,26 @@ async function waitFor(check, timeoutMs = 10000, stepMs = 100) {
     await new Promise((resolveWait) => setTimeout(resolveWait, stepMs))
   }
   return null
+}
+
+/** Evaluate client.js in a VM (no React) and return its opt-in test helpers. */
+function loadClientHelpers() {
+  const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
+  let helpers = null
+  const sandbox = {
+    console,
+    document: { currentScript: null },
+    window: {
+      __DSH_BOOT__: { entries: [] },
+      __ModuleLoader__: { load: () => {} },
+    },
+    __meshWakerTestHook: (value) => {
+      helpers = value
+    },
+  }
+  vm.createContext(sandbox)
+  vm.runInContext(source, sandbox, { filename: 'client.js' })
+  return helpers
 }
 
 /** Boot a hub-mode harness with the approval bridge enabled and wait until it is armed. */
@@ -1891,6 +1912,56 @@ async function main() {
     const status = await request(h.base, '/mesh/status')
     const ok = typeof status.json?.logFile === 'string' && status.json.logFile.length > 0 && typeof status.json?.logBytes === 'number'
     report('logging: status exposes logFile and logBytes fields', ok, `logFile=${status.json?.logFile} logBytes=${status.json?.logBytes}`)
+  })
+
+  // 83-85. Archived sessions have a UI exit; deleted ids stop polluting the archive set.
+  await runCase('client: archived session rows are greyed, labelled and not actionable', async () => {
+    const helpers = loadClientHelpers()
+    const live = helpers.formatSessionRow({ id: 'session-a', title: '活跃', archived: false })
+    const archived = helpers.formatSessionRow({ id: 'session-b', title: '归档', archived: true })
+    const ok =
+      live.label === '' &&
+      live.disabled === false &&
+      live.opacity === 1 &&
+      archived.label === '已归档' &&
+      archived.disabled === true &&
+      archived.opacity === 0.55
+    report('client: archived session rows are greyed, labelled and not actionable', ok, `live=${JSON.stringify(live)} archived=${JSON.stringify(archived)}`)
+  })
+
+  await runCase('client: the archive action posts one request to /mesh/sessions/archive', async () => {
+    const helpers = loadClientHelpers()
+    const calls = []
+    const stub = async (url, init) => {
+      calls.push({ url, init })
+      return { ok: true, status: 200 }
+    }
+    const result = await helpers.archiveSessionRequest('session-b', stub, 'http://127.0.0.1:8795')
+    const call = calls[0] ?? {}
+    const ok =
+      result === true &&
+      calls.length === 1 &&
+      call.url === 'http://127.0.0.1:8795/mesh/sessions/archive' &&
+      call.init?.method === 'POST' &&
+      JSON.parse(call.init?.body ?? '{}').session === 'session-b'
+    report('client: the archive action posts one request to /mesh/sessions/archive', ok, `calls=${calls.length} url=${call.url ?? '-'} method=${call.init?.method ?? '-'}`)
+  })
+
+  await runCase('sessions: deleting an archived session clears its id from the archive view', async (boot) => {
+    const h = await boot({
+      seedSessions: [{ id: 'session-arch-del', title: 'to delete' }],
+      archivedIds: ['session-arch-del'],
+    })
+    const before = await request(h.base, '/mesh/sessions?archived=1')
+    const deleted = await request(h.base, '/mesh/sessions/delete', { method: 'POST', body: { session: 'session-arch-del' } })
+    // Re-seed the same id: the host archive set still contains it, so only the local
+    // tombstone can keep it out of the archived view.
+    seedSession(h.sessionsRoot, { id: 'session-arch-del', title: 'to delete' })
+    const afterArchived = await request(h.base, '/mesh/sessions?archived=1')
+    const afterAll = await request(h.base, '/mesh/sessions')
+    const listed = (afterAll.json?.sessions ?? []).find((session) => session.id === 'session-arch-del')
+    const ok = before.json?.total === 1 && deleted.status === 200 && afterArchived.json?.total === 0 && listed?.archived === false
+    report('sessions: deleting an archived session clears its id from the archive view', ok, `before=${before.json?.total} deleted=${deleted.status} afterArchived=${afterArchived.json?.total} listedArchived=${listed?.archived}`)
   })
 
   const failed = results.filter((result) => !result.ok)
