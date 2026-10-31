@@ -71,7 +71,7 @@ function seedSession(sessionsRoot, { id, title, workspace = 'ws-test' }) {
  * and standalone boots must not touch the network. Pass `config` to boot a hub-mode
  * install (bootstrap / pull) and `writeToken: false` to start with no stored token.
  */
-async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null, archivedIds = [] } = {}) {
+async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null, archivedIds = [], toolsDelayCalls = 0 } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-endpoints-'))
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
@@ -162,8 +162,25 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   const port = await freePort()
   const disposers = []
   const listeners = new Map()
+  let toolsGetCalls = 0
+  const toolsService = {
+    register: (definition) => {
+      state.tools.push(definition)
+      return () => {}
+    },
+  }
   const ctx = {
     logger: { info() {}, warn() {}, error() {} },
+    // Hosts expose services through ctx.get; toolsDelayCalls simulates the host's tools
+    // service arriving after the plugin's first turns (the 2026-10-31 registration race).
+    // With a delay configured, ctx.tools stays undefined so only the get() path can succeed.
+    get: (name) => {
+      if (name === 'tools') {
+        toolsGetCalls += 1
+        return toolsGetCalls > toolsDelayCalls ? toolsService : undefined
+      }
+      return undefined
+    },
     effect: (fn) => {
       const dispose = fn()
       if (typeof dispose === 'function') disposers.push(dispose)
@@ -178,12 +195,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
       }
     },
     commands: { register: () => () => {} },
-    tools: {
-      register: (definition) => {
-        state.tools.push(definition)
-        return () => {}
-      },
-    },
+    tools: toolsDelayCalls > 0 ? undefined : toolsService,
     sessionController,
     agents,
     workspaceRegistry,
@@ -2067,6 +2079,45 @@ async function main() {
     const listed = status.json?.pendingTaskList?.find((row) => row.taskId === 'T-caller')
     const ok = listed?.requesterSessionId === 'session-orch'
     report('receipt: the tool handler uses the caller session when the host passes it', ok, `requesterSessionId=${listed?.requesterSessionId ?? '-'}`)
+  })
+
+  // 91-93. Tool registration must retry a not-yet-ready host service, and failures must be
+  // visible in /mesh/status instead of vanishing into log.warn.
+  await runCase('tools: registration retries until the host tools service appears', async (boot) => {
+    const h = await boot({ toolsDelayCalls: 3 })
+    const status = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/status')
+      return snapshot.json?.tools?.dispatch === true && snapshot.json?.tools?.ask === true ? snapshot : null
+    }, 8000)
+    const names = h.state.tools.map((tool) => tool.name)
+    const ok = Boolean(status) && names.includes('mesh_dispatch') && names.includes('mesh_ask')
+    report('tools: registration retries until the host tools service appears', ok, `tools=${JSON.stringify(status?.json?.tools)} registered=${names.join(',')}`)
+  })
+
+  await runCase('tools: a permanently missing tools service is reported, not thrown', async (boot) => {
+    const h = await boot({ toolsDelayCalls: 999 })
+    const status = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/status')
+      return snapshot.json?.tools?.dispatch === false && snapshot.json?.toolsError ? snapshot : null
+    }, 8000)
+    const alive = await request(h.base, '/mesh/sessions')
+    const ok =
+      Boolean(status) &&
+      status.json?.tools?.dispatch === false &&
+      status.json?.tools?.ask === false &&
+      /host exposes no tools service/.test(status.json?.toolsError ?? '') &&
+      alive.status === 200
+    report('tools: a permanently missing tools service is reported, not thrown', ok, `tools=${JSON.stringify(status?.json?.tools)} toolsError=${JSON.stringify(status?.json?.toolsError ?? '')} health=${alive.status}`)
+  })
+
+  await runCase('tools: both tools report registered on a normal host', async (boot) => {
+    const h = await boot({})
+    const status = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/status')
+      return snapshot.json?.tools?.dispatch === true ? snapshot : null
+    }, 8000)
+    const ok = status.json?.tools?.dispatch === true && status.json?.tools?.ask === true && status.json?.toolsError === null
+    report('tools: both tools report registered on a normal host', ok, `tools=${JSON.stringify(status?.json?.tools)} toolsError=${JSON.stringify(status?.json?.toolsError)}`)
   })
 
   const failed = results.filter((result) => !result.ok)

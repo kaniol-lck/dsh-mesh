@@ -5,9 +5,18 @@
 > **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
 > `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留 + 分页/日志 + 归档面板/残留清理 + 回执按 requester 路由）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留 + 分页/日志 + 归档面板/残留清理 + 回执按 requester 路由 + 工具注册自检）。
 
 ---
+
+## v0.7.8（2026-10-31，mesh_dispatch 注册不再静默失败）
+
+| 项 | 内容 |
+|---|---|
+| 缺陷 | 真机日志每次启动只有 `registered tool mesh_ask`、**从未**出现 `registered tool mesh_dispatch`，失败分支只走 `log.warn`（宿主日志里也找不到）→ 所有会话都拿不到 `mesh_dispatch`，只能退回项目级 CLI，与「任何项目都能派活」冲突 |
+| 根因 | 两个工具各自复制了一份注册逻辑：dispatch 的 IIFE 先执行，`ctx.get('tools')` 在宿主 tools 服务就绪前返回 undefined，`ctx.tools` 又没被用作兜底，异常只写 `log.warn`；mesh_ask 的第二次查询恰好赶上服务就绪所以成功。现已统一：`ctx.get('tools') ?? ctx.tools` 兜底 + `installModelTool()` 共享安装器，服务未就绪时**重试 5 次、间隔 500ms**（`ctx.effect` 管理定时器），成功即停 |
+| 可见性 | 每次尝试写 waker 日志（`tool mesh_dispatch not registered yet: …; retry n/5`，放弃时 `tool mesh_dispatch NOT registered: <reason> (gave up after 5 retries)`，成功 `registered tool mesh_dispatch`）；`/mesh/status` 增 `tools: {dispatch, ask}` 与 `toolsError`，任何会话可自查 |
+| 测试 | +3（共 93/93）：tools 服务延迟 3 次后出现 → 重试成功且 status 两项 true、state.tools 有 dispatch/ask；服务永远缺失 → status 两项 false、`toolsError` 含 `host exposes no tools service`、8795 仍存活不抛；正常宿主两项 true 且 `toolsError=null`。既有 90 例全绿 |
 
 ## v0.7.7（2026-10-31，回执投给派活方而不是单一 receiptTo）
 

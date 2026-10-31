@@ -3730,40 +3730,104 @@ export function apply(ctx, config) {
     }
   }
 
-  void (async () => {
+  // Both model tools share one definition builder and one installer. Registration can lose
+  // a race with the host's tools service (ctx.get('tools') is still undefined on the first
+  // plugin turn), so it retries a few times instead of failing silently; every outcome goes
+  // to the waker log and to /mesh/status.tools.
+  const toolState = {
+    dispatch: { ok: false, error: null },
+    ask: { ok: false, error: null },
+  }
+
+  function toolsService() {
+    const viaGet = typeof ctx.get === 'function' ? ctx.get('tools') : undefined
+    return viaGet ?? ctx.tools
+  }
+
+  function installModelTool(definition, label, attempt = 0) {
+    let tools = null
+    try {
+      tools = toolsService()
+    } catch (error) {
+      toolState[label].error = `${label}: ${error.message}`
+    }
+    if (tools && typeof tools.register === 'function') {
+      try {
+        ctx.effect(() => tools.register(definition))
+        toolState[label].ok = true
+        toolState[label].error = null
+        fileLog(`registered tool ${definition.name}`)
+        return true
+      } catch (error) {
+        toolState[label].error = `${label}: ${error.message}`
+      }
+    } else if (!toolState[label].error) {
+      toolState[label].error = `${label}: host exposes no tools service (ctx.get('tools') and ctx.tools are empty)`
+    }
+    const reason = toolState[label].error
+    if (attempt >= 5) {
+      fileLog(`tool ${definition.name} NOT registered: ${reason} (gave up after ${attempt} retries)`)
+      return false
+    }
+    fileLog(`tool ${definition.name} not registered yet: ${reason}; retry ${attempt + 1}/5 in 500ms`)
+    try {
+      ctx.effect(() => {
+        const timer = setTimeout(() => installModelTool(definition, label, attempt + 1), 500)
+        timer.unref?.()
+        return () => clearTimeout(timer)
+      })
+    } catch (error) {
+      fileLog(`tool ${definition.name} retry timer failed: ${error.message}`)
+    }
+    return false
+  }
+
+  async function buildToolDefinition({ name, description, parameters, required = [], output, execute }) {
     let definition = null
     try {
       const { defineTool } = await import('@deepseek-ai/dsh-tools')
-      definition = defineTool({
-        name: MESH_DISPATCH_TOOL.name,
-        description: MESH_DISPATCH_TOOL.description,
-        parameters: MESH_DISPATCH_TOOL.parameters,
-        output: DISPATCH_OUTPUT,
-        execute: (args, extra) => dispatchLocalTask(args, extra),
-      })
+      definition = defineTool({ name, description, parameters, output, execute })
     } catch (error) {
       const properties = {}
-      for (const [key, spec] of Object.entries(MESH_DISPATCH_TOOL.parameters)) {
+      for (const [key, spec] of Object.entries(parameters)) {
         const { required: _required, ...rest } = spec
         properties[key] = rest
       }
-      definition = {
-        name: MESH_DISPATCH_TOOL.name,
-        description: MESH_DISPATCH_TOOL.description,
-        parameters: { type: 'object', properties, required: MESH_DISPATCH_TOOL.required },
-        output: DISPATCH_OUTPUT,
-        execute: (args, extra) => dispatchLocalTask(args, extra),
-      }
-      fileLog(`dsh-tools not resolvable (${error.message}); mesh_dispatch registered with a plain JSON Schema`)
+      definition = { name, description, parameters: { type: 'object', properties, required }, output, execute }
+      fileLog(`defineTool unavailable for ${name} (${error.message}); using a plain JSON Schema`)
     }
-    try {
-      const tools = typeof ctx.get === 'function' ? ctx.get('tools') : ctx.tools
-      if (!tools?.register) throw new Error('host exposes no tools service')
-      ctx.effect(() => tools.register(definition))
-      fileLog('registered tool mesh_dispatch')
-    } catch (error) {
-      log.warn(`[mesh-waker] mesh_dispatch tool not registered: ${error.message}`)
-    }
+    return definition
+  }
+
+  void (async () => {
+    const dispatchDefinition = await buildToolDefinition({
+      name: MESH_DISPATCH_TOOL.name,
+      description: MESH_DISPATCH_TOOL.description,
+      parameters: MESH_DISPATCH_TOOL.parameters,
+      required: MESH_DISPATCH_TOOL.required,
+      output: DISPATCH_OUTPUT,
+      execute: (args, extra) => dispatchLocalTask(args, extra),
+    })
+    installModelTool(dispatchDefinition, 'dispatch')
+
+    const askDefinition = await buildToolDefinition({
+      name: MESH_ASK_TOOL.name,
+      description: MESH_ASK_TOOL.description,
+      parameters: MESH_ASK_TOOL.parameters,
+      required: MESH_ASK_TOOL.required,
+      output: ASK_OUTPUT,
+      execute: async (args) => {
+        const question = String(args?.question ?? '').trim()
+        if (!question) throw new Error('question is required')
+        if (question.length > 2000) throw new Error('question is too long (max 2000 characters)')
+        const options = (Array.isArray(args?.options) ? args.options : [])
+          .map((option) => String(option))
+          .filter(Boolean)
+          .slice(0, 6)
+        return await askViaMesh({ question, options, to: args?.to, timeoutSeconds: args?.timeoutSeconds })
+      },
+    })
+    installModelTool(askDefinition, 'ask')
   })()
 
   // mesh_ask (0.7.0): same registration path as mesh_dispatch — defineTool when the host
@@ -3784,51 +3848,6 @@ export function apply(ctx, config) {
     },
     render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
   }
-
-  async function registerModelTool({ name, description, parameters, required = [], output, execute }) {
-    let definition = null
-    try {
-      const { defineTool } = await import('@deepseek-ai/dsh-tools')
-      definition = defineTool({ name, description, parameters, output, execute })
-    } catch (error) {
-      const properties = {}
-      for (const [key, spec] of Object.entries(parameters)) {
-        const { required: _required, ...rest } = spec
-        properties[key] = rest
-      }
-      definition = { name, description, parameters: { type: 'object', properties, required }, output, execute }
-      fileLog(`defineTool unavailable for ${name} (${error.message}); using a plain JSON Schema`)
-    }
-    const tools = typeof ctx.get === 'function' ? ctx.get('tools') : ctx.tools
-    if (!tools?.register) throw new Error('host exposes no tools service')
-    ctx.effect(() => tools.register(definition))
-    fileLog(`registered tool ${name}`)
-    return definition
-  }
-
-  void (async () => {
-    try {
-      await registerModelTool({
-        name: MESH_ASK_TOOL.name,
-        description: MESH_ASK_TOOL.description,
-        parameters: MESH_ASK_TOOL.parameters,
-        required: MESH_ASK_TOOL.required,
-        output: ASK_OUTPUT,
-        execute: async (args) => {
-          const question = String(args?.question ?? '').trim()
-          if (!question) throw new Error('question is required')
-          if (question.length > 2000) throw new Error('question is too long (max 2000 characters)')
-          const options = (Array.isArray(args?.options) ? args.options : [])
-            .map((option) => String(option))
-            .filter(Boolean)
-            .slice(0, 6)
-          return await askViaMesh({ question, options, to: args?.to, timeoutSeconds: args?.timeoutSeconds })
-        },
-      })
-    } catch (error) {
-      log.warn(`[mesh-waker] mesh_ask tool not registered: ${error.message}`)
-    }
-  })()
 
   // Restore batches before the listener comes up, then poll liveness for early alerts.
   restoreBatches()
@@ -4207,6 +4226,9 @@ export function apply(ctx, config) {
                   return 0
                 }
               })(),
+              // Model-tool self-check: a silent registration failure is visible here.
+              tools: { dispatch: toolState.dispatch.ok, ask: toolState.ask.ok },
+              toolsError: toolState.dispatch.error ?? toolState.ask.error ?? null,
               ...state,
               throttled: throttleSummary(),
               historyCached: history.size,

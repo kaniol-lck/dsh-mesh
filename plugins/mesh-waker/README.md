@@ -344,6 +344,8 @@ tail -n 2 ~/.dsh/mesh-waker/receipts.jsonl
 
 工具描述里明确写了：投递后**不要轮询等待**，插件会在回合结束时写回执；要「全部完成再叫我」就用同一个 `batchId`。
 
+**自查工具是否注册成功**：`GET /mesh/status` 的 `tools` 字段给出 `{dispatch, ask}` 两个布尔值，失败原因在 `toolsError`（例如 `host exposes no tools service`）。工具注册会等待宿主 tools 服务就绪（最多重试 5 次、每次 500ms），每次成功/失败都写一行到 waker 日志；模型说「工具未注册」时先看这两个字段，不要猜。
+
 ```bash
 # 新建一个执行会话并投第一单（--create 的典型用法）
 dsh-mesh-dispatch --target "worker-a" --create --text "先读 README，列出与实现不一致处" --task --batch B-a
