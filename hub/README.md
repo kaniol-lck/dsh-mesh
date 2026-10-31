@@ -196,6 +196,8 @@ curl 'http://<HUB-HOST>:8790/api/board?key=env/host' -H "Authorization: Bearer $
 
 **轮换与审计**：控制台每行「轮换」「吊销」；admin API 为 `POST /api/admin/rotate {name}` 与 `DELETE /api/admin/agents?name=…`（加 `&purge=1` 连行删除）。控制台底部「审计」显示最近操作，完整记录用 `GET /api/admin/audit?limit=50`；轮换、吊销、权限变更都会写 audit。
 
+**令牌过期**：控制台节点行显示「永久」或到期时间，可用一行输入设置/清除；`POST /api/admin/agents`、`POST /api/admin/rotate`、`POST /api/enroll` 与控制台生成注册码都接受可选 `expires_at`（ISO 8601 或 epoch 毫秒，省略 = 永不过期）。到期后请求返回 `401 token expired; rotate or re-enroll this agent`，审计记 `auth.expired`。
+
 ## 五、REST 接口一览
 
 | 方法 | 路径 | 鉴权 | 说明 |

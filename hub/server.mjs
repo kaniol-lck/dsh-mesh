@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.16'
+const HUB_VERSION = '0.7.17'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
@@ -510,6 +510,25 @@ function parseScopesInput(raw) {
     if (!scopes.includes(scope)) scopes.push(scope)
   }
   return { scopes }
+}
+
+/**
+ * Parses an optional token expiry. Accepts ISO 8601 or epoch milliseconds; omitted/null/
+ * empty means "never expires" (the historical default). Past instants are allowed so an
+ * admin can deliberately test expiry.
+ */
+function parseTokenExpiry(raw) {
+  if (raw === undefined || raw === null || raw === '') return { value: null }
+  let ms
+  if (typeof raw === 'number') ms = raw
+  else if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    ms = /^\d+$/.test(trimmed) ? Number(trimmed) : Date.parse(trimmed)
+  } else {
+    return { error: 'expires_at must be an ISO 8601 date or epoch milliseconds' }
+  }
+  if (!Number.isFinite(ms) || ms <= 0) return { error: 'expires_at must be a valid ISO 8601 date or epoch milliseconds' }
+  return { value: Math.floor(ms) }
 }
 
 function ipInCidr(ip, cidr) {
@@ -1441,7 +1460,12 @@ async function refresh() {
       ).join('') + '<div class="scope-hint muted" style="margin-top:4px">' +
         (none ? '未选择任何 scope ≠ 无权限，等于全部权限；请显式勾选或使用吊销' : '') + '</div>';
       const cidrs = '<input type="text" data-cidrs value="' + esc((a.allowed_cidrs || '')) + '" placeholder="192.168.1.0/24,10.0.0.0/8" size="22"' + (isAdmin ? '' : ' disabled') + '>';
-      const expiry = a.token_expires_at ? new Date(a.token_expires_at).toLocaleDateString() : '不过期';
+      const expiryText = a.token_expires_at ? new Date(a.token_expires_at).toLocaleString() : '永久';
+      const expiryInput = isAdmin
+        ? '<div style="margin-top:4px"><input type="datetime-local" data-expiry value="' +
+          (a.token_expires_at ? new Date(a.token_expires_at).toISOString().slice(0, 16) : '') +
+          '" style="width:170px"> <button data-act="expiry">设置</button></div>'
+        : '';
       const seen = a.last_seen_at ? Date.parse(a.last_seen_at) : a.last_seen;
       const actions = isAdmin
         ? '<button data-act="save"' + (none ? ' disabled' : '') + '>保存</button> ' +
@@ -1450,7 +1474,7 @@ async function refresh() {
           (!a.has_token && !a.online ? ' <button data-act="purge" class="danger">清理</button>' : '')
         : '<span class="muted">只读</span>';
       return '<tr data-name="' + esc(a.name) + '"><td>' + esc(a.name) + '</td><td>' + scopeBoxes + '</td>' +
-        '<td>' + cidrs + '</td><td>' + esc(expiry) + '</td>' +
+        '<td>' + cidrs + '</td><td>' + esc(expiryText) + expiryInput + '</td>' +
         '<td title="' + esc(absTime(seen)) + '">' + esc(humanAgo(seen)) + '</td><td>' + actions + '</td></tr>';
     }).join('');
     document.getElementById('adminNote').textContent = isAdmin
@@ -1480,6 +1504,11 @@ document.addEventListener('click', async (event) => {
     }
     const cidrs = row.querySelector('input[data-cidrs]').value;
     const result = await post('/console/agents/update', { name, scopes, allowed_cidrs: cidrs });
+    if (result) refresh();
+  }
+  if (act === 'expiry') {
+    const raw = row.querySelector('input[data-expiry]').value;
+    const result = await post('/console/agents/expiry', { name, expires_at: raw || null });
     if (result) refresh();
   }
   if (act === 'rotate') {
@@ -1717,6 +1746,14 @@ async function handleConsole(req, res, url) {
       audit('console.scopes', name, ip, true)
       return sendJson(res, 200, { ok: true, name, scopes: scopes.includes('*') ? ALL_SCOPES : scopes, stored, allowed_cidrs: cidrs })
     }
+    if (action === 'expiry') {
+      const expiry = parseTokenExpiry(body.expires_at)
+      if (expiry.error) return sendJson(res, 400, { error: expiry.error })
+      const result = db.prepare('UPDATE agents SET token_expires_at = ? WHERE name = ?').run(expiry.value, name)
+      if (!Number(result.changes ?? 0)) return sendJson(res, 404, { error: 'unknown agent' })
+      audit('console.expiry', name, ip, true)
+      return sendJson(res, 200, { ok: true, name, token_expires_at: expiry.value })
+    }
     if (action === 'rotate') {
       const row = db.prepare('SELECT name FROM agents WHERE name = ?').get(name)
       if (!row) return sendJson(res, 404, { error: 'unknown agent' })
@@ -1773,9 +1810,11 @@ async function handleConsole(req, res, url) {
     }
     const name = body.name === undefined ? '' : String(body.name).trim()
     if (name && !/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: 'invalid agent name' })
-    const code = mintEnrollCode(name || null)
+    const expiry = parseTokenExpiry(body.expires_at)
+    if (expiry.error) return sendJson(res, 400, { error: expiry.error })
+    const code = mintEnrollCode(name || null, expiry.value)
     audit('admin.enroll_code', name || null, ip, true)
-    return sendJson(res, 201, { code, name: name || null, expires_in_seconds: ENROLL_CODE_TTL_MS / 1000 })
+    return sendJson(res, 201, { code, name: name || null, expires_at: expiry.value, expires_in_seconds: ENROLL_CODE_TTL_MS / 1000 })
   }
 
   res.writeHead(404, { 'content-type': 'application/json' })
@@ -2286,11 +2325,11 @@ const enrollCodes = new Map()
 const ENROLL_CODE_TTL_MS = 10 * 60_000
 const enrollAttempts = new Map()
 
-function mintEnrollCode(name) {
+function mintEnrollCode(name, tokenExpiresAt = null) {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
   let code = ''
   for (let index = 0; index < 8; index += 1) code += alphabet[randomBytes(1)[0] % alphabet.length]
-  enrollCodes.set(code, { name: name || null, expiresAt: now() + ENROLL_CODE_TTL_MS, createdAt: now() })
+  enrollCodes.set(code, { name: name || null, tokenExpiresAt, expiresAt: now() + ENROLL_CODE_TTL_MS, createdAt: now() })
   for (const [key, value] of enrollCodes) if (value.expiresAt <= now()) enrollCodes.delete(key)
   return code
 }
@@ -2316,18 +2355,21 @@ async function handleEnroll(req, res) {
     const name = String(body.name ?? entry.name ?? '').trim()
     if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: 'name must match [A-Za-z0-9_-]{1,32} (pass name or bind it when minting the code)' })
     enrollCodes.delete(code) // single use, even if the insert below fails
+    const expiry = parseTokenExpiry(body.expires_at ?? entry.tokenExpiresAt)
+    if (expiry.error) return sendJson(res, 400, { error: expiry.error })
     const token = mintToken('mesh')
     const ts = now()
     const existing = db.prepare('SELECT name FROM agents WHERE name = ?').get(name)
     if (existing) {
-      db.prepare('UPDATE agents SET token_hash = ?, host = COALESCE(?, host) WHERE name = ?').run(hashToken(token), body.host ?? null, name)
+      db.prepare('UPDATE agents SET token_hash = ?, token_expires_at = ?, host = COALESCE(?, host) WHERE name = ?')
+        .run(hashToken(token), expiry.value, body.host ?? null, name)
     } else {
-      db.prepare('INSERT INTO agents (name, host, description, first_seen, last_seen, token_hash) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(name, body.host ?? null, body.description ?? null, ts, ts, hashToken(token))
+      db.prepare('INSERT INTO agents (name, host, description, first_seen, last_seen, token_hash, token_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(name, body.host ?? null, body.description ?? null, ts, ts, hashToken(token), expiry.value)
     }
     audit('enroll', name, ip, true)
     console.log(`[mesh] enrolled ${name} from ${ip}`)
-    return sendJson(res, 201, { name, token, note: 'store this now; rotate or re-enroll if lost' })
+    return sendJson(res, 201, { name, token, expires_at: expiry.value, note: 'store this now; rotate or re-enroll if lost' })
   } catch (error) {
     return sendJson(res, 400, { error: error.message })
   }
@@ -2602,18 +2644,21 @@ async function handleAdmin(req, res, url) {
       if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: 'name must match [A-Za-z0-9_-]{1,32}' })
       const token = mintToken('mesh')
       const ts = now()
+      const expiry = parseTokenExpiry(body.expires_at)
+      if (expiry.error) return sendJson(res, 400, { error: expiry.error })
       const existing = db.prepare('SELECT name FROM agents WHERE name = ?').get(name)
       if (existing) {
-        db.prepare('UPDATE agents SET token_hash = ?, host = COALESCE(?, host), description = COALESCE(?, description) WHERE name = ?')
-          .run(hashToken(token), body.host ?? null, body.description ?? null, name)
+        db.prepare('UPDATE agents SET token_hash = ?, token_expires_at = ?, host = COALESCE(?, host), description = COALESCE(?, description) WHERE name = ?')
+          .run(hashToken(token), expiry.value, body.host ?? null, body.description ?? null, name)
       } else {
-        db.prepare('INSERT INTO agents (name, host, description, first_seen, last_seen, token_hash) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(name, body.host ?? null, body.description ?? null, ts, ts, hashToken(token))
+        db.prepare('INSERT INTO agents (name, host, description, first_seen, last_seen, token_hash, token_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .run(name, body.host ?? null, body.description ?? null, ts, ts, hashToken(token), expiry.value)
       }
       audit('admin.mint', name, ip, true)
       return sendJson(res, 201, {
         name,
         token,
+        expires_at: expiry.value,
         note: 'store this now — only its SHA-256 is kept and it cannot be shown again; rotate to get a new one',
       })
     }
@@ -2623,10 +2668,12 @@ async function handleAdmin(req, res, url) {
       const name = String(body.name ?? '').trim()
       const row = db.prepare('SELECT name FROM agents WHERE name = ?').get(name)
       if (!row) return sendJson(res, 404, { error: `unknown agent "${name}"` })
+      const expiry = parseTokenExpiry(body.expires_at)
+      if (expiry.error) return sendJson(res, 400, { error: expiry.error })
       const token = mintToken('mesh')
-      db.prepare('UPDATE agents SET token_hash = ? WHERE name = ?').run(hashToken(token), name)
+      db.prepare('UPDATE agents SET token_hash = ?, token_expires_at = ? WHERE name = ?').run(hashToken(token), expiry.value, name)
       audit('admin.rotate', name, ip, true)
-      return sendJson(res, 200, { name, token, note: 'previous token is now invalid' })
+      return sendJson(res, 200, { name, token, expires_at: expiry.value, note: 'previous token is now invalid' })
     }
 
     if ((path === '/api/admin/enroll/approve' || path === '/api/admin/enroll/deny') && req.method === 'POST') {
@@ -2639,9 +2686,11 @@ async function handleAdmin(req, res, url) {
       const body = await readJson(req)
       const name = body.name === undefined ? '' : String(body.name).trim()
       if (name && !/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: 'name must match [A-Za-z0-9_-]{1,32}' })
-      const code = mintEnrollCode(name || null)
+      const expiry = parseTokenExpiry(body.expires_at)
+      if (expiry.error) return sendJson(res, 400, { error: expiry.error })
+      const code = mintEnrollCode(name || null, expiry.value)
       audit('admin.enroll_code', name || null, ip, true)
-      return sendJson(res, 201, { code, name: name || null, expires_in_seconds: ENROLL_CODE_TTL_MS / 1000 })
+      return sendJson(res, 201, { code, name: name || null, expires_at: expiry.value, expires_in_seconds: ENROLL_CODE_TTL_MS / 1000 })
     }
 
     if (path === '/api/admin/agents' && req.method === 'GET') {

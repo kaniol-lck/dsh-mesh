@@ -4,11 +4,20 @@ v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审�
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 79/79，wake push 用例打印 `SKIP`；设置后 87/87）、`node --test test/*.test.mjs`（3/3；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 83/83，wake push 用例打印 `SKIP`；设置后 91/91）、`node --test test/*.test.mjs`（3/3；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
 > **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；补丁进入 0.7.12（见下条）。
 
 ---
+
+## v0.7.17（2026-10-31，token 过期可设置 + 文档校准）
+
+| 项 | 内容 |
+|---|---|
+| token 过期 | `/api/admin/agents`、`/api/admin/rotate`、`/api/enroll` 与控制台注册码接受可选 `expires_at`（ISO 8601 或 epoch 毫秒，省略 = 永不过期）；控制台节点行可设置/清除；到期请求返回 `401 token expired...`，审计 `auth.expired`（鉴权判断原本已有，缺的是签发入口） |
+| 文档校准 | `hub/README.en.md` 控制台段改为 0.7.x 管理能力（scopes/CIDR/轮换/吊销/注册码/过期），去掉「read-only」；health 示例用 `<version>` 占位；`hub/README.md` 补令牌过期说明 |
+| 链接 | `hub/README.md` 相对链接扫描 dead=0（`skills/mesh/SKILL.md` 路径已正确） |
+| 验证 | smoke：未设 `MESH_WAKE_SECRET` 83/83、设置后 91/91（过期 401 + 原因、未过期 200、非法 `expires_at` 400、rotate 过期 401）；`node --test test/*.test.mjs` 3/3；README.en 无 read-only/0.5.7 |
 
 ## v0.7.16（2026-10-31，管理面安全：空 scope 拒绝 + 明文管理面告警）
 

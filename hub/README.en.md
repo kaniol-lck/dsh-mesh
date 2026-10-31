@@ -181,15 +181,16 @@ MESH_BASE=http://127.0.0.1:8791 MESH_ADMIN_TOKEN="$MESH_ADMIN_TOKEN" node smoke-
 
 MIT — see [../LICENSE](../LICENSE).
 
-## Read-only console
+## Console (admin)
 
-The hub serves a read-only status page at GET /console.
+The hub serves an admin console at `GET /console` (requires `MESH_VIEW_TOKEN`, falling back to `MESH_ADMIN_TOKEN`; with neither set the page is 404, not an unauthenticated dashboard).
 
-- Requires MESH_VIEW_TOKEN (falls back to MESH_ADMIN_TOKEN); with neither set the page is a 404
-  rather than an unauthenticated dashboard;
-- Login exchanges the token for an HttpOnly + SameSite=Strict cookie valid for 12 hours — the token
-  never sits in the URL or localStorage;
-- Five failed attempts per minute lock the IP out for 60 seconds; every endpoint is read-only, all
-  mutations stay in the DSH plugin;
-- Shows hub version, online count, unread mail, board size, blobs, uptime, members with plugin
-  versions (outdated badge) and the latest audit rows.
+- **Source allow-list**: loopback only by default. Set `MESH_CONSOLE_ALLOW=192.168.0.0/16` (comma-separated IP/CIDR) to reach it from the LAN; `/api/admin/*` obeys the same list.
+- Login exchanges the token for an HttpOnly + SameSite=Strict cookie valid for 12 hours — the token never sits in the URL or localStorage. View tokens are read-only; admin tokens can:
+  - mint single-use enrollment codes (10 minutes) and approve/deny device-code pairing;
+  - edit per-agent scopes and IP allow-lists (an empty scope set is rejected; pass `["*"]` for full access);
+  - set or clear token expiry (`expires_at`, ISO 8601 or epoch milliseconds; empty = never expires);
+  - rotate/revoke tokens and purge revoked agents.
+- Five failed login attempts per minute lock the IP out for 60 seconds.
+- Shows hub version, online count, unread mail, board size, blobs, uptime, members with plugin versions (outdated badge), pending devices and the latest audit rows.
+- Without TLS the hub prints a startup warning: console and `/api/admin/*` are exposed over plain HTTP unless the source allow-list is narrowed or TLS is enabled.

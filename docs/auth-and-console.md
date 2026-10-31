@@ -38,7 +38,7 @@
 ## 3. IP 白名单与过期
 
 - `allowed_cidrs`：逗号分隔 IPv4/CIDR，如 `192.168.1.0/24,10.8.0.0/16`；留空 = 不限来源。
-- `token_expires_at`：毫秒时间戳；到期后该 token 返回 `401 token expired; rotate or re-enroll this agent`。
+- `token_expires_at`：毫秒时间戳；到期后该 token 返回 `401 token expired; rotate or re-enroll this agent`，审计记 `auth.expired`。可在控制台节点行设置/清除，或在 mint/rotate/enroll/注册码请求里传 `expires_at`（ISO 8601 或 epoch 毫秒）；省略 = `NULL`（永不过期，默认）。
 - 反代/frp 场景需要在反代上透传真实来源地址，否则白名单看到的都是反代 IP。
 
 ---

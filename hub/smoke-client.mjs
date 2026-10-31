@@ -673,6 +673,44 @@ try {
   )
 }
 
+// --- expiring tokens: issuance and enforcement --------------------------------
+{
+  const expiredMint = await admin('/api/admin/agents', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'expired', expires_at: Date.now() - 1000 }),
+  })
+  const expiredMintBody = await expiredMint.json()
+  const expiredReq = await fetch(`${BASE}/api/status`, { headers: { authorization: `Bearer ${expiredMintBody.token}` } })
+  const expiredBody = await expiredReq.json().catch(() => ({}))
+  check(
+    'expired token gets 401 with an expired reason',
+    expiredReq.status === 401 && String(expiredBody.error ?? '').includes('expired'),
+    `HTTP ${expiredReq.status} ${JSON.stringify(expiredBody)}`,
+  )
+
+  const freshMint = await admin('/api/admin/agents', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'fresh', expires_at: Date.now() + 60_000 }),
+  })
+  const freshMintBody = await freshMint.json()
+  const freshReq = await fetch(`${BASE}/api/status`, { headers: { authorization: `Bearer ${freshMintBody.token}` } })
+  check('future expiry token still works', freshReq.status === 200, `HTTP ${freshReq.status}`)
+
+  const invalidExpiry = await admin('/api/admin/agents', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'bad-expiry', expires_at: 'not-a-date' }),
+  })
+  check('invalid expires_at is rejected', invalidExpiry.status === 400, `HTTP ${invalidExpiry.status}`)
+
+  const rotateExpired = await admin('/api/admin/rotate', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'fresh', expires_at: Date.now() - 1000 }),
+  })
+  const rotateExpiredBody = await rotateExpired.json()
+  const rotateReq = await fetch(`${BASE}/api/status`, { headers: { authorization: `Bearer ${rotateExpiredBody.token}` } })
+  check('rotate can set an already-expired token', rotateReq.status === 401, `HTTP ${rotateReq.status}`)
+}
+
 // --- enrollment: legacy 8-char code and device-code pairing -------------------
 {
   const minted = await (await admin('/api/admin/enroll-codes', { method: 'POST', body: '{}' })).json()
