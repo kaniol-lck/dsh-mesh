@@ -2612,6 +2612,13 @@ async function main() {
     report('client: the plugin declares uiWorkspace so the open-session button can navigate', ok, `declared=${/inject:\s*\[[^\]]*'uiWorkspace'/.test(source)} handler=${source.includes('hostCtx?.uiWorkspace')}`)
   })
 
+  await runCase('client: package.json injects the ui-workspace client package', async () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'package.json'), 'utf8'))
+    const inject = pkg?.dsh?.client?.inject ?? []
+    const ok = inject.includes('@deepseek-ai/dsh-client-ui-workspace') && inject.includes('@deepseek-ai/dsh-client-ui-settings-plugins')
+    report('client: package.json injects the ui-workspace client package', ok, `inject=${inject.join(',')}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

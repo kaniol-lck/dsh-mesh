@@ -9,6 +9,18 @@
 
 ---
 
+## v0.7.18（2026-10-31，声明 ui-workspace 依赖，「打开会话」真跳转；**需重启宿主生效**）
+
+| 项 | 内容 |
+|---|---|
+| 根因（协调会话从 asar 核实） | `uiWorkspace` 由 `@deepseek-ai/dsh-client-ui-workspace` 提供；本插件 `package.json` 的 `dsh.client.inject` 只列了两个 settings 包，没注入 ui-workspace → `ctx.uiWorkspace` 是 undefined，按钮只能走兜底。上一单在 client `inject` 里加 `uiWorkspace` 只是 Cordis 服务声明，**包未注入服务仍不存在** |
+| 修法 | `dsh.client.inject` 增加 `@deepseek-ai/dsh-client-ui-workspace`（架子包会带入它自己的 session/workspace/layout 依赖）；client 运行时 `inject` 保持 `['slots','uiWorkspace']`，两者缺一不可 |
+| target 形状 | 宿主用裸 **session id 字符串**：`replaceMain(summary.id, …)`、`openSession(target)` 都如此（也接受 subagent address 对象）。任务库的 `targetSessionId` 直接作为 target 传入，无需 workspaceId；若会话已归档/不在当前工作区，宿主可能不切换，前端给明确提示 |
+| 探测 | 面板挂载时打印一次 `[mesh-waker] uiWorkspace available: … keys=… openSession=…`；点击时打印 `openSession target <id>`，失败打印错误原文（不再静默） |
+| 兜底 | 「复制会话 id」「复制任务标记 `[TASK T-xxx]`」两个次按钮保留；无会话 id / 无 API / 调用抛错三种情况都有可见文案 |
+| 测试 | +1（共 122/122）：静态断言 package.json 的 `dsh.client.inject` 含 `@deepseek-ai/dsh-client-ui-workspace`。既有 121 例全绿 |
+| 生效条件 | **必须重启宿主**（以及按需同步安装目录）后 `ctx.uiWorkspace` 才存在；本单不重启、不部署 |
+
 ## v0.7.17（2026-10-31，「打开会话」真的能跳转）
 
 | 项 | 内容 |

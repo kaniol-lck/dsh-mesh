@@ -261,7 +261,7 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 **面板**：任务面板在「Mesh 信箱」页面顶部标签「派活任务」里（与「信箱」并列）；设置页只保留一行跳转说明。**左右分栏**：左栏按批次聚合（组头 `B-xxx · done/total · 总耗时`，可折叠；无 batchId 归「未分组」置底），行内 `ID / 状态 / 耗时(人读) / 目标会话`；右栏为选中任务详情（创建→开始→结束时间线、正文全文、回执摘要、refs、打开会话/取消任务），空态「选择左侧任务查看详情」；窄屏（<900px）退化为上下布局。顶部统计 `pending/进行中/今日完成/停滞`，支持状态与目标会话过滤；右栏 tab 顶部还有一条「派活任务：N 条待办/进行中」入口摘要。入口名可用 `entryLabel` 配置（默认 `Mesh 信箱`）。
 
-「打开会话」依赖宿主 `uiWorkspace`（客户端插件必须在 `inject` 里声明该服务，否则 `ctx.uiWorkspace` 为 undefined，按钮只能复制 id）：成功会切到该会话并提示；会话已归档/跨工作区或宿主无导航时显示明确提示，并提供「复制会话 id」「复制任务标记 `[TASK T-xxx]`」两个退路。
+「打开会话」依赖宿主 `uiWorkspace`：`package.json` 的 `dsh.client.inject` 必须包含 `@deepseek-ai/dsh-client-ui-workspace`（它提供 uiWorkspace 服务），client 运行时 `inject` 同时声明 `uiWorkspace`——**两者缺一，`ctx.uiWorkspace` 都是 undefined**。改完包声明后**需要重启宿主**才生效。target 直接传裸 session id（宿主 `replaceMain(summary.id, …)` 同样如此）；成功会切到该会话并提示；会话已归档/跨工作区或宿主无导航时显示明确提示，并提供「复制会话 id」「复制任务标记 `[TASK T-xxx]`」两个退路。控件挂载/点击时会在控制台打印一次 `[mesh-waker] uiWorkspace …` 与 `openSession target` 便于排查。
 
 ## 设置页（0.7.13）
 

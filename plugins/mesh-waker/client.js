@@ -1107,21 +1107,37 @@ try {
           setNote('该任务没有目标会话 id（batch/任务记录不完整）')
           return
         }
-        // uiWorkspace must be declared in this plugin's `inject` list; without that it is
-        // undefined on ctx and the old code silently fell through to a clipboard write.
+        // The host accepts a bare session id here (UiWorkspaceService.replaceMain is also
+        // called with `summary.id` / a subagent address object by the host itself).
         const api = hostCtx?.uiWorkspace ?? (typeof hostCtx?.get === 'function' ? hostCtx.get('uiWorkspace') : undefined)
         if (api && typeof api.openSession === 'function') {
+          const target = String(sessionId)
           try {
-            await api.openSession(sessionId)
-            setNote('已切换到会话 ' + sessionId + '（若主界面未切换：该会话可能已归档或不属于当前工作区）')
+            console.info('[mesh-waker] openSession target', target)
+            await api.openSession(target)
+            setNote('已切换到会话 ' + target + '（若主界面未切换：该会话可能已归档或不属于当前工作区）')
             return
           } catch (error) {
-            setNote('打开会话失败：' + error.message + '（可复制会话 id 或任务标记手动定位）')
+            console.info('[mesh-waker] openSession failed', target, String(error && error.message ? error.message : error))
+            setNote('打开会话失败：' + (error && error.message ? error.message : String(error)) + '（可复制会话 id 或任务标记手动定位）')
             return
           }
         }
         setNote('宿主未提供会话导航（uiWorkspace 不可用）；请从左侧边栏切换，或复制会话 id / [TASK ' + taskId + '] 标记辅助定位')
       }
+
+      // One-shot runtime probe (0.7.18): is the declared uiWorkspace service actually there?
+      React.useEffect(() => {
+        const api = hostCtx?.uiWorkspace ?? (typeof hostCtx?.get === 'function' ? hostCtx.get('uiWorkspace') : undefined)
+        console.info(
+          '[mesh-waker] uiWorkspace available:',
+          Boolean(api),
+          'keys=',
+          api ? Object.keys(api).join(',') : '-',
+          'openSession=',
+          typeof (api && api.openSession),
+        )
+      }, [])
 
       const rows = (tasks && tasks.tasks) || []
       const groups = groupTasksByBatch(rows)
