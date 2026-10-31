@@ -45,7 +45,7 @@ dsh plugin add dsh-mesh-waker
 - **会话（conversation）**：回信可以带上同一个 `conversation` id，一段对话始终落在同一个会话里，而不是散成许多新会话；
 - **共享黑板**：小体积 JSON / 文本 KV，外加一条只追加的日志，适合存整个团队都该看到的任务状态；
 - **blob 通道**：单文件最大 64 MiB，支持断点续传、sha256 校验、按 blob 的 ACL，放不适合塞进消息体的东西；
-- **审批转发**（可选，`plugins/mesh-approval`）：把编码 agent 的"危险命令待批准"提示转发给人，经 mesh 回复 approve / deny。
+- **审批转发**（可选，`plugins/mesh-approval`）：把编码 agent 的"危险命令待批准"提示转进 mesh 收件箱，由人回复 approve / deny；它是 Hermes 侧 Python 插件（非 npm），见 [plugins/mesh-approval/README.md](plugins/mesh-approval/README.md)。
 
 ## 多会话协作
 
@@ -112,12 +112,20 @@ curl -s -X POST http://127.0.0.1:8790/api/send \
   -d '{"to":"agent-b","subject":"构建","body":"麻烦重新构建一次","conversation":"conv/build"}'
 ```
 
-### 4. 可选：唤醒推送（DSH 插件）
+### 4. 可选：客户端与插件（三种形态）
 
-`plugins/mesh-waker` 把中枢的唤醒 ping 变成真正的会话回合：装进 DSH profile、填上中枢地址和该 agent 的 token，即使没人在看窗口，agent 也会自己处理来信。`plugins/mesh-approval` 则把 Hermes 风格的审批提示改成经 mesh 转发给人。
+本仓有三类东西，安装方式不同，别混：
+
+| 形态 | 是什么 | 安装 |
+|---|---|---|
+| `dsh-mesh-waker` | DSH 客户端插件，**npm 包** | `dsh plugin add dsh-mesh-waker`（或用本地 link，见 [其 README](plugins/mesh-waker/README.md)） |
+| `mesh-approval` | **Hermes 侧 Python 插件**（不是 npm 包） | 放进 Hermes 插件目录并声明 `kind: standalone`，见 [README](plugins/mesh-approval/README.md) |
+| hub | **独立服务**（不是插件） | Docker 或裸跑 `node hub/server.mjs`，见 [hub/README.md](hub/README.md) |
+
+`plugins/mesh-waker` 把中枢的唤醒 ping 变成真正的会话回合：装进 DSH profile、填上中枢地址和该 agent 的 token，即使没人在看窗口，agent 也会自己处理来信。`plugins/mesh-approval` 则把 Hermes 风格的审批提示改成经 mesh 转发给人（唯一参考实现，改造成其他 harness 的方法也在那份 README 里）。
 
 ```bash
-# 客户端插件已发布到 npm；中枢本体用本仓库 hub/ 起
+# 只有 waker 发到 npm；中枢本体用本仓库 hub/ 起
 dsh plugin add dsh-mesh-waker          # desktop profile 要用应用自带终端
 dsh plugin --profile web add dsh-mesh-waker
 ```
@@ -170,6 +178,7 @@ dsh plugin --profile web add dsh-mesh-waker
 - [发布流程](docs/release.md)（插件预检、next/latest 两级、hub 发布与回滚）
 - [文档索引](docs/README.md) · [贡献指南](CONTRIBUTING.md)
 - [客户端插件 mesh-waker](plugins/mesh-waker/README.md)
+- [审批转发 mesh-approval](plugins/mesh-approval/README.md)（Hermes 侧 Python 插件，含改造成其他 harness 的三步）
 - [给 agent 的协作约定](skills/mesh/SKILL.md)
 
 
