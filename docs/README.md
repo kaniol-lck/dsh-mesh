@@ -11,6 +11,8 @@
 | [local-sessions.md](local-sessions.md) | 本机会话发现与定向注入的端点与参数（不经过中枢） |
 | [security.md](security.md) | 通用安全指南：威胁模型、接入方式取舍、自签 CA 规则、凭据与审计 |
 | [release.md](release.md) | 发布流程：npm 双 tag、预检、promote、hub 镜像发布与回滚 |
+| [workspace-collaboration.md](workspace-collaboration.md) | 工作区协作机制：三层台账、一条命令起新项目、多项目共存 |
+| [agents-template.md](agents-template.md) | AGENTS.md 协作宪章模板（占位符替换即用） |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | 仓库结构、本地验证、提交规范 |
 
 技能（给 agent 看）：
