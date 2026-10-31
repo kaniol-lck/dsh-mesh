@@ -17,6 +17,10 @@
 ## 怎么起一个新项目
 
 ```bash
+# 0) 先装 worklog 技能（生成的包装器要找到它的实现）
+cp -r <本仓>/skills/worklog ~/.dsh/skills/worklog
+#    装在别处也可以：在项目里设 WORKLOG_SCRIPTS=<技能>/scripts（或每次跑包装器时带上）
+
 # 1) 目标项目先是一个 git 仓库
 cd <项目根> && git init
 

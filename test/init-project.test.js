@@ -104,3 +104,65 @@ test('dry run writes nothing', () => {
   assert.match(result.stdout, /plan dir/)
   assert.ok(!existsSync(path.join(dir, '.worklog')))
 })
+
+const REPO_SKILL_SCRIPTS = path.join(ROOT, 'skills', 'worklog', 'scripts')
+const REPO_DISPATCH = path.join(ROOT, 'scripts', 'mesh-dispatch.mjs')
+const skillAvailable = existsSync(path.join(REPO_SKILL_SCRIPTS, 'roadmap.mjs'))
+
+function runNode(dir, script, args = [], env = {}) {
+  return spawnSync(process.execPath, [path.join(dir, script), ...args], {
+    cwd: dir,
+    encoding: 'utf8',
+    env: { ...process.env, WORKLOG_SCRIPTS: REPO_SKILL_SCRIPTS, MESH_DISPATCH_SCRIPT: REPO_DISPATCH, ...env },
+  })
+}
+
+test(
+  'e2e: scaffolded project runs roadmap --write',
+  { skip: skillAvailable ? false : 'worklog skill not available in this checkout' },
+  () => {
+    const dir = tempRepo()
+    assert.equal(run(dir).status, 0)
+    const result = runNode(dir, '.worklog/bin/roadmap.mjs', ['--write'])
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`)
+    assert.match(result.stdout, /wrote ROADMAP/)
+    const roadmap = read(dir, 'ROADMAP.md')
+    assert.match(roadmap, /AUTO:TODO START/)
+    assert.match(roadmap, /AUTO:TODO END/)
+    const check = runNode(dir, '.worklog/bin/roadmap.mjs', ['--check'])
+    assert.equal(check.status, 0, `${check.stderr}\n${check.stdout}`)
+  },
+)
+
+test(
+  'e2e: generated forwarders run their implementations',
+  { skip: skillAvailable ? false : 'worklog skill not available in this checkout' },
+  () => {
+    const dir = tempRepo()
+    assert.equal(run(dir).status, 0)
+    for (const [script, args] of [
+      ['defects.mjs', ['--help']],
+      ['dispatch.mjs', ['--help']],
+    ]) {
+      const result = runNode(dir, `.worklog/bin/${script}`, args)
+      assert.equal(result.status, 0, `${script}: ${result.stderr}\n${result.stdout}`)
+    }
+  },
+)
+
+test(
+  'e2e: forwarder reports a clear error when the implementation is missing',
+  { skip: skillAvailable ? false : 'worklog skill not available in this checkout' },
+  () => {
+    const dir = tempRepo()
+    assert.equal(run(dir).status, 0)
+    const result = spawnSync(process.execPath, [path.join(dir, '.worklog/bin/roadmap.mjs'), '--check'], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: { ...process.env, WORKLOG_SCRIPTS: path.join(dir, 'nowhere'), HOME: dir, USERPROFILE: dir },
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /not found/)
+    assert.match(result.stderr, /looked for:/)
+  },
+)
