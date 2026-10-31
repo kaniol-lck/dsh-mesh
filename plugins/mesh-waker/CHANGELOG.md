@@ -9,6 +9,18 @@
 
 ---
 
+## v0.7.16（2026-10-31，派活任务面板视觉/交互重做）
+
+| 项 | 内容 |
+|---|---|
+| 左右分栏 | `TaskRegistryPanel` 改为与「信箱」一致的左右分栏：左=批次聚合列表，右=选中任务详情（标题、创建→开始→结束时间线、正文全文、回执摘要、refs、打开会话/取消任务）；右侧空态「选择左侧任务查看详情」；`useIsNarrow()` 在 <900px 退化为上下布局 |
+| 批次聚合 | 新增纯函数 `groupTasksByBatch()`：按 `batchId` 分组、组头 `B-xxx · done/total · 总耗时 …`、组默认展开可折叠、最近批次在上、无 batchId 归「未分组」置底、组内按 createdAt 排序 |
+| 人读耗时 | 新增 `formatDuration()`（`340毫秒` / `12.0秒` / `12分09秒` / `1小时01分`，null → `-`）与 `formatStamp()`（本地 `MM-DD HH:mm:ss`），列表/详情/组头统一使用 |
+| 按钮三档 | 定义 `buttonPrimary`（实底）/`buttonSecondary`（描边）/`buttonDanger`（红描边），任务面板内全部按钮改用这三档；取消任务用危险按钮（`DELETE /mesh/tasks/:id` 仅 pending） |
+| 右栏入口 | 新增 `TaskTabSummary` 组件挂在右栏 tab 顶部：`派活任务：N 条待办/进行中` + 「打开任务面板」按钮（宿主无主页面导航 API，复制 `入口名 → 派活任务` 作为提示，不做假跳转） |
+| 布局修复 | Row/SettingsSection 标题与说明加 `wordBreak:keep-all` + 已有 `nowrap/ellipsis`，修设置页「本机会话」被挤成竖排断字（「本归」）的问题 |
+| 测试 | +3（共 120/120）：`formatDuration` 五组样例；`formatStamp` 格式与非法值；`groupTasksByBatch` 分组/排序/完成数/总耗时/未分组置底。既有 117 例全绿 |
+
 ## v0.7.15（2026-10-31，任务列表显示可读标题）
 
 | 项 | 内容 |

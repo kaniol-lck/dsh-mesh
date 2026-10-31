@@ -2555,6 +2555,57 @@ async function main() {
     report('tasks: without meta.subject the stored subject is the cleaned first line', ok, `subject=${JSON.stringify(row?.subject ?? '')}`)
   })
 
+  // 118-120. Task panel pure helpers: duration/stamp formatting and batch grouping.
+  await runCase('client: formatDuration renders human durations', async () => {
+    const helpers = loadClientHelpers()
+    const samples = {
+      '340': helpers.formatDuration(340),
+      '728962': helpers.formatDuration(728962),
+      '3700000': helpers.formatDuration(3700000),
+      'null': helpers.formatDuration(null),
+      '12000': helpers.formatDuration(12000),
+    }
+    const ok =
+      samples['340'] === '340毫秒' &&
+      samples['728962'] === '12分09秒' &&
+      samples['3700000'] === '1小时01分' &&
+      samples['null'] === '-' &&
+      samples['12000'] === '12.0秒'
+    report('client: formatDuration renders human durations', ok, `samples=${JSON.stringify(samples)}`)
+  })
+
+  await runCase('client: formatStamp renders local MM-DD HH:mm:ss', async () => {
+    const helpers = loadClientHelpers()
+    const stamp = helpers.formatStamp('2026-10-31T20:07:16+08:00')
+    const invalid = helpers.formatStamp('not a date')
+    const ok = /^\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(stamp) && invalid === '-'
+    report('client: formatStamp renders local MM-DD HH:mm:ss', ok, `stamp=${stamp} invalid=${JSON.stringify(invalid)}`)
+  })
+
+  await runCase('client: groupTasksByBatch groups by batch, keeps ungrouped last and sorts inside', async () => {
+    const helpers = loadClientHelpers()
+    const tasks = [
+      { taskId: 'T-u1', batchId: null, createdAt: 10, status: 'pending', durationMs: null },
+      { taskId: 'T-b2', batchId: 'B-late', createdAt: 30, status: 'settled', durationMs: 2000 },
+      { taskId: 'T-b1', batchId: 'B-late', createdAt: 20, status: 'settled', durationMs: 1000 },
+      { taskId: 'T-a1', batchId: 'B-early', createdAt: 40, status: 'started', durationMs: null },
+    ]
+    const groups = helpers.groupTasksByBatch(tasks)
+    const late = groups.find((group) => group.batchId === 'B-late')
+    const ungrouped = groups[groups.length - 1]
+    const ok =
+      groups.length === 3 &&
+      late.tasks.map((task) => task.taskId).join(',') === 'T-b1,T-b2' &&
+      late.done === 2 &&
+      late.total === 2 &&
+      late.durationMs === 3000 &&
+      late.label === 'B-late' &&
+      ungrouped.batchId === null &&
+      ungrouped.label === '未分组' &&
+      ungrouped.tasks[0].taskId === 'T-u1'
+    report('client: groupTasksByBatch groups by batch, keeps ungrouped last and sorts inside', ok, `groups=${groups.map((group) => group.label + ':' + group.total).join(',')} lateDuration=${late?.durationMs}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

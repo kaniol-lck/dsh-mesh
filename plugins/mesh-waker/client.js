@@ -64,6 +64,50 @@ function formatTaskStatus(status) {
   return labels[String(status ?? '')] ?? String(status ?? '-')
 }
 
+/** Human-readable duration: 340毫秒 / 12.1秒 / 12分09秒 / 1小时01分. */
+function formatDuration(ms) {
+  const value = Number(ms)
+  if (ms === null || ms === undefined || !Number.isFinite(value) || value < 0) return '-'
+  const pad = (n) => String(n).padStart(2, '0')
+  if (value < 1000) return Math.round(value) + '毫秒'
+  const seconds = value / 1000
+  if (value < 60_000) return seconds.toFixed(1) + '秒'
+  const totalSeconds = Math.round(seconds)
+  if (value < 3_600_000) return Math.floor(totalSeconds / 60) + '分' + pad(totalSeconds % 60) + '秒'
+  const totalMinutes = Math.floor(totalSeconds / 60)
+  return Math.floor(totalMinutes / 60) + '小时' + pad(totalMinutes % 60) + '分'
+}
+
+/** Local timestamp MM-DD HH:mm:ss (accepts ISO strings or epoch ms). */
+function formatStamp(value) {
+  const date = value instanceof Date ? value : new Date(value)
+  if (!date || Number.isNaN(date.getTime())) return '-'
+  const pad = (n) => String(n).padStart(2, '0')
+  return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds())
+}
+
+/** Group tasks by batchId (ungrouped at the bottom), newest batch first. */
+function groupTasksByBatch(tasks) {
+  const rows = Array.isArray(tasks) ? tasks.slice() : []
+  const groups = new Map()
+  for (const task of rows) {
+    const batchId = task && task.batchId ? String(task.batchId) : null
+    const key = batchId ?? '__ungrouped__'
+    if (!groups.has(key)) groups.set(key, { key, batchId, tasks: [], latest: 0 })
+    const group = groups.get(key)
+    group.tasks.push(task)
+    group.latest = Math.max(group.latest, Number(task && task.createdAt) || 0)
+  }
+  const result = [...groups.values()].map((group) => {
+    group.tasks.sort((left, right) => (Number(left && left.createdAt) || 0) - (Number(right && right.createdAt) || 0))
+    const done = group.tasks.filter((task) => task && task.status === 'settled').length
+    const durationMs = group.tasks.reduce((sum, task) => sum + (Number.isFinite(Number(task && task.durationMs)) ? Number(task.durationMs) : 0), 0)
+    return { ...group, done, total: group.tasks.length, durationMs, label: group.batchId ?? '未分组' }
+  })
+  result.sort((left, right) => (left.batchId ? 0 : 1) - (right.batchId ? 0 : 1) || right.latest - left.latest)
+  return result
+}
+
 /** POST /mesh/sessions/archive once; injectable fetch keeps this testable without a host. */
 async function archiveSessionRequest(sessionId, fetchImpl, base = 'http://127.0.0.1:8795') {
   const doFetch = fetchImpl ?? fetch
@@ -128,6 +172,12 @@ try {
       indent: { marginLeft: 122 },
       hr: { border: 0, borderTop: '1px solid currentColor', opacity: 0.15, margin: '4px 0' },
     }
+
+    // Three button tiers, used everywhere in the task panel (one meaning = one style).
+    const buttonBase = { padding: '4px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, flexShrink: 0 }
+    const buttonPrimary = { ...buttonBase, border: '1px solid rgba(99,102,241,0.9)', background: 'rgba(99,102,241,0.85)', color: '#fff' }
+    const buttonSecondary = { ...buttonBase, border: '1px solid currentColor', background: 'transparent', color: 'inherit' }
+    const buttonDanger = { ...buttonBase, border: '1px solid rgba(217,83,79,0.9)', background: 'transparent', color: '#d9534f' }
 
     async function json(url, init) {
       const res = await fetch(url, { cache: 'no-store', ...init })
@@ -715,6 +765,7 @@ try {
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
+                wordBreak: 'keep-all',
               },
             },
             title,
@@ -731,6 +782,7 @@ try {
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
+                    wordBreak: 'keep-all',
                   },
                 },
                 description,
@@ -780,6 +832,7 @@ try {
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
+                    wordBreak: 'keep-all',
                   },
                 },
                 description,
@@ -976,14 +1029,28 @@ try {
     }
 
     /** Task registry panel: lives on the inbox page next to the mailbox, not in settings. */
+    function useIsNarrow() {
+      const [narrow, setNarrow] = React.useState(typeof window !== 'undefined' ? window.innerWidth < 900 : false)
+      React.useEffect(() => {
+        const onResize = () => setNarrow(window.innerWidth < 900)
+        window.addEventListener('resize', onResize)
+        return () => window.removeEventListener('resize', onResize)
+      }, [])
+      return narrow
+    }
+
+    /** Task registry panel: left = batch-grouped list, right = detail (inbox-style split). */
     function TaskRegistryPanel() {
       const [tasks, setTasks] = React.useState(null)
       const [filter, setFilter] = React.useState({ status: '', session: '' })
+      const [selectedId, setSelectedId] = React.useState(null)
       const [detail, setDetail] = React.useState(null)
+      const [collapsed, setCollapsed] = React.useState({})
       const [note, setNote] = React.useState(null)
+      const narrow = useIsNarrow()
 
       const load = React.useCallback(async (next = { status: '', session: '' }) => {
-        const params = new URLSearchParams({ limit: '50' })
+        const params = new URLSearchParams({ limit: '100' })
         if (next.status) params.set('status', next.status)
         if (next.session) params.set('session', next.session.trim())
         try {
@@ -997,21 +1064,38 @@ try {
         void load()
       }, [load])
 
-      const openDetail = async (taskId) => {
-        if (detail?.task?.taskId === taskId) {
+      React.useEffect(() => {
+        if (!selectedId) {
           setDetail(null)
-          return
+          return undefined
         }
+        let alive = true
+        json(BASE + '/mesh/tasks/' + encodeURIComponent(selectedId))
+          .then((value) => {
+            if (alive) setDetail(value)
+          })
+          .catch((error) => {
+            if (alive) setNote('读取任务失败：' + error.message)
+          })
+        return () => {
+          alive = false
+        }
+      }, [selectedId])
+
+      const cancelTask = async (taskId) => {
         try {
-          setDetail(await json(BASE + '/mesh/tasks/' + encodeURIComponent(taskId)))
+          await json(BASE + '/mesh/tasks/' + encodeURIComponent(taskId), { method: 'DELETE' })
+          setNote('已取消任务 ' + taskId)
+          setSelectedId(null)
+          await load(filter)
         } catch (error) {
-          setNote('读取任务失败：' + error.message)
+          setNote('取消失败：' + error.message)
         }
       }
 
-      const openTaskSession = (sessionId) => {
+      const openSession = (sessionId) => {
         if (!sessionId) return
-        if (hostCtx?.uiWorkspace?.openSession) {
+        if (hostCtx && hostCtx.uiWorkspace && hostCtx.uiWorkspace.openSession) {
           try {
             hostCtx.uiWorkspace.openSession(sessionId)
             return
@@ -1020,28 +1104,40 @@ try {
           }
         }
         try {
-          void navigator.clipboard?.writeText(sessionId)
+          void navigator.clipboard.writeText(sessionId)
           setNote('宿主未暴露页面导航，已复制会话 id：' + sessionId)
         } catch {
           setNote('会话 id：' + sessionId)
         }
       }
 
-      const rows = tasks?.tasks ?? []
+      const rows = (tasks && tasks.tasks) || []
+      const groups = groupTasksByBatch(rows)
       const pending = rows.filter((task) => task.status === 'pending').length
+      const running = rows.filter((task) => task.status === 'started').length
       const doneToday = rows.filter(
         (task) => task.status === 'settled' && task.settledAt && new Date(task.settledAt).toDateString() === new Date().toDateString(),
       ).length
       const stalled = rows.filter((task) => task.status === 'stalled').length
+      const selected = detail && detail.task ? detail.task : null
 
-      return h(
+      const listPane = h(
         'div',
-        { style: { display: 'grid', gap: 8, alignContent: 'start', padding: '10px 12px', minWidth: 0, overflowY: 'auto' } },
-        note ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, note) : null,
+        {
+          style: {
+            flex: narrow ? '1 1 auto' : '0 0 340px',
+            minWidth: 0,
+            minHeight: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            borderRight: narrow ? 'none' : '0.5px solid var(--dsw-alias-border-l3)',
+            borderBottom: narrow ? '1px solid var(--dsw-alias-border-l3)' : 'none',
+          },
+        },
         h(
           'div',
-          { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: 12 } },
-          h('span', { style: { opacity: 0.8 } }, `pending ${pending} · 今日完成 ${doneToday} · stalled ${stalled}`),
+          { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', padding: '8px 10px', borderBottom: '0.5px solid var(--dsw-alias-border-l3)', fontSize: 12 } },
+          h('span', { style: { opacity: 0.8 } }, 'pending ' + pending + ' · 进行中 ' + running + ' · 今日完成 ' + doneToday + ' · 停滞 ' + stalled),
           h(
             'select',
             {
@@ -1055,14 +1151,15 @@ try {
             },
             [
               ['', '全部状态'],
-              ['pending', 'pending'],
-              ['settled', 'settled'],
-              ['stalled', 'stalled'],
-              ['cancelled', 'cancelled'],
+              ['pending', '待执行'],
+              ['started', '进行中'],
+              ['settled', '已完成'],
+              ['stalled', '停滞'],
+              ['cancelled', '已取消'],
             ].map(([value, label]) => h('option', { key: value, value }, label)),
           ),
           h('input', {
-            style: { ...controlStyle, width: 200, fontSize: 12, padding: '2px 6px' },
+            style: { ...controlStyle, width: 150, fontSize: 12, padding: '2px 6px' },
             placeholder: '目标会话 id（回车过滤）',
             value: filter.session,
             onChange: (event) => setFilter({ ...filter, session: event.target.value }),
@@ -1070,81 +1167,173 @@ try {
               if (event.key === 'Enter') void load(filter)
             },
           }),
-          h('button', { type: 'button', style: styles.button, onClick: () => void load(filter) }, '刷新'),
+          h('button', { type: 'button', style: buttonSecondary, onClick: () => void load(filter) }, '刷新'),
         ),
+        note ? h('div', { style: { fontSize: 11, opacity: 0.75, padding: '4px 10px' } }, note) : null,
         h(
           'div',
-          { style: { display: 'grid', gap: 1, fontSize: 12, minWidth: 0 } },
-          h(
-            'div',
-            {
-              style: {
-                display: 'grid',
-                gridTemplateColumns: '110px 90px minmax(100px, 0.9fr) minmax(140px, 1.2fr) 70px 70px 140px',
-                gap: 8,
-                padding: '4px 6px',
-                opacity: 0.65,
-                borderBottom: '1px solid rgba(127,127,127,0.25)',
-              },
-            },
-            h('span', null, 'ID'),
-            h('span', null, '批次'),
-            h('span', null, '目标会话'),
-            h('span', null, '摘要'),
-            h('span', null, '状态'),
-            h('span', null, '耗时'),
-            h('span', null, '创建时间'),
-          ),
-          rows.map((task) =>
-            h(
-              'div',
-              {
-                key: task.taskId,
-                style: {
-                  display: 'grid',
-                  gridTemplateColumns: '110px 90px minmax(100px, 0.9fr) minmax(140px, 1.2fr) 70px 70px 140px',
-                  gap: 8,
-                  padding: '4px 6px',
-                  cursor: 'pointer',
-                  borderBottom: '1px solid rgba(127,127,127,0.12)',
-                  background: detail?.task?.taskId === task.taskId ? 'rgba(99,102,241,0.12)' : 'transparent',
-                },
-                onClick: () => void openDetail(task.taskId),
-                title: task.subject,
-              },
-              h('span', { style: { fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.taskId),
-              h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.batchId ?? '-'),
-              h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.targetTitle ?? task.targetSessionId ?? '-'),
-              h(
-                'span',
-                { title: task.subject || '(未命名任务)', style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-                task.subject || '(未命名任务)',
-              ),
-              h('span', null, formatTaskStatus(task.status)),
-              h('span', null, task.durationMs === null || task.durationMs === undefined ? '-' : task.durationMs + 'ms'),
-              h('span', { style: { opacity: 0.75 } }, task.createdAt ? new Date(task.createdAt).toLocaleString() : '-'),
-            ),
-          ),
-          rows.length ? null : h('div', { style: { opacity: 0.6, padding: 6 } }, '（暂无任务）'),
+          { style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '4px 0' } },
+          groups.length === 0
+            ? h('div', { style: { padding: 12, fontSize: 12, opacity: 0.6 } }, '（暂无任务）')
+            : groups.map((group) => {
+                const isCollapsed = collapsed[group.key] === true
+                return h(
+                  'div',
+                  { key: group.key },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      onClick: () => setCollapsed({ ...collapsed, [group.key]: !isCollapsed }),
+                      style: {
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        width: '100%',
+                        minHeight: 28,
+                        padding: '4px 10px',
+                        border: 'none',
+                        borderBottom: '0.5px solid var(--dsw-alias-border-l3)',
+                        background: 'transparent',
+                        color: 'inherit',
+                        cursor: 'pointer',
+                        fontSize: 11,
+                        fontWeight: 600,
+                        textAlign: 'left',
+                      },
+                    },
+                    h('span', { style: { flexShrink: 0 } }, (isCollapsed ? '▸ ' : '▾ ') + group.label),
+                    h('span', { style: { opacity: 0.7, flexShrink: 0 } }, group.done + '/' + group.total),
+                    h('span', { style: { opacity: 0.7, marginLeft: 'auto' } }, '总耗时 ' + formatDuration(group.durationMs)),
+                  ),
+                  isCollapsed
+                    ? null
+                    : group.tasks.map((task) =>
+                        h(
+                          'button',
+                          {
+                            key: task.taskId,
+                            type: 'button',
+                            onClick: () => setSelectedId(task.taskId),
+                            title: task.subject || '(未命名任务)',
+                            style: {
+                              display: 'grid',
+                              gridTemplateColumns: '96px 70px 78px minmax(0, 1fr)',
+                              gap: 6,
+                              width: '100%',
+                              alignItems: 'center',
+                              minHeight: 28,
+                              padding: '3px 10px',
+                              border: 'none',
+                              borderBottom: '1px solid rgba(127,127,127,0.12)',
+                              background: selectedId === task.taskId ? 'rgba(99,102,241,0.14)' : 'transparent',
+                              color: 'inherit',
+                              cursor: 'pointer',
+                              fontSize: 11,
+                              textAlign: 'left',
+                            },
+                          },
+                          h('span', { style: { fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.taskId),
+                          h('span', null, formatTaskStatus(task.status)),
+                          h('span', null, formatDuration(task.durationMs)),
+                          h(
+                            'span',
+                            { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.8 } },
+                            task.targetTitle || task.targetSessionId || '-',
+                          ),
+                        ),
+                      ),
+                )
+              }),
         ),
-        detail?.task
+      )
+
+      const rightPane = h(
+        'div',
+        { style: { flex: '1 1 auto', minWidth: 0, minHeight: 0, overflowY: 'auto', padding: '10px 14px' } },
+        selected
           ? h(
               'div',
-              { style: { border: '1px solid rgba(127,127,127,0.25)', borderRadius: 8, padding: 10, display: 'grid', gap: 6 } },
-              h('div', { style: { fontSize: 13, fontWeight: 600 } }, `${detail.task.taskId} · ${detail.task.status} · ${detail.task.createdAt ? new Date(detail.task.createdAt).toLocaleString() : '-'}`),
-              h('div', { style: { fontSize: 12, opacity: 0.8 } }, '摘要：' + (detail.task.subject || '-')),
-              h('div', { style: { fontSize: 12, opacity: 0.8 } }, '回执：' + (detail.task.receiptSummary ?? detail.task.receiptRef ?? '（无）')),
-              h('pre', { style: { maxHeight: 220, overflow: 'auto', fontSize: 11, whiteSpace: 'pre-wrap', margin: 0 } }, detail.task.text ?? '（无正文）'),
+              { style: { display: 'grid', gap: 8, fontSize: 12 } },
+              h('div', { style: { fontSize: 14, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, selected.subject || '(未命名任务)'),
               h(
                 'div',
-                { style: { display: 'flex', gap: 8 } },
-                h('button', { type: 'button', style: styles.button, onClick: () => openTaskSession(detail.task.targetSessionId) }, '打开会话'),
-                h('button', { type: 'button', style: styles.button, onClick: () => setDetail(null) }, '收起'),
+                { style: { display: 'flex', gap: 10, flexWrap: 'wrap', opacity: 0.8 } },
+                h('span', null, '创建 ' + formatStamp(selected.createdAt)),
+                h('span', null, '开始 ' + formatStamp(selected.startedAt)),
+                h('span', null, '结束 ' + formatStamp(selected.settledAt)),
               ),
+              h(
+                'div',
+                { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+                h('span', null, '状态：' + formatTaskStatus(selected.status)),
+                selected.batchId ? h('span', null, '批次：' + selected.batchId) : null,
+                h('span', null, '耗时：' + formatDuration(selected.durationMs)),
+                h('span', null, '正文：' + selected.textBytes + ' B'),
+              ),
+              h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+                h('button', { type: 'button', style: buttonSecondary, onClick: () => openSession(selected.targetSessionId) }, '打开会话'),
+                selected.status === 'pending'
+                  ? h('button', { type: 'button', style: buttonDanger, onClick: () => void cancelTask(selected.taskId) }, '取消任务')
+                  : null,
+              ),
+              h('div', { style: { fontWeight: 600, marginTop: 4 } }, '正文'),
+              h('pre', { style: { maxHeight: 260, overflow: 'auto', whiteSpace: 'pre-wrap', margin: 0, fontSize: 11, background: 'rgba(127,127,127,0.06)', padding: 8, borderRadius: 6 } }, selected.text || '（无正文）'),
+              h('div', { style: { fontWeight: 600 } }, '回执'),
+              h('div', { style: { opacity: 0.85 } }, selected.receiptSummary || selected.receiptRef || '（无）'),
+              selected.refs && selected.refs.length ? h('div', { style: { fontWeight: 600 } }, '引用') : null,
+              selected.refs && selected.refs.length ? h('div', { style: { opacity: 0.85, fontFamily: 'monospace' } }, selected.refs.join(' · ')) : null,
             )
-          : null,
+          : h('div', { style: { display: 'grid', placeItems: 'center', height: '100%', opacity: 0.55, fontSize: 12 } }, '选择左侧任务查看详情'),
+      )
+
+      return h(
+        'div',
+        { style: { display: 'flex', flexDirection: narrow ? 'column' : 'row', height: '100%', minHeight: 0, minWidth: 0 } },
+        listPane,
+        rightPane,
       )
     }
+
+    /** Compact task summary for the right sidebar tab (entry point next to the mailbox). */
+    function TaskTabSummary() {
+      const [counts, setCounts] = React.useState(null)
+      const entryLabel = useEntryLabel()
+      React.useEffect(() => {
+        let alive = true
+        json(BASE + '/mesh/tasks?limit=100')
+          .then((value) => {
+            const rows = (value && value.tasks) || []
+            if (alive) setCounts(rows.filter((task) => task.status === 'pending' || task.status === 'started').length)
+          })
+          .catch(() => {})
+        return () => {
+          alive = false
+        }
+      }, [])
+      return h(
+        'div',
+        { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px', borderBottom: '0.5px solid var(--dsw-alias-border-l3)', fontSize: 11 } },
+        h('span', { style: { opacity: 0.8 } }, '派活任务：' + (counts === null ? '…' : counts) + ' 条待办/进行中'),
+        h(
+          'button',
+          {
+            type: 'button',
+            style: { ...buttonSecondary, marginLeft: 'auto', padding: '2px 8px', fontSize: 11 },
+            title: '打开 ' + entryLabel + ' 页面的「派活任务」标签',
+            onClick: () => {
+              try {
+                void navigator.clipboard.writeText(entryLabel + ' → 派活任务')
+              } catch {
+                /* clipboard is best effort */
+              }
+            },
+          },
+          '打开任务面板',
+        ),
+      )
+    }
+
 
     function MeshSection() {
       const [config, setConfig] = React.useState(null)
@@ -2624,6 +2813,7 @@ try {
       return h(
         'div',
         { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, fontSize: 12 } },
+        h(TaskTabSummary),
         h(
           'div',
           {
@@ -2949,5 +3139,5 @@ try {
 // VM test hook: harnesses that evaluate this file without React (see the dynamic-id test)
 // opt in by defining the global, so runtime behaviour and globals stay unchanged.
 if (typeof globalThis !== 'undefined' && typeof globalThis.__meshWakerTestHook === 'function') {
-  globalThis.__meshWakerTestHook({ staleVersionNotice, formatSessionRow, formatTaskStatus, archiveSessionRequest })
+  globalThis.__meshWakerTestHook({ staleVersionNotice, formatSessionRow, formatTaskStatus, formatDuration, formatStamp, groupTasksByBatch, archiveSessionRequest })
 }
