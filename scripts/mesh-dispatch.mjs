@@ -54,6 +54,7 @@ Options:
   --task [id]        attach a task id so the waker writes a receipt when the turn
                      ends; "--task" alone generates T-<base36 timestamp>
   --receipt <mode>   file | queue | wake (waker default when omitted); implies --task
+  --requester <id>   session id or title that should receive the receipt (default: waker receiptTo)
   --batch [id]       join a batch barrier: one aggregate receipt when every task ends;
                      "--batch" alone generates B-<base36 timestamp>
   --deadline <dur>   batch deadline like 2h / 90m / 600s (waker default when omitted)
@@ -68,7 +69,7 @@ function fail(message, code = 1) {
 }
 
 function parseArgs(argv) {
-  const options = { mode: 'queue', dryRun: false, wake: false, task: undefined, receipt: undefined, batch: undefined, deadline: undefined }
+  const options = { mode: 'queue', dryRun: false, wake: false, requester: undefined, task: undefined, receipt: undefined, batch: undefined, deadline: undefined }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     const takeValue = () => {
@@ -92,6 +93,7 @@ function parseArgs(argv) {
         break
       }
       case '--receipt': options.receipt = takeValue(); break
+      case '--requester': options.requester = takeValue(); break
       // Same optional-value shape as --task: bare flag generates an id.
       case '--batch': {
         const next = argv[index + 1]
@@ -224,13 +226,14 @@ async function main() {
     ? {
         taskId,
         ...(options.receipt ? { receipt: options.receipt } : {}),
+        ...(options.requester ? { requester: options.requester } : {}),
         ...(batchId ? { batchId, ...(deadlineMs ? { deadlineMs } : {}) } : {}),
       }
     : undefined
 
   if (options.dryRun) {
     console.log(
-      `dry-run: session=${target.id} chars=${chars} wake=${wakeFlag}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}${deadlineMs ? ` deadline=${deadlineMs}ms` : ''} (not sent)`,
+      `dry-run: session=${target.id} requester=${options.requester ?? '-'} chars=${chars} wake=${wakeFlag}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}${deadlineMs ? ` deadline=${deadlineMs}ms` : ''} (not sent)`,
     )
     return
   }

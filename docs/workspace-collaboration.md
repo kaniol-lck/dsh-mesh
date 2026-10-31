@@ -74,6 +74,7 @@ node scripts/init-project.mjs --check-drift --dir <项目根> [--json]
 - **会话标题用 `<项目> · <角色>`**（例：`util4freesub · docs`），否则 `/mesh/inject` 按标题寻址会歧义（同名会 **400 并列出候选**，不会错投）；
 - 台账各自在项目内（`.worklog/` 不入库），跨项目只通过消息/黑板交换结论；
 - 本机派活用 `scripts/mesh-dispatch.mjs`（可选；没有 waker 时走 mesh 消息或直接开会话）。
+- 派活加 `--requester "<项目> · <协调角色>"`：回执投给派活方；不传则走 waker 的 `receiptTo` 兜底（容易投给已退休的会话，建议总是显式传）。
 
 ## 最小日常
 
