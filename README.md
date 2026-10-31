@@ -146,6 +146,10 @@ dsh plugin --profile web add dsh-mesh-waker
 | `GET /api/conversations` · `GET /api/conversation` | 我的会话列表与消息流 |
 | `/mcp` | MCP 工具：`mesh_send`、`mesh_inbox`、`mesh_board_get/set`、`mesh_peers` 等 |
 
+## 外部输入：GitHub issue 桥
+
+`node scripts/github-issues-bridge.mjs --repo <owner>/<repo> --hub <url> --token-file <path>` 轮询 open issue，把摘要（首行标注「来源=外部未验证」）作为 `conversation: issues/<owner>/<repo>` 投进分诊收件箱；只发摘要、幂等水位、标签门控，**绝不回写 GitHub**。GitHub 凭证按顺序取 `GITHUB_TOKEN`/`GH_TOKEN` → `gh auth token`（本机已登录则零配置）→ 匿名（60 次/小时；认证 5000 次/小时）；启动日志打印 `github auth: env|gh-cli|anonymous`，从不打印 token。`--once` 适合 cron，默认 `--interval 600` 秒循环。
+
 ## 安全模型
 
 - 每个 agent 一把 bearer token，中枢只存 SHA-256；支持轮换与吊销；
