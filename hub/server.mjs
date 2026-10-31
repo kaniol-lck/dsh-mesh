@@ -1,5 +1,5 @@
 /**
- * dsh-mesh 鈥?LAN agent mesh hub.
+ * dsh-mesh — LAN agent mesh hub.
  *
  * A single always-on process that lives on the NAS. It speaks MCP over
  * Streamable HTTP, so every DSH machine reaches it with nothing but an
@@ -114,7 +114,7 @@ const TRUST_PROXY = process.env.MESH_TRUST_PROXY === '1'
 // --- wake (inbound push) -----------------------------------------------------
 // After a message is queued, the hub may POST a signed "you have mail" ping to the
 // recipient's own LAN endpoint (a dsh host plugin listens there). The ping carries no
-// message content 鈥?the receiver still reads /api/inbox 鈥?so a leaked wake endpoint
+// message content — the receiver still reads /api/inbox — so a leaked wake endpoint
 // can trigger a turn but cannot forge a message. Best effort only: the inbox is truth.
 const WAKE_SECRET = process.env.MESH_WAKE_SECRET ?? ''
 const WAKE_TIMEOUT_MS = Number(process.env.MESH_WAKE_TIMEOUT_MS ?? 3000)
@@ -559,7 +559,7 @@ function clientIp(req) {
 // This is deliberately NOT an entry gate. A caller presenting a valid token is always
 // served. Blocking by source IP used to lock out every agent at once when the hub sits
 // behind an frp TCP tunnel (frpc forwards from 127.0.0.1, so all external clients share
-// one source address) 鈥?a single port scanner could take the whole mesh down for 60s at
+// one source address) — a single port scanner could take the whole mesh down for 60s at
 // a time. Now only the failing requests are slowed, and a good token clears the streak.
 const failures = new Map()
 function recordFailure(ip) {
@@ -592,8 +592,8 @@ const headerValue = (req, name) => {
 
 /**
  * Resolve the caller.
- *   token mode 鈥?the bearer token alone decides identity (headers are advisory)
- *   open mode  鈥?X-Mesh-Agent names the caller; only for a LAN trusted end to end
+ *   token mode — the bearer token alone decides identity (headers are advisory)
+ *   open mode  — X-Mesh-Agent names the caller; only for a LAN trusted end to end
  */
 function resolveIdentity(req) {
   const ip = clientIp(req)
@@ -747,7 +747,7 @@ function buildServer(agentName, agentHost, publicUrl) {
   // Identity comes from the token; host/description come from the registry row, never
   // from the request header (clients usually do not send X-Mesh-Host, so reporting it
   // made `host` permanently null). `hub` reports the URL this caller actually reached,
-  // not the listen address 鈥?0.0.0.0 is useless to a caller.
+  // not the listen address — 0.0.0.0 is useless to a caller.
   tool('mesh_whoami', 'Report the identity the hub associates with this caller, and the endpoint this caller used to reach the hub.', {}, () => {
     const row = db.prepare('SELECT name, host, description, last_seen FROM agents WHERE name = ?').get(agentName)
     return {
@@ -2574,7 +2574,7 @@ async function handleBootstrap(req, res) {
 /**
  * Admin face: mint, rotate and revoke agent tokens.
  * Requires `Authorization: Bearer <MESH_ADMIN_TOKEN>` (or the generated
- * data/admin.token on first boot). A minted token is returned exactly once 鈥? * the hub only keeps its SHA-256.
+ * data/admin.token on first boot). A minted token is returned exactly once — * the hub only keeps its SHA-256.
  *
  *   POST   /api/admin/agents   {name, host?, description?}  -> {name, token}
  *   POST   /api/admin/rotate   {name}                       -> {name, token}
@@ -2614,7 +2614,7 @@ async function handleAdmin(req, res, url) {
       return sendJson(res, 201, {
         name,
         token,
-        note: 'store this now 鈥?only its SHA-256 is kept and it cannot be shown again; rotate to get a new one',
+        note: 'store this now — only its SHA-256 is kept and it cannot be shown again; rotate to get a new one',
       })
     }
 
@@ -2823,7 +2823,7 @@ function resolveAdminToken() {
   }
   const minted = mintToken('admin')
   writeFileSync(file, `${minted}\n`, { mode: 0o600 })
-  console.log('[mesh] no MESH_ADMIN_TOKEN set 鈥?generated one')
+  console.log('[mesh] no MESH_ADMIN_TOKEN set — generated one')
   console.log(`[mesh]   file  : ${file}  (mode 600)`)
   console.log('[mesh]   read it on the host: cat <that file> -- not printed here by default,')
   console.log('[mesh]   because docker logs keep stdout for a long time. Set MESH_PRINT_ADMIN_TOKEN=1')
@@ -2837,8 +2837,8 @@ httpServer.listen(PORT, HOST, () => {
   const scheme = TLS_ENABLED ? 'https' : 'http'
   console.log(`[mesh] listening on ${scheme}://${HOST}:${PORT}/mcp  (health: /health)`)
   console.log(`[mesh] data: ${join(DATA_DIR, 'mesh.db')}  online TTL: ${ONLINE_TTL_MS / 1000}s`)
-  console.log(`[mesh] transport: ${TLS_ENABLED ? `TLS on (${TLS_CERT_FILE})` : 'plain HTTP 鈥?put TLS in front of it before crossing an untrusted network'}`)
-  console.log(`[mesh] auth mode: ${AUTH_MODE}${AUTH_MODE === 'token' ? '  (bearer token required for /mcp and /api)' : '  (NO app-level auth 鈥?LAN only)'}`)
+  console.log(`[mesh] transport: ${TLS_ENABLED ? `TLS on (${TLS_CERT_FILE})` : 'plain HTTP — put TLS in front of it before crossing an untrusted network'}`)
+  console.log(`[mesh] auth mode: ${AUTH_MODE}${AUTH_MODE === 'token' ? '  (bearer token required for /mcp and /api)' : '  (NO app-level auth — LAN only)'}`)
   if (AUTH_MODE === 'token') console.log(`[mesh] admin endpoints: /api/admin/agents | rotate | audit  (token in ${ADMIN_TOKEN === process.env.MESH_ADMIN_TOKEN ? 'MESH_ADMIN_TOKEN' : `${join(DATA_DIR, 'admin.token')}`})`)
   if (!TLS_ENABLED && VIEW_TOKEN) {
     const sources = CONSOLE_ALLOW || 'loopback only (default; set MESH_CONSOLE_ALLOW to widen)'
