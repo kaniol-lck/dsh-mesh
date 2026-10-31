@@ -219,6 +219,10 @@ curl 'http://<HUB-HOST>:8790/api/board?key=env/host' -H "Authorization: Bearer $
 
 MCP 面等价于其中 10 个工具，位于 `POST /mcp`。
 
+**消息保留**：超过 `MESH_MESSAGE_TTL_MS` 的**已读**消息会被清理；**未读消息不会因超期丢失**，只会在收件箱里带 `stale: true`（响应顶层 `stale_count` 提示本页积压）。`MESH_MAX_UNREAD_MESSAGES`（默认 0=关闭）超限只告警、不删除。
+
+**黑板 CAS 与可见性**：`POST /api/board` 可带整数 `if_version`——匹配当前版本则写入并把 `version` +1；不匹配返回 **409** `{current_version, current_value}`；新 key 用 `if_version=0` 创建，不带则直接覆盖并 +1。`visible_to` 与 blob 同语义（`*` 或逗号分隔 agent 白名单）：`GET /api/board` 只列可见 key，不可见直读返回 **404**，`/api/board/log` 同样过滤；admin 全量视图用 `GET /api/admin/board`。
+
 ---
 
 ## 五·补1、会话视图（只含自己的消息）
@@ -283,7 +287,9 @@ curl -s -X POST "$HUB/api/blob/<id>/commit"
 | `MESH_TLS_CERT` / `MESH_TLS_KEY` | 空 | 同时设置则以 HTTPS 提供服务 |
 | `MESH_TRUST_PROXY` | `0` | 置 `1` 时才信任 `X-Forwarded-For`（前面有自己控制的反代时） |
 | `MESH_ONLINE_TTL_MS` | `120000` | 多久没请求算离线 |
-| `MESH_MESSAGE_TTL_MS` | `604800000` | 消息保留（7 天） |
+| `MESH_MESSAGE_TTL_MS` | `604800000` | 已读消息保留（7 天）；未读只标 stale，不删除 |
+| `MESH_MAX_UNREAD_MESSAGES` | `0` | 未读积压告警阈值（0=关闭）；超限只 WARN，不删除 |
+| `MESH_PURGE_INTERVAL_MS` | `3600000` | 清理/标记未读的间隔（测试可调小，最小 1000） |
 | `MESH_MAX_BODY_BYTES` | `1048576` | 非 blob 端点的单个请求体上限（超出 → 413） |
 | `MESH_MAX_BLOB_BYTES` | `67108864` | 单个 blob 文件上限（64 MiB，超出 → 413） |
 | `MESH_MAX_BLOB_CHUNK_BYTES` | `8388608` | 单个 chunk 上限（8 MiB，超出 → 413） |

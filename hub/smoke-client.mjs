@@ -149,6 +149,42 @@ try {
   const task = await call(bob.client, 'mesh_board_get', { key: 'task/smoke' })
   check('board entries carry owner and status', task.owner === 'bob' && task.status === 'todo', `${task.owner}/${task.status}`)
 
+  // --- board CAS + per-key visibility -----------------------------------------
+  {
+    const boardPost = (token, payload) => fetch(`${BASE}/api/board`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const created = await boardPost(aliceToken, { key: 'cas/smoke', value: 'v1' })
+    const createdBody = await created.json()
+    check('board write starts at version 1', created.status === 200 && createdBody.version === 1, `v${createdBody.version}`)
+    const bumped = await boardPost(aliceToken, { key: 'cas/smoke', value: 'v2', if_version: 1 })
+    const bumpedBody = await bumped.json()
+    check('board CAS match bumps the version', bumped.status === 200 && bumpedBody.version === 2, `v${bumpedBody.version}`)
+    const conflict = await boardPost(aliceToken, { key: 'cas/smoke', value: 'v3', if_version: 1 })
+    const conflictBody = await conflict.json()
+    check(
+      'board CAS mismatch is 409 with current state',
+      conflict.status === 409 && conflictBody.current_version === 2 && conflictBody.current_value === 'v2',
+      `HTTP ${conflict.status} v${conflictBody.current_version}`,
+    )
+    const fresh = await boardPost(aliceToken, { key: 'cas/new', value: 'first', if_version: 0 })
+    const freshBody = await fresh.json()
+    check('if_version=0 creates a new key at version 1', fresh.status === 200 && freshBody.version === 1, `v${freshBody.version}`)
+
+    await boardPost(aliceToken, { key: 'board/private', value: 'secret', visible_to: 'alice' })
+    const bobBoard = await (await fetch(`${BASE}/api/board`, { headers: { authorization: `Bearer ${bobToken}` } })).json()
+    const bobKeys = (bobBoard.entries || []).map((entry) => entry.key)
+    check('private board key is hidden from the list', !bobKeys.includes('board/private'), `${bobKeys.length} keys`)
+    const bobRead = await fetch(`${BASE}/api/board?key=board/private`, { headers: { authorization: `Bearer ${bobToken}` } })
+    check('private board key is 404 for other agents', bobRead.status === 404, `HTTP ${bobRead.status}`)
+    const aliceRead = await fetch(`${BASE}/api/board?key=board/private`, { headers: { authorization: `Bearer ${aliceToken}` } })
+    check('allowlisted agent can read the private board key', aliceRead.status === 200, `HTTP ${aliceRead.status}`)
+    const adminBoard = await (await admin('/api/admin/board', { method: 'GET' })).json()
+    check('admin sees private board keys', (adminBoard.entries || []).some((entry) => entry.key === 'board/private'), 'admin sees all')
+  }
+
   // A closing message is delivered and readable, but must not wake the recipient.
   const closing = await call(alice.client, 'mesh_send', {
     to: 'bob',

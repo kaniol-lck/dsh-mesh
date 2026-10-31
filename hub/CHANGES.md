@@ -4,11 +4,21 @@ v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审�
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 91/91，wake push 用例打印 `SKIP`；设置后 99/99）、`node --test test/*.test.mjs`（3/3；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 99/99，wake push 用例打印 `SKIP`；设置后 107/107）、`node --test test/*.test.mjs`（4/4；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
 > **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；补丁进入 0.7.12（见下条）。
 
 ---
+
+## v0.7.19（2026-10-31，未读不丢 + 黑板 CAS/可见性）
+
+| 项 | 内容 |
+|---|---|
+| 未读消息不删 | 清扫只删除**已读**且超 TTL 的消息；未读超 TTL 只写 `stale_at`，`/api/inbox` 行带 `stale: true`、顶层带 `stale_count`（本页）；`MESH_MAX_UNREAD_MESSAGES`（默认 0=关）超限只 WARN，不删除 |
+| 黑板 CAS | `POST /api/board` 可选 `if_version`：匹配→版本 +1；不匹配→**409** `{current_version, current_value}`；`if_version=0` 仅用于新 key；不带则覆盖并 +1。`GET /api/admin/board` 提供 admin 全量视图 |
+| 黑板可见性 | key 支持 `visible_to`（`*` 或白名单）：GET 列表过滤、不可见直读 **404**、`board_log` 同步过滤；旧 key 迁移为 `*` + `version=1` |
+| 迁移 | `messages.stale_at`、`board.version` / `board.visible_to` 幂等 ALTER；旧数据默认可见、版本 1 |
+| 验证 | smoke：未设 `MESH_WAKE_SECRET` 99/99、设置后 107/107（CAS 匹配/409、`if_version=0`、私有 key 列表/直读、admin 视图）；`node --test test/*.test.mjs` 4/4（未读 stale、已读清理） |
 
 ## v0.7.18（2026-10-31，blob 可见性 / 回滚 / 分端限额）
 

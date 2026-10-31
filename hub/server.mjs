@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.18'
+const HUB_VERSION = '0.7.19'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
@@ -51,6 +51,11 @@ const HOST = process.env.MESH_HOST ?? '0.0.0.0'
 const DATA_DIR = process.env.MESH_DATA_DIR ?? join(HERE, 'data')
 const ONLINE_TTL_MS = Number(process.env.MESH_ONLINE_TTL_MS ?? 120_000)
 const MESSAGE_TTL_MS = Number(process.env.MESH_MESSAGE_TTL_MS ?? 7 * 24 * 3600_000)
+// How often read mail is swept and unread mail is marked stale (tests shorten this).
+const PURGE_INTERVAL_MS = Math.max(1000, Number(process.env.MESH_PURGE_INTERVAL_MS ?? 3600_000))
+// Optional unread backlog alarm (0 = off). This never deletes: an unread message is the
+// one piece of state that must survive a long-offline peer.
+const MAX_UNREAD_MESSAGES = Number(process.env.MESH_MAX_UNREAD_MESSAGES ?? 0)
 
 // --- resource caps -----------------------------------------------------------
 // The hub is a long-lived process. Everything a caller can create without bound
@@ -176,7 +181,9 @@ CREATE TABLE IF NOT EXISTS board (
   updated_by TEXT,
   updated_at INTEGER NOT NULL,
   owner      TEXT,
-  status     TEXT
+  status     TEXT,
+  version    INTEGER NOT NULL DEFAULT 1,
+  visible_to TEXT NOT NULL DEFAULT '*'
 );
 CREATE TABLE IF NOT EXISTS board_log (
   id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -245,6 +252,9 @@ CREATE TABLE IF NOT EXISTS blobs (
   // claimed_at: a puller took these rows for processing. Not read; expires on its own so
   // a crashed puller's messages become claimable again (see the claim=1 inbox parameter).
   if (!messageColumns.some((c) => c.name === 'claimed_at')) db.exec('ALTER TABLE messages ADD COLUMN claimed_at INTEGER')
+  // stale_at: an unread message older than the TTL. Unread mail is never deleted, only
+  // marked, so a peer that was offline for a week still gets its inbox (see purgeExpired).
+  if (!messageColumns.some((c) => c.name === 'stale_at')) db.exec('ALTER TABLE messages ADD COLUMN stale_at INTEGER')
   // Console P1: least privilege per agent. Empty scopes means the historical full set, so
   // existing nodes keep working after the upgrade.
   if (!agentColumns.some((c) => c.name === 'scopes')) db.exec('ALTER TABLE agents ADD COLUMN scopes TEXT')
@@ -260,6 +270,9 @@ CREATE TABLE IF NOT EXISTS blobs (
   const boardColumns = db.prepare('PRAGMA table_info(board)').all()
   if (!boardColumns.some((c) => c.name === 'owner')) db.exec('ALTER TABLE board ADD COLUMN owner TEXT')
   if (!boardColumns.some((c) => c.name === 'status')) db.exec('ALTER TABLE board ADD COLUMN status TEXT')
+  // Board CAS/visibility: version starts at 1 and old keys are mesh-visible.
+  if (!boardColumns.some((c) => c.name === 'version')) db.exec('ALTER TABLE board ADD COLUMN version INTEGER NOT NULL DEFAULT 1')
+  if (!boardColumns.some((c) => c.name === 'visible_to')) db.exec("ALTER TABLE board ADD COLUMN visible_to TEXT NOT NULL DEFAULT '*'")
   // Blob v2: resumable upload (status uploading -> ready) and a per-blob read ACL.
   const blobColumns = db.prepare('PRAGMA table_info(blobs)').all()
   if (!blobColumns.some((c) => c.name === 'status')) db.exec("ALTER TABLE blobs ADD COLUMN status TEXT NOT NULL DEFAULT 'ready'")
@@ -295,7 +308,17 @@ function touchAgent(name, host) {
 
 function purgeExpired() {
   const ts = now()
-  db.prepare('DELETE FROM messages WHERE created_at < ? AND pinned = 0').run(ts - MESSAGE_TTL_MS)
+  const cutoff = ts - MESSAGE_TTL_MS
+  // Read mail ages out; unread mail is never dropped — a peer that was off the network for
+  // longer than the TTL must still receive it. Mark it stale instead so the UI can say so.
+  db.prepare('DELETE FROM messages WHERE created_at < ? AND read_at IS NOT NULL AND pinned = 0').run(cutoff)
+  db.prepare('UPDATE messages SET stale_at = ? WHERE created_at < ? AND read_at IS NULL AND stale_at IS NULL AND pinned = 0').run(ts, cutoff)
+  if (MAX_UNREAD_MESSAGES > 0) {
+    const unread = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE read_at IS NULL').get().n
+    if (unread > MAX_UNREAD_MESSAGES) {
+      console.warn(`[mesh] WARN ${unread} unread messages exceed MESH_MAX_UNREAD_MESSAGES=${MAX_UNREAD_MESSAGES}; nothing is deleted, but peers should drain their inbox`)
+    }
+  }
 
   // board_log and audit are append-only; without this they grow for the life of the
   // NAS. Keep a time window and a row cap (whichever bites first).
@@ -730,7 +753,7 @@ function fetchInboxPage(agentName, { unreadOnly = true, limit = 20, order = 'asc
   params.push(limit + 1)
   const rows = db
     .prepare(
-      `SELECT id, sender, subject, body, created_at, read_at, claimed_at, reply_to, conversation, no_reply, pinned, interrupt, delivery_mode FROM messages
+      `SELECT id, sender, subject, body, created_at, read_at, claimed_at, stale_at, reply_to, conversation, no_reply, pinned, interrupt, delivery_mode FROM messages
         WHERE ${clauses.join(' AND ')}
         ORDER BY created_at ${descending ? 'DESC' : 'ASC'} LIMIT ?`,
     )
@@ -738,7 +761,7 @@ function fetchInboxPage(agentName, { unreadOnly = true, limit = 20, order = 'asc
   const hasMore = rows.length > limit
   const page = hasMore ? rows.slice(0, limit) : rows
   const nextBefore = hasMore && descending ? page[page.length - 1].created_at : null
-  return { rows: page, hasMore, nextBefore }
+  return { rows: page.map((row) => ({ ...row, stale: Boolean(row.stale_at) })), hasMore, nextBefore }
 }
 
 /** Build one MCP server bound to one agent identity. */
@@ -916,6 +939,7 @@ function buildServer(agentName, agentHost, publicUrl) {
         agent: agentName,
         count: page.rows.length,
         order: sortOrder,
+        stale_count: page.rows.filter((row) => row.stale).length,
         has_more: page.hasMore,
         next_before: page.nextBefore,
         messages: page.rows,
@@ -932,32 +956,47 @@ function buildServer(agentName, agentHost, publicUrl) {
 
   tool(
     'mesh_board_set',
-    'Write a shared key/value entry on the hub board. Optional owner/status turn an entry into an assignable task (owner = the agent expected to act, status = free-form such as todo/doing/done). Every change is also appended to the board log.',
-    { key: z.string(), value: z.string(), owner: z.string().optional(), status: z.string().optional() },
-    ({ key, value, owner, status }) => {
+    'Write a shared key/value entry on the hub board. Optional owner/status turn an entry into an assignable task; if_version enables compare-and-set (mismatch returns current_version/current_value); visible_to is "*" or a comma-separated agent allowlist. Every change is also appended to the board log.',
+    {
+      key: z.string(),
+      value: z.string(),
+      owner: z.string().optional(),
+      status: z.string().optional(),
+      if_version: z.number().int().min(0).optional(),
+      visible_to: z.string().optional(),
+    },
+    ({ key, value, owner, status, if_version, visible_to }) => {
       assertText('key', key, MAX_KEY_BYTES)
       assertText('value', value, MAX_BOARD_BYTES)
       if (owner !== undefined) assertText('owner', owner, MAX_RECIPIENT_BYTES)
       if (status !== undefined) assertText('status', status, 40)
-      const ts = now()
-      db.prepare(
-        'INSERT INTO board (key, value, updated_by, updated_at, owner, status) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at, owner = COALESCE(excluded.owner, board.owner), status = COALESCE(excluded.status, board.status)',
-      ).run(key, value, agentName, ts, owner ?? null, status ?? null)
-      db.prepare('INSERT INTO board_log (key, value, actor, at) VALUES (?, ?, ?, ?)').run(key, value, agentName, ts)
-      return { key, value, owner: owner ?? null, status: status ?? null, updated_by: agentName, updated_at: ts }
+      const visibleTo = visible_to === undefined ? null : visibilityOf(visible_to)
+      const result = writeBoard({
+        key,
+        value,
+        owner: owner ?? null,
+        status: status ?? null,
+        visibleTo,
+        ifVersion: if_version ?? null,
+        actor: agentName,
+      })
+      if (result.conflict) return { error: 'version conflict', ...result.conflict }
+      return result.row
     },
   )
 
   tool('mesh_board_get', 'Read one shared board entry.', { key: z.string() }, ({ key }) => {
-    const row = db.prepare('SELECT key, value, updated_by, updated_at, owner, status FROM board WHERE key = ?').get(key)
-    return row ?? { key, found: false }
+    const row = db.prepare('SELECT key, value, updated_by, updated_at, owner, status, version, visible_to FROM board WHERE key = ?').get(key)
+    if (!row || !boardVisible(row, agentName, null)) return { key, found: false }
+    return row
   })
 
   tool('mesh_board_list', 'List shared board keys, optionally filtered by prefix.', { prefix: z.string().optional() }, ({ prefix }) => {
     const rows = prefix
-      ? db.prepare("SELECT key, value, updated_by, updated_at, owner, status FROM board WHERE key LIKE ? ORDER BY key").all(`${prefix}%`)
-      : db.prepare('SELECT key, value, updated_by, updated_at, owner, status FROM board ORDER BY key').all()
-    return { count: rows.length, entries: rows }
+      ? db.prepare("SELECT key, value, updated_by, updated_at, owner, status, version, visible_to FROM board WHERE key LIKE ? ORDER BY key").all(`${prefix}%`)
+      : db.prepare('SELECT key, value, updated_by, updated_at, owner, status, version, visible_to FROM board ORDER BY key').all()
+    const entries = rows.filter((row) => boardVisible(row, agentName, null))
+    return { count: entries.length, entries }
   })
 
   tool('mesh_status', 'Hub counters: agents, online agents, queued messages, board size.', {}, () => {
@@ -1197,7 +1236,39 @@ function visibilityOf(value) {
   return [...new Set(names)].join(',')
 }
 
-/** Who may download this blob: the uploader, an admin, or an allowlisted agent. */
+/** Who may read this board key: everyone ("*"), an allowlisted agent, or an admin. */
+function boardVisible(row, agentName, req) {
+  if (!row) return false
+  if (req && isAdmin(req)) return true
+  const visible = String(row.visible_to || '*')
+  return visible === '*' || visible.split(',').includes(agentName)
+}
+
+/**
+ * Compare-and-set board write shared by REST and MCP. Returns {row} on success or
+ * {conflict:{current_version,current_value}} when ifVersion does not match.
+ */
+function writeBoard({ key, value, owner, status, visibleTo, ifVersion, actor }) {
+  const existing = db.prepare('SELECT key, value, version, visible_to FROM board WHERE key = ?').get(key)
+  if (!existing && ifVersion !== null && ifVersion !== 0) {
+    return { conflict: { current_version: 0, current_value: null } }
+  }
+  if (existing && ifVersion !== null && ifVersion !== existing.version) {
+    return { conflict: { current_version: existing.version, current_value: existing.value } }
+  }
+  const ts = now()
+  if (existing) {
+    db.prepare(
+      'UPDATE board SET value = ?, updated_by = ?, updated_at = ?, owner = COALESCE(?, owner), status = COALESCE(?, status), version = version + 1, visible_to = COALESCE(?, visible_to) WHERE key = ?',
+    ).run(value, actor, ts, owner, status, visibleTo, key)
+  } else {
+    db.prepare('INSERT INTO board (key, value, updated_by, updated_at, owner, status, version, visible_to) VALUES (?, ?, ?, ?, ?, ?, 1, ?)')
+      .run(key, value, actor, ts, owner, status, visibleTo ?? '*')
+  }
+  db.prepare('INSERT INTO board_log (key, value, actor, at) VALUES (?, ?, ?, ?)').run(key, value, actor, ts)
+  const row = db.prepare('SELECT key, value, updated_by, updated_at, owner, status, version, visible_to FROM board WHERE key = ?').get(key)
+  return { row }
+}
 function blobReadable(row, agentName, req) {
   if (isAdmin(req)) return true
   if (row.uploader === agentName) return true
@@ -1967,6 +2038,7 @@ async function handleRest(req, res, url) {
         agent: id.name,
         count: page.rows.length,
         order,
+        stale_count: page.rows.filter((row) => row.stale).length,
         has_more: page.hasMore,
         next_before: page.nextBefore,
         messages: page.rows,
@@ -1990,29 +2062,34 @@ async function handleRest(req, res, url) {
       if (!body.key || body.value === undefined) return sendJson(res, 400, { error: 'key and value are required' })
       assertText('key', String(body.key), MAX_KEY_BYTES)
       assertText('value', String(body.value), MAX_BOARD_BYTES)
-      const ts = now()
       const owner = body.owner === undefined || body.owner === null ? null : String(body.owner)
       const status = body.status === undefined || body.status === null ? null : String(body.status)
       if (owner !== null) assertText('owner', owner, MAX_RECIPIENT_BYTES)
       if (status !== null) assertText('status', status, 40)
-      db.prepare(
-        'INSERT INTO board (key, value, updated_by, updated_at, owner, status) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at, owner = COALESCE(excluded.owner, board.owner), status = COALESCE(excluded.status, board.status)',
-      ).run(body.key, String(body.value), id.name, ts, owner, status)
-      db.prepare('INSERT INTO board_log (key, value, actor, at) VALUES (?, ?, ?, ?)').run(body.key, String(body.value), id.name, ts)
-      return sendJson(res, 200, { key: body.key, owner, status, updated_by: id.name, updated_at: ts })
+      const visibleTo = body.visible_to === undefined ? null : visibilityOf(body.visible_to)
+      let ifVersion = null
+      if (body.if_version !== undefined && body.if_version !== null && body.if_version !== '') {
+        ifVersion = Number(body.if_version)
+        if (!Number.isInteger(ifVersion) || ifVersion < 0) return sendJson(res, 400, { error: 'if_version must be a non-negative integer' })
+      }
+      const result = writeBoard({ key: String(body.key), value: String(body.value), owner, status, visibleTo, ifVersion, actor: id.name })
+      if (result.conflict) return sendJson(res, 409, { error: 'version conflict', ...result.conflict })
+      return sendJson(res, 200, result.row)
     }
 
     if (path === '/api/board' && req.method === 'GET') {
       const key = q.get('key')
       if (key) {
-        const row = db.prepare('SELECT key, value, updated_by, updated_at, owner, status FROM board WHERE key = ?').get(key)
-        return sendJson(res, row ? 200 : 404, row ?? { key, found: false })
+        const row = db.prepare('SELECT key, value, updated_by, updated_at, owner, status, version, visible_to FROM board WHERE key = ?').get(key)
+        if (!row || !boardVisible(row, id.name, req)) return sendJson(res, 404, { key, found: false })
+        return sendJson(res, 200, row)
       }
       const prefix = q.get('prefix')
       const rows = prefix
-        ? db.prepare('SELECT key, value, updated_by, updated_at, owner, status FROM board WHERE key LIKE ? ORDER BY key').all(`${prefix}%`)
-        : db.prepare('SELECT key, value, updated_by, updated_at, owner, status FROM board ORDER BY key').all()
-      return sendJson(res, 200, { count: rows.length, entries: rows })
+        ? db.prepare('SELECT key, value, updated_by, updated_at, owner, status, version, visible_to FROM board WHERE key LIKE ? ORDER BY key').all(`${prefix}%`)
+        : db.prepare('SELECT key, value, updated_by, updated_at, owner, status, version, visible_to FROM board ORDER BY key').all()
+      const entries = rows.filter((row) => boardVisible(row, id.name, req))
+      return sendJson(res, 200, { count: entries.length, entries })
     }
 
     // The change log used to be write-only. Expose it so "who changed this key" is
@@ -2026,7 +2103,12 @@ async function handleRest(req, res, url) {
         : prefix
           ? db.prepare('SELECT id, key, value, actor, at FROM board_log WHERE key LIKE ? ORDER BY id DESC LIMIT ?').all(`${prefix}%`, limit)
           : db.prepare('SELECT id, key, value, actor, at FROM board_log ORDER BY id DESC LIMIT ?').all(limit)
-      return sendJson(res, 200, { count: rows.length, entries: rows })
+      const boardRows = new Map(db.prepare('SELECT key, visible_to FROM board').all().map((row) => [row.key, row]))
+      const entries = rows.filter((row) => {
+        const boardRow = boardRows.get(row.key)
+        return !boardRow || boardVisible(boardRow, id.name, req)
+      })
+      return sendJson(res, 200, { count: entries.length, entries })
     }
 
     if (path === '/api/status' && req.method === 'GET') {
@@ -2703,6 +2785,17 @@ async function handleAdmin(req, res, url) {
       return sendJson(res, 201, { code, name: name || null, expires_at: expiry.value, expires_in_seconds: ENROLL_CODE_TTL_MS / 1000 })
     }
 
+    if (path === '/api/admin/board' && req.method === 'GET') {
+      const key = String(url.searchParams.get('key') ?? '').trim()
+      if (key) {
+        const row = db.prepare('SELECT key, value, updated_by, updated_at, owner, status, version, visible_to FROM board WHERE key = ?').get(key)
+        if (!row) return sendJson(res, 404, { key, found: false })
+        return sendJson(res, 200, row)
+      }
+      const rows = db.prepare('SELECT key, value, updated_by, updated_at, owner, status, version, visible_to FROM board ORDER BY key').all()
+      return sendJson(res, 200, { count: rows.length, entries: rows })
+    }
+
     if (path === '/api/admin/agents' && req.method === 'GET') {
       const rows = db.prepare('SELECT name, host, description, first_seen, last_seen, token_hash FROM agents ORDER BY name').all()
       const ts = now()
@@ -2851,7 +2944,7 @@ setInterval(() => {
   } catch (error) {
     console.error('[mesh] purge failed:', error.message)
   }
-}, 3600_000).unref()
+}, PURGE_INTERVAL_MS).unref()
 
 // Every minute: expire idle MCP sessions (ungraceful client shutdowns) and forget
 // stale failure counters, so memory stays flat over months of uptime.

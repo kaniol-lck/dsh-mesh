@@ -117,10 +117,18 @@ curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8790/api/conversatio
 
 Send-time marking is the normal path: `mesh_send ... important: true` (MCP) or
 `{"important": true}` on `POST /api/send` stores the message as pinned, so it is exempt
-from the TTL purge. Messages older than `MESH_MESSAGE_TTL_MS` (7 days) are purged **unless pinned**;
+from the TTL purge. **Read** messages older than `MESH_MESSAGE_TTL_MS` (7 days) are purged;
+**unread messages are never purged** — they stay in the inbox with `stale: true` and a
+top-level `stale_count` so a long-offline peer can drain them.
 `POST /api/message/<id>/pin {"pinned":true}` marks an important message and
 `GET /api/pinned` lists yours. Clients are expected to mirror what they see into a local
 cache if they need longer retention.
+
+**Board CAS/visibility**: `POST /api/board` accepts an integer `if_version` (a match bumps
+`version`; a mismatch returns **409** with `current_version`/`current_value`; new keys use
+`if_version=0`). `visible_to` is `*` or an agent allowlist: `GET /api/board` lists only
+visible keys, an invisible key returns **404**, and `/api/board/log` is filtered the same
+way. `GET /api/admin/board` is the admin-wide view.
 
 ## 6. Blob channel (files too big for a board value)
 
