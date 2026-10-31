@@ -1964,6 +1964,111 @@ async function main() {
     report('sessions: deleting an archived session clears its id from the archive view', ok, `before=${before.json?.total} deleted=${deleted.status} afterArchived=${afterArchived.json?.total} listedArchived=${listed?.archived}`)
   })
 
+  // 86-90. Receipt routing: the dispatcher (requester) gets its own receipts; receiptTo is
+  // only the fallback so a second workspace no longer receives another one's receipts.
+  const receiptConfig = { receiptTo: 'receipt holder', receiptMode: 'queue' }
+  const receiptSeeds = [
+    { id: 'session-worker', title: 'worker' },
+    { id: 'session-orch', title: 'orchestrator' },
+    { id: 'session-holder', title: 'receipt holder' },
+  ]
+
+  await runCase('receipt: a requester receives the receipt instead of receiptTo', async (boot) => {
+    const h = await boot({ seedSessions: receiptSeeds, config: receiptConfig })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'do it', meta: { taskId: 'T-requester', requester: 'orchestrator' } },
+    })
+    h.emit('session/event', { id: 'session-worker' }, { type: 'turn/start', turn: 2 })
+    h.emit('session/event', { id: 'session-worker' }, { type: 'turn/end', turn: 2, reason: { kind: 'completed' } })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-orch'), 4000)
+    const status = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/status')
+      return snapshot.json?.lastReceipt?.deliveredTo === 'session-orch' ? snapshot : null
+    }, 4000)
+    const holderPrompts = h.state.prompts.filter((prompt) => prompt.sessionId === 'session-holder').length
+    const ok = Boolean(delivered) && holderPrompts === 0 && status.json?.lastReceipt?.deliveredTo === 'session-orch'
+    report('receipt: a requester receives the receipt instead of receiptTo', ok, `deliveredTo=${status.json?.lastReceipt?.deliveredTo ?? '-'} holderPrompts=${holderPrompts} orchPrompts=${h.state.prompts.filter((p) => p.sessionId === 'session-orch').length}`)
+  })
+
+  await runCase('receipt: an unresolved requester falls back to receiptTo and says so', async (boot) => {
+    const h = await boot({ seedSessions: receiptSeeds, config: receiptConfig })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'do it', meta: { taskId: 'T-ghost', requester: 'ghost session' } },
+    })
+    const pending = await request(h.base, '/mesh/status')
+    h.emit('session/event', { id: 'session-worker' }, { type: 'turn/start', turn: 3 })
+    h.emit('session/event', { id: 'session-worker' }, { type: 'turn/end', turn: 3, reason: { kind: 'completed' } })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-holder'), 4000)
+    const status = await request(h.base, '/mesh/status')
+    const listed = pending.json?.pendingTaskList?.find((row) => row.taskId === 'T-ghost')
+    const ok =
+      Boolean(delivered) &&
+      listed?.requester === 'ghost session' &&
+      listed?.requesterSessionId === null &&
+      /requester not resolved/.test(status.json?.lastError ?? '')
+    report('receipt: an unresolved requester falls back to receiptTo and says so', ok, `deliveredTo=${status.json?.lastReceipt?.deliveredTo ?? '-'} lastError=${JSON.stringify(status.json?.lastError ?? '')}`)
+  })
+
+  await runCase('receipt: without a requester the receiptTo fallback still works', async (boot) => {
+    const h = await boot({ seedSessions: receiptSeeds, config: receiptConfig })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'do it', meta: { taskId: 'T-fallback' } },
+    })
+    h.emit('session/event', { id: 'session-worker' }, { type: 'turn/start', turn: 4 })
+    h.emit('session/event', { id: 'session-worker' }, { type: 'turn/end', turn: 4, reason: { kind: 'completed' } })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-holder'), 4000)
+    const status = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/status')
+      return snapshot.json?.lastReceipt?.deliveredTo === 'session-holder' ? snapshot : null
+    }, 4000)
+    const ok = Boolean(delivered) && status.json?.lastReceipt?.deliveredTo === 'session-holder'
+    report('receipt: without a requester the receiptTo fallback still works', ok, `deliveredTo=${status.json?.lastReceipt?.deliveredTo ?? '-'}`)
+  })
+
+  await runCase('receipt: batch aggregate goes to the batch requester', async (boot) => {
+    const h = await boot({ seedSessions: receiptSeeds, config: receiptConfig })
+    for (const target of ['worker', 'orchestrator']) {
+      await request(h.base, '/mesh/inject', {
+        method: 'POST',
+        body: {
+          title: target,
+          text: `batch work on ${target}`,
+          meta: { taskId: `T-batch-${target}`, batchId: 'B-requester', requester: 'orchestrator' },
+        },
+      })
+    }
+    for (const target of ['session-worker', 'session-orch']) {
+      h.emit('session/event', { id: target }, { type: 'turn/start', turn: 5 })
+      h.emit('session/event', { id: target }, { type: 'turn/end', turn: 5, reason: { kind: 'completed' } })
+    }
+    const promptHasBatch = (prompt) => (prompt.content ?? []).some((part) => /BATCH/.test(part.text ?? ''))
+    const delivered = await waitFor(
+      () => h.state.prompts.find((prompt) => prompt.sessionId === 'session-orch' && promptHasBatch(prompt)),
+      6000,
+    )
+    const status = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/status')
+      return snapshot.json?.lastReceipt?.deliveredTo === 'session-orch' ? snapshot : null
+    }, 4000)
+    const holderPrompts = h.state.prompts.filter((prompt) => prompt.sessionId === 'session-holder').length
+    const ok = Boolean(delivered) && holderPrompts === 0 && status.json?.lastReceipt?.deliveredTo === 'session-orch'
+    report('receipt: batch aggregate goes to the batch requester', ok, `batchPrompts=${h.state.prompts.filter(promptHasBatch).length} holderPrompts=${holderPrompts} deliveredTo=${status.json?.lastReceipt?.deliveredTo ?? '-'}`)
+  })
+
+  await runCase('receipt: the tool handler uses the caller session when the host passes it', async (boot) => {
+    const h = await boot({ seedSessions: receiptSeeds, config: receiptConfig })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'worker', text: 'from a tool call', taskId: 'T-caller' }, { sessionId: 'session-orch' })
+    const status = await request(h.base, '/mesh/status')
+    const listed = status.json?.pendingTaskList?.find((row) => row.taskId === 'T-caller')
+    const ok = listed?.requesterSessionId === 'session-orch'
+    report('receipt: the tool handler uses the caller session when the host passes it', ok, `requesterSessionId=${listed?.requesterSessionId ?? '-'}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

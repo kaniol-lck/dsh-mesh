@@ -433,10 +433,16 @@ export const MESH_DISPATCH_TOOL = {
     'Dispatch a task text into another local DSH session (same machine, no hub). target = session id, full title, or a unique title substring. ' +
     'Returns immediately with taskId; do NOT poll or wait for the result — the waker writes a receipt when that turn ends (file by default). ' +
     'Pass the same batchId for several tasks to get exactly one aggregate notice after all of them finish (batch barrier). ' +
-    'Set createIfMissing:true to create the session when target does not resolve.',
+    'Set createIfMissing:true to create the session when target does not resolve. ' +
+    'requester names the session that should receive the receipt (usually passed by the CLI; models may omit it).',
   parameters: {
     target: { type: 'string', required: true, description: 'Session id, full title, or a unique title substring.' },
     text: { type: 'string', required: true, description: 'Task text, delivered verbatim (max 64 KiB).' },
+    requester: {
+      type: 'string',
+      description:
+        'Session id or title that receives the receipt (the dispatcher). Usually set by the CLI; the tool handler also uses the caller session when the host exposes it.',
+    },
     createIfMissing: {
       type: 'boolean',
       description: 'Create a session titled with target when it does not resolve (default false).',
@@ -2969,21 +2975,41 @@ export function apply(ctx, config) {
     return receipt.summary ? `${first}\n${receipt.summary}` : first
   }
 
-  /** Deliver one notice (receipt or batch text) to receiptTo; file mode never injects. */
-  async function deliverNotice(mode, text, label) {
-    if (mode === 'file') return false
-    if (!c.receiptTo) {
-      state.lastError = 'receiptTo is empty; notice written to file only'
-      fileLog(`${label} delivery skipped: receiptTo is empty`)
-      return false
-    }
-    let target
+  /** Resolve a requester id/title once; a miss falls back to receiptTo with a loud note. */
+  function resolveRequester(raw) {
+    const requester = String(raw ?? '').trim()
+    if (!requester) return { requester: null, sessionId: null }
     try {
-      target = resolveLocalSession({ session: c.receiptTo, title: c.receiptTo })
+      const target = resolveLocalSession({ session: requester, title: requester })
+      return { requester, sessionId: target.id }
     } catch (error) {
-      state.lastError = `receiptTo not resolved: ${error.message}`
-      fileLog(`${label} delivery skipped: ${error.message}`)
-      return false
+      state.lastError = `requester not resolved (${requester}): ${error.message}; falling back to receiptTo`
+      fileLog(`requester ${requester} not resolved (${error.message}); receipts fall back to receiptTo`)
+      return { requester, sessionId: null }
+    }
+  }
+
+  /**
+   * Deliver one notice (receipt or batch text). `targetSessionId` wins when given (the
+   * dispatcher's own session); otherwise fall back to the configured receiptTo; file mode
+   * never injects. Returns the session id that actually received it, or null.
+   */
+  async function deliverNotice(mode, text, label, targetSessionId) {
+    if (mode === 'file') return null
+    let targetId = targetSessionId ? String(targetSessionId) : ''
+    if (!targetId) {
+      if (!c.receiptTo) {
+        state.lastError = 'no requester and receiptTo is empty; notice written to file only'
+        fileLog(`${label} delivery skipped: no requester, receiptTo is empty`)
+        return null
+      }
+      try {
+        targetId = resolveLocalSession({ session: c.receiptTo, title: c.receiptTo }).id
+      } catch (error) {
+        state.lastError = `receiptTo not resolved: ${error.message}`
+        fileLog(`${label} delivery skipped: ${error.message}`)
+        return null
+      }
     }
     let turnMode = 'queue'
     if (mode === 'wake') {
@@ -2991,20 +3017,30 @@ export function apply(ctx, config) {
       else log.warn('[mesh-waker] wake delivery needs wakeSecret; delivering as queue')
     }
     try {
-      await promptWithResume(target.id, text, turnMode)
-      fileLog(`${label} delivered to ${target.id} (${mode}, mode=${turnMode})`)
-      return true
+      await promptWithResume(targetId, text, turnMode)
+      fileLog(`${label} delivered to ${targetId} (${mode}, mode=${turnMode})`)
+      return targetId
     } catch (error) {
       state.lastError = `${label} delivery failed: ${error.message}`
       fileLog(`${label} delivery failed: ${error.message}`)
-      return false
+      return null
     }
   }
 
-  async function deliverReceipt(receipt) {
+  async function deliverReceipt(receipt, task) {
     if (receipt.receiptMode === 'file') return
-    await deliverNotice(receipt.receiptMode, receiptBody(receipt), `receipt ${receipt.taskId}`)
+    const deliveredTo = await deliverNotice(
+      receipt.receiptMode,
+      receiptBody(receipt),
+      `receipt ${receipt.taskId}`,
+      task?.requesterSessionId ?? '',
+    )
+    if (deliveredTo && lastReceipt && lastReceipt.taskId === receipt.taskId) {
+      lastReceipt.deliveredTo = deliveredTo
+      state.lastReceipt = lastReceipt
+    }
   }
+
 
   function clearPending(task) {
     if (!task) return
@@ -3042,11 +3078,11 @@ export function apply(ctx, config) {
       injectedDuringTurn: task.injectedDuringTurn === true,
     })
     writeReceiptFile(receipt)
-    lastReceipt = { taskId: receipt.taskId, status: receipt.status, at: receipt.endedAt }
+    lastReceipt = { taskId: receipt.taskId, status: receipt.status, at: receipt.endedAt, deliveredTo: null }
     state.lastReceipt = lastReceipt
     state.pendingTasks = pendingTasks.size
     fileLog(`receipt ${taskId} ${receipt.status} turn=${receipt.turn ?? '-'} duration=${receipt.durationMs}ms`)
-    void deliverReceipt(receipt)
+    void deliverReceipt(receipt, task)
     updateBatchTask(taskId, receipt)
     return receipt
   }
@@ -3065,8 +3101,12 @@ export function apply(ctx, config) {
     // mistaken for the task finishing (the T-130 false receipt).
     const openTurn = liveness.get(target.id)?.openTurn ?? null
     const injectedDuringTurn = openTurn !== null
+    // Receipts go back to whoever dispatched the task; receiptTo is only the fallback.
+    const requester = resolveRequester(meta?.requester)
     const task = {
       sessionId: target.id,
+      requester: requester.requester,
+      requesterSessionId: requester.sessionId,
       injectedAt: Date.now(),
       baselineTurn: injectedDuringTurn ? openTurn : maxTurnFor(target.id),
       injectedDuringTurn,
@@ -3093,7 +3133,7 @@ export function apply(ctx, config) {
     task.stallTimer = timer
     receiptTimers.add(timer)
     fileLog(
-      `task ${taskId} pending on ${target.id} baselineTurn=${task.baselineTurn ?? 'unknown'} duringTurn=${injectedDuringTurn} mode=${task.mode} receipt=${receiptMode}${batchId ? ` batch=${batchId}` : ''}`,
+      `task ${taskId} pending on ${target.id} baselineTurn=${task.baselineTurn ?? 'unknown'} duringTurn=${injectedDuringTurn} mode=${task.mode} receipt=${receiptMode} requester=${task.requester ?? '-'}${batchId ? ` batch=${batchId}` : ''}`,
     )
     return taskId
   }
@@ -3292,7 +3332,7 @@ export function apply(ctx, config) {
     })
   }
 
-  function finalizeBatch(batchId, { partial = false } = {}) {
+  async function finalizeBatch(batchId, { partial = false } = {}) {
     const batch = batches.get(batchId)
     if (!batch || batch.finalized) return null
     batch.finalized = true
@@ -3322,11 +3362,18 @@ export function apply(ctx, config) {
       summaryChars: c.receiptSummaryChars,
     })
     writeReceiptFile(record)
-    lastReceipt = { taskId: batchId, status: partial ? 'partial' : 'completed', at: now }
+    lastReceipt = { taskId: batchId, status: partial ? 'partial' : 'completed', at: now, deliveredTo: null }
     state.lastReceipt = lastReceipt
     state.pendingBatches = batches.size
     fileLog(`batch ${batchId} finalized partial=${partial} ${record.done}/${record.total}`)
-    void deliverNotice(batch.barrierMode, body, `batch ${batchId}`)
+    const batchTarget = batch.requesterSessionId ?? ''
+    void (async () => {
+      const deliveredTo = await deliverNotice(batch.barrierMode, body, `batch ${batchId}`, batchTarget)
+      if (deliveredTo && lastReceipt && lastReceipt.taskId === batchId) {
+        lastReceipt.deliveredTo = deliveredTo
+        state.lastReceipt = lastReceipt
+      }
+    })()
     // A closed batch stops waiting: unsettled members must not emit their own receipts later.
     for (const taskId of batch.tasks.keys()) if (pendingTasks.has(taskId)) cancelPendingTask(taskId)
     batches.delete(batchId)
@@ -3367,6 +3414,8 @@ export function apply(ctx, config) {
         barrierMode: c.barrierMode,
         alertMode: c.alertMode,
         alerted: new Set(),
+        requesterSessionId: null,
+        requesterSessionIds: new Set(),
         tasks: new Map(),
         finalized: false,
         deadlineTimer: null,
@@ -3380,7 +3429,24 @@ export function apply(ctx, config) {
       clearTimeout(batch.completeTimer)
       batch.completeTimer = null
     }
-    batch.tasks.set(taskId, { sessionId: task.sessionId, status: 'pending', settledAt: null, durationMs: null, summary: '' })
+    batch.tasks.set(taskId, {
+      sessionId: task.sessionId,
+      requester: task.requester ?? null,
+      requesterSessionId: task.requesterSessionId ?? null,
+      status: 'pending',
+      settledAt: null,
+      durationMs: null,
+      summary: '',
+    })
+    // One aggregate notice per batch: the first requester gets it, extras are recorded so
+    // the log (and the receipt rows) still show who else dispatched into this batch.
+    if (task.requesterSessionId) {
+      batch.requesterSessionIds.add(task.requesterSessionId)
+      if (!batch.requesterSessionId) batch.requesterSessionId = task.requesterSessionId
+      else if (batch.requesterSessionId !== task.requesterSessionId) {
+        fileLog(`batch ${batchId} mixed requesters: first=${batch.requesterSessionId} also=${task.requesterSessionId}; aggregate goes to the first`)
+      }
+    }
     state.pendingBatches = batches.size
     saveBatches()
     fileLog(`batch ${batchId} +${taskId} (${batch.tasks.size} tasks)`)
@@ -3429,7 +3495,12 @@ export function apply(ctx, config) {
           at,
         })
         saveBatches()
-        void deliverNotice(batch.alertMode, `[BATCH-ALERT] ${batchId} ${taskId} ${derived.state} ${derived.detail}`, `batch alert ${batchId}/${taskId}`)
+        void deliverNotice(
+          batch.alertMode,
+          `[BATCH-ALERT] ${batchId} ${taskId} ${derived.state} ${derived.detail}`,
+          `batch alert ${batchId}/${taskId}`,
+          batch.requesterSessionId ?? '',
+        )
         fileLog(`batch ${batchId} alert task=${taskId} state=${derived.state}`)
       }
     }
@@ -3585,7 +3656,31 @@ export function apply(ctx, config) {
     return { id: sessionId, title: name }
   }
 
-  async function dispatchLocalTask(args = {}) {
+  let toolExtraLogged = false
+
+  /** The caller session, when the host hands it to a tool handler (shape differs per host). */
+  function callerSessionFrom(extra) {
+    if (!extra || typeof extra !== 'object') return ''
+    const candidates = [
+      extra.sessionId,
+      extra.session?.id,
+      extra.agent?.id,
+      extra.agentId,
+      extra.context?.sessionId,
+      extra.toolContext?.sessionId,
+    ]
+    const hit = candidates.find((value) => typeof value === 'string' && value.trim())
+    return hit ? String(hit).trim() : ''
+  }
+
+  async function dispatchLocalTask(args = {}, extra = null) {
+    // Probe once: hosts differ in what they pass as the tool handler's second argument.
+    if (!toolExtraLogged && extra && typeof extra === 'object') {
+      toolExtraLogged = true
+      fileLog('tool extra keys: ' + Object.keys(extra).join(','))
+    }
+    const callerSession = callerSessionFrom(extra)
+    const requester = callerSession || String(args.requester ?? '').trim()
     const target = String(args.target ?? '').trim()
     const text = String(args.text ?? '')
     if (!target) throw new Error('target is required (session id, full title, or a unique title substring)')
@@ -3607,6 +3702,7 @@ export function apply(ctx, config) {
     const resolved = buildDispatchMeta(args)
     const meta = {
       taskId: resolved.taskId,
+      ...(requester ? { requester } : {}),
       ...(resolved.batchId ? { batchId: resolved.batchId } : {}),
       ...(args.receipt ? { receipt: String(args.receipt) } : {}),
       ...(resolved.deadlineMs ? { deadlineMs: resolved.deadlineMs } : {}),
@@ -3620,7 +3716,7 @@ export function apply(ctx, config) {
       throw error
     }
     fileLog(
-      `mesh_dispatch: ${text.length} chars -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''} created=${createdSession}`,
+      `mesh_dispatch: ${text.length} chars -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession}`,
     )
     return {
       ok: true,
@@ -3628,6 +3724,7 @@ export function apply(ctx, config) {
       title: session.title ?? null,
       taskId,
       batchId: meta.batchId ?? null,
+      requester: requester || null,
       mode: args.mode === 'steer' ? 'steer' : 'queue',
       created: createdSession,
     }
@@ -3642,7 +3739,7 @@ export function apply(ctx, config) {
         description: MESH_DISPATCH_TOOL.description,
         parameters: MESH_DISPATCH_TOOL.parameters,
         output: DISPATCH_OUTPUT,
-        execute: (args) => dispatchLocalTask(args),
+        execute: (args, extra) => dispatchLocalTask(args, extra),
       })
     } catch (error) {
       const properties = {}
@@ -3655,7 +3752,7 @@ export function apply(ctx, config) {
         description: MESH_DISPATCH_TOOL.description,
         parameters: { type: 'object', properties, required: MESH_DISPATCH_TOOL.required },
         output: DISPATCH_OUTPUT,
-        execute: (args) => dispatchLocalTask(args),
+        execute: (args, extra) => dispatchLocalTask(args, extra),
       }
       fileLog(`dsh-tools not resolvable (${error.message}); mesh_dispatch registered with a plain JSON Schema`)
     }
@@ -4024,6 +4121,9 @@ export function apply(ctx, config) {
         const target = resolveLocalSession(draft)
         const mode = draft.mode === 'steer' ? 'steer' : 'queue'
         const meta = draft.meta && typeof draft.meta === 'object' ? draft.meta : {}
+        // The dispatcher names itself so the receipt returns to it, not to receiptTo.
+        const requester = String(draft.requester ?? meta.requester ?? '').trim()
+        if (requester && !meta.requester) meta.requester = requester
         const batchId = meta.batchId ? String(meta.batchId).trim() : null
         // Register before prompting: a very fast turn can end before this request returns.
         let taskId = null
@@ -4072,6 +4172,15 @@ export function apply(ctx, config) {
               // Task receipts: count waiting for turn/end, the latest settled one, and where
               // they go. The file path is a local path, never a credential.
               pendingTasks: pendingTasks.size,
+              // Per-task detail: who dispatched it (requester) and where it was injected.
+              pendingTaskList: [...pendingTasks.entries()].map(([taskId, task]) => ({
+                taskId,
+                sessionId: task.sessionId,
+                requester: task.requester ?? null,
+                requesterSessionId: task.requesterSessionId ?? null,
+                injectedAt: task.injectedAt,
+                receipt: task.receiptMode,
+              })),
               pendingBatches: batches.size,
               // Queues an operator can act on without reading logs. Local-only status:
               // previews are one-line and bounded, no tokens or paths.

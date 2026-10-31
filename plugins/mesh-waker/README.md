@@ -220,7 +220,15 @@ npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task --receipt
 | `receiptSummaryChars` | `300` | 摘要按**码点**截断，不会切出半个字符 |
 | `receiptStallMs` | `600000` | 注入后这么久仍无 `turn/start`，判 `not-started` |
 
-回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode / baselineTurn / settledTurn / injectedDuringTurn`。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。`baselineTurn`/`settledTurn` 是结算诊断：`queue` 注入发生在回合进行中时 `baselineTurn` 等于该回合，只有更晚回合的 `turn/end` 才会结算（`settledTurn > baselineTurn`），`steer` 则同一回合即可。注入给 `receiptTo` 的正文首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`，第二行是摘要。
+回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode / baselineTurn / settledTurn / injectedDuringTurn`。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。`baselineTurn`/`settledTurn` 是结算诊断：`queue` 注入发生在回合进行中时 `baselineTurn` 等于该回合，只有更晚回合的 `turn/end` 才会结算（`settledTurn > baselineTurn`），`steer` 则同一回合即可。注入给接收方的正文首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`，第二行是摘要。
+
+**回执投递给谁（0.7.7）**：优先投给**派活方**（requester），否则 `receiptTo`，都没有才只写文件。
+
+1. `requester`（`/mesh/inject` 的 body 字段或 `mesh_dispatch` 的工具参数，CLI `--requester` 会带）解析成功 → 只投给该会话；`mesh_dispatch` 被模型调用时若宿主把调用方 session 传给 handler（`_extra`/第二参数），自动用它；
+2. requester 解析失败 → 记录 `lastError`（`requester not resolved … falling back to receiptTo`）后回退 `receiptTo`；
+3. 都没有 → 只写文件，`lastError` 说明原因。
+
+batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 requester**；batch 内混有多个 requester 时，其余记日志与回执行（`batch … mixed requesters`）。`/mesh/status` 的 `pendingTaskList` 每行带 `requester`/`requesterSessionId`，`lastReceipt.deliveredTo` 是实际投到的会话 id。
 
 > 回执只走**本机** inject，绝不推到 hub；`receiptTo` 解析不到时只写文件并置 `lastError`，不会去打扰别的会话。日志与回执里没有 token、密钥。
 

@@ -5,9 +5,17 @@
 > **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
 > `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
 
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留 + 分页/日志 + 归档面板/残留清理）。
+复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留 + 分页/日志 + 归档面板/残留清理 + 回执按 requester 路由）。
 
 ---
+
+## v0.7.7（2026-10-31，回执投给派活方而不是单一 receiptTo）
+
+| 项 | 内容 |
+|---|---|
+| 事故 | 多工作区试点：`util4freesub` 的协调会话派 `T-OPS-001`（batch `B-OPS-001`），回执与 batch 聚合都投给了 `receiptTo`（dsh-mesh 协调会话 `session-7fa21aa4…`），派活方 `session-6dc757df…` 永远收不到自己的回执 |
+| 修法 | ① `mesh_dispatch` 新增 `requester` 参数（CLI 传；模型可省略），handler 第二参数若带调用方 session 自动使用（`extra.sessionId`/`session.id`/`agent.id`/`agentId`/`context.sessionId`，首次打一行 `tool extra keys:` 探测）；`/mesh/inject` 接受 body `requester` 或 `meta.requester`；② 投递优先级：解析成功的 requester → `receiptTo` → 只写文件 + `lastError`；requester 解析失败退回 `receiptTo` 并写明原因；③ batch 聚合与 batch alert 投给该 batch 第一个 requester，混合 requester 记日志；④ `/mesh/status` 增 `pendingTaskList`（每行 `requester`/`requesterSessionId`），`lastReceipt.deliveredTo` 记录实际投到的会话 |
+| 测试 | +5（共 90/90）：requester 命中只投 requester（`deliveredTo=session-orch`，receiptTo 0 次）；requester 解析失败回退 receiptTo 且 `lastError` 含 `requester not resolved`、`pendingTaskList` 两字段正确；无 requester 走 receiptTo（向后兼容）；batch 聚合投给 requester（`/BATCH/` 只到 orch）；工具 handler 第二参数 `{sessionId}` 被用作 requester。既有 85 例全绿 |
 
 ## v0.7.6（2026-10-31，归档态可见与可操作；删除后清理残留归档 id）
 
