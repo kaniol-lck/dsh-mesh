@@ -89,3 +89,50 @@ hub 不走 npm，按下面的通用步骤发布；部署目标（本机、容器
 - npm 命名边界：确认只在 npm 发布 `dsh-mesh-waker`；`hub/package.json` 保持 `private: true`；
   不要把 hub 当成 `dsh-mesh` 发布（npm 上同名包属第三方）；
 - 远端的升级等到 `latest` 提升之后再统一做。
+
+## 发布说明模板
+
+`gh release create <tag> --notes-file notes.md` 可直接复用下面五段。**没有破坏性变更时也要写清「无需迁移」，不要留空**——空着会让读者无法区分"没检查"和"确认不需要"。
+
+```markdown
+## 变更
+- 一句话一条，写用户能感知的变化（不写内部重构）
+
+## 影响（谁会受影响：升级方 / 客户端 / 运维）
+- 升级方：
+- 客户端：
+- 运维：
+
+## 迁移（要改的配置、要跑的命令、要不要重启）
+- 无 / 具体步骤
+
+## 兼容性（版本要求、破坏性变更、回退方式）
+- 最低版本要求、破坏性变更、回退到哪个 tag
+
+## 升级建议（推荐路径与验证命令）
+- 推荐顺序与验证命令
+```
+
+### 真实例子：v0.7.20（2026-10-31，smoke 覆盖收口 + 部署变量补齐；无行为变更）
+
+```markdown
+## 变更
+- smoke 覆盖 107 → 119：控制台登录/CSRF/成功写入、allowed_cidrs 拒绝、interrupt/delivery 落库、board log 列表与不可见 key 过滤、blob /meta、chunk offset 409、插件版本上报与 outdated 标记
+- node:test 4 → 6：会话上限与空闲回收、只读控制台角色 403
+- .env.example / docker-compose.yml 补齐全部 38 个 MESH_* 变量（此前分别缺 27 / 22），逐项注明用途、默认值、是否必需
+
+## 影响（谁会受影响：升级方 / 客户端 / 运维）
+- 升级方：无行为变更；新增配置项均为可选，默认值不变
+- 客户端：无
+- 运维：compose 改用 ${VAR:-default} 透传，升级后 `docker compose config` 会多出这些默认项
+
+## 迁移（要改的配置、要跑的命令、要不要重启）
+- 无需迁移。若自定义过 compose，可对照新模板补齐变量说明；重启方式不变（`docker compose up -d`）
+
+## 兼容性（版本要求、破坏性变更、回退方式）
+- 无破坏性变更；回退到上一个镜像 tag 即可
+- 验证：smoke 无 MESH_WAKE_SECRET 111/111、设置后 119/119；`node --test test/*.test.mjs` 6/6
+
+## 升级建议（推荐路径与验证命令）
+- 拉新镜像 → `docker compose up -d` → 核对 `/health` 版本 → 跑一次 smoke
+```
