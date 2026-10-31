@@ -703,6 +703,8 @@ function normalizeBase(config) {
     // Tell the receiving session which task/batch it is running (one header line). Off
     // restores byte-identical delivery.
     injectHeader: c.injectHeader !== false,
+    // Display name of the inbox entry / page (sidebar tooltip, page title, settings jump).
+    entryLabel: c.entryLabel ? String(c.entryLabel).slice(0, 40) : 'Mesh 信箱',
     permissionPresetByTrust: {
       strict: 'read-only',
       normal: 'workspace-write',
@@ -2596,6 +2598,8 @@ export function apply(ctx, config) {
     branchReuseHours: c.branchReuseHours,
     catchUpOnStart: c.catchUpOnStart,
     catchUpDelayMs: c.catchUpDelayMs,
+    // The client reads this to label the inbox entry/title (config.entryLabel).
+    entryLabel: c.entryLabel,
   })
 
   /** The settings panel talks to this process over loopback; anything else may only wake. */

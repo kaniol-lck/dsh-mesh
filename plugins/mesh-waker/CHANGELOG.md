@@ -9,6 +9,17 @@
 
 ---
 
+## v0.7.12（2026-10-31，任务面板移到信箱页；入口名可配；修本机会话行布局）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | owner 反馈「这个 UI 不行，期望与 Mesh 信箱共用入口」：任务列表挤在设置页，且截图里「本机会话」行与归档按钮重叠 |
+| 页面结构 | `MeshInboxPage` 顶部新增「信箱 / 派活任务」标签（沿用页面内的按钮式 segment，不新造视觉语言）；「派活任务」渲染新组件 `TaskRegistryPanel()`（统计 + 状态/会话过滤 + 表格 + 点行展开正文/回执/打开会话）；设置页删掉任务表格与详情，只留一行「去任务面板」说明 |
+| 入口名 | 新配置 `entryLabel`（默认 `Mesh 信箱`，≤40 字）：页面标题、侧栏 SVG `<title>` tooltip、右栏标签标题、设置页跳转文案共用；README 配置表已收录 |
+| 布局 | 「本机会话」每行改为 `display:flex; align-items:center; gap:8px; height:28px; min-width:0`，标题 `flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap`，归档按钮 `flex-shrink:0; width:56px; height:24px`，行级 `title` 放完整标题 |
+| 宿主探测 | 客户端 apply 一次性 `console.info('[mesh-waker] uiWorkspace keys: …')`；静态核对 asar：`startSession, openSession, openWorkspace, listDirectory, createDirectory, pickDirectory, connectWorkspace, unarchiveSession, pinSession, unpinSession, archiveSession, forkSession`——**没有**「打开自定义主页面」的 API，所以设置页跳转按钮只给文案提示，不假装能导航 |
+| 测试 | 服务端 109/109 全绿（本次只改 client 与配置键；无新增服务端用例，`node scripts/check-loadable.mjs` 校验 client 可加载） |
+
 ## v0.7.11（2026-10-31，层1 任务库：正文落盘 + 可查询索引 + 面板）
 
 | 项 | 内容 |

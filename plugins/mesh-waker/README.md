@@ -170,6 +170,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `injectHeader` | `true` | 注入正文前加一行 `[TASK …]` 表头；设 `false` 退回逐字投递 |
 | `tasksRetentionDays` | `30` | 任务库保留天数（启动时裁掉更旧的记录） |
 | `tasksMaxRows` | `5000` | 任务库最多保留条数（超量裁最旧） |
+| `entryLabel` | `Mesh 信箱` | 信箱入口显示名（侧栏 tooltip、页面标题、设置页跳转文案共用；≤40 字） |
 
 ### 信任与权限
 
@@ -258,7 +259,7 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 **状态流转**：派活写 `pending`；结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`。`refs[]` 由派活方经 `meta.refs` 传入（只存字符串，waker 不解析 `.worklog`）。
 
-**面板**：设置页「派活任务」区块，列为 `ID / 批次 / 目标会话 / 状态 / 耗时 / 创建时间 / 摘要`，支持状态与目标会话过滤；点行展开正文与回执摘要，提供「打开会话」（宿主 `uiWorkspace.openSession`，不可用时复制会话 id）。顶部统计 `pending N · 今日完成 M · 失败 K`（基于当前筛选结果）。
+**面板**：任务面板在「Mesh 信箱」页面顶部标签「派活任务」里（与「信箱」并列）；设置页只保留一行跳转说明。列表列为 `ID / 批次 / 目标会话 / 状态 / 耗时 / 创建时间`，支持状态与目标会话过滤；点行展开正文与回执摘要，提供「打开会话」（宿主 `uiWorkspace.openSession`，不可用时复制会话 id）。顶部统计 `pending N · 今日完成 M · stalled K`（基于当前筛选结果）。入口名可用 `entryLabel` 配置（默认 `Mesh 信箱`）。
 
 ## 批次与进度判定（0.5.2）
 

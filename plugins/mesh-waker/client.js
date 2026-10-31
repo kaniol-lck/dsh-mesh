@@ -862,8 +862,196 @@ try {
       )
     }
 
+    // Configurable entry name: the sidebar tooltip, the main page title and the settings
+    // jump line all read it from /mesh/status (config.entryLabel).
+    let meshEntryLabel = 'Mesh 信箱'
+
+    function useEntryLabel() {
+      const [label, setLabel] = React.useState(meshEntryLabel)
+      React.useEffect(() => {
+        let alive = true
+        json(BASE + '/mesh/status')
+          .then((snapshot) => {
+            const next = snapshot?.config?.entryLabel || 'Mesh 信箱'
+            meshEntryLabel = next
+            if (alive) setLabel(next)
+          })
+          .catch(() => {})
+        return () => {
+          alive = false
+        }
+      }, [])
+      return label
+    }
+
+    /** Task registry panel: lives on the inbox page next to the mailbox, not in settings. */
+    function TaskRegistryPanel() {
+      const [tasks, setTasks] = React.useState(null)
+      const [filter, setFilter] = React.useState({ status: '', session: '' })
+      const [detail, setDetail] = React.useState(null)
+      const [note, setNote] = React.useState(null)
+
+      const load = React.useCallback(async (next = { status: '', session: '' }) => {
+        const params = new URLSearchParams({ limit: '50' })
+        if (next.status) params.set('status', next.status)
+        if (next.session) params.set('session', next.session.trim())
+        try {
+          setTasks(await json(BASE + '/mesh/tasks?' + params.toString()))
+        } catch (error) {
+          setNote('读取任务库失败：' + error.message)
+        }
+      }, [])
+
+      React.useEffect(() => {
+        void load()
+      }, [load])
+
+      const openDetail = async (taskId) => {
+        if (detail?.task?.taskId === taskId) {
+          setDetail(null)
+          return
+        }
+        try {
+          setDetail(await json(BASE + '/mesh/tasks/' + encodeURIComponent(taskId)))
+        } catch (error) {
+          setNote('读取任务失败：' + error.message)
+        }
+      }
+
+      const openTaskSession = (sessionId) => {
+        if (!sessionId) return
+        if (hostCtx?.uiWorkspace?.openSession) {
+          try {
+            hostCtx.uiWorkspace.openSession(sessionId)
+            return
+          } catch {
+            /* fall through to the clipboard note */
+          }
+        }
+        try {
+          void navigator.clipboard?.writeText(sessionId)
+          setNote('宿主未暴露页面导航，已复制会话 id：' + sessionId)
+        } catch {
+          setNote('会话 id：' + sessionId)
+        }
+      }
+
+      const rows = tasks?.tasks ?? []
+      const pending = rows.filter((task) => task.status === 'pending').length
+      const doneToday = rows.filter(
+        (task) => task.status === 'settled' && task.settledAt && new Date(task.settledAt).toDateString() === new Date().toDateString(),
+      ).length
+      const stalled = rows.filter((task) => task.status === 'stalled').length
+
+      return h(
+        'div',
+        { style: { display: 'grid', gap: 8, alignContent: 'start', padding: '10px 12px', minWidth: 0, overflowY: 'auto' } },
+        note ? h('div', { style: { fontSize: 12, opacity: 0.75 } }, note) : null,
+        h(
+          'div',
+          { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: 12 } },
+          h('span', { style: { opacity: 0.8 } }, `pending ${pending} · 今日完成 ${doneToday} · stalled ${stalled}`),
+          h(
+            'select',
+            {
+              style: selectStyle,
+              value: filter.status,
+              onChange: (event) => {
+                const next = { ...filter, status: event.target.value }
+                setFilter(next)
+                void load(next)
+              },
+            },
+            [
+              ['', '全部状态'],
+              ['pending', 'pending'],
+              ['settled', 'settled'],
+              ['stalled', 'stalled'],
+              ['cancelled', 'cancelled'],
+            ].map(([value, label]) => h('option', { key: value, value }, label)),
+          ),
+          h('input', {
+            style: { ...controlStyle, width: 200, fontSize: 12, padding: '2px 6px' },
+            placeholder: '目标会话 id（回车过滤）',
+            value: filter.session,
+            onChange: (event) => setFilter({ ...filter, session: event.target.value }),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') void load(filter)
+            },
+          }),
+          h('button', { type: 'button', style: styles.button, onClick: () => void load(filter) }, '刷新'),
+        ),
+        h(
+          'div',
+          { style: { display: 'grid', gap: 1, fontSize: 12, minWidth: 0 } },
+          h(
+            'div',
+            {
+              style: {
+                display: 'grid',
+                gridTemplateColumns: '120px 100px minmax(120px, 1fr) 80px 80px 150px',
+                gap: 8,
+                padding: '4px 6px',
+                opacity: 0.65,
+                borderBottom: '1px solid rgba(127,127,127,0.25)',
+              },
+            },
+            h('span', null, 'ID'),
+            h('span', null, '批次'),
+            h('span', null, '目标会话'),
+            h('span', null, '状态'),
+            h('span', null, '耗时'),
+            h('span', null, '创建时间'),
+          ),
+          rows.map((task) =>
+            h(
+              'div',
+              {
+                key: task.taskId,
+                style: {
+                  display: 'grid',
+                  gridTemplateColumns: '120px 100px minmax(120px, 1fr) 80px 80px 150px',
+                  gap: 8,
+                  padding: '4px 6px',
+                  cursor: 'pointer',
+                  borderBottom: '1px solid rgba(127,127,127,0.12)',
+                  background: detail?.task?.taskId === task.taskId ? 'rgba(99,102,241,0.12)' : 'transparent',
+                },
+                onClick: () => void openDetail(task.taskId),
+                title: task.subject,
+              },
+              h('span', { style: { fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.taskId),
+              h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.batchId ?? '-'),
+              h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.targetTitle ?? task.targetSessionId ?? '-'),
+              h('span', null, task.status),
+              h('span', null, task.durationMs === null || task.durationMs === undefined ? '-' : task.durationMs + 'ms'),
+              h('span', { style: { opacity: 0.75 } }, task.createdAt ? new Date(task.createdAt).toLocaleString() : '-'),
+            ),
+          ),
+          rows.length ? null : h('div', { style: { opacity: 0.6, padding: 6 } }, '（暂无任务）'),
+        ),
+        detail?.task
+          ? h(
+              'div',
+              { style: { border: '1px solid rgba(127,127,127,0.25)', borderRadius: 8, padding: 10, display: 'grid', gap: 6 } },
+              h('div', { style: { fontSize: 13, fontWeight: 600 } }, `${detail.task.taskId} · ${detail.task.status} · ${detail.task.createdAt ? new Date(detail.task.createdAt).toLocaleString() : '-'}`),
+              h('div', { style: { fontSize: 12, opacity: 0.8 } }, '摘要：' + (detail.task.subject || '-')),
+              h('div', { style: { fontSize: 12, opacity: 0.8 } }, '回执：' + (detail.task.receiptSummary ?? detail.task.receiptRef ?? '（无）')),
+              h('pre', { style: { maxHeight: 220, overflow: 'auto', fontSize: 11, whiteSpace: 'pre-wrap', margin: 0 } }, detail.task.text ?? '（无正文）'),
+              h(
+                'div',
+                { style: { display: 'flex', gap: 8 } },
+                h('button', { type: 'button', style: styles.button, onClick: () => openTaskSession(detail.task.targetSessionId) }, '打开会话'),
+                h('button', { type: 'button', style: styles.button, onClick: () => setDetail(null) }, '收起'),
+              ),
+            )
+          : null,
+      )
+    }
+
     function MeshSection() {
       const [config, setConfig] = React.useState(null)
+      const entryLabel = useEntryLabel()
       const [status, setStatus] = React.useState(null)
       const [roster, setRoster] = React.useState({ self: null, peers: [] })
       const [note, setNote] = React.useState(null)
@@ -875,9 +1063,6 @@ try {
       const [peerFilter, setPeerFilter] = React.useState('')
       const [maintenanceNote, setMaintenanceNote] = React.useState(null)
       const [sessions, setSessions] = React.useState(null)
-      const [tasks, setTasks] = React.useState(null)
-      const [taskFilter, setTaskFilter] = React.useState({ status: '', session: '' })
-      const [taskDetail, setTaskDetail] = React.useState(null)
 
       const startDrag = (event) => {
         event.preventDefault()
@@ -940,7 +1125,6 @@ try {
         } catch {
           /* session list is optional (older host) */
         }
-        void loadTasks()
       }, [])
 
       const archiveSession = async (session) => {
@@ -956,47 +1140,6 @@ try {
       }
 
       // Task registry (0.7.11): list is filterable; detail carries the body + receipt summary.
-      const loadTasks = async (filter = taskFilter) => {
-        const params = new URLSearchParams({ limit: '50' })
-        if (filter?.status) params.set('status', filter.status)
-        if (filter?.session) params.set('session', filter.session.trim())
-        try {
-          setTasks(await json(BASE + '/mesh/tasks?' + params.toString()))
-        } catch (error) {
-          setNote('读取任务库失败：' + error.message)
-        }
-      }
-
-      const openTask = async (taskId) => {
-        if (taskDetail?.task?.taskId === taskId) {
-          setTaskDetail(null)
-          return
-        }
-        try {
-          setTaskDetail(await json(BASE + '/mesh/tasks/' + encodeURIComponent(taskId)))
-        } catch (error) {
-          setNote('读取任务失败：' + error.message)
-        }
-      }
-
-      const openTaskSession = (sessionId) => {
-        if (!sessionId) return
-        if (hostCtx?.uiWorkspace?.openSession) {
-          try {
-            hostCtx.uiWorkspace.openSession(sessionId)
-            return
-          } catch {
-            /* fall through to the clipboard note */
-          }
-        }
-        try {
-          void navigator.clipboard?.writeText(sessionId)
-          setNote('当前宿主导航不可用，已复制会话 id：' + sessionId)
-        } catch {
-          setNote('会话 id：' + sessionId)
-        }
-      }
-
       const loadHistory = async () => {
         try {
           const data = await json(BASE + '/mesh/history/conversations')
@@ -1154,13 +1297,22 @@ try {
               const row = formatSessionRow(session)
               return h(
                 'div',
-                { key: row.id, style: { display: 'flex', gap: 8, alignItems: 'center', opacity: row.opacity } },
-                h('span', { style: { flex: 1, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, row.title),
+                {
+                  key: row.id,
+                  title: row.title,
+                  style: { display: 'flex', alignItems: 'center', gap: 8, height: 28, minWidth: 0, opacity: row.opacity },
+                },
+                h(
+                  'span',
+                  { style: { flex: 1, minWidth: 0, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                  row.title,
+                ),
                 row.label
                   ? h(
                       'span',
                       {
                         style: {
+                          flexShrink: 0,
                           fontSize: 11,
                           padding: '1px 6px',
                           borderRadius: 4,
@@ -1173,7 +1325,15 @@ try {
                   : null,
                 row.disabled
                   ? null
-                  : h('button', { type: 'button', style: styles.button, onClick: () => archiveSession(session) }, '归档'),
+                  : h(
+                      'button',
+                      {
+                        type: 'button',
+                        style: { ...styles.button, flexShrink: 0, width: 56, height: 24, padding: 0, fontSize: 11 },
+                        onClick: () => archiveSession(session),
+                      },
+                      '归档',
+                    ),
               )
             }),
             (sessions ?? []).length ? null : h('span', { style: { fontSize: 12, opacity: 0.6 } }, '（无会话）'),
@@ -1216,92 +1376,18 @@ try {
         ),
         h(
           Row,
-          {
-            title: '派活任务',
-            description: '任务库（0.7.11）：ID / 批次 / 目标会话 / 状态 / 耗时 / 创建时间 / 摘要；点行看正文、回执摘要与目标会话。',
-          },
+          { title: '派活任务', description: `任务面板已移到「${entryLabel}」页面（顶部标签「派活任务」），设置页不再放表格。` },
           h(
-            'div',
-            { style: { display: 'grid', gap: 6, minWidth: 340 } },
-            h(
-              'div',
-              { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: 12 } },
-              h(
-                'span',
-                { style: { opacity: 0.8 } },
-                `pending ${(tasks?.tasks ?? []).filter((task) => task.status === 'pending').length} · 今日完成 ${(tasks?.tasks ?? []).filter((task) => task.status === 'settled' && task.settledAt && new Date(task.settledAt).toDateString() === new Date().toDateString()).length} · 失败 ${(tasks?.tasks ?? []).filter((task) => task.status === 'stalled').length}`,
-              ),
-              h(
-                'select',
-                {
-                  style: selectStyle,
-                  value: taskFilter.status,
-                  onChange: (event) => {
-                    const next = { ...taskFilter, status: event.target.value }
-                    setTaskFilter(next)
-                    void loadTasks(next)
-                  },
-                },
-                [
-                  ['', '全部状态'],
-                  ['pending', 'pending'],
-                  ['settled', 'settled'],
-                  ['stalled', 'stalled'],
-                  ['cancelled', 'cancelled'],
-                ].map(([value, label]) => h('option', { key: value, value }, label)),
-              ),
-              h('input', {
-                style: { ...selectStyle, minWidth: 150 },
-                placeholder: '目标会话 id（回车过滤）',
-                value: taskFilter.session,
-                onChange: (event) => setTaskFilter({ ...taskFilter, session: event.target.value }),
-                onKeyDown: (event) => {
-                  if (event.key === 'Enter') void loadTasks()
-                },
-              }),
-            ),
-            h(
-              'div',
-              { style: { display: 'grid', gap: 2, maxHeight: 200, overflowY: 'auto', fontSize: 12 } },
-              (tasks?.tasks ?? []).map((task) =>
-                h(
-                  'div',
-                  {
-                    key: task.taskId,
-                    style: {
-                      display: 'grid',
-                      gridTemplateColumns: '110px 90px 1fr 70px 80px',
-                      gap: 6,
-                      cursor: 'pointer',
-                      padding: '2px 0',
-                      opacity: taskDetail?.task?.taskId === task.taskId ? 1 : 0.85,
-                    },
-                    onClick: () => void openTask(task.taskId),
-                  },
-                  h('span', { style: { fontFamily: 'monospace' } }, task.taskId),
-                  h('span', null, task.batchId ?? '-'),
-                  h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, task.targetTitle ?? task.targetSessionId ?? '-'),
-                  h('span', null, task.status),
-                  h('span', null, task.durationMs === null || task.durationMs === undefined ? '-' : task.durationMs + 'ms'),
+            'button',
+            {
+              type: 'button',
+              style: styles.button,
+              onClick: () =>
+                setNote(
+                  '请从左侧边栏打开「' + entryLabel + '」→ 顶部「派活任务」；宿主未暴露主页面导航 API（uiWorkspace 只有 startSession/openSession/openWorkspace 等）。',
                 ),
-              ),
-              (tasks?.tasks ?? []).length ? null : h('span', { style: { opacity: 0.6 } }, '（暂无任务）'),
-            ),
-            taskDetail?.task
-              ? h(
-                  'div',
-                  { style: { borderTop: '1px solid rgba(120,120,120,0.25)', paddingTop: 6, display: 'grid', gap: 4 } },
-                  h('div', { style: { fontSize: 12, fontWeight: 600 } }, `${taskDetail.task.taskId} · ${taskDetail.task.status} · ${taskDetail.task.createdAt ? new Date(taskDetail.task.createdAt).toLocaleString() : '-'}`),
-                  h('div', { style: { fontSize: 12, opacity: 0.8 } }, '回执：' + (taskDetail.task.receiptSummary ?? taskDetail.task.receiptRef ?? '（无）')),
-                  h('pre', { style: { maxHeight: 180, overflow: 'auto', fontSize: 11, whiteSpace: 'pre-wrap', margin: 0 } }, taskDetail.task.text ?? '（无正文）'),
-                  h(
-                    'div',
-                    { style: { display: 'flex', gap: 8 } },
-                    h('button', { type: 'button', style: styles.button, onClick: () => openTaskSession(taskDetail.task.targetSessionId) }, '打开会话'),
-                    h('button', { type: 'button', style: styles.button, onClick: () => setTaskDetail(null) }, '收起'),
-                  ),
-                )
-              : null,
+            },
+            '去任务面板',
           ),
         ),
         h(
@@ -1736,6 +1822,7 @@ try {
           strokeLinejoin: 'round',
           'aria-hidden': 'true',
         },
+        h('title', null, meshEntryLabel),
         h('rect', { x: 2, y: 3.5, width: 12, height: 9, rx: 1.5 }),
         h('path', { d: 'M2.5 4.5 8 8.5l5.5-4' }),
       )
@@ -1743,6 +1830,8 @@ try {
 
     /** The main-slot inbox page: same data as the settings block, full width. */
     function MeshInboxPage() {
+      const entryLabel = useEntryLabel()
+      const [view, setView] = React.useState('inbox')
       const [list, setList] = React.useState([])
       const [active, setActive] = React.useState(null)
       const [thread, setThread] = React.useState([])
@@ -1908,7 +1997,42 @@ try {
               minWidth: 0,
             },
           },
-          h('div', { style: { fontSize: 15, fontWeight: 600 } }, 'Mesh 信箱'),
+          h('div', { style: { fontSize: 15, fontWeight: 600 } }, entryLabel),
+          h(
+            'div',
+            {
+              style: {
+                display: 'flex',
+                gap: 0,
+                border: '1px solid var(--dsw-alias-border-l1)',
+                borderRadius: 6,
+                overflow: 'hidden',
+              },
+            },
+            [
+              ['inbox', '信箱'],
+              ['tasks', '派活任务'],
+            ].map(([key, label]) =>
+              h(
+                'button',
+                {
+                  key,
+                  type: 'button',
+                  onClick: () => setView(key),
+                  style: {
+                    border: 'none',
+                    background: view === key ? 'rgba(99,102,241,0.16)' : 'transparent',
+                    color: 'inherit',
+                    fontSize: 12,
+                    padding: '3px 10px',
+                    cursor: 'pointer',
+                    fontWeight: view === key ? 600 : 400,
+                  },
+                },
+                label,
+              ),
+            ),
+          ),
           unread ? h('span', { style: { fontSize: 11, padding: '1px 7px', borderRadius: 9, background: 'rgba(99,102,241,0.85)', color: '#fff' } }, unread + ' 未读') : null,
           h('div', { style: { flex: 1 } }),
           h('button', { type: 'button', style: buttonStyle, onClick: currentSession }, '当前会话'),
@@ -1916,9 +2040,24 @@ try {
           h('button', { type: 'button', style: buttonStyle, onClick: () => void loadList() }, '刷新'),
         ),
         note ? h('div', { style: { fontSize: 12, opacity: 0.7, paddingBottom: 8 } }, note) : null,
-        h(
-          'div',
-          { style: { display: 'flex', flex: 1, minHeight: 0, border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8, overflow: 'hidden' } },
+        view === 'tasks'
+          ? h(
+              'div',
+              {
+                style: {
+                  flex: 1,
+                  minHeight: 0,
+                  border: '1px solid var(--dsw-alias-border-l1)',
+                  borderRadius: 8,
+                  overflow: 'hidden',
+                  display: 'flex',
+                },
+              },
+              h(TaskRegistryPanel),
+            )
+          : h(
+              'div',
+              { style: { display: 'flex', flex: 1, minHeight: 0, border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8, overflow: 'hidden' } },
           h(
             'div',
             { style: { flex: '0 0 ' + leftWidth + 'px', display: 'flex', flexDirection: 'column', minHeight: 0, background: 'rgba(127,127,127,0.05)' } },
@@ -2522,6 +2661,13 @@ try {
       inject: ['slots'],
       apply(ctx) {
         hostCtx = ctx
+        // One-shot probe (0.7.12): what can the host's uiWorkspace actually do? Navigation
+        // designed against a guessed API is how "打开会话" silently does nothing.
+        try {
+          console.info('[mesh-waker] uiWorkspace keys: ' + Object.keys(hostCtx?.uiWorkspace ?? {}).join(','))
+        } catch {
+          /* probe is diagnostic only */
+        }
         const disposers = []
         disposers.push(
           ctx.slots.inject('settings.section', () =>
@@ -2557,12 +2703,12 @@ try {
                   multiple: false,
                   keepMounted: true,
                   priority: 'extension',
-                  title: () => 'Mesh 信箱',
+                  title: () => meshEntryLabel,
                   guide: [
                     {
                       id: 'open',
                       order: 30,
-                      title: () => 'Mesh 信箱',
+                      title: () => meshEntryLabel,
                       description: () => '查看与其它 agent 的往来信件（跟随当前会话筛选）',
                       icon: MeshInboxGlyph,
                     },
