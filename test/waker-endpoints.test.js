@@ -1555,8 +1555,12 @@ async function main() {
         },
       })
       await waitFor(() => fake.requests.some((entry) => entry.path === '/api/inbox'), 15000)
-      await sleep(1500)
-      const logText = fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').slice(logStart) : ''
+      const readLog = () => (fs.existsSync(TEST_LOG) ? fs.readFileSync(TEST_LOG, 'utf8').slice(logStart) : '')
+      // Consumption happens on the first pull that sees the question group. Tool-registration
+      // retries (0.7.8) can delay start-up past a fixed sleep, so poll the log instead of
+      // sleeping 1500ms: the assertion is about the outcome, not about elapsed time.
+      await waitFor(() => /question traffic consumed/.test(readLog()), 8000)
+      const logText = readLog()
       const ok =
         h.state.prompts.length === 0 &&
         h.state.created.length === 0 &&
