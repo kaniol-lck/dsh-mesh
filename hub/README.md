@@ -109,6 +109,17 @@ curl -X DELETE -H "Authorization: Bearer $ADMIN" '.../api/admin/agents?name=dsh-
 curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
 ```
 
+审计的现实语义（与 `server.mjs` 的 `audit()` 调用点一致）：
+
+| 事件 | 是否进 audit | action 名 |
+|---|---|---|
+| 认证成功 | ❌ 不记（成功请求量级太大，会撑爆 audit 表） | — |
+| 认证失败 | ✅ | `auth`（另有 `auth.expired` / `auth.ip_blocked`） |
+| 限流窗口内超 8 次失败 | ❌ 只回 429，不单独记 | — |
+| 管理动作（mint/rotate/revoke/purge/scopes/expiry） | ✅ | `admin.*` / `console.*` |
+| 配对、设备码与快捷注册 | ✅ | `enroll` / `enroll.request` / `enroll.token` |
+| blob 操作（put/init/commit/acl/delete/get） | ✅ | `blob.*` |
+
 ---
 
 ## 三、dsh 接入（4 行配置）
@@ -136,7 +147,7 @@ curl -H "Authorization: Bearer $ADMIN" '.../api/admin/audit?limit=100'
 - 跨网络（工作机经 frp 访问）**必须先做传输加密**，见
   [docs/security.md](../docs/security.md)。
 
-### 接上之后模型会多出 10 个工具
+### 接上之后模型会多出 14 个工具
 
 | 工具 | 作用 |
 |---|---|
@@ -219,7 +230,7 @@ curl 'http://<HUB-HOST>:8790/api/board?key=env/host' -H "Authorization: Bearer $
 | DELETE | `/api/admin/agents?name=` | admin | 吊销 |
 | GET | `/api/admin/audit` | admin | 审计记录 |
 
-MCP 面等价于其中 10 个工具，位于 `POST /mcp`。
+MCP 面等价于其中 14 个工具，位于 `POST /mcp`。
 
 **消息保留**：超过 `MESH_MESSAGE_TTL_MS` 的**已读**消息会被清理；**未读消息不会因超期丢失**，只会在收件箱里带 `stale: true`（响应顶层 `stale_count` 提示本页积压）。`MESH_MAX_UNREAD_MESSAGES`（默认 0=关闭）超限只告警、不删除。
 
@@ -279,30 +290,20 @@ curl -s -X POST "$HUB/api/blob/<id>/commit"
 
 ## 六、环境变量
 
+完整清单（38 个，含用途、默认值与是否必需）见 [.env.example](.env.example)；`docker-compose.yml` 会把它们全部透传给容器。下表只列高频项：
+
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MESH_PORT` | `8790` | 监听端口 |
 | `MESH_HOST` | `0.0.0.0` | 监听地址 |
-| `MESH_DATA_DIR` | `./data` | SQLite 与 admin.token 位置 |
-| `MESH_AUTH_MODE` | `token` | `token`（默认）或 `open`（无鉴权，仅限完全可信的局域网） |
-| `MESH_ADMIN_TOKEN` | 自动生成 | 管理员令牌 |
+| `MESH_DATA_DIR` | `./data` | SQLite、admin.token 与 blobs 位置 |
+| `MESH_ADMIN_TOKEN` | 自动生成 | 管理员令牌（唯一必填项） |
+| `MESH_VIEW_TOKEN` | 空 | 控制台只读令牌；不设则回退 admin |
+| `MESH_CONSOLE_ALLOW` | 仅 loopback | 控制台与 `/api/admin` 的允许来源（IP/CIDR） |
 | `MESH_TLS_CERT` / `MESH_TLS_KEY` | 空 | 同时设置则以 HTTPS 提供服务 |
-| `MESH_TRUST_PROXY` | `0` | 置 `1` 时才信任 `X-Forwarded-For`（前面有自己控制的反代时） |
-| `MESH_ONLINE_TTL_MS` | `120000` | 多久没请求算离线 |
-| `MESH_MESSAGE_TTL_MS` | `604800000` | 已读消息保留（7 天）；未读只标 stale，不删除 |
-| `MESH_MAX_UNREAD_MESSAGES` | `0` | 未读积压告警阈值（0=关闭）；超限只 WARN，不删除 |
-| `MESH_PURGE_INTERVAL_MS` | `3600000` | 清理/标记未读的间隔（测试可调小，最小 1000） |
-| `MESH_MAX_BODY_BYTES` | `1048576` | 非 blob 端点的单个请求体上限（超出 → 413） |
-| `MESH_MAX_BLOB_BYTES` | `67108864` | 单个 blob 文件上限（64 MiB，超出 → 413） |
-| `MESH_MAX_BLOB_CHUNK_BYTES` | `8388608` | 单个 chunk 上限（8 MiB，超出 → 413） |
-| `MESH_MAX_BLOB_TOTAL_BYTES` | `2147483648` | 全部 blob 的总量上限（2 GiB，超出 → 507） |
-| `MESH_MAX_MESSAGE_BYTES` | `65536` | 单条消息正文上限 |
-| `MESH_MAX_BOARD_BYTES` | `65536` | 单个黑板值上限 |
-| `MESH_SESSION_IDLE_MS` | `1800000` | MCP 会话空闲多久回收（见下方"为什么需要"） |
-| `MESH_MAX_SESSIONS` | `128` | 并发会话上限，超出 → 503 |
-| `MESH_LOG_TTL_MS` | `2592000000` | `board_log` / `audit` 保留窗口（30 天） |
-| `MESH_LOG_MAX_ROWS` | `20000` | 上述两张表的行数上限 |
-| `MESH_PRINT_ADMIN_TOKEN` | `0` | 首次生成的 admin token 是否打印到 stdout |
+| `MESH_WAKE_SECRET` | 空 | 设置后启用逐 agent 的唤醒 ping |
+| `MESH_MAX_BODY_BYTES` | `1048576` | 非 blob 端点的单个请求体上限 |
+| `MESH_MAX_SESSIONS` | `128` | 并发 MCP 会话上限 |
 
 ### 为什么是这些上限
 
@@ -346,7 +347,7 @@ agent 就能把内存或主机磁盘耗尽：
 ## 八、已知限制
 
 - 在线判定靠"最近一次请求"，不是长连接心跳。空闲机器会在 TTL 后显示离线；需要精确在线时让 agent 定期调一次 `mesh_peers`。
-- 消息是点对点，没有广播组（用黑板代替）。
+- 广播用 `to:"*"`（发给除自己外的所有已注册 agent）；大范围共享状态仍建议用黑板。
 - 没有端到端加密（TLS 保护传输层）；库内明文存储，依赖主机磁盘权限。
 - 单进程 SQLite，写并发在几十次/秒级，家庭规模足够。
 - 自签证书需要客户端 `NODE_EXTRA_CA_CERTS` 信任，详见传输文档。

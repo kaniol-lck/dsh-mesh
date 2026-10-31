@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.20'
+const HUB_VERSION = '0.7.21'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
@@ -730,6 +730,17 @@ function parseLimit(raw, fallback, max) {
   const parsed = Number(raw)
   if (!Number.isInteger(parsed) || parsed < 1) throw new BadRequest(`limit must be an integer between 1 and ${max}`)
   return Math.min(parsed, max)
+}
+
+/** Truncate to at most maxBytes of UTF-8 without splitting a codepoint; adds … when cut. */
+function truncateUtf8(text, maxBytes) {
+  const buf = Buffer.from(String(text))
+  if (buf.length <= maxBytes) return { value: String(text), truncated: false }
+  const suffix = '…'
+  let end = maxBytes - Buffer.byteLength(suffix)
+  // back off continuation bytes, then drop the lead byte of the partial character
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1
+  return { value: buf.subarray(0, end).toString('utf8') + suffix, truncated: true }
 }
 
 const DEFAULT_CLAIM_TTL_MS = 300_000
@@ -2183,9 +2194,12 @@ async function handleRest(req, res, url) {
       ).all(conv, id.name, id.name, before, before, limit)
       const messages = rows.reverse().map((row) => {
         const out = { ...row, conversation: conv }
-        if (!full && out.body && out.body.length > 4096) {
-          out.body = out.body.slice(0, 4096)
-          out.truncated = true
+        if (!full && out.body) {
+          const truncated = truncateUtf8(out.body, 4096)
+          if (truncated.truncated) {
+            out.body = truncated.value
+            out.truncated = true
+          }
         }
         return out
       })

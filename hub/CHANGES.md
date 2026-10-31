@@ -4,11 +4,20 @@ v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审�
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 111/111，wake push 用例打印 `SKIP`；设置后 119/119）、`node --test test/*.test.mjs`（6/6；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 113/113，wake push 用例打印 `SKIP`；设置后 121/121）、`node --test test/*.test.mjs`（6/6；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
 > **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；补丁进入 0.7.12（见下条）。
 
 ---
+
+## v0.7.21（2026-10-31，截断按字节 + 文档对齐审计/工具/变量）
+
+| 项 | 内容 |
+|---|---|
+| 会话截断 | `/api/conversation` 的 4 KiB 截断改为按 UTF-8 **字节**（≤4096），不切多字节字符，末尾补 `…`；smoke 中文/emoji 两例断言字节数与无 `U+FFFD` |
+| 审计文档 | README 增加「审计现实语义」表：成功认证不记、失败记 `auth`、超限只 429、管理与配对/blob 记对应 action，与 `audit()` 调用点一致 |
+| README | 中文删「没有广播组」（现有 `to:"*"`），环境变量表指向 `.env.example`（保留高频项），工具数 10→14；英文工具清单改为实际 14 个（删除 `mesh_read`/`mesh_presence`/`mesh_cache_clear`） |
+| 验证 | smoke 119→121（新增 2 例截断）；`node --test test/*.test.mjs` 6/6；两 README 相对链接 dead=0 |
 
 ## v0.7.20（2026-10-31，smoke 覆盖收口 + 部署变量补齐；无行为变更）
 

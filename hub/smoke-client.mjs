@@ -497,6 +497,27 @@ try {
     const target = full.messages.find((m) => m.body.length === 5000)
     check('full=1 returns the untruncated body', Boolean(target), `${target?.body.length ?? 0} chars`)
 
+    // Truncation is byte-based: CJK is 3 bytes/char, emoji 4, so a 4096-character slice
+    // would overshoot and a naive byte slice could split a codepoint.
+    const utf8Conv = 'conv/trunc-utf8'
+    await call(alice.client, 'mesh_send', { to: 'bob', body: '中'.repeat(3000), conversation: utf8Conv })
+    await call(alice.client, 'mesh_send', { to: 'bob', body: '😀'.repeat(2000), conversation: utf8Conv })
+    const utf8Thread = await (await fetch(`${BASE}/api/conversation?conversation=${encodeURIComponent(utf8Conv)}`, {
+      headers: { authorization: `Bearer ${aliceToken}` },
+    })).json()
+    const cjk = utf8Thread.messages.find((m) => m.body.startsWith('中'))
+    const emoji = utf8Thread.messages.find((m) => m.body.startsWith('😀'))
+    check(
+      'truncation is byte-accurate for CJK',
+      Boolean(cjk) && Buffer.byteLength(cjk.body) <= 4096 && !cjk.body.includes('\uFFFD'),
+      `${Buffer.byteLength(cjk?.body ?? '')} bytes`,
+    )
+    check(
+      'truncation keeps emoji codepoints whole',
+      Boolean(emoji) && Buffer.byteLength(emoji.body) <= 4096 && !emoji.body.includes('\uFFFD'),
+      `${Buffer.byteLength(emoji?.body ?? '')} bytes`,
+    )
+
     const pin = await fetch(`${BASE}/api/message/${target.id}/pin`, {
       method: 'POST',
       headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/json' },

@@ -86,8 +86,9 @@ Rows expire after `MESH_MCP_SESSION_TTL_MS` (default 7 days). Set
 `MESH_MCP_LENIENT_SESSION=1` to also rebuild sessions for ids the hub never issued
 (useful for clients that do not re-initialize on 404).
 
-Tools exposed: `mesh_register`, `mesh_peers`, `mesh_send`, `mesh_inbox`, `mesh_read`,
-`mesh_board_set`, `mesh_board_get`, `mesh_board_list`, `mesh_presence`, `mesh_cache_clear`.
+Tools exposed: `mesh_register`, `mesh_peers`, `mesh_whoami`, `mesh_send`, `mesh_inbox`,
+`mesh_ack`, `mesh_board_set`, `mesh_board_get`, `mesh_board_list`, `mesh_status`,
+`mesh_blob_upload`, `mesh_blob_download`, `mesh_blob_list`, `mesh_blob_delete`.
 
 ## 4. Optional: wake push
 
