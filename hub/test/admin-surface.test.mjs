@@ -99,12 +99,12 @@ test('plain HTTP warns and console/admin default to loopback only', async (t) =>
   const hub = await startHub()
   t.after(() => hub.stop())
 
-  const blockedConsole = await get(hub.base, '/console/api/overview', { 'x-forwarded-for': '192.168.1.9' })
-  assert.equal(blockedConsole.status, 403, 'console from a LAN address must be blocked by default')
+  const blockedConsole = await get(hub.base, '/console/api/overview', { 'x-forwarded-for': '203.0.113.9' })
+  assert.equal(blockedConsole.status, 403, 'console from a non-loopback address must be blocked by default')
   const allowedConsole = await get(hub.base, '/console/api/overview', { 'x-forwarded-for': '127.0.0.1' })
   assert.equal(allowedConsole.status, 200, 'console from loopback must work')
 
-  const blockedAdmin = await get(hub.base, '/api/admin/agents', { 'x-forwarded-for': '192.168.1.9' })
+  const blockedAdmin = await get(hub.base, '/api/admin/agents', { 'x-forwarded-for': '203.0.113.9' })
   assert.equal(blockedAdmin.status, 403, '/api/admin must obey the same source allow-list')
   const allowedAdmin = await get(hub.base, '/api/admin/agents', { 'x-forwarded-for': '127.0.0.1' })
   assert.equal(allowedAdmin.status, 200, 'admin from loopback must work')
@@ -114,12 +114,12 @@ test('plain HTTP warns and console/admin default to loopback only', async (t) =>
 })
 
 test('explicit MESH_CONSOLE_ALLOW widens console and admin sources', async (t) => {
-  const hub = await startHub({ MESH_CONSOLE_ALLOW: '192.168.0.0/16' })
+  const hub = await startHub({ MESH_CONSOLE_ALLOW: '203.0.113.0/24' })
   t.after(() => hub.stop())
 
-  const consoleResponse = await get(hub.base, '/console/api/overview', { 'x-forwarded-for': '192.168.1.9' })
+  const consoleResponse = await get(hub.base, '/console/api/overview', { 'x-forwarded-for': '203.0.113.9' })
   assert.equal(consoleResponse.status, 200)
-  const adminResponse = await get(hub.base, '/api/admin/agents', { 'x-forwarded-for': '192.168.1.9' })
+  const adminResponse = await get(hub.base, '/api/admin/agents', { 'x-forwarded-for': '203.0.113.9' })
   assert.equal(adminResponse.status, 200)
 })
 

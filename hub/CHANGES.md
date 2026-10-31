@@ -4,7 +4,7 @@ v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审�
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（87/87）、`node --test test/`（3/3）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 79/79，wake push 用例打印 `SKIP`；设置后 87/87）、`node --test test/*.test.mjs`（3/3；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
 > **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；补丁进入 0.7.12（见下条）。
 
@@ -17,7 +17,7 @@ v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话
 | scopes 空集拒绝 | 控制台保存空数组/空串 → 400（原先存 `""` 又被读成全部，等于误给全权）；全权必须显式传 `["*"]`；历史空串行不改语义（仍按全权）但启动时 WARN 列出行数 |
 | 管理面来源收紧 | `MESH_CONSOLE_ALLOW` 未设置时默认仅 loopback（原先 loopback+RFC1918）；`/api/admin/*` 同样受该来源限制（非允许来源 403）；无 TLS 且 console 启用时启动 WARN「console/admin over plain HTTP」 |
 | 迁移 | 老部署若从内网访问 console 或 `/api/admin/*`，需显式设置 `MESH_CONSOLE_ALLOW=192.168.0.0/16`（或实际网段），否则远程管理面 403；数据库无需迁移 |
-| 验证 | `node smoke-client.mjs` 87/87（空数组/空串 400、`["*"]` 200 且全权、单 scope 仍受限）；`node --test test/` 3/3（明文 WARN、默认 loopback 403、显式允许 200、历史空串 WARN） |
+| 验证 | `node smoke-client.mjs`：未设 `MESH_WAKE_SECRET` 79/79（wake push SKIP），设置后 87/87（空数组/空串 400、`["*"]` 200 且全权、单 scope 仍受限）；`node --test test/*.test.mjs` 3/3（明文 WARN、默认 loopback 403、显式允许 200、历史空串 WARN；Node 24 下 `test/` 目录写法报 MODULE_NOT_FOUND） |
 
 ## v0.7.15（2026-10-29，pull 自举与收件箱 claim）
 
