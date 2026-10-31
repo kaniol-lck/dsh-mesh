@@ -4,11 +4,21 @@ v0.1.0 是一次外部评审的输入包。评审在 2026-10-21 做了静态审�
 发现"能跑、但不够常驻"的一组问题。v0.2.0 只改这些，**不扩大功能面**（工具数仍是 10 个）；
 v0.2.1 是接入三台机器后暴露的两个展示层缺陷；v0.4.0 加对话分组。
 
-复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 83/83，wake push 用例打印 `SKIP`；设置后 91/91）、`node --test test/*.test.mjs`（3/3；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
+复验方式：`node smoke-client.mjs`（未设 `MESH_WAKE_SECRET` 时 91/91，wake push 用例打印 `SKIP`；设置后 99/99）、`node --test test/*.test.mjs`（3/3；Node 24 下 `test/` 目录写法会报 MODULE_NOT_FOUND）、`NODE_EXTRA_CA_CERTS=... node scripts/tls-check.mjs`（6/6）。
 
 > **2026-10-29 补记**：0.7.9 的 per-agent scopes 当时只覆盖 MCP 工具，REST 面未判权；补丁进入 0.7.12（见下条）。
 
 ---
+
+## v0.7.18（2026-10-31，blob 可见性 / 回滚 / 分端限额）
+
+| 项 | 内容 |
+|---|---|
+| blob 列表过滤 | `GET /api/blobs` 只返回调用者可读的条目（admin / uploader / `visible_to` 命中）；被过滤的条目直接不出现，不泄露数量。越权下载与 `/meta` 由 403 改为 **404**（不确认存在性） |
+| size 回滚 | `commit` 大小不符时删除已写文件与 `blobs` 行（原先返回 400 但保留 `uploading` 行），与 sha 不符路径一致 |
+| 分端限额 | 新增 `MESH_MAX_BLOB_CHUNK_BYTES`（默认 8 MiB，单 chunk 超限 → 413）；`MESH_MAX_BLOB_BYTES` 仍为单文件 64 MiB；`MESH_MAX_BODY_BYTES`（1 MiB）只作用于非 blob 端点；`/health.blobs` 暴露 `max_file/max_chunk/max_total` 供客户端预检 |
+| 破坏性影响 | 非 admin 的 `/api/blobs` 结果变少（仅可见项）；越权直连从 403 变 404；单 chunk 超过 8 MiB 的客户端需要拆片 |
+| 验证 | smoke：未设 `MESH_WAKE_SECRET` 91/91、设置后 99/99（列表过滤、私有 meta/download 404、size 回滚、file/chunk 413、health 限额）；`node --test test/*.test.mjs` 3/3 |
 
 ## v0.7.17（2026-10-31，token 过期可设置 + 文档校准）
 

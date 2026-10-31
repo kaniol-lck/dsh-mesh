@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.17'
+const HUB_VERSION = '0.7.18'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
@@ -68,6 +68,7 @@ const MAX_RECIPIENT_BYTES = 64
 // sha256, and expire on their own so a forgotten transfer cannot fill the disk.
 const BLOB_DIR = join(DATA_DIR, 'blobs')
 const MAX_BLOB_BYTES = Number(process.env.MESH_MAX_BLOB_BYTES ?? 64 * 1024 * 1024) // 64 MiB per file
+const MAX_BLOB_CHUNK_BYTES = Number(process.env.MESH_MAX_BLOB_CHUNK_BYTES ?? 8 * 1024 * 1024) // 8 MiB per chunk
 const MAX_BLOB_TOTAL_BYTES = Number(process.env.MESH_MAX_BLOB_TOTAL_BYTES ?? 2 * 1024 * 1024 * 1024) // 2 GiB
 const BLOB_TTL_MS = Number(process.env.MESH_BLOB_TTL_MS ?? 24 * 3600_000) // 24 h
 // A conversation id groups messages that belong to one dialogue, so a receiving dsh can
@@ -2212,7 +2213,8 @@ async function handleRest(req, res, url) {
         return sendJson(res, 409, { error: 'offset mismatch', expected_offset: current, got: offset })
       }
       const declared = Number(row.expected_bytes ?? 0)
-      const chunk = await readBody(req, Math.max(1, declared - current))
+      const chunkLimit = Math.min(MAX_BLOB_CHUNK_BYTES, Math.max(1, declared - current))
+      const chunk = await readBody(req, chunkLimit)
       if (!chunk.length) throw new BadRequest('empty chunk')
       if (current + chunk.length > declared) {
         return sendJson(res, 413, { error: 'chunk exceeds declared size', declared, current })
@@ -2235,6 +2237,10 @@ async function handleRest(req, res, url) {
       if (!existsSync(file)) return sendJson(res, 404, { error: 'blob payload missing' })
       const size = statSync(file).size
       if (row.expected_bytes != null && size !== row.expected_bytes) {
+        // Roll back the whole upload: a half-written file must not linger as "uploading",
+        // which is what the docs promise and what the sha mismatch path already does.
+        try { unlinkSync(file) } catch { /* already gone */ }
+        db.prepare('DELETE FROM blobs WHERE id = ?').run(row.id)
         return sendJson(res, 400, { error: 'size mismatch', expected: row.expected_bytes, actual: size })
       }
       const sha = createHash('sha256').update(readFileSync(file)).digest('hex')
@@ -2255,11 +2261,15 @@ async function handleRest(req, res, url) {
 
     if (path === '/api/blobs' && req.method === 'GET') {
       const mine = q.get('mine') === '1'
+      const admin = isAdmin(req)
       const cols = 'id, name, bytes, sha256, uploader, created_at, expires_at, status, visible_to'
       const rows = mine
         ? db.prepare(`SELECT ${cols} FROM blobs WHERE uploader = ? ORDER BY created_at DESC LIMIT 100`).all(id.name)
-        : db.prepare(`SELECT ${cols} FROM blobs ORDER BY created_at DESC LIMIT 100`).all()
-      return sendJson(res, 200, { blobs: rows })
+        : db.prepare(`SELECT ${cols} FROM blobs ORDER BY created_at DESC LIMIT 1000`).all()
+      // Never leak metadata for blobs the caller cannot read; filtered-out rows are simply
+      // absent (no count, so the response does not confirm their existence).
+      const visible = admin ? rows : rows.filter((row) => blobReadable(row, id.name, req))
+      return sendJson(res, 200, { blobs: visible.slice(0, 100) })
     }
 
     const blobPath = path.match(/^\/api\/blob\/([0-9a-f-]{36})(\/meta)?$/)
@@ -2284,11 +2294,11 @@ async function handleRest(req, res, url) {
         return sendJson(res, 200, { deleted: row.id })
       }
       if (blobPath[2]) {
-        if (!blobReadable(row, id.name, req)) return sendJson(res, 403, { error: 'this blob is not visible to you' })
+        if (!blobReadable(row, id.name, req)) return sendJson(res, 404, { error: 'blob not found' })
         return sendJson(res, 200, row)
       }
       if (req.method !== 'GET') return sendJson(res, 405, { error: 'GET, PATCH or DELETE' })
-      if (!blobReadable(row, id.name, req)) return sendJson(res, 403, { error: 'this blob is not visible to you' })
+      if (!blobReadable(row, id.name, req)) return sendJson(res, 404, { error: 'blob not found' })
       if (row.status !== 'ready') return sendJson(res, 409, { error: 'blob is still uploading', status: row.status })
       const file = join(BLOB_DIR, row.id)
       if (!existsSync(file)) {
@@ -2745,7 +2755,7 @@ const httpServer = makeServer(async (req, res) => {
   if (url.pathname === '/health' && req.method === 'GET') {
     res.writeHead(200, { 'content-type': 'application/json' })
     const blobStats = db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes),0) AS bytes FROM blobs').get()
-    res.end(JSON.stringify({ ok: true, service: 'dsh-mesh', version: HUB_VERSION, sessions: sessions.size, persisted_sessions: db.prepare('SELECT COUNT(*) AS n FROM mcp_sessions').get().n, lenient_session: MCP_LENIENT_SESSION, session_cap: MAX_SESSIONS, wake: Boolean(WAKE_SECRET), relay: RELAY_ENABLED ? RELAY_TARGET : null, blobs: { count: blobStats.n, bytes: blobStats.bytes, max_file: MAX_BLOB_BYTES, max_total: MAX_BLOB_TOTAL_BYTES },
+    res.end(JSON.stringify({ ok: true, service: 'dsh-mesh', version: HUB_VERSION, sessions: sessions.size, persisted_sessions: db.prepare('SELECT COUNT(*) AS n FROM mcp_sessions').get().n, lenient_session: MCP_LENIENT_SESSION, session_cap: MAX_SESSIONS, wake: Boolean(WAKE_SECRET), relay: RELAY_ENABLED ? RELAY_TARGET : null, blobs: { count: blobStats.n, bytes: blobStats.bytes, max_file: MAX_BLOB_BYTES, max_chunk: MAX_BLOB_CHUNK_BYTES, max_total: MAX_BLOB_TOTAL_BYTES },
       pinned_messages: db.prepare('SELECT COUNT(*) AS n FROM messages WHERE pinned = 1').get().n, uptime_seconds: Math.round(process.uptime()) }))
     return
   }

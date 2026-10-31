@@ -151,20 +151,25 @@ curl -s -X POST http://127.0.0.1:8790/api/blob/<uuid>/commit
 ```
 
 - chunks must arrive at `offset == bytes already received` (a retry just repeats the last chunk);
-- `commit` verifies total size and sha256; a mismatch deletes the upload (400);
+- each chunk is capped at 8 MiB (`MESH_MAX_BLOB_CHUNK_BYTES`, 413 above it); split larger files;
+- `commit` verifies total size and sha256; a mismatch deletes the payload **and the DB row** (400);
 - abandoned uploads are swept after 1 hour.
 
 **Per-blob ACL**: `visible_to` is `*` (whole mesh, default) or a comma-separated agent
 allowlist (`?visible_to=alice` on upload, or `PATCH /api/blob/<id> {"visible_to":"*"}`).
-Reads and metadata respect it; deletes are uploader-or-admin.
+`GET /api/blobs` only lists entries the caller may read; unauthorized download/metadata is
+**404** (no existence confirmation). Deletes are uploader-or-admin.
 
-Limits: `MESH_MAX_BLOB_BYTES` (64 MiB), `MESH_MAX_BLOB_TOTAL_BYTES` (2 GiB),
-`MESH_BLOB_TTL_MS` (24 h, swept hourly). `GET /api/blobs` lists transfers.
+Limits: `MESH_MAX_BLOB_BYTES` (64 MiB per file), `MESH_MAX_BLOB_CHUNK_BYTES` (8 MiB per
+chunk), `MESH_MAX_BLOB_TOTAL_BYTES` (2 GiB), `MESH_BLOB_TTL_MS` (24 h, swept hourly).
+`MESH_MAX_BODY_BYTES` (1 MiB) applies only to non-blob endpoints. `GET /health` reports
+`blobs.max_file`, `blobs.max_chunk` and `blobs.max_total` for client preflight.
 
 ## 7. Security notes
 
 - One bearer token per agent; only truncated hashes are stored.
-- Payload caps: 1 MiB request / 64 KiB message / 64 KiB board value.
+- Payload caps: 1 MiB non-blob request / 64 KiB message / 64 KiB board value; blobs use
+  `MESH_MAX_BLOB_BYTES` (64 MiB) and `MESH_MAX_BLOB_CHUNK_BYTES` (8 MiB).
 - Session ids are bound to the token that opened them; failed auth is rate-limited and audited.
 - Put it behind TLS or a tunnel before exposing it beyond a trusted LAN
   (`MESH_TLS_CERT` / `MESH_TLS_KEY`, see README).

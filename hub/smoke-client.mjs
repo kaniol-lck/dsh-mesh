@@ -338,7 +338,7 @@ try {
     const privBody = await priv.json()
     const asBob = await fetch(`${BASE}/api/blob/${privBody.id}`, { headers: { authorization: `Bearer ${bobToken}` } })
     const asAlice = await fetch(`${BASE}/api/blob/${privBody.id}`, { headers: { authorization: `Bearer ${aliceToken}` } })
-    check('blob ACL blocks non-allowlisted agents', asBob.status === 403 && asAlice.status === 200, `bob ${asBob.status}, alice ${asAlice.status}`)
+    check('blob ACL blocks non-allowlisted agents', asBob.status === 404 && asAlice.status === 200, `bob ${asBob.status}, alice ${asAlice.status}`)
     const reopen = await fetch(`${BASE}/api/blob/${privBody.id}`, {
       method: 'PATCH',
       headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/json' },
@@ -346,6 +346,88 @@ try {
     })
     const asBob2 = await fetch(`${BASE}/api/blob/${privBody.id}`, { headers: { authorization: `Bearer ${bobToken}` } })
     check('uploader can reopen a blob to the mesh', reopen.status === 200 && asBob2.status === 200, `patch ${reopen.status}, bob ${asBob2.status}`)
+
+    // --- list/meta/download must not leak invisible blobs ------------------
+    const hiddenRes = await fetch(`${BASE}/api/blob?name=hidden.bin&sha256=${sha}&visible_to=alice`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/octet-stream' },
+      body: payload,
+    })
+    const hiddenBody = await hiddenRes.json()
+    const sharedRes = await fetch(`${BASE}/api/blob?name=shared.bin&sha256=${sha}&visible_to=bob`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/octet-stream' },
+      body: payload,
+    })
+    const sharedBody = await sharedRes.json()
+    const bobList = await (await fetch(`${BASE}/api/blobs`, { headers: { authorization: `Bearer ${bobToken}` } })).json()
+    const bobIds = new Set((bobList.blobs || []).map((row) => row.id))
+    check(
+      'blob list hides invisible entries',
+      bobIds.has(sharedBody.id) && !bobIds.has(hiddenBody.id),
+      `shared=${bobIds.has(sharedBody.id)} hidden=${bobIds.has(hiddenBody.id)}`,
+    )
+    const hiddenMeta = await fetch(`${BASE}/api/blob/${hiddenBody.id}/meta`, { headers: { authorization: `Bearer ${bobToken}` } })
+    check('invisible blob metadata is 404', hiddenMeta.status === 404, `HTTP ${hiddenMeta.status}`)
+    const hiddenGet = await fetch(`${BASE}/api/blob/${hiddenBody.id}`, { headers: { authorization: `Bearer ${bobToken}` } })
+    check('invisible blob download is 404', hiddenGet.status === 404, `HTTP ${hiddenGet.status}`)
+    const aliceList = await (await fetch(`${BASE}/api/blobs`, { headers: { authorization: `Bearer ${aliceToken}` } })).json()
+    check('uploader still sees their private blob in the list', (aliceList.blobs || []).some((row) => row.id === hiddenBody.id), 'visible to uploader')
+
+    // --- size mismatch: roll back the payload and the row ------------------
+    const mismatchPayload = Buffer.from('0123456789')
+    const mismatchSha = createHash('sha256').update(mismatchPayload).digest('hex')
+    const mismatchInit = await fetch(`${BASE}/api/blob/init`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'size-mismatch.bin', bytes: mismatchPayload.length, sha256: mismatchSha }),
+    })
+    const mismatchBody = await mismatchInit.json()
+    await fetch(`${BASE}${mismatchBody.chunk_url}?offset=0`, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/octet-stream' },
+      body: mismatchPayload.subarray(0, 4),
+    })
+    const mismatchCommit = await fetch(`${BASE}${mismatchBody.commit_url}`, {
+      method: 'POST', headers: { authorization: `Bearer ${aliceToken}` },
+    })
+    const mismatchResult = await mismatchCommit.json()
+    const mismatchMeta = await fetch(`${BASE}/api/blob/${mismatchBody.id}/meta`, { headers: { authorization: `Bearer ${aliceToken}` } })
+    check(
+      'size mismatch rolls back the row',
+      mismatchCommit.status === 400 && mismatchResult.expected === 10 && mismatchResult.actual === 4 && mismatchMeta.status === 404,
+      `commit ${mismatchCommit.status}, meta ${mismatchMeta.status}`,
+    )
+
+    // --- per-endpoint caps: file cap and chunk cap -> 413 ------------------
+    const overFile = await fetch(`${BASE}/api/blob/init`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'too-big.bin', bytes: 64 * 1024 * 1024 + 1, sha256: 'a'.repeat(64) }),
+    })
+    check('blob above MESH_MAX_BLOB_BYTES is 413', overFile.status === 413, `HTTP ${overFile.status}`)
+    const chunkInit = await fetch(`${BASE}/api/blob/init`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'chunk-cap.bin', bytes: 9 * 1024 * 1024, sha256: 'b'.repeat(64) }),
+    })
+    const chunkInitBody = await chunkInit.json()
+    const overChunk = await fetch(`${BASE}${chunkInitBody.chunk_url}?offset=0`, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${aliceToken}`, 'content-type': 'application/octet-stream' },
+      body: Buffer.alloc(8 * 1024 * 1024 + 1),
+    })
+    check('chunk above MESH_MAX_BLOB_CHUNK_BYTES is 413', overChunk.status === 413, `HTTP ${overChunk.status}`)
+    const caps = await (await fetch(`${BASE}/health`)).json()
+    check(
+      'health exposes blob limits',
+      caps.blobs?.max_file === 64 * 1024 * 1024 && caps.blobs?.max_chunk === 8 * 1024 * 1024,
+      `file=${caps.blobs?.max_file} chunk=${caps.blobs?.max_chunk}`,
+    )
+
+    for (const id of [hiddenBody.id, sharedBody.id, chunkInitBody.id]) {
+      await fetch(`${BASE}/api/blob/${id}`, { method: 'DELETE', headers: { authorization: `Bearer ${aliceToken}` } }).catch(() => {})
+    }
   }
 
   // --- conversation views: my dialogues, truncation, pinning ---------------------

@@ -259,14 +259,17 @@ curl -s -X POST "$HUB/api/blob/<id>/commit"
 ```
 
 - `offset` 必须等于已收字节数（重传只需重发最后一片）；
-- `commit` 校验总大小与 sha256，不符则**删除整包**并返回 400；
+- 单片上限 8 MiB（`MESH_MAX_BLOB_CHUNK_BYTES`），超出 → 413；大文件请拆片；
+- `commit` 校验总大小与 sha256，不符则**删除整包与 DB 行**并返回 400；
 - 1 小时未完成的上传由 sweep 清理。
 
 **blob ACL**：`visible_to` 为 `*`（默认，全网可读）或逗号分隔的 agent 白名单
 （上传时 `?visible_to=alice`，或 `PATCH /api/blob/<id> {"visible_to":"*"}` 改回）；
-读与元数据都受它约束，删除仅上传者或 admin。
+`GET /api/blobs` 只列出调用者可读的条目，未授权的下载/元数据返回 **404**（不确认存在性）；
+删除仅上传者或 admin。
 
-限制：单文件 64 MiB、总量 2 GiB、默认 24h 过期（逐小时清理）；sha256 不符直接 400 且不落盘。
+限制：单文件 64 MiB（`MESH_MAX_BLOB_BYTES`）、单 chunk 8 MiB（`MESH_MAX_BLOB_CHUNK_BYTES`）、
+总量 2 GiB、默认 24h 过期（逐小时清理）；`MESH_MAX_BODY_BYTES`（1 MiB）只作用于非 blob 端点。
 
 ## 六、环境变量
 
@@ -281,7 +284,10 @@ curl -s -X POST "$HUB/api/blob/<id>/commit"
 | `MESH_TRUST_PROXY` | `0` | 置 `1` 时才信任 `X-Forwarded-For`（前面有自己控制的反代时） |
 | `MESH_ONLINE_TTL_MS` | `120000` | 多久没请求算离线 |
 | `MESH_MESSAGE_TTL_MS` | `604800000` | 消息保留（7 天） |
-| `MESH_MAX_BODY_BYTES` | `1048576` | 单个请求体上限（超出 → 413） |
+| `MESH_MAX_BODY_BYTES` | `1048576` | 非 blob 端点的单个请求体上限（超出 → 413） |
+| `MESH_MAX_BLOB_BYTES` | `67108864` | 单个 blob 文件上限（64 MiB，超出 → 413） |
+| `MESH_MAX_BLOB_CHUNK_BYTES` | `8388608` | 单个 chunk 上限（8 MiB，超出 → 413） |
+| `MESH_MAX_BLOB_TOTAL_BYTES` | `2147483648` | 全部 blob 的总量上限（2 GiB，超出 → 507） |
 | `MESH_MAX_MESSAGE_BYTES` | `65536` | 单条消息正文上限 |
 | `MESH_MAX_BOARD_BYTES` | `65536` | 单个黑板值上限 |
 | `MESH_SESSION_IDLE_MS` | `1800000` | MCP 会话空闲多久回收（见下方"为什么需要"） |
