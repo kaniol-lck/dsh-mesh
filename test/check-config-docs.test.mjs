@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -39,14 +41,47 @@ test('tableKeys: only backticked first-column rows count', () => {
   assert.deepEqual([...keys], ['tokenFile', 'wakeSecret'])
 })
 
-test('script: exits 1 while real MISSING keys remain, and reports both levels', () => {
-  const result = spawnSync(process.execPath, [SCRIPT], { encoding: 'utf8' })
+/** Build a throwaway "repo" the script can run against: <root>/scripts/<copy of the checker>. */
+function fakeRepo({ wakerSource, wakerReadme, docs = {}, hubServer = "process.env.MESH_TEST_KEY", hubDocs = "MESH_TEST_KEY" }) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'check-config-docs-'))
+  mkdirSync(path.join(dir, 'scripts'), { recursive: true })
+  mkdirSync(path.join(dir, 'plugins', 'mesh-waker'), { recursive: true })
+  mkdirSync(path.join(dir, 'docs'), { recursive: true })
+  mkdirSync(path.join(dir, 'skills', 'mesh'), { recursive: true })
+  mkdirSync(path.join(dir, 'hub'), { recursive: true })
+  copyFileSync(SCRIPT, path.join(dir, 'scripts', 'check-config-docs.mjs'))
+  writeFileSync(path.join(dir, 'plugins', 'mesh-waker', 'index.js'), wakerSource, 'utf8')
+  writeFileSync(path.join(dir, 'plugins', 'mesh-waker', 'README.md'), wakerReadme, 'utf8')
+  for (const [name, body] of Object.entries(docs)) writeFileSync(path.join(dir, 'docs', name), body, 'utf8')
+  writeFileSync(path.join(dir, 'skills', 'mesh', 'SKILL.md'), '# skill\n', 'utf8')
+  writeFileSync(path.join(dir, 'hub', 'server.mjs'), hubServer, 'utf8')
+  writeFileSync(path.join(dir, 'hub', 'README.md'), hubDocs, 'utf8')
+  writeFileSync(path.join(dir, 'hub', '.env.example'), hubDocs, 'utf8')
+  return dir
+}
+
+function runFixture(dir) {
+  return spawnSync(process.execPath, [path.join(dir, 'scripts', 'check-config-docs.mjs')], { encoding: 'utf8' })
+}
+
+test('script: reports MISSING and NOT-IN-TABLE from a fixture, independent of this repo', () => {
+  const dir = fakeRepo({
+    wakerSource: 'const a = c.ghostKey; const b = c.proseKey;',
+    wakerReadme: '# waker\n\nno config table here\n',
+    docs: { 'extra.md': 'proseKey is described here but not in the table\n' },
+  })
+  const result = runFixture(dir)
   assert.equal(result.status, 1, result.stdout + result.stderr)
-  assert.match(result.stdout, /MISSING（任何文档都没有）/)
-  assert.match(result.stdout, /NOT-IN-TABLE（README 有但配置表没列）/)
-  // these three are documented in prose, so they must not be reported as MISSING
-  const missingLine = result.stdout.split('\n').find((line) => line.startsWith('MISSING（')) ?? ''
-  for (const key of ['tokenFile', 'wakeSecret', 'topics']) {
-    assert.ok(!missingLine.includes(key), `${key} must not be MISSING`)
-  }
+  assert.match(result.stdout, /MISSING（任何文档都没有）：.*ghostKey/)
+  assert.match(result.stdout, /NOT-IN-TABLE（README 有但配置表没列）：.*proseKey/)
+})
+
+test('script: a fixture with everything documented exits 0', () => {
+  const dir = fakeRepo({
+    wakerSource: 'const token = c.tokenFile;',
+    wakerReadme: '| `tokenFile` | path | token file |\n',
+  })
+  const result = runFixture(dir)
+  assert.equal(result.status, 0, result.stdout + result.stderr)
+  assert.doesNotMatch(result.stdout, /MISSING（任何文档都没有）/)
 })

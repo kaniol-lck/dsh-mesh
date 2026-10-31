@@ -30,8 +30,8 @@ jobs:
           node --check plugins/mesh-waker/index.js
           node --check plugins/mesh-waker/client.js
 
-      - name: Client bundle id resolution
-        run: node test/dynamic-id.test.js
+      - name: Test suite
+        run: node --test test/*.test.js test/*.test.mjs
 
       - name: Secret scan
         run: python3 scripts/check-secrets.py
