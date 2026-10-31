@@ -106,7 +106,7 @@ export function findLeaks(text) {
     for (const fingerprint of FINGERPRINTS) {
       if (fingerprint.test(line)) matched = true
     }
-    // A line that warns "do not write `1.2.3.4`" quotes the bad example; it is not a leak.
+    // A line that warns "do not write a real address here" quotes the bad example; it is not a leak.
     const quotedWarning = /(不要|禁止|勿|别|占位|placeholder)/.test(line)
     for (const match of line.matchAll(IPV4)) {
       const octets = match.slice(1, 5).map(Number)

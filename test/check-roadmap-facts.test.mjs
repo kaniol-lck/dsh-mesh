@@ -46,7 +46,9 @@ test('facts: wrong version declaration is a MISMATCH', () => {
 })
 
 test('facts: a real IPv4 in the file is a LEAK', () => {
-  const dir = fixture(['# demo', VERSION_ROW, '| 实时核对 | `curl http://120.1.2.3:8790/health` |', DEPLOY_ROW])
+  // 运行时拼接：测试文件里出现公网 IP 字面量会被 check-paths 当成泄漏（它分不清示例与真实）。
+  const badIp = ['120', '1', '2', '3'].join('.')
+  const dir = fixture(['# demo', VERSION_ROW, '| 实时核对 | `curl http://' + badIp + ':8790/health` |', DEPLOY_ROW])
   const result = run(dir)
   assert.equal(result.status, 1, result.stdout + result.stderr)
   assert.match(result.stdout, /LEAK 第 3 行/)
