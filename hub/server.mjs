@@ -32,13 +32,13 @@ import { fileURLToPath } from 'node:url'
 
 // Hub version and the oldest plugin build the hub still fully understands. Both are
 // advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.15'
+const HUB_VERSION = '0.7.16'
 const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
 // Read-only console. Without a view token (or an admin token to fall back on) the
 // console does not exist at all — a default-open dashboard is how tokens leak.
 const VIEW_TOKEN = process.env.MESH_VIEW_TOKEN || process.env.MESH_ADMIN_TOKEN || null
-// Who may even open the console. Default: loopback + RFC1918, because a management page on
-// a plain-HTTP LAN is only acceptable when it cannot be reached from outside that LAN.
+// Who may even open the console. Default: loopback only — a management page on plain HTTP
+// must not be reachable from the LAN unless the operator explicitly opts in.
 const CONSOLE_ALLOW = String(process.env.MESH_CONSOLE_ALLOW ?? '').trim()
 import { DatabaseSync } from 'node:sqlite'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -478,9 +478,38 @@ const TOOL_SCOPE = {
 
 function scopesOfRow(row) {
   const raw = String(row?.scopes ?? '').trim()
+  // Historical rows with an empty string predate the "empty means all" fix; keep treating
+  // them as full access so a deploy does not silently break running nodes (startup warns).
   if (!raw) return ALL_SCOPES
   const parsed = raw.split(',').map((s) => s.trim()).filter(Boolean)
+  if (parsed.includes('*')) return ALL_SCOPES
   return ALL_SCOPES.filter((scope) => parsed.includes(scope))
+}
+
+/**
+ * Validates an incoming scopes update. The empty set is rejected: it used to be stored as
+ * "" and read back as "all", so an admin who unchecked everything accidentally granted
+ * everything. Full access must now be explicit ("*" or every scope).
+ */
+function parseScopesInput(raw) {
+  if (raw === undefined) return { error: 'scopes is required (use ["*"] for all scopes)' }
+  const list = Array.isArray(raw)
+    ? raw
+    : typeof raw === 'string'
+      ? raw.split(',').map((value) => value.trim()).filter(Boolean)
+      : null
+  if (!list) return { error: 'scopes must be an array or a comma separated string' }
+  if (list.length === 0) {
+    return { error: '空 scope 集等于全权，已被拒绝；若要禁用该节点请吊销 token，若要全权请显式传 ["*"]（或现有全权表示）' }
+  }
+  const scopes = []
+  for (const value of list) {
+    const scope = String(value).trim()
+    if (scope === '*') return { scopes: ['*'] }
+    if (!ALL_SCOPES.includes(scope)) return { error: `unknown scope "${scope}" (allowed: ${ALL_SCOPES.join(', ')}, or ["*"] for all)` }
+    if (!scopes.includes(scope)) scopes.push(scope)
+  }
+  return { scopes }
 }
 
 function ipInCidr(ip, cidr) {
@@ -1178,7 +1207,7 @@ function parseCookies(req) {
 function consoleAllowed(ip) {
   const entries = CONSOLE_ALLOW
     ? CONSOLE_ALLOW.split(',').map((entry) => entry.trim()).filter(Boolean)
-    : ['127.0.0.1', '::1', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
+    : ['127.0.0.1', '::1']
   return entries.some((entry) => (entry.includes('/') ? ipInCidr(ip, entry) : entry === ip))
 }
 
@@ -1404,15 +1433,18 @@ async function refresh() {
     }).join('');
     const isAdmin = ROLE === 'admin';
     document.getElementById('agents').innerHTML = (agents.agents || []).map((a) => {
+      const granted = a.scopes || ALL_SCOPES;
+      const none = !ALL_SCOPES.some((scope) => granted.includes(scope));
       const scopeBoxes = ALL_SCOPES.map((scope) =>
         '<label style="margin-right:6px"><input type="checkbox" data-scope="' + scope + '" ' +
-        ((a.scopes || ALL_SCOPES).includes(scope) ? 'checked' : '') + (isAdmin ? '' : ' disabled') + '> ' + scope + '</label>'
-      ).join('');
+        (granted.includes(scope) ? 'checked' : '') + (isAdmin ? '' : ' disabled') + '> ' + scope + '</label>'
+      ).join('') + '<div class="scope-hint muted" style="margin-top:4px">' +
+        (none ? '未选择任何 scope ≠ 无权限，等于全部权限；请显式勾选或使用吊销' : '') + '</div>';
       const cidrs = '<input type="text" data-cidrs value="' + esc((a.allowed_cidrs || '')) + '" placeholder="192.168.1.0/24,10.0.0.0/8" size="22"' + (isAdmin ? '' : ' disabled') + '>';
       const expiry = a.token_expires_at ? new Date(a.token_expires_at).toLocaleDateString() : '不过期';
       const seen = a.last_seen_at ? Date.parse(a.last_seen_at) : a.last_seen;
       const actions = isAdmin
-        ? '<button data-act="save">保存</button> ' +
+        ? '<button data-act="save"' + (none ? ' disabled' : '') + '>保存</button> ' +
           '<button data-act="rotate" class="danger">轮换</button> ' +
           '<button data-act="revoke" class="danger">吊销</button>' +
           (!a.has_token && !a.online ? ' <button data-act="purge" class="danger">清理</button>' : '')
@@ -1441,6 +1473,11 @@ document.addEventListener('click', async (event) => {
   const act = button.getAttribute('data-act');
   if (act === 'save') {
     const scopes = [...row.querySelectorAll('input[data-scope]')].filter((box) => box.checked).map((box) => box.dataset.scope);
+    const hint = row.querySelector('.scope-hint');
+    if (!scopes.length) {
+      if (hint) hint.textContent = '未选择任何 scope ≠ 无权限，等于全部权限；请显式勾选或使用吊销';
+      return;
+    }
     const cidrs = row.querySelector('input[data-cidrs]').value;
     const result = await post('/console/agents/update', { name, scopes, allowed_cidrs: cidrs });
     if (result) refresh();
@@ -1460,6 +1497,16 @@ document.addEventListener('click', async (event) => {
     const result = await post('/console/agents/purge', { name });
     if (result) refresh();
   }
+});
+document.addEventListener('change', (event) => {
+  if (!event.target.matches('input[data-scope]')) return;
+  const row = event.target.closest('tr');
+  const boxes = [...row.querySelectorAll('input[data-scope]')];
+  const none = boxes.every((box) => !box.checked);
+  const button = row.querySelector('button[data-act="save"]');
+  if (button) button.disabled = none;
+  const hint = row.querySelector('.scope-hint');
+  if (hint) hint.textContent = none ? '未选择任何 scope ≠ 无权限，等于全部权限；请显式勾选或使用吊销' : '';
 });
 async function generateEnroll() {
   const data = await post('/console/enroll-code', {});
@@ -1658,14 +1705,17 @@ async function handleConsole(req, res, url) {
     if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: 'invalid agent name' })
     const action = path.slice('/console/agents/'.length)
     if (action === 'update') {
-      const scopes = Array.isArray(body.scopes) ? body.scopes.filter((scope) => ALL_SCOPES.includes(scope)) : []
+      const parsedScopes = parseScopesInput(body.scopes)
+      if (parsedScopes.error) return sendJson(res, 400, { error: parsedScopes.error })
+      const scopes = parsedScopes.scopes
       const cidrs = String(body.allowed_cidrs ?? '').trim()
       if (cidrs && !cidrs.split(',').every((entry) => /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(entry.trim()))) {
         return sendJson(res, 400, { error: 'allowed_cidrs must be comma separated IPv4 or IPv4/CIDR' })
       }
-      db.prepare('UPDATE agents SET scopes = ?, allowed_cidrs = ? WHERE name = ?').run(scopes.join(','), cidrs || null, name)
+      const stored = scopes.includes('*') ? '*' : scopes.join(',')
+      db.prepare('UPDATE agents SET scopes = ?, allowed_cidrs = ? WHERE name = ?').run(stored, cidrs || null, name)
       audit('console.scopes', name, ip, true)
-      return sendJson(res, 200, { ok: true, name, scopes, allowed_cidrs: cidrs })
+      return sendJson(res, 200, { ok: true, name, scopes: scopes.includes('*') ? ALL_SCOPES : scopes, stored, allowed_cidrs: cidrs })
     }
     if (action === 'rotate') {
       const row = db.prepare('SELECT name FROM agents WHERE name = ?').get(name)
@@ -2534,12 +2584,16 @@ async function handleBootstrap(req, res) {
  *   GET    /api/admin/audit?limit=50                        -> recent auth/ops
  */
 async function handleAdmin(req, res, url) {
+  const ip = clientIp(req)
+  if (!consoleAllowed(ip)) {
+    audit('admin_blocked', null, ip, false)
+    return sendJson(res, 403, { error: 'admin is not reachable from this address (MESH_CONSOLE_ALLOW)' })
+  }
   if (!isAdmin(req)) {
-    audit('admin', null, clientIp(req), false)
+    audit('admin', null, ip, false)
     return sendJson(res, 401, { error: 'admin token required' })
   }
   const path = url.pathname
-  const ip = clientIp(req)
 
   try {
     if (path === '/api/admin/agents' && req.method === 'POST') {
@@ -2786,4 +2840,10 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`[mesh] transport: ${TLS_ENABLED ? `TLS on (${TLS_CERT_FILE})` : 'plain HTTP 鈥?put TLS in front of it before crossing an untrusted network'}`)
   console.log(`[mesh] auth mode: ${AUTH_MODE}${AUTH_MODE === 'token' ? '  (bearer token required for /mcp and /api)' : '  (NO app-level auth 鈥?LAN only)'}`)
   if (AUTH_MODE === 'token') console.log(`[mesh] admin endpoints: /api/admin/agents | rotate | audit  (token in ${ADMIN_TOKEN === process.env.MESH_ADMIN_TOKEN ? 'MESH_ADMIN_TOKEN' : `${join(DATA_DIR, 'admin.token')}`})`)
+  if (!TLS_ENABLED && VIEW_TOKEN) {
+    const sources = CONSOLE_ALLOW || 'loopback only (default; set MESH_CONSOLE_ALLOW to widen)'
+    console.warn(`[mesh] WARN console/admin over plain HTTP (no MESH_TLS_CERT); allowed sources: ${sources}`)
+  }
+  const legacyScopes = db.prepare("SELECT COUNT(*) AS n FROM agents WHERE scopes = ''").get().n
+  if (legacyScopes) console.warn(`[mesh] ${legacyScopes} 个节点 scopes 为空串（等价全权），建议在控制台重新设置`)
 })

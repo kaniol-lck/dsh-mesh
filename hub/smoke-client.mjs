@@ -640,6 +640,37 @@ try {
     body: JSON.stringify({ to: 'bob', body: 'unrestricted send still works' }),
   })
   check('unrestricted token still sends over REST', unrestrictedSend.status === 201, `HTTP ${unrestrictedSend.status}`)
+
+  // An empty scope set used to be stored as "" and read back as "all"; it must 400 now,
+  // and "all" must be asked for explicitly.
+  const emptyArray = await admin('/console/agents/update', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'reader', scopes: [], allowed_cidrs: '' }),
+  })
+  check('empty scope array is rejected (would mean all scopes)', emptyArray.status === 400, `HTTP ${emptyArray.status}`)
+
+  const emptyString = await admin('/console/agents/update', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'reader', scopes: '', allowed_cidrs: '' }),
+  })
+  check('empty scope string is rejected', emptyString.status === 400, `HTTP ${emptyString.status}`)
+
+  const starToken = await mint('star')
+  const starUpdate = await admin('/console/agents/update', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'star', scopes: ['*'], allowed_cidrs: '' }),
+  })
+  const starInbox = await fetch(`${BASE}/api/inbox`, { headers: { authorization: `Bearer ${starToken}` } })
+  const starSend = await fetch(`${BASE}/api/send`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${starToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ to: 'bob', body: 'star scope send' }),
+  })
+  check(
+    '["*"] is explicit full access',
+    starUpdate.status === 200 && starInbox.status === 200 && starSend.status === 201,
+    `update ${starUpdate.status}, inbox ${starInbox.status}, send ${starSend.status}`,
+  )
 }
 
 // --- enrollment: legacy 8-char code and device-code pairing -------------------
