@@ -4637,6 +4637,115 @@ async function main() {
   })
 
 
+
+  // 219-223. lib/ split (T-292): index re-exports stay stable, modules are self-contained,
+  // the published file list includes lib/, and pure helpers behave the same from lib/.
+  const LIB = path.join(REPO, 'plugins', 'mesh-waker', 'lib')
+  const libUrl = (name) => pathToFileURL(path.join(LIB, name)).href
+
+  await runCase('lib: index.js still exports every original symbol', async () => {
+    const api = await import(pathToFileURL(ENTRY).href)
+    const expected = [
+      'hubConsoleUrlFor', 'localDayName', 'nextPollDelayMs', 'classifyTurnEnd', 'truncateText', 'buildReceipt',
+      'receiptNoticeText', 'isCoordinatorTitle', 'resolveTaskText', 'storeTaskText', 'compactTaskRows', 'messageText',
+      'deriveLivenessState', 'humanDuration', 'buildBatchReceipt', 'durationToMs', 'buildDispatchMeta',
+      'MESH_DISPATCH_TOOL', 'MESH_ASK_TOOL', 'DISPATCH_OUTPUT', 'ASK_OUTPUT', 'MESH_COMPLETE_TOOL', 'COMPLETE_OUTPUT',
+      'MESH_THREAD_TOOL', 'THREAD_OUTPUT', 'validateToolSchema', 'previewText', 'truncateUtf8', 'inlineBodyText',
+      'cleanTaskSubject', 'resolveTaskSubject', 'normalizeThread', 'withTaskHeader', 'SESSION_PAGE_DEFAULT',
+      'SESSION_PAGE_MAX', 'paginateSessions', 'apply', 'name', 'inject',
+    ]
+    const missing = expected.filter((key) => api[key] === undefined)
+    const wrongType = expected.filter((key) => {
+      const value = api[key]
+      if (key === 'apply') return typeof value !== 'function'
+      if (key === 'name' || key === 'inject') return typeof value === 'undefined'
+      if (key === 'SESSION_PAGE_DEFAULT' || key === 'SESSION_PAGE_MAX') return typeof value !== 'number'
+      if (key.endsWith('_TOOL') || key.endsWith('_OUTPUT')) return typeof value !== 'object'
+      return typeof value !== 'function'
+    })
+    const ok = missing.length === 0 && wrongType.length === 0
+    report('lib: index.js still exports every original symbol', ok, `missing=${missing.join(',') || '-'} wrongType=${wrongType.join(',') || '-'}`)
+  })
+
+  await runCase('lib: every module imports standalone and the graph has no cycles', async () => {
+    const files = ['text', 'receipt', 'tools', 'session', 'tasks', 'settings']
+    const modules = {}
+    for (const name of files) modules[name] = await import(libUrl(`${name}.mjs`))
+    const edges = {}
+    for (const name of files) {
+      const source = fs.readFileSync(path.join(LIB, `${name}.mjs`), 'utf8')
+      edges[name] = [...source.matchAll(/from '(\.\/[^']+)'/g)].map((m) => m[1].replace('./', '').replace('.mjs', ''))
+    }
+    const visiting = new Set()
+    const seen = new Set()
+    const cycle = (node) => {
+      if (visiting.has(node)) return true
+      if (seen.has(node)) return false
+      visiting.add(node)
+      for (const next of edges[node] ?? []) if (cycle(next)) return true
+      visiting.delete(node)
+      seen.add(node)
+      return false
+    }
+    const cyclic = files.filter((name) => cycle(name))
+    const exportsOk =
+      typeof modules.text.truncateText === 'function' &&
+      typeof modules.receipt.buildReceipt === 'function' &&
+      typeof modules.tools.validateToolSchema === 'function' &&
+      typeof modules.session.withTaskHeader === 'function' &&
+      typeof modules.tasks.resolveTaskText === 'function' &&
+      typeof modules.settings.clampInterval === 'function'
+    const ok = exportsOk && cyclic.length === 0
+    report('lib: every module imports standalone and the graph has no cycles', ok, `cyclic=${cyclic.join(',') || '-'} edges=${JSON.stringify(edges)}`)
+  })
+
+  await runCase('lib: pure helpers behave the same when imported from lib/', async () => {
+    const text = await import(libUrl('text.mjs'))
+    const receipt = await import(libUrl('receipt.mjs'))
+    const tools = await import(libUrl('tools.mjs'))
+    const filtered = text.messageText({
+      content: [
+        { type: 'thinking', text: 'hidden' },
+        { type: 'text', text: 'visible answer' },
+        { type: 'tool_result', text: 'tool noise' },
+      ],
+    })
+    const built = receipt.buildReceipt({ taskId: 'T-LIB-1', status: 'completed', injectedAt: Date.now() - 1200, source: 'declared' })
+    const rejected = tools.validateToolSchema({ schema: { type: 'object', properties: { a: { type: ['string'] } } } })
+    const ok =
+      filtered === 'visible answer' &&
+      /^\[RECEIPT\] T-LIB-1 completed \d+ms \(declared\)$/.test(receipt.receiptNoticeText(built)) &&
+      rejected.ok === false
+    report('lib: pure helpers behave the same when imported from lib/', ok, `message=${JSON.stringify(filtered)} schemaOk=${rejected.ok}`)
+  })
+
+  await runCase('lib: resolveTaskText still resolves refs, legacy text and misses', async () => {
+    const { resolveTaskText } = await import(pathToFileURL(ENTRY).href)
+    const { resolveTaskText: fromLib } = await import(libUrl('tasks.mjs'))
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-lib-tasks-'))
+    try {
+      const body = 'lib 内容寻址正文'
+      const hex = require('node:crypto').createHash('sha256').update(body, 'utf8').digest('hex')
+      fs.writeFileSync(path.join(dir, `${hex}.txt`), body)
+      const viaIndex = resolveTaskText({ textRef: `sha256:${hex}` }, dir)
+      const viaLib = fromLib({ textRef: `sha256:${hex}` }, dir)
+      const legacy = fromLib({ text: '旧行内正文' }, dir)
+      const missing = fromLib({}, dir)
+      const ok = viaIndex === body && viaLib === body && legacy === '旧行内正文' && missing === ''
+      report('lib: resolveTaskText still resolves refs, legacy text and misses', ok, `index=${JSON.stringify(viaIndex)} lib=${JSON.stringify(viaLib)}`)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('lib: package.json files includes lib/ for publishing', async () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'package.json'), 'utf8'))
+    const files = Array.isArray(pkg.files) ? pkg.files : []
+    const exportsMap = pkg.exports ?? {}
+    const ok = files.includes('lib/') && exportsMap['.'] === './index.js'
+    report('lib: package.json files includes lib/ for publishing', ok, `files=${files.join(',')} entry=${exportsMap['.'] ?? '-'}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

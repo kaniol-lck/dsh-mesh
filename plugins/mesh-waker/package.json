@@ -18,6 +18,7 @@
   "files": [
     "index.js",
     "client.js",
+    "lib/",
     "bin/",
     "cordis.bundle.yml",
     "cordis.patch.example.yml",
