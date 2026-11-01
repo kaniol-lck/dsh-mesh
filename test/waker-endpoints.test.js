@@ -3123,11 +3123,14 @@ async function main() {
   await runCase('receipt: two coordinators in the same cwd stay ambiguous and are not guessed', async (boot) => {
     const logFile = fileLogFile()
     const cwd = workspaceCwd()
+    // Equal mtimes: no newest candidate, so inference must refuse to guess (T-287 keeps
+    // "clearly newest wins", but indistinguishable stays ambiguous).
+    const sameTime = Date.now() - 2 * 60 * 60 * 1000
     const h = await boot({
       seedSessions: [
         { id: 'session-amb-target', title: 'pilot · pipeline', cwd },
-        { id: 'session-amb-a', title: 'pilot · 协调', cwd },
-        { id: 'session-amb-b', title: 'pilot · coordinator', cwd },
+        { id: 'session-amb-a', title: 'pilot · 协调', cwd, mtime: sameTime },
+        { id: 'session-amb-b', title: 'pilot · coordinator', cwd, mtime: sameTime },
       ],
       config: { logFile, receiptMode: 'file', receiptTo: '' },
     })
@@ -3328,11 +3331,13 @@ async function main() {
   await runCase('restart: an ambiguous workspace stays undelivered without failing', async (boot) => {
     const logFile = fileLogFile()
     const cwd = workspaceCwd()
+    // Equal mtimes so inference stays ambiguous; a clearly newer coordinator would now win.
+    const sameTime = Date.now() - 2 * 60 * 60 * 1000
     const h = await boot({
       seedSessions: [
         { id: 'session-orphan-target', title: 'orphan target', cwd },
-        { id: 'session-orph-a', title: 'orphan · 协调', cwd },
-        { id: 'session-orph-b', title: 'orphan · coordinator', cwd },
+        { id: 'session-orph-a', title: 'orphan · 协调', cwd, mtime: sameTime },
+        { id: 'session-orph-b', title: 'orphan · coordinator', cwd, mtime: sameTime },
       ],
       tasksSeed: [seedOrphan('T-ORPH-AMB', { status: 'pending' })],
       config: { logFile, receiptMode: 'queue', receiptTo: '' },
@@ -4342,6 +4347,129 @@ async function main() {
     }
   })
 
+
+  // 206-211. Numbered coordinators (T-287): one matcher, latest wins, ambiguity still wins
+  // over guessing when mtimes cannot separate the candidates.
+  await runCase('coordinator: numbered titles are recognised by the shared matcher', async () => {
+    const { isCoordinatorTitle } = await import(pathToFileURL(ENTRY).href)
+    const ok =
+      isCoordinatorTitle('mesh · 协调 2') === true &&
+      isCoordinatorTitle('mesh · 协调-3') === true &&
+      isCoordinatorTitle('x · coordinator 2') === true &&
+      isCoordinatorTitle('mesh · 协调') === true &&
+      isCoordinatorTitle('mesh · coordinator') === true &&
+      isCoordinatorTitle('任务（协调会话，abc）：请处理') === false &&
+      isCoordinatorTitle('mesh · 协调 2 的说明') === false &&
+      isCoordinatorTitle('mesh · waker') === false
+    report('coordinator: numbered titles are recognised by the shared matcher', ok, `numbered=${isCoordinatorTitle('mesh · 协调 2')} plain=${isCoordinatorTitle('mesh · 协调')} body=${isCoordinatorTitle('任务（协调会话，abc）：请处理')}`)
+  })
+
+  await runCase('coordinator: plain titles still match and body mentions do not', async () => {
+    const { isCoordinatorTitle } = await import(pathToFileURL(ENTRY).href)
+    const ok =
+      isCoordinatorTitle('mesh · 协调') === true &&
+      isCoordinatorTitle('mesh · coordinator') === true &&
+      isCoordinatorTitle('任务（协调会话，abc）：请处理') === false &&
+      isCoordinatorTitle('mesh · 协调 2 的说明') === false
+    report('coordinator: plain titles still match and body mentions do not', ok, `plain=${isCoordinatorTitle('mesh · 协调')} body=${isCoordinatorTitle('任务（协调会话，abc）：请处理')}`)
+  })
+
+  await runCase('coordinator: the newest numbered coordinator wins in the registry', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'coord2-repo')
+    const now = Date.now()
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-coord2-old', title: 'mesh · 协调', cwd, mtime: now - 3 * 24 * 60 * 60 * 1000 },
+        { id: 'session-coord2-new', title: 'mesh · 协调 2', cwd, mtime: now - 60 * 60 * 1000 },
+      ],
+      prepareHome: (home) => {
+        const registryDir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(registryDir, { recursive: true })
+        fs.writeFileSync(
+          path.join(registryDir, 'workspaces.json'),
+          `${JSON.stringify({ machine: 'm', workspaces: { 'coord2-repo': { cwd, coordinator: 'session-coord2-old', roles: [] } } }, null, 2)}\n`,
+        )
+      },
+    })
+    const entry = registryOf(h).workspaces?.['coord2-repo']
+    const ok = entry?.coordinator === 'session-coord2-new'
+    report('coordinator: the newest numbered coordinator wins in the registry', ok, `coordinator=${entry?.coordinator ?? '-'}`)
+  })
+
+  await runCase('coordinator: a retired binding is rewritten and logged', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'coord3-repo')
+    const logFile = path.join(os.tmpdir(), `waker-coord3-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile },
+      seedSessions: [
+        { id: 'session-coord3-old', title: 'mesh · 协调', cwd, mtime: Date.now() - 5 * 24 * 60 * 60 * 1000 },
+        { id: 'session-coord3-new', title: 'mesh · 协调 2', cwd, mtime: Date.now() - 30 * 60 * 1000 },
+      ],
+      prepareHome: (home) => {
+        const registryDir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(registryDir, { recursive: true })
+        fs.writeFileSync(
+          path.join(registryDir, 'workspaces.json'),
+          `${JSON.stringify({ machine: 'm', workspaces: { 'coord3-repo': { cwd, coordinator: 'session-coord3-old', roles: [] } } }, null, 2)}\n`,
+        )
+      },
+    })
+    const entry = registryOf(h).workspaces?.['coord3-repo']
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok =
+      entry?.coordinator === 'session-coord3-new' &&
+      /coordinator session-coord3-old -> session-coord3-new/.test(log)
+    report('coordinator: a retired binding is rewritten and logged', ok, `coordinator=${entry?.coordinator ?? '-'} logged=${/coordinator session-coord3-old -> session-coord3-new/.test(log)}`)
+  })
+
+  await runCase('coordinator: requester inference reaches the numbered coordinator', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'coord4-repo')
+    const logFile = path.join(os.tmpdir(), `waker-coord4-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile, receiptMode: 'queue' },
+      seedSessions: [
+        { id: 'session-coord4', title: 'mesh · 协调 2', cwd, mtime: Date.now() - 60 * 1000 },
+        { id: 'session-coord4-worker', title: 'worker', cwd },
+      ],
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'do the numbered work', meta: { taskId: 'T-COORD4' } },
+    })
+    h.emit('session/event', { id: 'session-coord4-worker' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-coord4-worker' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-coord4'), 4000)
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok = Boolean(delivered) && /requester inferred from workspace: mesh · 协调 2 \(session-coord4\)/.test(log)
+    report('coordinator: requester inference reaches the numbered coordinator', ok, `deliveredTo=${delivered ? 'session-coord4' : '-'} inferred=${/requester inferred/.test(log)}`)
+  })
+
+  await runCase('coordinator: indistinguishable candidates stay ambiguous', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'coord5-repo')
+    const sameTime = Date.now() - 2 * 60 * 60 * 1000
+    const logFile = path.join(os.tmpdir(), `waker-coord5-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile, receiptMode: 'queue' },
+      seedSessions: [
+        { id: 'session-coord5-a', title: 'mesh · 协调', cwd, mtime: sameTime },
+        { id: 'session-coord5-b', title: 'mesh · 协调 2', cwd, mtime: sameTime },
+        { id: 'session-coord5-worker', title: 'worker', cwd },
+      ],
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'ambiguous work', meta: { taskId: 'T-COORD5' } },
+    })
+    h.emit('session/event', { id: 'session-coord5-worker' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-coord5-worker' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const settles = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-COORD5')
+    const log = fs.readFileSync(logFile, 'utf8')
+    const prompts = h.state.prompts.filter(
+      (prompt) => prompt.sessionId === 'session-coord5-a' || prompt.sessionId === 'session-coord5-b',
+    )
+    const ok = settles.length === 1 && prompts.length === 0 && /requester inference ambiguous: 2 coordinator sessions/.test(log)
+    report('coordinator: indistinguishable candidates stay ambiguous', ok, `receipts=${settles.length} prompts=${prompts.length} ambiguous=${/inference ambiguous/.test(log)}`)
+  })
 
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)

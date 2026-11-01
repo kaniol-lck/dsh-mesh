@@ -315,6 +315,16 @@ export function receiptNoticeText(receipt, { includeSummary = false } = {}) {
 }
 
 /**
+ * One definition of "this session is a coordinator": the title must END with
+ * `· 协调` / `· coordinator`, optionally followed by a sequence number (`协调 2`,
+ * `协调-3`, `coordinator 2`). Text that merely mentions coordination in the body does
+ * not match. Both the workspace registry and requester inference must use this (T-287).
+ */
+export function isCoordinatorTitle(title) {
+  return /·\s*(协调|coordinator)(?:\s*[-_]?\s*\d+)?\s*$/i.test(String(title ?? ''))
+}
+
+/**
  * Read the body of one task row. 0.7.30+ rows store content-addressed text
  * (`textRef: sha256:<hex>`) in the texts directory; older rows may still carry inline
  * `text` or a `textPath`. Missing/legacy references degrade to '' instead of throwing.
@@ -3760,13 +3770,17 @@ export function apply(ctx, config) {
     for (const [slug, list] of sessionsBySlug) {
       const entry = workspaces.workspaces[slug]
       if (!entry) continue
-      const coordinators = list.filter((session) => /·\s*(协调|coordinator)\s*$/i.test(String(session.title ?? '')))
+      const coordinators = list.filter((session) => isCoordinatorTitle(session.title))
       coordinators.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
       const coordinator = coordinators[0] ?? null
       const nextCoordinator = coordinator ? coordinator.id : null
-      if ((entry.coordinator ?? null) !== nextCoordinator) {
+      const previousCoordinator = entry.coordinator ?? null
+      if (previousCoordinator !== nextCoordinator) {
         if (nextCoordinator) entry.coordinator = nextCoordinator
         else delete entry.coordinator
+        changed = true
+        // Correction of a retired/pointless binding must be visible in the log (T-287).
+        fileLog(`workspace ${slug} coordinator ${previousCoordinator ?? '(none)'} -> ${nextCoordinator ?? '(none)'}`)
         changed = true
       }
       if (nextCoordinator) {
@@ -4413,9 +4427,19 @@ export function apply(ctx, config) {
         session.id !== target.id &&
         !session.archived &&
         String(session.cwd ?? '').trim() === cwd &&
-        /·\s*(协调|coordinator)\s*$/i.test(String(session.title ?? '')),
+        isCoordinatorTitle(session.title),
     )
     if (matches.length === 1) return { kind: 'one', session: matches[0] }
+    if (matches.length > 1) {
+      // Numbered coordinators are normal (mesh · 协调 2). A clearly newer one wins; only
+      // equal/unknown activity keeps the "ambiguous, do not guess" behaviour (T-287).
+      matches.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
+      const newest = Number(matches[0].last_active ?? 0)
+      const runnerUp = Number(matches[1].last_active ?? 0)
+      if (Number.isFinite(newest) && Number.isFinite(runnerUp) && newest > runnerUp) {
+        return { kind: 'one', session: matches[0], pickedLatest: true }
+      }
+    }
     return { kind: matches.length === 0 ? 'none' : 'ambiguous', candidates: matches, cwd }
   }
 
@@ -4424,7 +4448,9 @@ export function apply(ctx, config) {
     if (!requester) {
       const inferred = inferRequesterFromWorkspace(target)
       if (inferred.kind === 'one') {
-        fileLog(`requester inferred from workspace: ${inferred.session.title} (${inferred.session.id})`)
+        fileLog(
+          `requester inferred from workspace: ${inferred.session.title} (${inferred.session.id})${inferred.pickedLatest ? ' [newest of several coordinators]' : ''}`,
+        )
         return { requester: inferred.session.title || inferred.session.id, sessionId: inferred.session.id, inferred: true }
       }
       if (inferred.kind === 'ambiguous') {
