@@ -170,6 +170,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `injectHeader` | `true` | 注入正文前加一行 `[TASK …]` 表头；设 `false` 退回逐字投递 |
 | `tasksRetentionDays` | `30` | 任务库保留天数（启动时裁掉更旧的记录） |
 | `tasksMaxRows` | `5000` | 任务库最多保留条数（超量裁最旧） |
+| `compactTaskText` | `true` | 启动时把仍内嵌正文的任务行迁移为 `textRef`（内容寻址存 `texts/<sha256>.txt`）；迁移失败不改写任务库 |
 | `entryLabel` | `Mesh 信箱` | 信箱入口显示名（侧栏 tooltip、页面标题、设置页跳转文案共用；≤40 字） |
 
 ### 信任与权限
@@ -246,16 +247,16 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 **存储**（`~/.dsh/mesh-waker/`，0600）：
 
-- `tasks.jsonl`：append-only，一行一条；字段 `taskId / batchId / thread / requester / targetSessionId / targetTitle / subject（正文首行 ≤120 字）/ textBytes / createdAt / deadlineMs / status / startedAt / settledAt / durationMs / receiptMode / receiptRef / receiptSummary / refs[] / reusedId?`（`reusedId: true` 表示同一 taskId 在 24 小时内重复注册；`receiptMode` 是投递时实际生效的回执模式，重启补发 `lost` 时据此通知等待方）；
-- 正文 ≤8 KiB 直接存 `text`；>8 KiB 落 `tasks/<taskId>.md`，jsonl 只记 `textPath`；
+- `tasks.jsonl`：append-only，一行一条；字段 `taskId / batchId / thread / requester / targetSessionId / targetTitle / subject（正文首行 ≤120 字）/ textBytes / textRef / createdAt / deadlineMs / status / startedAt / settledAt / durationMs / receiptMode / receiptRef / receiptSummary / refs[] / reusedId?`（`reusedId: true` 表示同一 taskId 在 24 小时内重复注册；`receiptMode` 是投递时实际生效的回执模式，重启补发 `lost` 时据此通知等待方）；
+- 正文按内容寻址存 `texts/<sha256>.txt`（0600，相同正文只写一次），jsonl 只记 `textRef: "sha256:…"`；旧行若仍内嵌 `text`（或旧版 `tasks/<taskId>.md`），启动时会一次性迁移（`compactTaskText: false` 可关闭；迁移失败不修改 jsonl）；
 - **保留策略**：`tasksRetentionDays`（默认 30 天）与 `tasksMaxRows`（默认 5000 条），启动时按「超龄或超量」裁最旧的，并压实 jsonl（被裁任务的正文文件一并清理）；
-- **正文隐私**：日志只打 `textBytes` 与 `subject`，**从不打印正文**；列表 API 不含正文，只有详情 API 返回全文。
+- **正文隐私**：日志只打 `textBytes` 与 `subject`，**从不打印正文**；列表 API 默认不含正文，只有详情 API（或 `?include=text`）经解析器返回全文。
 
 **API**（仅本机 loopback）：
 
 | 端点 | 用途 |
 |---|---|
-| `GET /mesh/tasks?status=&session=&batch=&limit=&offset=` | 列表（不含正文；默认 `limit=50`、`createdAt` 倒序、返回 `total`；`session` 同时匹配目标会话与 requester） |
+| `GET /mesh/tasks?status=&session=&batch=&limit=&offset=&include=text` | 列表（默认不含正文；`include=text` 时每条附 `text`（经 `textRef`/旧 `text` 解析）；默认 `limit=50`、`createdAt` 倒序、返回 `total`；`session` 同时匹配目标会话与 requester） |
 | `GET /mesh/tasks/:id` | 详情：全文 + 回执摘要（`receiptSummary`/`receiptRef`）+ 目标会话 `{sessionId, title, live}` |
 | `DELETE /mesh/tasks/:id` | 仅 `pending` 可取消（→ `cancelled`）；已 settled/stalled 返回 **409**，历史不改写 |
 | `GET /mesh/threads` | 线程列表：`{ thread, targetSessionId, targetTitle, count, lastTaskId, updatedAt, taskIds[] }`（`taskIds` 从任务库派生，按 createdAt 升序） |

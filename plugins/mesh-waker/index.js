@@ -302,6 +302,79 @@ export function receiptNoticeText(receipt, { includeSummary = false } = {}) {
   return first
 }
 
+/**
+ * Read the body of one task row. 0.7.30+ rows store content-addressed text
+ * (`textRef: sha256:<hex>`) in the texts directory; older rows may still carry inline
+ * `text` or a `textPath`. Missing/legacy references degrade to '' instead of throwing.
+ */
+export function resolveTaskText(row, textsDir = null) {
+  if (!row || typeof row !== 'object') return ''
+  const ref = typeof row.textRef === 'string' ? row.textRef : ''
+  if (ref) {
+    const match = /^sha256:([a-f0-9]{64})$/.exec(ref)
+    if (!match || !textsDir) return ''
+    try {
+      return readFileSync(join(textsDir, `${match[1]}.txt`), 'utf8')
+    } catch {
+      return ''
+    }
+  }
+  if (typeof row.text === 'string') return row.text
+  if (typeof row.textPath === 'string' && row.textPath) {
+    try {
+      return readFileSync(row.textPath, 'utf8')
+    } catch {
+      return ''
+    }
+  }
+  return ''
+}
+
+/** Content-addressed store: write texts/<sha256>.txt once, return `sha256:<hex>` or null. */
+export function storeTaskText(textsDir, body) {
+  try {
+    const hex = createHash('sha256').update(String(body), 'utf8').digest('hex')
+    const file = join(textsDir, `${hex}.txt`)
+    if (!existsSync(file)) {
+      mkdirSync(textsDir, { recursive: true })
+      writeFileSync(file, String(body), { mode: 0o600 })
+    }
+    return `sha256:${hex}`
+  } catch {
+    return null
+  }
+}
+
+/**
+ * In-place migration of loaded task rows: `text`/`textPath` -> `textRef`, writing each body
+ * once into the content-addressed store. Returns `{ migrated, failed }`; callers only rewrite
+ * the registry when `failed` is false (a partial failure leaves the file untouched).
+ */
+export function compactTaskRows(rows, textsDir) {
+  let migrated = 0
+  for (const row of rows) {
+    if (row.textRef) continue
+    const legacyPath = typeof row.textPath === 'string' ? row.textPath : null
+    if (typeof row.text !== 'string' && !legacyPath) continue
+    let body = typeof row.text === 'string' ? row.text : ''
+    if (!body && legacyPath) {
+      try {
+        body = readFileSync(legacyPath, 'utf8')
+      } catch {
+        body = ''
+      }
+    }
+    if (!body) continue
+    const ref = storeTaskText(textsDir, body)
+    if (!ref) return { migrated, failed: true, failedAt: row.taskId }
+    delete row.text
+    delete row.textPath
+    row.textRef = ref
+    migrated += 1
+  }
+  return { migrated, failed: false }
+}
+
 /** Content block types that are never an answer: reasoning and tool traffic. */
 const NON_ANSWER_PART_TYPES = new Set([
   'thinking',
@@ -971,6 +1044,8 @@ function normalizeBase(config) {
     // Layer-1 task registry retention: rows older than N days or beyond M rows are pruned.
     tasksRetentionDays: clampInterval(c.tasksRetentionDays, 30, 1, 3650),
     tasksMaxRows: clampInterval(c.tasksMaxRows, 5000, 50, 200000),
+    // One-time migration of inline task bodies to content-addressed texts/ (T-277).
+    compactTaskText: c.compactTaskText !== false,
     // Diagnostics: a dedicated log file outside the temp directory survives reboots, and a
     // single rotated copy keeps it bounded without a logging dependency.
     logFile: c.logFile ? String(c.logFile) : undefined,
@@ -3318,8 +3393,42 @@ export function apply(ctx, config) {
 
   const taskRegistryFile = join(homedir(), '.dsh', 'mesh-waker', 'tasks.jsonl')
   const taskTextDir = join(homedir(), '.dsh', 'mesh-waker', 'tasks')
-  const TASK_INLINE_TEXT_BYTES = 8192
+  // Content-addressed bodies: tasks.jsonl stores only textRef, so three rows of one task
+  // point at the same file and the registry stays small (T-277).
+  const taskTextsDir = join(homedir(), '.dsh', 'mesh-waker', 'texts')
   const taskRows = new Map()
+
+  /** Store a body once under texts/<sha256>.txt and return its ref, or null on failure. */
+  function writeTaskText(body) {
+    const ref = storeTaskText(taskTextsDir, body)
+    if (!ref) fileLog('task text store failed; keeping the body inline')
+    return ref
+  }
+
+  /**
+   * One-time, idempotent migration: rows that still embed `text` (or use the old
+   * tasks/<id>.md path) get a textRef and lose the inline copy. The registry is rewritten
+   * through a temp file; on any failure the original file is left untouched.
+   */
+  function compactTaskTexts() {
+    if (c.compactTaskText !== true) return 0
+    const result = compactTaskRows([...taskRows.values()], taskTextsDir)
+    if (result.failed) {
+      fileLog(`task text compaction aborted at ${result.failedAt}; registry left unchanged`)
+      return result.migrated
+    }
+    if (result.migrated === 0) return 0
+    try {
+      const lines = [...taskRows.values()].map((row) => JSON.stringify(row)).join('\n')
+      const temp = `${taskRegistryFile}.compact.tmp`
+      writeFileSync(temp, `${lines}\n`, { mode: 0o600 })
+      renameSync(temp, taskRegistryFile)
+      fileLog(`task text compacted: ${result.migrated} rows`)
+    } catch (error) {
+      fileLog(`task registry rewrite after compaction failed: ${error.message}`)
+    }
+    return result.migrated
+  }
 
   // ---------------------------------------------------------------- thread registry
   //
@@ -3455,10 +3564,6 @@ export function apply(ctx, config) {
     return { thread, released: true }
   }
 
-  function taskTextPath(taskId) {
-    return join(taskTextDir, `${taskId}.md`)
-  }
-
   function appendTaskRow(row) {
     try {
       mkdirSync(dirname(taskRegistryFile), { recursive: true })
@@ -3512,10 +3617,14 @@ export function apply(ctx, config) {
       keepIds.add(String(row.taskId))
     }
     try {
-      mkdirSync(dirname(taskRegistryFile), { recursive: true })
-      const temp = `${taskRegistryFile}.tmp`
-      writeFileSync(temp, kept.map((row) => JSON.stringify(row)).join('\n') + (kept.length ? '\n' : ''), { mode: 0o600 })
-      renameSync(temp, taskRegistryFile)
+      // Rewrite only when something was pruned: an unchanged file should stay byte-identical
+      // (the text migration's failure path relies on that, and boot avoids a 250KB rewrite).
+      if (kept.length !== rows.length) {
+        mkdirSync(dirname(taskRegistryFile), { recursive: true })
+        const temp = `${taskRegistryFile}.tmp`
+        writeFileSync(temp, kept.map((row) => JSON.stringify(row)).join('\n') + (kept.length ? '\n' : ''), { mode: 0o600 })
+        renameSync(temp, taskRegistryFile)
+      }
     } catch (error) {
       fileLog(`task registry compaction failed: ${error.message}`)
     }
@@ -3572,17 +3681,13 @@ export function apply(ctx, config) {
             .map((ref) => ref.slice(0, 200))
         : [],
     }
-    if (textBytes <= TASK_INLINE_TEXT_BYTES) {
+    const textRef = body ? writeTaskText(body) : null
+    if (textRef) {
+      row.textRef = textRef
+    } else if (body) {
+      // Storage failure must not lose the task body; keep it inline as a fallback.
       row.text = body
-    } else {
-      try {
-        mkdirSync(taskTextDir, { recursive: true })
-        writeFileSync(taskTextPath(taskId), body, { mode: 0o600 })
-        row.textPath = taskTextPath(taskId)
-      } catch (error) {
-        row.text = body.slice(0, TASK_INLINE_TEXT_BYTES)
-        fileLog(`task text file write failed for ${taskId}: ${error.message}`)
-      }
+      fileLog(`task text store unavailable for ${taskId}; kept inline (${textBytes} bytes)`)
     }
     taskRows.set(taskId, row)
     appendTaskRow(row)
@@ -3609,18 +3714,11 @@ export function apply(ctx, config) {
       receiptSummary: row.receiptSummary ?? null,
       refs: Array.isArray(row.refs) ? row.refs : [],
       reusedId: row.reusedId === true,
-      hasTextFile: Boolean(row.textPath),
+      textRef: row.textRef ?? null,
+      hasTextFile: Boolean(row.textRef || row.textPath),
     }
     if (!withText) return base
-    let text = row.text ?? null
-    if (text === null && row.textPath) {
-      try {
-        text = readFileSync(row.textPath, 'utf8')
-      } catch {
-        text = null
-      }
-    }
-    return { ...base, text }
+    return { ...base, text: resolveTaskText(row, taskTextsDir) }
   }
 
   /**
@@ -4733,6 +4831,8 @@ export function apply(ctx, config) {
   // Restore batches before the listener comes up, then poll liveness for early alerts.
   loadTaskRegistry()
   loadThreads()
+  // Migrate inline bodies before anything reads or rewrites rows (idempotent, T-277).
+  compactTaskTexts()
   // Once per process: pending/started rows from a previous host process can never settle.
   void reconcileOrphanTasks().catch((error) => {
     fileLog(`restart reconciliation failed: ${error && error.message ? error.message : error}`)
@@ -4867,7 +4967,9 @@ export function apply(ctx, config) {
           total: rows.length,
           limit,
           offset,
-          tasks: rows.slice(offset, offset + limit).map((row) => taskRowForApi(row)),
+          tasks: rows
+            .slice(offset, offset + limit)
+            .map((row) => taskRowForApi(row, { withText: params.get('include') === 'text' })),
         }),
       )
       return

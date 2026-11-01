@@ -77,7 +77,7 @@ function seedSession(sessionsRoot, { id, title, workspace = 'ws-test' }) {
  * and standalone boots must not touch the network. Pass `config` to boot a hub-mode
  * install (bootstrap / pull) and `writeToken: false` to start with no stored token.
  */
-async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null, archivedIds = [], toolsDelayCalls = 0, tasksSeed = null } = {}) {
+async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null, archivedIds = [], toolsDelayCalls = 0, tasksSeed = null, prepareHome = null } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-endpoints-'))
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
@@ -170,6 +170,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   process.env.USERPROFILE = home
   process.env.HOME = home
   process.env.MESH_WAKER_SESSIONS_ROOT = sessionsRoot
+  if (typeof prepareHome === 'function') prepareHome(home)
 
   const { apply } = await import(pathToFileURL(ENTRY).href)
   const port = await freePort()
@@ -2330,7 +2331,8 @@ async function main() {
       row?.targetSessionId === 'session-taskreg' &&
       row?.batchId === 'B-reg' &&
       row?.text === undefined &&
-      row?.hasTextFile === false
+      typeof row?.textRef === 'string' &&
+      row?.hasTextFile === true
     report('tasks: a dispatched task is listed as pending with a subject', ok, `total=${listed.json?.total} status=${row?.status ?? '-'} subject=${JSON.stringify(row?.subject ?? '')} hasBodyInList=${row?.text !== undefined}`)
   })
 
@@ -3493,6 +3495,117 @@ async function main() {
     const receipts = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-LOST-FILE' && receipt.status === 'lost')
     const ok = lost?.json?.task?.status === 'lost' && receipts.length === 1 && receipts[0].receiptMode === 'file' && h.state.prompts.length === 0
     report('restart: an old row without requester stays file only and warns', ok, `status=${lost?.json?.task?.status ?? '-'} receiptMode=${receipts[0]?.receiptMode ?? '-'} prompts=${h.state.prompts.length}`)
+  })
+
+  // 167-172. Task bodies are stored by content hash (T-277): the jsonl keeps only a ref,
+  // identical bodies dedupe, and old inline rows migrate without losing the text.
+  const textsDirOf = (h) => path.join(h.home, '.dsh', 'mesh-waker', 'texts')
+  const listTextFiles = (h) => {
+    try {
+      return fs.readdirSync(textsDirOf(h)).filter((name) => name.endsWith('.txt'))
+    } catch {
+      return []
+    }
+  }
+
+  await runCase('tasks: a registered row keeps a textRef instead of the inline body', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-txt', title: 'txt target' }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    const body = '正文只存一次：content addressed body'
+    await tool.execute({ target: 'txt target', text: body, taskId: 'T-TXT-1' }, { sessionId: 'session-coord' })
+    const row = readTaskRows(h).find((entry) => entry.taskId === 'T-TXT-1')
+    const ref = /^sha256:([a-f0-9]{64})$/.exec(row?.textRef ?? '')
+    const stored = ref ? fs.readFileSync(path.join(textsDirOf(h), `${ref[1]}.txt`), 'utf8') : ''
+    const ok =
+      typeof row?.textRef === 'string' &&
+      row.text === undefined &&
+      row.textBytes === Buffer.byteLength(body) &&
+      typeof row.subject === 'string' &&
+      stored === body
+    report('tasks: a registered row keeps a textRef instead of the inline body', ok, `textRef=${String(row?.textRef).slice(0, 20)} bytes=${row?.textBytes ?? '-'} hasText=${row?.text !== undefined}`)
+  })
+
+  await runCase('tasks: identical bodies share one text file', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-dup-txt', title: 'dup txt target' }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'dup txt target', text: '完全相同的正文', taskId: 'T-TXT-A' }, { sessionId: 'session-coord' })
+    await tool.execute({ target: 'dup txt target', text: '完全相同的正文', taskId: 'T-TXT-B' }, { sessionId: 'session-coord' })
+    const rows = readTaskRows(h).filter((entry) => entry.taskId === 'T-TXT-A' || entry.taskId === 'T-TXT-B')
+    const files = listTextFiles(h)
+    const ok = rows.length === 2 && rows[0].textRef === rows[1].textRef && files.length === 1
+    report('tasks: identical bodies share one text file', ok, `files=${files.length} sameRef=${rows[0]?.textRef === rows[1]?.textRef}`)
+  })
+
+  await runCase('tasks: a legacy inline row migrates to a textRef and still resolves', async (boot) => {
+    const body = '迁移前的内嵌正文'
+    const h = await boot({
+      tasksSeed: [seededTask('T-LEGACY-TXT', { status: 'settled', settledAt: Date.now() - 1000, text: body, textBytes: Buffer.byteLength(body) })],
+    })
+    const row = readTaskRows(h).find((entry) => entry.taskId === 'T-LEGACY-TXT')
+    const { resolveTaskText } = await import(pathToFileURL(ENTRY).href)
+    const resolved = resolveTaskText(row, textsDirOf(h))
+    const ok =
+      typeof row?.textRef === 'string' &&
+      row.text === undefined &&
+      row.textBytes === Buffer.byteLength(body) &&
+      resolved === body &&
+      listTextFiles(h).length === 1
+    report('tasks: a legacy inline row migrates to a textRef and still resolves', ok, `textRef=${String(row?.textRef).slice(0, 20)} resolved=${JSON.stringify(resolved)}`)
+  })
+
+  await runCase('tasks: resolveTaskText handles ref, legacy text and nothing', async () => {
+    const { resolveTaskText } = await import(pathToFileURL(ENTRY).href)
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-texts-'))
+    try {
+      const body = '内容寻址正文'
+      const hex = require('node:crypto').createHash('sha256').update(body, 'utf8').digest('hex')
+      fs.writeFileSync(path.join(dir, `${hex}.txt`), body)
+      const byRef = resolveTaskText({ textRef: `sha256:${hex}` }, dir)
+      const byText = resolveTaskText({ text: '旧行内正文' }, dir)
+      const missing = resolveTaskText({}, dir)
+      const broken = resolveTaskText({ textRef: 'sha256:not-a-hash' }, dir)
+      const ok = byRef === body && byText === '旧行内正文' && missing === '' && broken === ''
+      report('tasks: resolveTaskText handles ref, legacy text and nothing', ok, `ref=${JSON.stringify(byRef)} legacy=${JSON.stringify(byText)} missing=${JSON.stringify(missing)} broken=${JSON.stringify(broken)}`)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('tasks: the task list hides text by default and adds it with include=text', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-inc', title: 'include target' }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    const body = '按需返回的正文'
+    await tool.execute({ target: 'include target', text: body, taskId: 'T-INC-1' }, { sessionId: 'session-coord' })
+    const plain = await request(h.base, '/mesh/tasks')
+    const withText = await request(h.base, '/mesh/tasks?include=text')
+    const plainRow = plain.json?.tasks?.find((row) => row.taskId === 'T-INC-1')
+    const textRow = withText.json?.tasks?.find((row) => row.taskId === 'T-INC-1')
+    const ok =
+      plainRow?.text === undefined &&
+      typeof plainRow?.textRef === 'string' &&
+      textRow?.text === body
+    report('tasks: the task list hides text by default and adds it with include=text', ok, `defaultHasText=${plainRow?.text !== undefined} includeText=${JSON.stringify(textRow?.text ?? null)}`)
+  })
+
+  await runCase('tasks: a failed migration leaves tasks.jsonl untouched', async (boot) => {
+    let before = ''
+    const h = await boot({
+      tasksSeed: [seededTask('T-MIG-FAIL', { status: 'settled', settledAt: Date.now() - 1000, text: '不能被破坏的正文' })],
+      prepareHome: (home) => {
+        const registry = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(registry, { recursive: true })
+        before = fs.readFileSync(path.join(registry, 'tasks.jsonl'), 'utf8')
+        // A file where the texts directory should be makes every text write fail.
+        fs.writeFileSync(path.join(registry, 'texts'), 'not a directory')
+      },
+    })
+    await request(h.base, '/mesh/tasks')
+    const after = fs.readFileSync(path.join(h.home, '.dsh', 'mesh-waker', 'tasks.jsonl'), 'utf8')
+    const ok = before.length > 0 && after === before && /T-MIG-FAIL/.test(after)
+    report('tasks: a failed migration leaves tasks.jsonl untouched', ok, `unchanged=${after === before} bytes=${after.length}`)
   })
 
   const failed = results.filter((result) => !result.ok)
