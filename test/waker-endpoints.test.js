@@ -2650,11 +2650,18 @@ async function main() {
 
   // 124-125. Host schema subset guard (T-236): type arrays silently block registration.
   await runCase('tools: both output schemas pass the host JSON Schema subset', async () => {
-    const { DISPATCH_OUTPUT, ASK_OUTPUT, validateToolSchema } = await import(pathToFileURL(ENTRY).href)
+    const { DISPATCH_OUTPUT, ASK_OUTPUT, THREAD_OUTPUT, COMPLETE_OUTPUT, validateToolSchema } = await import(pathToFileURL(ENTRY).href)
     const dispatch = validateToolSchema(DISPATCH_OUTPUT)
     const ask = validateToolSchema(ASK_OUTPUT)
-    const ok = dispatch.ok === true && ask.ok === true
-    report('tools: both output schemas pass the host JSON Schema subset', ok, `dispatch=${dispatch.ok ? 'ok' : dispatch.issues.join('; ')} ask=${ask.ok ? 'ok' : ask.issues.join('; ')}`)
+    const thread = validateToolSchema(THREAD_OUTPUT)
+    const complete = validateToolSchema(COMPLETE_OUTPUT)
+    const schemas = { dispatch: dispatch.ok, ask: ask.ok, thread: thread.ok, complete: complete.ok }
+    const ok = Object.values(schemas).every(Boolean)
+    report(
+      'tools: both output schemas pass the host JSON Schema subset',
+      ok,
+      `dispatch=${dispatch.ok ? 'ok' : dispatch.issues.join('; ')} ask=${ask.ok ? 'ok' : ask.issues.join('; ')} thread=${thread.ok ? 'ok' : thread.issues.join('; ')} complete=${complete.ok ? 'ok' : complete.issues.join('; ')}`,
+    )
   })
 
   await runCase('tools: validateToolSchema rejects a type array with the host wording', async () => {
@@ -3606,6 +3613,132 @@ async function main() {
     const after = fs.readFileSync(path.join(h.home, '.dsh', 'mesh-waker', 'tasks.jsonl'), 'utf8')
     const ok = before.length > 0 && after === before && /T-MIG-FAIL/.test(after)
     report('tasks: a failed migration leaves tasks.jsonl untouched', ok, `unchanged=${after === before} bytes=${after.length}`)
+  })
+
+  // 173-179. mesh_complete (0.7.31): the worker declares the outcome instead of waker
+  // guessing from turn/end; observed settlement stays as the fallback.
+  const dispatchTo = async (h, target, text, taskId) => {
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target, text, taskId }, { sessionId: 'session-coord' })
+  }
+  const completedTool = (h) => {
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_complete')
+    if (!tool) throw new Error('mesh_complete was not registered')
+    return tool
+  }
+  const lastReceiptFor = (h, taskId) =>
+    orphanReceipts(h)
+      .filter((receipt) => receipt.taskId === taskId)
+      .pop()
+
+  await runCase('complete: a declared completion settles with its own summary and source', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-declare', title: 'declare target' }], config: { receiptMode: 'file' } })
+    await dispatchTo(h, 'declare target', 'do the thing', 'T-DECL-1')
+    const result = await completedTool(h).execute(
+      { taskId: 'T-DECL-1', status: 'done', summary: '我写的一行摘要' },
+      { agent: { id: 'session-declare' } },
+    )
+    const task = await request(h.base, '/mesh/tasks/T-DECL-1')
+    const receipt = lastReceiptFor(h, 'T-DECL-1')
+    const status = await request(h.base, '/mesh/status')
+    const ok =
+      result?.ok === true &&
+      result?.source === 'declared' &&
+      task.json?.task?.status === 'settled' &&
+      receipt?.status === 'completed' &&
+      receipt?.source === 'declared' &&
+      receipt?.summary === '我写的一行摘要' &&
+      status.json?.tools?.complete === true
+    report('complete: a declared completion settles with its own summary and source', ok, `task=${task.json?.task?.status} receipt=${receipt?.status}/${receipt?.source} tools.complete=${String(status.json?.tools?.complete)}`)
+  })
+
+  await runCase('complete: a session cannot complete another session task', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-owner', title: 'owner target' },
+        { id: 'session-intruder', title: 'intruder' },
+      ],
+      config: { receiptMode: 'file' },
+    })
+    await dispatchTo(h, 'owner target', 'owner only', 'T-OWN-1')
+    let message = ''
+    try {
+      await completedTool(h).execute({ taskId: 'T-OWN-1', status: 'done' }, { agent: { id: 'session-intruder' } })
+    } catch (error) {
+      message = String(error && error.message ? error.message : error)
+    }
+    const task = await request(h.base, '/mesh/tasks/T-OWN-1')
+    const ok = /belongs to session-owner/.test(message) && task.json?.task?.status === 'pending'
+    report('complete: a session cannot complete another session task', ok, `error=${JSON.stringify(message)} status=${task.json?.task?.status}`)
+  })
+
+  await runCase('complete: an unknown task id is rejected', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-unknown', title: 'unknown target' }] })
+    let message = ''
+    try {
+      await completedTool(h).execute({ taskId: 'T-NOPE', status: 'done' }, { agent: { id: 'session-unknown' } })
+    } catch (error) {
+      message = String(error && error.message ? error.message : error)
+    }
+    const ok = /unknown task "T-NOPE"/.test(message)
+    report('complete: an unknown task id is rejected', ok, `error=${JSON.stringify(message)}`)
+  })
+
+  await runCase('complete: a second declaration returns already settled', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-twice', title: 'twice target' }], config: { receiptMode: 'file' } })
+    await dispatchTo(h, 'twice target', 'settle me once', 'T-TWICE-1')
+    const tool = completedTool(h)
+    const first = await tool.execute({ taskId: 'T-TWICE-1', status: 'done' }, { agent: { id: 'session-twice' } })
+    const promptsAfterFirst = h.state.prompts.length
+    const second = await tool.execute({ taskId: 'T-TWICE-1', status: 'done' }, { agent: { id: 'session-twice' } })
+    const receipts = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-TWICE-1')
+    const ok =
+      first?.ok === true &&
+      second?.alreadySettled === true &&
+      receipts.length === 1 &&
+      h.state.prompts.length === promptsAfterFirst
+    report('complete: a second declaration returns already settled', ok, `alreadySettled=${String(second?.alreadySettled)} receipts=${receipts.length} prompts=${h.state.prompts.length}`)
+  })
+
+  await runCase('complete: blocked maps to failed and keeps the worker detail', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-blocked', title: 'blocked target' }], config: { receiptMode: 'file' } })
+    await dispatchTo(h, 'blocked target', 'will block', 'T-BLOCK-1')
+    const result = await completedTool(h).execute(
+      { taskId: 'T-BLOCK-1', status: 'blocked', detail: 'missing credentials for the deploy step' },
+      { agent: { id: 'session-blocked' } },
+    )
+    const receipt = lastReceiptFor(h, 'T-BLOCK-1')
+    const ok =
+      result?.receiptStatus === 'failed' &&
+      receipt?.status === 'failed' &&
+      receipt?.reasonDetail === 'missing credentials for the deploy step' &&
+      receipt?.source === 'declared'
+    report('complete: blocked maps to failed and keeps the worker detail', ok, `receipt=${receipt?.status} detail=${JSON.stringify(receipt?.reasonDetail ?? '')}`)
+  })
+
+  await runCase('complete: an undeclared task still settles from turn/end as observed', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-observed', title: 'observed target' }], config: { receiptMode: 'file' } })
+    await dispatchTo(h, 'observed target', 'no declaration', 'T-OBS-1')
+    h.emit('session/event', { id: 'session-observed' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-observed' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const settled = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-OBS-1')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const receipt = lastReceiptFor(h, 'T-OBS-1')
+    const ok = settled?.json?.task?.status === 'settled' && receipt?.source === 'observed' && receipt?.status === 'completed'
+    report('complete: an undeclared task still settles from turn/end as observed', ok, `status=${settled?.json?.task?.status ?? '-'} source=${receipt?.source ?? '-'}`)
+  })
+
+  await runCase('complete: the receipt notice marks declared and observed sources', async () => {
+    const { receiptNoticeText } = await import(pathToFileURL(ENTRY).href)
+    const declared = receiptNoticeText({ taskId: 'T-NOTICE-D', status: 'completed', durationMs: 1234, source: 'declared' })
+    const observed = receiptNoticeText({ taskId: 'T-NOTICE-O', status: 'completed', durationMs: 300100, source: 'observed' })
+    const ok =
+      declared === '[RECEIPT] T-NOTICE-D completed 1234ms (declared)' &&
+      observed === '[RECEIPT] T-NOTICE-O completed 300100ms (observed)'
+    report('complete: the receipt notice marks declared and observed sources', ok, `declared=${JSON.stringify(declared)} observed=${JSON.stringify(observed)}`)
   })
 
   const failed = results.filter((result) => !result.ok)

@@ -262,6 +262,7 @@ export function buildReceipt({
   baselineTurn = null,
   settledTurn = null,
   injectedDuringTurn = false,
+  source = 'observed',
 } = {}) {
   const at = endedAt ?? Date.now()
   return {
@@ -275,6 +276,7 @@ export function buildReceipt({
     endedAt: at,
     durationMs: injectedAt ? Math.max(0, at - injectedAt) : null,
     summary: truncateText(summary, summaryChars),
+    source: source === 'declared' ? 'declared' : 'observed',
     receiptMode,
     // Diagnostics: a receipt whose settledTurn equals baselineTurn (queue mode) means the
     // task was injected while that turn was already running — useful when auditing.
@@ -291,7 +293,8 @@ export function buildReceipt({
  * full-summary behaviour returns when the caller asks for it (T-269).
  */
 export function receiptNoticeText(receipt, { includeSummary = false } = {}) {
-  const first = `[RECEIPT] ${receipt.taskId} ${receipt.status} ${receipt.durationMs ?? 0}ms`
+  const marker = receipt.source ? ` (${receipt.source})` : ''
+  const first = `[RECEIPT] ${receipt.taskId} ${receipt.status} ${receipt.durationMs ?? 0}ms${marker}`
   if (receipt.status === 'error' || receipt.status === 'lost') {
     const detail = String(receipt.reasonDetail ?? receipt.reasonKind ?? '')
       .replace(/\s+/g, ' ')
@@ -637,6 +640,41 @@ export const ASK_OUTPUT = {
       timeoutSeconds: { type: 'number' },
     },
     required: ['status', 'questionId'],
+  },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+}
+
+/**
+ * Worker-side completion tool (0.7.31): the session doing the work declares the outcome
+ * instead of waker guessing from turn/end. `summary` is whatever the worker writes (receipt
+ * file only); `detail` becomes the reason line for blocked tasks.
+ */
+export const MESH_COMPLETE_TOOL = {
+  name: 'mesh_complete',
+  description:
+    'Declare the outcome of a task dispatched to THIS session. status done|partial|blocked settles the task immediately with source=declared; summary is your own ≤300-char summary for the receipt file. Unknown tasks, tasks of other sessions, and already-settled tasks are rejected (already-settled returns alreadySettled:true). Tasks that never call this still settle from turn/end with source=observed.',
+  parameters: {
+    taskId: { type: 'string', required: true, description: 'Task id from the [TASK …] header.' },
+    status: { type: 'string', required: true, enum: ['done', 'partial', 'blocked'], description: 'done | partial | blocked' },
+    summary: { type: 'string', description: 'Your own summary (≤300 chars), stored in receipts.jsonl only.' },
+    detail: { type: 'string', description: 'One-line reason when blocked (goes into the receipt reasonDetail).' },
+  },
+  required: ['taskId', 'status'],
+}
+
+export const COMPLETE_OUTPUT = {
+  schema: {
+    type: 'object',
+    properties: {
+      ok: { type: 'boolean' },
+      taskId: { type: 'string' },
+      status: { type: 'string' },
+      receiptStatus: { type: 'string' },
+      source: { type: 'string' },
+      alreadySettled: { type: 'boolean' },
+      summary: { type: 'string' },
+    },
+    required: ['ok', 'taskId', 'status'],
   },
   render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
 }
@@ -3913,7 +3951,10 @@ export function apply(ctx, config) {
     const turnMatches =
       Boolean(shot) && (details.turn === null || details.turn === undefined || shot.turn === null || shot.turn === details.turn)
     const textIsFresh = Boolean(shot) && Number.isFinite(shot.at) && Number.isFinite(task.injectedAt) && shot.at >= task.injectedAt
-    const summary = turnMatches && textIsFresh ? shot.text : ''
+    // A declared completion writes its own summary; observed settlement still uses the
+    // guarded snapshot (never invent prose the worker did not send).
+    const captured = turnMatches && textIsFresh ? shot.text : ''
+    const summary = details.summary !== undefined ? String(details.summary) : captured
     const receipt = buildReceipt({
       taskId,
       sessionId: task.sessionId,
@@ -3929,6 +3970,7 @@ export function apply(ctx, config) {
       baselineTurn: task.baselineTurn ?? null,
       settledTurn: details.turn ?? null,
       injectedDuringTurn: task.injectedDuringTurn === true,
+      source: details.source ?? 'observed',
     })
     writeReceiptFile(receipt)
     // Registry status mirrors the receipt: not-started is the stall path, everything else
@@ -4714,6 +4756,52 @@ export function apply(ctx, config) {
     throw new Error(`action must be list | subscribe | release, got "${action || '(empty)'}"`)
   }
 
+  const COMPLETE_STATUS = { done: 'completed', partial: 'partial', blocked: 'failed' }
+
+  /** Settle a task because its target session declared the outcome (0.7.31). */
+  function completeTaskDeclared(args = {}, extra = null) {
+    const caller = callerSessionFrom(extra)
+    if (!caller) {
+      throw new Error('mesh_complete needs the calling session; the host did not pass one (no default session is guessed)')
+    }
+    const taskId = String(args.taskId ?? '').trim()
+    if (!taskId) throw new Error('taskId is required')
+    const requested = String(args.status ?? '').trim()
+    if (!COMPLETE_STATUS[requested]) throw new Error('status must be done | partial | blocked')
+    const task = pendingTasks.get(taskId)
+    if (!task) {
+      const row = taskRows.get(taskId)
+      if (!row) throw new Error(`unknown task "${taskId}"`)
+      fileLog(`mesh_complete ${taskId} ignored: already settled (${row.status}) by ${caller}`)
+      return { ok: true, alreadySettled: true, taskId, status: row.status, source: 'declared' }
+    }
+    if (task.sessionId !== caller) {
+      throw new Error(`task "${taskId}" belongs to ${task.sessionId}, not ${caller}; only its target session can complete it`)
+    }
+    const summary = String(args.summary ?? '').slice(0, 300)
+    const detail = String(args.detail ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 300)
+    const receipt = settleTask(taskId, task, {
+      turn: liveness.get(task.sessionId)?.openTurn ?? null,
+      status: COMPLETE_STATUS[requested],
+      reasonKind: requested,
+      reasonDetail: detail || null,
+      summary,
+      source: 'declared',
+    })
+    fileLog(`mesh_complete ${taskId} ${requested} by ${caller} -> ${receipt ? receipt.status : COMPLETE_STATUS[requested]}`)
+    return {
+      ok: true,
+      taskId,
+      status: requested,
+      receiptStatus: receipt?.status ?? COMPLETE_STATUS[requested],
+      source: 'declared',
+      summary: receipt?.summary ?? '',
+    }
+  }
+
   // Both model tools share one definition builder and one installer. Registration can lose
   // a race with the host's tools service (ctx.get('tools') is still undefined on the first
   // plugin turn), so it retries a few times instead of failing silently; every outcome goes
@@ -4722,6 +4810,7 @@ export function apply(ctx, config) {
     dispatch: { ok: false, error: null },
     ask: { ok: false, error: null },
     thread: { ok: false, error: null },
+    complete: { ok: false, error: null },
   }
 
   function toolsService() {
@@ -4823,6 +4912,16 @@ export function apply(ctx, config) {
       execute: (args, extra) => meshThreadAction(args, extra),
     })
     installModelTool(threadDefinition, 'thread')
+
+    const completeDefinition = await buildToolDefinition({
+      name: MESH_COMPLETE_TOOL.name,
+      description: MESH_COMPLETE_TOOL.description,
+      parameters: MESH_COMPLETE_TOOL.parameters,
+      required: MESH_COMPLETE_TOOL.required,
+      output: COMPLETE_OUTPUT,
+      execute: (args, extra) => completeTaskDeclared(args, extra),
+    })
+    installModelTool(completeDefinition, 'complete')
   })()
 
   // mesh_ask (0.7.0): same registration path as mesh_dispatch — defineTool when the host
@@ -4888,6 +4987,37 @@ export function apply(ctx, config) {
     }
 
     // Task registry API (0.7.11): list without bodies, detail with body, DELETE = cancel.
+    if (path === '/mesh/tasks/complete' && req.method === 'POST') {
+      // Same logic as the mesh_complete tool, for scripts (0.7.31).
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const chunks = []
+      let size = 0
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size > MAX_BODY) {
+          res.writeHead(413).end()
+          return
+        }
+        chunks.push(chunk)
+      }
+      try {
+        const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        const sessionId = String(draft.sessionId ?? '').trim()
+        if (!sessionId) throw new Error('sessionId is required')
+        const result = completeTaskDeclared(draft, { sessionId })
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify(result))
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
+      return
+    }
+
     if (path === '/mesh/threads' && req.method === 'GET') {
       // Threads are the "same line of work" identity: each entry is the current binding
       // plus every task that carried the id (derived from the task registry).
@@ -5373,8 +5503,14 @@ export function apply(ctx, config) {
                 }
               })(),
               // Model-tool self-check: a silent registration failure is visible here.
-              tools: { dispatch: toolState.dispatch.ok, ask: toolState.ask.ok, thread: toolState.thread.ok },
-              toolsError: toolState.dispatch.error ?? toolState.ask.error ?? toolState.thread.error ?? null,
+              tools: {
+                dispatch: toolState.dispatch.ok,
+                ask: toolState.ask.ok,
+                thread: toolState.thread.ok,
+                complete: toolState.complete.ok,
+              },
+              toolsError:
+                toolState.dispatch.error ?? toolState.ask.error ?? toolState.thread.error ?? toolState.complete.error ?? null,
               // Effective limits and optional-seam state, so operators never have to guess.
               limits: { maxInlineBytes: c.maxInlineBytes },
               seams: { approval: seams.approval, questions: seams.questions },

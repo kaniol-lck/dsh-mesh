@@ -397,7 +397,9 @@ tail -n 2 ~/.dsh/mesh-waker/receipts.jsonl
 
 **worker 侧线程工具（0.7.23，`mesh_thread`）**：`action=list`（`scope=mine|all`）看绑定；`action=subscribe, thread=TH-1` 把**调用方会话**绑到该线程（已被别的会话占用 → 拒绝并报占用者，不抢）；`action=release, thread=TH-1` 只有当前绑定者能解绑，解绑后该线程从 `threads.json` 移除——未来不带 `target` 的派活会报 `unknown thread`，即「交回协调」语义。调用方会话来自宿主传入的 caller（`extra.agent.id`/`sessionId`），拿不到就明确报错，不猜默认会话。同一逻辑也暴露为 loopback HTTP：`POST /mesh/threads/subscribe`、`POST /mesh/threads/release`（body `{thread, sessionId}`）；`GET /mesh/threads` 每条新增 `subscribedBy`（`dispatch`/`self`）与 `taskIds[]`。
 
-**自查工具是否注册成功**：`GET /mesh/status` 的 `tools` 字段给出 `{dispatch, ask, thread}` 三个布尔值，失败原因在 `toolsError`（例如 `host exposes no tools service`）。工具注册会等待宿主 tools 服务就绪（最多重试 5 次、每次 500ms），每次成功/失败都写一行到 waker 日志；模型说「工具未注册」时先看这些字段，不要猜。
+**worker 侧完成声明（0.7.31，`mesh_complete`）**：被派活的会话可主动声明结果——`mesh_complete({taskId, status: 'done'|'partial'|'blocked', summary?, detail?})`。命中**属于调用方会话的在飞任务**才结算：`done→completed`、`partial→partial`、`blocked→failed`（`detail` 成为回执 `reasonDetail`），`summary` 用会话自己写的（≤300 字，只落 `receipts.jsonl`），回执 `source=declared`；未知 taskId、别人的任务、已结算任务都明确报错（已结算返回 `alreadySettled:true`，不重复投递）。未声明的任务仍按 `turn/end` 自动结算，回执 `source=observed`。HTTP 侧：`POST /mesh/tasks/complete`（body `{taskId, status, summary?, detail?, sessionId}`）。
+
+**自查工具是否注册成功**：`GET /mesh/status` 的 `tools` 字段给出 `{dispatch, ask, thread, complete}` 四个布尔值，失败原因在 `toolsError`（例如 `host exposes no tools service`）。工具注册会等待宿主 tools 服务就绪（最多重试 5 次、每次 500ms），每次成功/失败都写一行到 waker 日志；模型说「工具未注册」时先看这些字段，不要猜。
 
 ```bash
 # 新建一个执行会话并投第一单（--create 的典型用法）

@@ -16,6 +16,7 @@
 - 线程身份：`mesh_dispatch` 的 `thread` 参数可续派到同一会话，任务头带 `THREAD`，`GET /mesh/threads` 查看绑定。
 - `mesh_thread` 工具：`list` / `subscribe` / `release`，worker 可主动接管或交回线索。
 - 重启后自动把上一进程遗留的任务标为 `lost` 并通知派活方，不再无声消失。
+- 任务可由执行会话主动声明完成：`mesh_complete`（`done` / `partial` / `blocked`），回执标注 `(declared)`；未声明的任务仍按回合结束自动结算并标注 `(observed)`。
 - 回执可投给派活方（`requester`），而不是只投全局 `receiptTo`。
 
 ### Changed
