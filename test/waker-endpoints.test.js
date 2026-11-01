@@ -3377,6 +3377,60 @@ async function main() {
     report('receipt: no assistant snapshot keeps the summary empty', ok, `summary=${JSON.stringify(summary)}`)
   })
 
+  // 158-162. A receipt notice is a completion signal, not a letter (T-269): the summary
+  // stays in the file/API, only error/lost carry a reason line.
+  await runCase('receipt notice: completed injects the status line without the summary', async () => {
+    const { receiptNoticeText } = await import(pathToFileURL(ENTRY).href)
+    const summary = '验收成立，接下来等三单收尾。'.repeat(3)
+    const text = receiptNoticeText({ taskId: 'T-NOTICE-1', status: 'completed', durationMs: 5000, summary })
+    const ok = text === '[RECEIPT] T-NOTICE-1 completed 5000ms' && text.indexOf(summary) === -1
+    report('receipt notice: completed injects the status line without the summary', ok, `text=${JSON.stringify(text)} summaryInjected=${text.includes(summary)}`)
+  })
+
+  await runCase('receipt notice: error adds exactly one reason line', async () => {
+    const { receiptNoticeText } = await import(pathToFileURL(ENTRY).href)
+    const text = receiptNoticeText({
+      taskId: 'T-NOTICE-ERR',
+      status: 'error',
+      durationMs: 120,
+      summary: '长篇摘要不应出现',
+      reasonDetail: 'error: SERVER upstream 502',
+    })
+    const lines = text.split('\n')
+    const ok = lines.length === 2 && lines[0] === '[RECEIPT] T-NOTICE-ERR error 120ms' && lines[1] === 'error: SERVER upstream 502'
+    report('receipt notice: error adds exactly one reason line', ok, `text=${JSON.stringify(text)}`)
+  })
+
+  await runCase('receipt notice: lost carries its reason', async () => {
+    const { receiptNoticeText } = await import(pathToFileURL(ENTRY).href)
+    const text = receiptNoticeText({
+      taskId: 'T-NOTICE-LOST',
+      status: 'lost',
+      durationMs: 0,
+      reasonDetail: 'host restart',
+      summary: 'session restarted before this task finished; resend if still needed',
+    })
+    const ok = text.includes('host restart') && !text.includes('session restarted before this task finished')
+    report('receipt notice: lost carries its reason', ok, `text=${JSON.stringify(text)}`)
+  })
+
+  await runCase('receipt notice: includeSummary restores the legacy text', async () => {
+    const { receiptNoticeText } = await import(pathToFileURL(ENTRY).href)
+    const text = receiptNoticeText(
+      { taskId: 'T-NOTICE-OLD', status: 'completed', durationMs: 42, summary: '旧行为摘要' },
+      { includeSummary: true },
+    )
+    const ok = text === '[RECEIPT] T-NOTICE-OLD completed 42ms\n旧行为摘要'
+    report('receipt notice: includeSummary restores the legacy text', ok, `text=${JSON.stringify(text)}`)
+  })
+
+  await runCase('receipt notice: an empty summary leaves a single clean line', async () => {
+    const { receiptNoticeText } = await import(pathToFileURL(ENTRY).href)
+    const text = receiptNoticeText({ taskId: 'T-NOTICE-EMPTY', status: 'completed', durationMs: 1, summary: '' })
+    const ok = text === '[RECEIPT] T-NOTICE-EMPTY completed 1ms' && !text.endsWith('\n')
+    report('receipt notice: an empty summary leaves a single clean line', ok, `text=${JSON.stringify(text)}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

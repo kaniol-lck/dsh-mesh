@@ -32,3 +32,6 @@
         catchUpMaxConversations: 3
         cooldownMs: 1500
         registerIntervalMs: 300000
+        # Receipt notices inject the status line only (the summary stays in receipts.jsonl and
+        # the task API). Set true to restore the legacy "status line + summary" text.
+        receiptNoticeSummary: false

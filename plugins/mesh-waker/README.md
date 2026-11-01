@@ -224,8 +224,9 @@ npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task --receipt
 | `receiptSummaryChars` | `300` | 摘要按**码点**截断，不会切出半个字符 |
 | `receiptStallMs` | `600000` | 注入后这么久仍无 `turn/start`，判 `not-started` |
 | `startedClaimWindowMs` | `30000` | `baselineTurn=null`（注入时还没有回合信息）时，`turn/start` 距注入不超过此窗口才认领 `started`；超窗保持 pending（不造进度） |
+| `receiptNoticeSummary` | `false` | 注入的回执通知是否附带摘要正文。默认只发状态行（回执是完成信号，不是信件）；`error`/`lost` 始终附一行 `reasonDetail`（≤120 字）供处置；摘要仍写入 `receipts.jsonl`、面板与任务 API 可查 |
 
-回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode / baselineTurn / settledTurn / injectedDuringTurn`。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。`baselineTurn`/`settledTurn` 是结算诊断：`queue` 注入发生在回合进行中时 `baselineTurn` 等于该回合，只有更晚回合的 `turn/end` 才会结算（`settledTurn > baselineTurn`），`steer` 则同一回合即可。注入给接收方的正文首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`，第二行是摘要。
+回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode / baselineTurn / settledTurn / injectedDuringTurn`。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。`baselineTurn`/`settledTurn` 是结算诊断：`queue` 注入发生在回合进行中时 `baselineTurn` 等于该回合，只有更晚回合的 `turn/end` 才会结算（`settledTurn > baselineTurn`），`steer` 则同一回合即可。注入给接收方的通知首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`；**0.7.28 起默认只有这一行**（摘要留在文件/面板/API，避免回执被当成回信对刷）。`status ∈ {error, lost}` 时附一行 `reasonDetail`（≤120 字）；需要旧行为（状态行 + 摘要）时设 `receiptNoticeSummary: true`。
 
 **回执投递给谁（0.7.7 / 0.7.24 收紧）**：优先投给**派活方**（requester），否则 `receiptTo`，都没有才只写文件。0.7.24 起 file 模式也会在 waker 日志留一行 `receipt <id> <status> → file only (requester=有/无, receiptTo=有/无)`；两者都缺时额外写 `WARN … nobody was notified`。requester 缺失时按**目标会话的 cwd** 推断同工作区唯一的协调会话（标题以 `· 协调`/`· coordinator` 结尾）：恰好 1 个才用，0 个或多个不猜（日志写 `requester inference ambiguous`）；**不会**拿全局 `receiptTo` 跨工作区兜底。
 

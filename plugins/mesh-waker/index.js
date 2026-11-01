@@ -284,6 +284,24 @@ export function buildReceipt({
   }
 }
 
+/**
+ * Text of one injected receipt notice. A receipt is a completion signal, not a letter: by
+ * default only the status line is injected (the summary stays in receipts.jsonl and the task
+ * API). error/lost add one reason line because the dispatcher must act on it; the legacy
+ * full-summary behaviour returns when the caller asks for it (T-269).
+ */
+export function receiptNoticeText(receipt, { includeSummary = false } = {}) {
+  const first = `[RECEIPT] ${receipt.taskId} ${receipt.status} ${receipt.durationMs ?? 0}ms`
+  if (receipt.status === 'error' || receipt.status === 'lost') {
+    const detail = String(receipt.reasonDetail ?? receipt.reasonKind ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    return detail ? `${first}\n${truncateText(detail, 120)}` : first
+  }
+  if (includeSummary && receipt.summary) return `${first}\n${receipt.summary}`
+  return first
+}
+
 /** Content block types that are never an answer: reasoning and tool traffic. */
 const NON_ANSWER_PART_TYPES = new Set([
   'thinking',
@@ -934,6 +952,9 @@ function normalizeBase(config) {
     receiptFile: c.receiptFile ? String(c.receiptFile) : join(homedir(), '.dsh', 'mesh-waker', 'receipts.jsonl'),
     receiptTo: c.receiptTo ? String(c.receiptTo).trim() : '',
     receiptSummaryChars: clampInterval(c.receiptSummaryChars, 300, 20, 4000),
+    // Receipt notices are completion signals, not letters: inject the status line only unless
+    // the operator explicitly wants the summary too (T-269).
+    receiptNoticeSummary: c.receiptNoticeSummary === true,
     receiptStallMs: clampInterval(c.receiptStallMs, 600000, 1000, 86_400_000),
     // `baselineTurn` is null when the plugin had no turn knowledge at injection time; a
     // turn/start arriving within this window still belongs to the task (T-253). Outside the
@@ -3286,8 +3307,7 @@ export function apply(ctx, config) {
   }
 
   function receiptBody(receipt) {
-    const first = `[RECEIPT] ${receipt.taskId} ${receipt.status} ${receipt.durationMs ?? 0}ms`
-    return receipt.summary ? `${first}\n${receipt.summary}` : first
+    return receiptNoticeText(receipt, { includeSummary: c.receiptNoticeSummary === true })
   }
 
   // ---------------------------------------------------------------- task registry

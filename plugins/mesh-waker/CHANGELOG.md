@@ -9,6 +9,16 @@
 
 ---
 
+## v0.7.28（2026-11-01，注入的回执通知只发状态行，治「对刷回执」的病根）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | `receiptMode=queue` 时注入的通知是「状态行 + 最多 300 字摘要」，回执长得像一封回信；两个协调会话 15 分钟内刷出 35 条任务 / 18 条回执 / 63KB 正文（平均 26 秒一条）。规则层已写「回执不是对话轮次」，机制层还没跟上 |
+| 修法 | 新增导出纯函数 `receiptNoticeText(receipt, { includeSummary })`：默认只输出 `[RECEIPT] <id> <status> <durationMs>ms` 一行；`status ∈ {error, lost}` 始终附一行 `reasonDetail`（空白折叠、≤120 字截断，供处置）；`includeSummary: true` 恢复旧的「状态行 + 摘要」 |
+| 配置 | 新增 `receiptNoticeSummary: false`（老配置缺失即新行为）；`cordis.patch.example.yml` 与 README 配置表已同步 |
+| 不变 | 摘要仍完整写入 `receipts.jsonl`；任务 API / 面板 / 批次回执不受影响；T-255/T-257/T-260/T-265/T-267 逻辑未动 |
+| 测试 | +5（共 162/162）：completed 只发状态行且 `indexOf(summary)===-1`；error 恰好附一行 reasonDetail；lost 带原因且不带旧摘要；`includeSummary:true` 恢复旧文本；空摘要不产生空行。既有 157 例全绿 |
+
 ## v0.7.27（2026-11-01，回执摘要不再抓上一个回合的正文）
 
 | 项 | 内容 |
