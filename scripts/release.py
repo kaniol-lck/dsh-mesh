@@ -4,7 +4,8 @@
     python scripts/release.py                 # preflight + npm publish --tag next
     python scripts/release.py --promote       # move the published version to latest
     python scripts/release.py --preflight     # check only, publish nothing
-    python scripts/release.py --check-versions  # version/changelog consistency only
+    python scripts/release.py --check-versions  # dev-mode version/changelog consistency
+    python scripts/release.py --assert-released # strict: unreleased section gone + released heading present
 
 Rules this script enforces (learned the hard way):
   * node --check on both halves of the plugin;
@@ -67,15 +68,102 @@ def read_json(path: Path):
         return None
 
 
-def version_checks() -> int:
-    """Guard the release sources of truth: hub code, hub metadata, and changelogs.
+RELEASED_HEADING = re.compile(r"^## \[(\d+\.\d+\.\d+)\]")
 
-    The waker CHANGELOG is maintained by the waker session, so a missing file is a SKIP
-    with an actionable hint instead of a crash; a file that exists but has no entry for the
-    version being released is a real preflight failure.
+
+def changelog_state(path: Path):
+    """Return (latest_released, has_unreleased_section, unreleased_has_content) or None when missing."""
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8")
+    latest = None
+    has_unreleased = "## [未发布]" in text
+    content = False
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = RELEASED_HEADING.match(line)
+        if match and latest is None:
+            latest = match.group(1)
+            break
+    if has_unreleased:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "## [未发布]")
+        for line in lines[start + 1 :]:
+            if line.startswith("## "):
+                break
+            stripped = line.strip()
+            if not stripped or "暂无变更" in stripped:
+                continue
+            content = True
+            break
+    return latest, has_unreleased, content
+
+
+def semver_compare(left: str, right: str) -> int:
+    a = [int(part) for part in left.split(".")]
+    b = [int(part) for part in right.split(".")]
+    for x, y in zip(a, b):
+        if x != y:
+            return x - y
+    return 0
+
+
+def check_axis(label: str, path: Path, version, release_mode: bool) -> int:
+    """Dev mode is lenient (unreleased-ahead is fine); release mode demands a released heading."""
+    rel = path.relative_to(ROOT).as_posix()
+    if version is None:
+        print(f"   FAIL {label}: package metadata has no version")
+        return 1
+    state = changelog_state(path)
+    if state is None:
+        print(f"   FAIL MISSING: {rel} (required before a release)")
+        return 1
+    latest, has_unreleased, unreleased_content = state
+    suffix = "（release check）" if release_mode else ""
+
+    if release_mode:
+        if has_unreleased:
+            detail = "仍有内容" if unreleased_content else "仍存在"
+            print(f"   FAIL {label}: [未发布] {detail}{suffix} - rename it to ## [{version}] - YYYY-MM-DD before releasing")
+            return 1
+        if latest == version:
+            print(f"   PASS {label}: released heading ## [{version}] present{suffix}")
+            return 0
+        print(f"   FAIL {label}: no released heading ## [{version}] (latest is {latest}){suffix}")
+        return 1
+
+    if latest is None and not has_unreleased:
+        print(f"   FAIL {label}: {rel} has neither a released heading nor [未发布]")
+        return 1
+    if latest is None:
+        print(f"   PASS {label}: only [未发布] so far, releasing {version}")
+        return 0
+    comparison = semver_compare(version, latest)
+    if comparison < 0:
+        print(f"   FAIL {label}: version regression {version} < latest released {latest}")
+        return 1
+    if comparison == 0:
+        if unreleased_content:
+            print(f"   WARN {label}: {version} is released but [未发布] already has content - time to cut a version?")
+        else:
+            print(f"   PASS {label}: {version} matches the latest released heading")
+        return 0
+    # version ahead of the last release
+    if has_unreleased:
+        print(f"   PASS {label}: {version} 未发布，内容在 [未发布]（最近发布 {latest}）")
+        return 0
+    print(f"   FAIL {label}: {version} > latest released {latest} but there is no [未发布] section")
+    return 1
+
+
+def version_checks(release_mode: bool = False) -> int:
+    """Guard the release sources of truth: versions and changelog state.
+
+    Development mode accepts a package version that is ahead of the last released
+    heading as long as [未发布] exists; release mode is strict and demands that the
+    version has its own released heading and that [未发布] is gone.
     """
     failures = 0
-    print("\n== version consistency")
+    print("\n== version consistency" + (" (release)" if release_mode else ""))
     try:
         server_text = SERVER.read_text(encoding="utf-8")
     except OSError as exc:
@@ -88,47 +176,15 @@ def version_checks() -> int:
     ok = bool(hub_version) and hub_version == hub_pkg_version
     print(f"   {'PASS' if ok else 'FAIL'} HUB_VERSION={hub_version!r} hub/package.json={hub_pkg_version!r}")
     failures += 0 if ok else 1
-
-    ok = False
-    if hub_version:
-        if not HUB_CHANGELOG.exists():
-            print("   FAIL MISSING: hub/CHANGELOG.md (required before a release)")
-        else:
-            try:
-                changelog = HUB_CHANGELOG.read_text(encoding="utf-8")
-            except OSError as exc:
-                print(f"   FAIL cannot read hub/CHANGELOG.md: {exc}")
-            else:
-                ok = bool(re.search(rf"^## \[{re.escape(hub_version)}\](?:\s*-\s*\d{{4}}-\d{{2}}-\d{{2}})?\s*$", changelog, re.MULTILINE))
-                print(f"   {'PASS' if ok else 'FAIL'} hub/CHANGELOG.md heading '## [{hub_version}]'")
-                if not ok:
-                    print(f"   hint: add '## [{hub_version}] - YYYY-MM-DD' above the previous release (the unreleased section is not a release)")
-    failures += 0 if ok else 1
+    failures += check_axis("hub", HUB_CHANGELOG, hub_version, release_mode)
 
     waker_pkg = read_json(PLUGIN / "package.json")
     waker_version = waker_pkg.get("version") if isinstance(waker_pkg, dict) else None
-    if not PLUGIN_CHANGELOG.exists():
-        print(f"   SKIP {PLUGIN_CHANGELOG.relative_to(ROOT).as_posix()} missing (add a CHANGELOG first)")
-    elif not waker_version:
-        print("   FAIL plugins/mesh-waker/package.json has no version")
-        failures += 1
-    else:
-        try:
-            changelog = PLUGIN_CHANGELOG.read_text(encoding="utf-8")
-        except OSError as exc:
-            print(f"   FAIL cannot read {PLUGIN_CHANGELOG.relative_to(ROOT).as_posix()}: {exc}")
-            failures += 1
-        else:
-            ok = bool(re.search(rf"^## \[{re.escape(waker_version)}\](?:\s*-\s*\d{{4}}-\d{{2}}-\d{{2}})?\s*$", changelog, re.MULTILINE))
-            print(f"   {'PASS' if ok else 'FAIL'} plugins/mesh-waker/CHANGELOG.md heading '## [{waker_version}]'")
-            if not ok:
-                print("   hint: add the released version section before publishing (the unreleased section is not a release)")
-            failures += 0 if ok else 1
+    failures += check_axis("waker", PLUGIN_CHANGELOG, waker_version, release_mode)
     return failures
 
-
 def preflight() -> int:
-    failures = version_checks()
+    failures = version_checks(release_mode=True)
     failures += step("node --check index.js", ["node", "--check", str(PLUGIN / "index.js")])
     failures += step("node --check client.js", ["node", "--check", str(PLUGIN / "client.js")])
     failures += step("loadable entry (real import)", ["node", str(ROOT / "scripts" / "check-loadable.mjs"), str(PLUGIN / "index.js")])
@@ -204,14 +260,20 @@ def main(argv=None) -> int:
     parser.add_argument("--tag", default="next", help="dist-tag to publish under (default next)")
     parser.add_argument("--promote", action="store_true", help="point latest at the current version")
     parser.add_argument("--preflight", action="store_true", help="run the gate only")
-    parser.add_argument("--check-versions", action="store_true", help="version/changelog consistency only (no build/test steps)")
+    parser.add_argument("--check-versions", action="store_true", help="version/changelog consistency only (development mode: unreleased-ahead is fine)")
+    parser.add_argument("--release", action="store_true", help="with --check-versions: strict release mode (unreleased section gone, released heading present)")
+    parser.add_argument("--assert-released", action="store_true", help="alias for --check-versions --release")
     args = parser.parse_args(argv)
 
     if args.promote:
         return promote()
+    if args.assert_released:
+        args.check_versions = True
+        args.release = True
     if args.check_versions:
-        failures = version_checks()
-        print("\n== version check:", "PASS" if failures == 0 else f"FAIL ({failures})")
+        failures = version_checks(release_mode=args.release)
+        label = "release" if args.release else "development"
+        print(f"\n== version check ({label}):", "PASS" if failures == 0 else f"FAIL ({failures})")
         return 0 if failures == 0 else 1
     if preflight():
         print("\nrelease blocked by preflight")
