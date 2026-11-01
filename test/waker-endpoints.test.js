@@ -34,23 +34,49 @@ function report(name, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `: ${detail}` : ''}`)
 }
 
-function freePort() {
-  return new Promise((resolvePort, reject) => {
-    const probe = net.createServer()
-    probe.on('error', reject)
-    probe.listen(0, '127.0.0.1', () => {
-      const { port } = probe.address()
-      probe.close(() => resolvePort(port))
+/**
+ * A port for the harness listener. Port 0 lets the OS pick from its dynamic range, and on
+ * this machine that range starts at 1024 (Windows default is 49152): the port handed to a
+ * listener can collide with an outbound connection's local port, and Windows SO_REUSEADDR
+ * then lets the bind succeed while connections are refused or reset (T-299: the plugin
+ * logged "listening" while every probe failed). Prefer a high range no OS hands to clients,
+ * and retry when a candidate is taken.
+ */
+async function freePort() {
+  const attempt = (port) =>
+    new Promise((resolvePort, reject) => {
+      const probe = net.createServer()
+      probe.on('error', reject)
+      probe.listen(port, '127.0.0.1', () => {
+        const { port: actual } = probe.address()
+        probe.close(() => resolvePort(actual))
+      })
     })
-  })
+  for (let index = 0; index < 20; index += 1) {
+    const candidate = 20000 + Math.floor(Math.random() * 12000)
+    try {
+      return await attempt(candidate)
+    } catch {
+      /* taken: try another candidate */
+    }
+  }
+  return await attempt(0)
 }
 
-async function request(base, route, { method = 'GET', body } = {}) {
-  const response = await fetch(`${base}${route}`, {
-    method,
-    headers: { connection: 'close', ...(body ? { 'content-type': 'application/json' } : {}) },
-    body: body ? JSON.stringify(body) : undefined,
-  })
+async function request(base, route, { method = 'GET', body, timeoutMs } = {}) {
+  let response
+  try {
+    response = await fetch(`${base}${route}`, {
+      method,
+      headers: { connection: 'close', ...(body ? { 'content-type': 'application/json' } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+      ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+    })
+  } catch (error) {
+    // undici's "fetch failed" hides the errno in error.cause; name it here so a flaky case
+    // reports ECONNREFUSED / ECONNRESET / ETIMEDOUT instead of the useless wrapper (T-299).
+    throw new Error(`request ${method} ${route} failed: ${describeProbeError(error)}`)
+  }
   const text = await response.text()
   let json = null
   try {
@@ -59,6 +85,39 @@ async function request(base, route, { method = 'GET', body } = {}) {
     /* non-JSON body: the assertion only needs the status */
   }
   return { status: response.status, json, text }
+}
+
+/**
+ * Name the failure instead of swallowing it (T-299). ECONNREFUSED means nothing is listening
+ * (bind failed or another socket owns the port); ETIMEDOUT means the listener exists but the
+ * handler never answered; ECONNRESET means it accepted and then dropped the connection. The
+ * three have different causes, so the boot error must say which. undici hides the real errno
+ * in error.cause (often an AggregateError), so walk the chain instead of printing the wrapper.
+ */
+function probeErrorChain(error) {
+  const codes = []
+  const messages = []
+  let current = error
+  for (let depth = 0; current && depth < 4; depth += 1) {
+    if (current.code) codes.push(String(current.code))
+    if (current.errno && String(current.errno) !== String(current.code)) codes.push(String(current.errno))
+    if (current.message) messages.push(String(current.message))
+    const next = Array.isArray(current.errors) && current.errors.length ? current.errors[0] : current.cause
+    current = next
+  }
+  return { codes, messages }
+}
+
+function describeProbeError(error) {
+  const { codes, messages } = probeErrorChain(error)
+  const joined = messages.join(' ')
+  const name = error?.name ?? 'error'
+  if (codes.includes('ECONNREFUSED') || /ECONNREFUSED/.test(joined)) return 'ECONNREFUSED (nothing is listening on the port)'
+  if (codes.includes('ETIMEDOUT') || name === 'TimeoutError' || /timed out|timeout/i.test(joined)) {
+    return 'ETIMEDOUT (the listener accepted the request but answered nothing within 1000ms)'
+  }
+  if (codes.includes('ECONNRESET') || /ECONNRESET/.test(joined)) return 'ECONNRESET (the connection was accepted and then reset)'
+  return `${codes.join('/') || name}: ${messages[0] ?? String(error)}`
 }
 
 function seedSession(sessionsRoot, { id, title, workspace = 'ws-test', mtime = null }) {
@@ -188,8 +247,25 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
       return () => {}
     },
   }
+  const pluginLog = []
   const ctx = {
-    logger: { info() {}, warn() {}, error() {} },
+    // The plugin reports listener failures through ctx.logger (EADDRINUSE and friends).
+    // A no-op logger made those vanish and the readiness loop could only say "never
+    // answered"; keep the tail so the boot error names the real cause (T-299).
+    logger: {
+      info(message) {
+        if (pluginLog.length > 50) pluginLog.shift()
+        pluginLog.push(`info: ${message}`)
+      },
+      warn(message) {
+        if (pluginLog.length > 50) pluginLog.shift()
+        pluginLog.push(`warn: ${message}`)
+      },
+      error(message) {
+        if (pluginLog.length > 50) pluginLog.shift()
+        pluginLog.push(`error: ${message}`)
+      },
+    },
     // Hosts expose services through ctx.get; toolsDelayCalls simulates the host's tools
     // service arriving after the plugin's first turns (the 2026-10-31 registration race).
     // With a delay configured, ctx.tools stays undefined so only the get() path can succeed.
@@ -245,26 +321,70 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   for (const key of Object.keys(merged)) {
     if (merged[key] === undefined) delete merged[key]
   }
-  apply(ctx, merged)
-
-  for (const key of Object.keys(previousEnv)) {
-    if (previousEnv[key] === undefined) delete process.env[key]
-    else process.env[key] = previousEnv[key]
+  // A boot that fails must not leak the listener, timers or the temp HOME: the failure
+  // injection case below relies on this, and a flaky boot should not poison later cases.
+  const cleanupBoot = () => {
+    if (globalThis.fetch !== realFetch) globalThis.fetch = realFetch
+    for (const dispose of disposers) {
+      try {
+        dispose()
+      } catch {
+        /* already closed */
+      }
+    }
+    try {
+      if (ownsTmp) fs.rmSync(tmp, { recursive: true, force: true })
+    } catch {
+      /* temp cleanup is best effort */
+    }
+  }
+  let applyError = null
+  try {
+    await apply(ctx, merged)
+  } catch (error) {
+    applyError = new Error(`the plugin apply() failed during boot: ${error?.message ?? error}`)
+  } finally {
+    for (const key of Object.keys(previousEnv)) {
+      if (previousEnv[key] === undefined) delete process.env[key]
+      else process.env[key] = previousEnv[key]
+    }
+  }
+  if (applyError) {
+    cleanupBoot()
+    throw applyError
   }
 
   const base = `http://127.0.0.1:${port}`
-  const deadline = Date.now() + 5000
+  const startedAt = Date.now()
+  const deadline = startedAt + 5000
+  let attempts = 0
   let ready = false
+  let lastProblem = 'no probe completed'
   while (Date.now() < deadline && !ready) {
+    // EADDRINUSE / EACCES arrive on the plugin's server object and are logged; waiting the
+    // full budget for a listener that already failed only hides the reason (T-299).
+    const listenerError = pluginLog.find((line) => /listener error/i.test(line))
+    if (listenerError) {
+      cleanupBoot()
+      throw new Error(`the test listener failed to start: ${listenerError}`)
+    }
+    attempts += 1
     try {
-      const probe = await request(base, '/mesh/status')
-      ready = probe.status === 200
-    } catch {
-      ready = false
+      const probe = await request(base, '/mesh/status', { timeoutMs: 1000 })
+      if (probe.status === 200) ready = true
+      else lastProblem = `HTTP ${probe.status}: ${String(probe.text ?? '').slice(0, 120)}`
+    } catch (error) {
+      lastProblem = describeProbeError(error)
     }
     if (!ready) await new Promise((resolveWait) => setTimeout(resolveWait, 50))
   }
-  if (!ready) throw new Error('the test listener never answered /mesh/status')
+  if (!ready) {
+    const pluginTail = pluginLog.slice(-3).join(' | ')
+    cleanupBoot()
+    throw new Error(
+      `the test listener never answered /mesh/status (last error: ${lastProblem}; after ${attempts} attempts in ${Date.now() - startedAt}ms${pluginTail ? `; plugin log: ${pluginTail}` : ''})`,
+    )
+  }
 
   return {
     base,
@@ -370,8 +490,11 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
       return send(404, { error: 'not found' })
     })
   })
-  await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
-  const { port } = server.address()
+  // Same high-range rule as the harness listener: port 0 comes from the OS dynamic range,
+  // where an outbound connection can hold the same port and Windows SO_REUSEADDR then lets
+  // the bind succeed while requests are refused/reset (T-299).
+  const port = await freePort()
+  await new Promise((resolveListen) => server.listen(port, '127.0.0.1', resolveListen))
   return {
     url: `http://127.0.0.1:${port}`,
     requests,
@@ -1887,9 +2010,12 @@ async function main() {
     try {
       h = await startQuestionHarness(boot, fake, {}, { pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 })
       const pending = meshAskTool(h).execute({ question: '继续吗？', options: ['继续', '收工'] })
-      await sleep(1500)
-      const during = await request(h.base, '/mesh/status')
-      const listed = during.json?.pendingQuestions ?? []
+      // Same as the approval bridge: wait for the reservation instead of a fixed 1.5s sample.
+      const during = await waitFor(async () => {
+        const status = await request(h.base, '/mesh/status')
+        return (status.json?.pendingQuestions ?? []).length === 1 ? status : null
+      }, 3000)
+      const listed = during?.json?.pendingQuestions ?? []
       const reservedDuringSend = listed.length === 1
       const untouched = !fake.readIds.includes('m-question-own') && h.state.created.length === 0 && h.state.prompts.length === 0
       fake.push({ id: 'm-question-reply', sender: 'peer-owner', conversation: listed[0]?.conversation ?? '', body: '1', created_at: Date.now() + 1000 })
@@ -1934,9 +2060,13 @@ async function main() {
     try {
       h = await startApprovalHarness(boot, fake)
       const pending = h.callApproval({ agent: { id: 'session-x' }, toolName: 'bash', callId: 'call-abcdef12', reason: 'danger' })
-      await sleep(400)
-      const during = await request(h.base, '/mesh/status')
-      const reservedDuringSend = (during.json?.pendingApprovals ?? []).length === 1
+      // Poll for the reservation instead of sampling once at 400ms: the bridge registers it
+      // synchronously, but a slow send must not turn a correct implementation into a flake.
+      const during = await waitFor(async () => {
+        const status = await request(h.base, '/mesh/status')
+        return (status.json?.pendingApprovals ?? []).length === 1 ? status : null
+      }, 3000)
+      const reservedDuringSend = Boolean(during)
       const outcome = await pending
       const ok = reservedDuringSend && outcome === 'allowed-once'
       report('approval bridge: reserves the conversation before /api/send', ok, `reservedDuringSend=${reservedDuringSend} outcome=${outcome}`)
@@ -4994,6 +5124,30 @@ async function main() {
     const ok = files.includes('lib/') && exportsMap['.'] === './index.js'
     report('lib: package.json files includes lib/ for publishing', ok, `files=${files.join(',')} entry=${exportsMap['.'] ?? '-'}`)
   })
+
+  // 241. Boot diagnostics (T-299): a listener that cannot bind must fail fast and name the
+  // real error instead of burning the 5s probe budget and reporting "never answered".
+  {
+    const occupied = await freePort()
+    const blocker = net.createServer()
+    await new Promise((resolveListen) => blocker.listen(occupied, '127.0.0.1', resolveListen))
+    let message = ''
+    const startedAt = Date.now()
+    try {
+      await startHarness({ config: { listenPort: occupied } })
+    } catch (error) {
+      message = error.message
+    } finally {
+      await new Promise((resolveClose) => blocker.close(resolveClose))
+    }
+    const elapsedMs = Date.now() - startedAt
+    const ok =
+      /the test listener failed to start/.test(message) &&
+      /EADDRINUSE/.test(message) &&
+      !/never answered/.test(message) &&
+      elapsedMs < 4000
+    report('harness: a listener that cannot bind fails fast with the real error', ok, `error=${message.split('\n')[0].slice(0, 220)} ms=${elapsedMs}`)
+  }
 
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
