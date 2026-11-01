@@ -21,6 +21,7 @@
 
 ### Changed
 
+- 任务与回执按工作区分层存放（区内 `ws/<slug>/`、跨区 `local/`），旧单文件首次启动自动迁移并保留 `.legacy.jsonl`；README 与 `GET /mesh/tasks` 等接口仍按聚合结果工作。
 - 注入的回执通知默认只发状态行（`error` / `lost` 附一行原因）；需要摘要时设 `receiptNoticeSummary: true`。
 - 任务面板按钮统一为主/次/危险三档样式。
 

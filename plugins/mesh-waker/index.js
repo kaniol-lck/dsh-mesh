@@ -1084,6 +1084,8 @@ function normalizeBase(config) {
     tasksMaxRows: clampInterval(c.tasksMaxRows, 5000, 50, 200000),
     // One-time migration of inline task bodies to content-addressed texts/ (T-277).
     compactTaskText: c.compactTaskText !== false,
+    // LCA storage tiers (T-282): same workspace -> ws/<slug>/, cross-workspace -> local/.
+    storageTiers: c.storageTiers !== false,
     // Diagnostics: a dedicated log file outside the temp directory survives reboots, and a
     // single rotated copy keeps it bounded without a logging dependency.
     logFile: c.logFile ? String(c.logFile) : undefined,
@@ -3407,10 +3409,364 @@ export function apply(ctx, config) {
     return Number.isFinite(known) ? known : null
   }
 
-  function writeReceiptFile(receipt) {
+  // ---------------------------------------------------------------- storage tiers
+  //
+  // docs: storage-tiers.md — a record lives at the LCA of both ends: same workspace -> T3
+  // (ws/<slug>/), same machine but different workspaces -> T2 (local/). Legacy single files
+  // are migrated once and kept as *.legacy.jsonl.
+
+  const meshHome = join(homedir(), '.dsh', 'mesh-waker')
+  const legacyTasksFile = join(meshHome, 'tasks.jsonl')
+  const legacyReceiptsFile = join(meshHome, 'receipts.jsonl')
+  const localDir = join(meshHome, 'local')
+  const wsRoot = join(meshHome, 'ws')
+  const workspacesFile = join(meshHome, 'workspaces.json')
+  const taskTextDir = join(meshHome, 'tasks')
+  const taskTextsDir = join(meshHome, 'texts')
+  const taskRows = new Map()
+  const taskFiles = new Map()
+  const workspaces = { machine: hostname(), workspaces: {} }
+
+  const tasksFileIn = (dir) => join(dir, 'tasks.jsonl')
+  const receiptsFileIn = (dir) => join(dir, 'receipts.jsonl')
+  const wsDirFor = (slug) => join(wsRoot, slug)
+  const locationOf = (slug) => `${workspaces.machine}/${slug}`
+
+  function readJsonOr(file, fallback) {
     try {
-      mkdirSync(dirname(c.receiptFile), { recursive: true })
-      appendFileSync(c.receiptFile, `${JSON.stringify(receipt)}\n`, { mode: 0o600 })
+      return JSON.parse(readFileSync(file, 'utf8'))
+    } catch {
+      return fallback
+    }
+  }
+
+  function saveWorkspaces() {
+    try {
+      mkdirSync(dirname(workspacesFile), { recursive: true })
+      const temp = `${workspacesFile}.tmp`
+      writeFileSync(temp, `${JSON.stringify(workspaces, null, 2)}\n`, { mode: 0o600 })
+      renameSync(temp, workspacesFile)
+      return true
+    } catch (error) {
+      fileLog(`workspaces.json write failed: ${error.message}`)
+      return false
+    }
+  }
+
+  /** Stable slug from a cwd's basename (never changes for the same directory). */
+  function slugifyCwd(cwd) {
+    const base = String(cwd ?? '')
+      .replace(/[\\/]+$/, '')
+      .split(/[\\/]/)
+      .filter(Boolean)
+      .pop()
+    return String(base ?? 'workspace')
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'workspace'
+  }
+
+  function loadWorkspaces() {
+    const raw = readJsonOr(workspacesFile, null)
+    if (!raw || typeof raw !== 'object') return
+    if (typeof raw.machine === 'string' && raw.machine.trim()) workspaces.machine = raw.machine.trim()
+    if (!raw.workspaces || typeof raw.workspaces !== 'object') return
+    for (const [slug, value] of Object.entries(raw.workspaces)) {
+      if (!value || typeof value !== 'object') continue
+      workspaces.workspaces[slug] = {
+        cwd: String(value.cwd ?? ''),
+        ...(value.coordinator ? { coordinator: String(value.coordinator) } : {}),
+        ...(Array.isArray(value.roles) ? { roles: value.roles.map(String) } : {}),
+      }
+    }
+  }
+
+  /** Register a cwd once. Existing entries stay byte-identical (human edits win). */
+  function ensureWorkspace(cwd) {
+    const path = String(cwd ?? '').trim()
+    if (!path) return null
+    for (const [slug, value] of Object.entries(workspaces.workspaces)) {
+      if (value.cwd === path) return slug
+    }
+    const base = slugifyCwd(path)
+    let slug = base
+    let suffix = 2
+    while (workspaces.workspaces[slug]) slug = `${base}-${suffix++}`
+    workspaces.workspaces[slug] = { cwd: path, coordinator: null, roles: [] }
+    saveWorkspaces()
+    fileLog(`workspace registered: ${slug} (${path})`)
+    return slug
+  }
+
+  /** Seed the registry from the host session index: one entry per distinct cwd. */
+  function registerWorkspacesFromSessions() {
+    let sessions = []
+    try {
+      sessions = listLocalSessions()
+    } catch {
+      sessions = []
+    }
+    const bySlug = new Map()
+    for (const session of sessions) {
+      if (!session.cwd) continue
+      const slug = ensureWorkspace(session.cwd)
+      if (!slug) continue
+      const list = bySlug.get(slug) ?? []
+      list.push(session)
+      bySlug.set(slug, list)
+    }
+    let changed = false
+    for (const [slug, list] of bySlug) {
+      const entry = workspaces.workspaces[slug]
+      if (!entry) continue
+      if (!entry.coordinator) {
+        const coordinators = list.filter((session) => /·\s*协调\s*$/.test(String(session.title ?? '')))
+        if (coordinators.length) {
+          coordinators.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
+          entry.coordinator = coordinators[0].id
+          if (coordinators.length > 1) {
+            fileLog(`WARN workspace ${slug} has ${coordinators.length} coordinators; using ${coordinators[0].id}`)
+          }
+          changed = true
+        }
+      }
+      if (!Array.isArray(entry.roles) || entry.roles.length === 0) {
+        const roles = new Set()
+        for (const session of list) {
+          const match = /·\s*([^\s·]+)\s*$/.exec(String(session.title ?? ''))
+          if (match && match[1] !== '协调') roles.add(match[1])
+        }
+        if (roles.size) {
+          entry.roles = [...roles]
+          changed = true
+        }
+      }
+    }
+    if (changed) saveWorkspaces()
+  }
+
+  let localSessionsCache = { at: 0, list: null }
+
+  /** Routing runs on every dispatch/settle; a short memo avoids rescanning session dirs. */
+  function cachedLocalSessions() {
+    const now = Date.now()
+    if (!localSessionsCache.list || now - localSessionsCache.at > 500) {
+      try {
+        localSessionsCache = { at: now, list: listLocalSessions() }
+      } catch {
+        localSessionsCache = { at: now, list: [] }
+      }
+    }
+    return localSessionsCache.list
+  }
+
+  function sessionCwdOf(sessionId) {
+    const id = String(sessionId ?? '').trim()
+    if (!id) return null
+    try {
+      return cachedLocalSessions().find((session) => session.id === id)?.cwd ?? null
+    } catch {
+      return null
+    }
+  }
+
+  /** Resolve a requester label/id to a local session id, or null when only a name is known. */
+  function resolveRequesterSessionId(value) {
+    const raw = String(value ?? '').trim()
+    if (!raw) return null
+    try {
+      if (cachedLocalSessions().some((session) => session.id === raw)) return raw
+      return resolveLocalSession({ session: raw, title: raw }).id
+    } catch {
+      return null
+    }
+  }
+
+  function routeForCwds(targetCwd, requesterCwd) {
+    if (!targetCwd) {
+      const origin = requesterCwd ? locationOf(ensureWorkspace(requesterCwd)) : `${workspaces.machine}/unknown`
+      return { scope: 'machine', workspace: null, dir: localDir, origin, peers: [], scopeUncertain: true }
+    }
+    const targetSlug = ensureWorkspace(targetCwd)
+    if (!requesterCwd) {
+      return { scope: 'workspace', workspace: targetSlug, dir: wsDirFor(targetSlug), origin: locationOf(targetSlug), peers: [], scopeUncertain: true }
+    }
+    const requesterSlug = ensureWorkspace(requesterCwd)
+    if (requesterSlug === targetSlug) {
+      return { scope: 'workspace', workspace: targetSlug, dir: wsDirFor(targetSlug), origin: locationOf(targetSlug), peers: [], scopeUncertain: false }
+    }
+    return {
+      scope: 'machine',
+      workspace: null,
+      dir: localDir,
+      origin: locationOf(requesterSlug),
+      peers: [locationOf(targetSlug)],
+      scopeUncertain: false,
+    }
+  }
+
+  function routeForSessions(targetSessionId, requesterSessionId) {
+    return routeForCwds(sessionCwdOf(targetSessionId), requesterSessionId ? sessionCwdOf(requesterSessionId) : null)
+  }
+
+  function routeForRow(row) {
+    return routeForSessions(row.targetSessionId, resolveRequesterSessionId(row.requester))
+  }
+
+  function dirForRow(row) {
+    if (row.scope === 'workspace' && row.workspace && workspaces.workspaces[row.workspace]) return wsDirFor(row.workspace)
+    if (row.scope === 'machine') return localDir
+    return routeForRow(row).dir
+  }
+
+  /** A record's routing fields, shared by tasks and receipts (docs §5). */
+  function scopeFields(route) {
+    return {
+      scope: route.scope,
+      origin: route.origin,
+      ...(route.peers.length ? { peers: route.peers } : {}),
+      ...(route.scopeUncertain ? { scopeUncertain: true } : {}),
+      ...(route.workspace ? { workspace: route.workspace } : {}),
+    }
+  }
+
+  /**
+   * Split one legacy file into tier files. Temp-write + rename; the legacy file is renamed
+   * only after every target write succeeded, so a mid-way failure leaves it untouched.
+   */
+  function migrateLegacyRecordFile(kind, legacyFile, routeRow) {
+    if (!existsSync(legacyFile)) return 0
+    let rows = []
+    try {
+      rows = readFileSync(legacyFile, 'utf8')
+        .split('\n')
+        .filter((line) => line.trim())
+        .map((line) => JSON.parse(line))
+        .filter((row) => row && typeof row === 'object')
+    } catch (error) {
+      fileLog(`storage tiers: cannot read legacy ${kind}: ${error.message}; left untouched`)
+      return 0
+    }
+    const groups = new Map()
+    for (const row of rows) {
+      let route
+      try {
+        route = routeRow(row)
+      } catch {
+        route = { scope: 'machine', workspace: null, dir: localDir, origin: `${workspaces.machine}/unknown`, peers: [], scopeUncertain: true }
+      }
+      const patched = { ...row, ...scopeFields(route) }
+      const file = join(route.dir, `${kind}.jsonl`)
+      const list = groups.get(file) ?? []
+      list.push(patched)
+      groups.set(file, list)
+    }
+    const temps = []
+    try {
+      for (const [file, list] of groups) {
+        mkdirSync(dirname(file), { recursive: true })
+        const existing = existsSync(file) ? readFileSync(file, 'utf8') : ''
+        const temp = `${file}.migrate.tmp`
+        writeFileSync(temp, `${existing}${list.map((row) => JSON.stringify(row)).join('\n')}\n`, { mode: 0o600 })
+        temps.push([temp, file])
+      }
+      for (const [temp, file] of temps) renameSync(temp, file)
+      renameSync(legacyFile, legacyFile.replace(/\.jsonl$/, '.legacy.jsonl'))
+      return rows.length
+    } catch (error) {
+      for (const [temp] of temps) {
+        try {
+          rmSync(temp, { force: true })
+        } catch {
+          /* best effort */
+        }
+      }
+      fileLog(`storage tiers: migration of ${kind} failed (${error.message}); legacy file untouched`)
+      return 0
+    }
+  }
+
+  function migrateLegacyStorage() {
+    if (c.storageTiers !== true) return { tasks: 0, receipts: 0 }
+    const tasks = migrateLegacyRecordFile('tasks', legacyTasksFile, (row) => routeForRow(row))
+    const receipts = migrateLegacyRecordFile('receipts', legacyReceiptsFile, (row) => routeForSessions(row.sessionId ?? row.targetSessionId, null))
+    if (tasks || receipts) {
+      fileLog(
+        `storage tiers: migrated tasks=${tasks} receipts=${receipts} workspaces=${Object.keys(workspaces.workspaces).length}`,
+      )
+    }
+    return { tasks, receipts }
+  }
+
+  function taskRecordFiles() {
+    if (c.storageTiers !== true) return [legacyTasksFile].filter((file) => existsSync(file))
+    const files = []
+    const local = tasksFileIn(localDir)
+    if (existsSync(local)) files.push(local)
+    try {
+      for (const name of readdirSync(wsRoot)) {
+        const file = tasksFileIn(join(wsRoot, name))
+        if (existsSync(file)) files.push(file)
+      }
+    } catch {
+      /* no ws dir yet */
+    }
+    if (existsSync(legacyTasksFile)) files.push(legacyTasksFile)
+    return files
+  }
+
+  function receiptDirFor(record) {
+    const sessionId = record?.sessionId ?? record?.targetSessionId ?? null
+    if (!sessionId) return localDir
+    return routeForCwds(sessionCwdOf(sessionId), null).dir
+  }
+
+  /** Physical file for a record kind/scope (docs §4); workspace scope needs the slug. */
+  function resolveRecordFile(kind, scope, slug = null) {
+    const dir = scope === 'workspace' && slug ? wsDirFor(slug) : localDir
+    return join(dir, `${kind}.jsonl`)
+  }
+
+  /**
+   * Upward lookup (docs §6): workspace layer -> local layer -> explicit miss. Hub (T1) is not
+   * implemented, so "not found" means "not in any local layer", never a guess.
+   */
+  function findRecord(kind, taskId, workspaceSlug = null) {
+    const files = []
+    if (workspaceSlug) files.push({ file: resolveRecordFile(kind, 'workspace', workspaceSlug), scope: 'workspace' })
+    files.push({ file: resolveRecordFile(kind, 'machine'), scope: 'machine' })
+    for (const { file, scope } of files) {
+      let found = null
+      try {
+        for (const line of readFileSync(file, 'utf8').split('\n')) {
+          if (!line.trim()) continue
+          try {
+            const row = JSON.parse(line)
+            if (row && row.taskId === taskId) found = { row, file, scope }
+          } catch {
+            /* skip torn line */
+          }
+        }
+      } catch {
+        /* missing layer: walk up */
+      }
+      if (found) return found
+    }
+    return null
+  }
+
+  function writeReceiptFile(receipt, dir = null) {
+    const files = []
+    if (dir) files.push(receiptsFileIn(dir))
+    // A custom receiptFile (old single-file setups, harnesses) keeps receiving a copy so
+    // existing consumers do not break; the default legacy path is not written at all.
+    if (resolve(c.receiptFile) !== resolve(legacyReceiptsFile)) files.push(c.receiptFile)
+    if (files.length === 0) files.push(c.receiptFile)
+    try {
+      for (const file of files) {
+        mkdirSync(dirname(file), { recursive: true })
+        appendFileSync(file, `${JSON.stringify(receipt)}\n`, { mode: 0o600 })
+      }
       return true
     } catch (error) {
       fileLog(`writing receipt failed: ${error.message}`)
@@ -3419,22 +3775,10 @@ export function apply(ctx, config) {
     }
   }
 
+
   function receiptBody(receipt) {
     return receiptNoticeText(receipt, { includeSummary: c.receiptNoticeSummary === true })
   }
-
-  // ---------------------------------------------------------------- task registry
-  //
-  // Layer-1 task history (0.7.11): every dispatched task is persisted so "what did this
-  // task ask for" can be answered after the fact, and task -> receipt -> session can be
-  // looked up. Bodies stay out of the log (only length + subject are logged).
-
-  const taskRegistryFile = join(homedir(), '.dsh', 'mesh-waker', 'tasks.jsonl')
-  const taskTextDir = join(homedir(), '.dsh', 'mesh-waker', 'tasks')
-  // Content-addressed bodies: tasks.jsonl stores only textRef, so three rows of one task
-  // point at the same file and the registry stays small (T-277).
-  const taskTextsDir = join(homedir(), '.dsh', 'mesh-waker', 'texts')
-  const taskRows = new Map()
 
   /** Store a body once under texts/<sha256>.txt and return its ref, or null on failure. */
   function writeTaskText(body) {
@@ -3443,10 +3787,27 @@ export function apply(ctx, config) {
     return ref
   }
 
+  /** Rewrite every tier file from the in-memory rows (temp file + rename per file). */
+  function rewriteTaskFiles() {
+    const byFile = new Map()
+    for (const [taskId, row] of taskRows) {
+      const file = taskFiles.get(taskId) ?? tasksFileIn(dirForRow(row))
+      const list = byFile.get(file) ?? []
+      list.push(row)
+      byFile.set(file, list)
+    }
+    for (const [file, rows] of byFile) {
+      mkdirSync(dirname(file), { recursive: true })
+      const temp = `${file}.rewrite.tmp`
+      writeFileSync(temp, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, { mode: 0o600 })
+      renameSync(temp, file)
+    }
+  }
+
   /**
    * One-time, idempotent migration: rows that still embed `text` (or use the old
-   * tasks/<id>.md path) get a textRef and lose the inline copy. The registry is rewritten
-   * through a temp file; on any failure the original file is left untouched.
+   * tasks/<id>.md path) get a textRef and lose the inline copy. The tier files are rewritten
+   * through temp files; on any failure the originals are left untouched.
    */
   function compactTaskTexts() {
     if (c.compactTaskText !== true) return 0
@@ -3457,10 +3818,7 @@ export function apply(ctx, config) {
     }
     if (result.migrated === 0) return 0
     try {
-      const lines = [...taskRows.values()].map((row) => JSON.stringify(row)).join('\n')
-      const temp = `${taskRegistryFile}.compact.tmp`
-      writeFileSync(temp, `${lines}\n`, { mode: 0o600 })
-      renameSync(temp, taskRegistryFile)
+      rewriteTaskFiles()
       fileLog(`task text compacted: ${result.migrated} rows`)
     } catch (error) {
       fileLog(`task registry rewrite after compaction failed: ${error.message}`)
@@ -3603,9 +3961,11 @@ export function apply(ctx, config) {
   }
 
   function appendTaskRow(row) {
+    const file = taskFiles.get(row.taskId) ?? tasksFileIn(dirForRow(row))
     try {
-      mkdirSync(dirname(taskRegistryFile), { recursive: true })
-      appendFileSync(taskRegistryFile, `${JSON.stringify(row)}\n`, { mode: 0o600 })
+      mkdirSync(dirname(file), { recursive: true })
+      appendFileSync(file, `${JSON.stringify(row)}\n`, { mode: 0o600 })
+      taskFiles.set(row.taskId, file)
       return true
     } catch (error) {
       fileLog(`task registry write failed for ${row.taskId}: ${error.message}`)
@@ -3622,46 +3982,55 @@ export function apply(ctx, config) {
     return next
   }
 
-  /** Load + compact tasks.jsonl, dropping rows older than tasksRetentionDays or beyond
-   *  tasksMaxRows. Compaction rewrites the file so pruned rows do not linger forever. */
+  /** Load every tier file into one in-memory view, then apply retention across the union. */
   function loadTaskRegistry() {
-    let rows = []
-    try {
-      rows = readFileSync(taskRegistryFile, 'utf8')
-        .split('\n')
-        .filter((line) => line.trim())
-        .map((line) => {
+    const files = taskRecordFiles()
+    const parsed = []
+    for (const file of files) {
+      try {
+        for (const line of readFileSync(file, 'utf8').split('\n')) {
+          if (!line.trim()) continue
           try {
-            return JSON.parse(line)
+            const row = JSON.parse(line)
+            if (row && typeof row === 'object' && row.taskId) parsed.push({ row, file })
           } catch {
-            return null
+            /* skip a torn line */
           }
-        })
-        .filter((row) => row && typeof row === 'object' && row.taskId)
-    } catch {
-      return
+        }
+      } catch {
+        /* unreadable file: skip */
+      }
     }
     const latest = new Map()
-    for (const row of rows) latest.set(String(row.taskId), row)
+    for (const entry of parsed) latest.set(String(entry.row.taskId), entry)
     const cutoff = Date.now() - c.tasksRetentionDays * 24 * 60 * 60 * 1000
     const kept = [...latest.values()]
-      .filter((row) => Number(row.createdAt) >= cutoff)
-      .sort((left, right) => Number(right.createdAt) - Number(left.createdAt))
+      .filter((entry) => Number(entry.row.createdAt) >= cutoff)
+      .sort((left, right) => Number(right.row.createdAt) - Number(left.row.createdAt))
       .slice(0, c.tasksMaxRows)
     taskRows.clear()
+    taskFiles.clear()
     const keepIds = new Set()
-    for (const row of kept) {
-      taskRows.set(String(row.taskId), row)
-      keepIds.add(String(row.taskId))
+    for (const entry of kept) {
+      const taskId = String(entry.row.taskId)
+      taskRows.set(taskId, entry.row)
+      taskFiles.set(taskId, entry.file)
+      keepIds.add(taskId)
     }
     try {
-      // Rewrite only when something was pruned: an unchanged file should stay byte-identical
-      // (the text migration's failure path relies on that, and boot avoids a 250KB rewrite).
-      if (kept.length !== rows.length) {
-        mkdirSync(dirname(taskRegistryFile), { recursive: true })
-        const temp = `${taskRegistryFile}.tmp`
-        writeFileSync(temp, kept.map((row) => JSON.stringify(row)).join('\n') + (kept.length ? '\n' : ''), { mode: 0o600 })
-        renameSync(temp, taskRegistryFile)
+      // Rewrite only when something was pruned: unchanged files stay byte-identical.
+      if (kept.length !== parsed.length) {
+        const byFile = new Map(files.map((file) => [file, []]))
+        for (const entry of kept) {
+          if (!byFile.has(entry.file)) byFile.set(entry.file, [])
+          byFile.get(entry.file).push(entry.row)
+        }
+        for (const [file, rows] of byFile) {
+          mkdirSync(dirname(file), { recursive: true })
+          const temp = `${file}.rewrite.tmp`
+          writeFileSync(temp, rows.map((row) => JSON.stringify(row)).join('\n') + (rows.length ? '\n' : ''), { mode: 0o600 })
+          renameSync(temp, file)
+        }
       }
     } catch (error) {
       fileLog(`task registry compaction failed: ${error.message}`)
@@ -3675,7 +4044,7 @@ export function apply(ctx, config) {
     } catch {
       /* no text dir yet */
     }
-    fileLog(`task registry loaded rows=${taskRows.size}`)
+    fileLog(`task registry loaded rows=${taskRows.size} files=${files.length}`)
   }
 
   /** Persist a dispatched task; bodies over 8 KiB go to tasks/<id>.md (privacy: never logged). */
@@ -3694,6 +4063,7 @@ export function apply(ctx, config) {
         fileLog(`WARN taskId ${taskId} reused (previous settled at ${new Date(settledAt).toISOString()})`)
       }
     }
+    const route = extra.route ?? routeForSessions(target.id, extra.requesterSessionId ?? null)
     const row = {
       taskId,
       batchId: extra.batchId ?? null,
@@ -3711,6 +4081,7 @@ export function apply(ctx, config) {
       durationMs: null,
       receiptMode: extra.receiptMode ?? null,
       receiptRef: null,
+      ...scopeFields(route),
       ...(reusedId ? { reusedId: true } : {}),
       refs: Array.isArray(meta?.refs)
         ? meta.refs
@@ -3728,8 +4099,11 @@ export function apply(ctx, config) {
       fileLog(`task text store unavailable for ${taskId}; kept inline (${textBytes} bytes)`)
     }
     taskRows.set(taskId, row)
+    taskFiles.set(taskId, join(route.dir, 'tasks.jsonl'))
     appendTaskRow(row)
-    fileLog(`task registry pending ${taskId} bytes=${textBytes} subject=${JSON.stringify(row.subject)}`)
+    fileLog(
+      `task registry pending ${taskId} bytes=${textBytes} scope=${route.scope}${route.workspace ? ` ws=${route.workspace}` : ''}${route.scopeUncertain ? ' scopeUncertain' : ''} subject=${JSON.stringify(row.subject)}`,
+    )
   }
 
   function taskRowForApi(row, { withText = false } = {}) {
@@ -3737,6 +4111,11 @@ export function apply(ctx, config) {
       taskId: row.taskId,
       batchId: row.batchId ?? null,
       thread: row.thread ?? null,
+      scope: row.scope ?? null,
+      origin: row.origin ?? null,
+      ...(Array.isArray(row.peers) && row.peers.length ? { peers: row.peers } : {}),
+      ...(row.scopeUncertain === true ? { scopeUncertain: true } : {}),
+      ...(row.workspace ? { workspace: row.workspace } : {}),
       requester: row.requester ?? null,
       targetSessionId: row.targetSessionId ?? null,
       targetTitle: row.targetTitle ?? null,
@@ -3924,7 +4303,7 @@ export function apply(ctx, config) {
         receiptMode: ['file', 'queue', 'wake'].includes(row.receiptMode) ? row.receiptMode : requester ? 'queue' : 'file',
         summaryChars: c.receiptSummaryChars,
       })
-      writeReceiptFile(receipt)
+      writeReceiptFile(receipt, dirForRow(row))
       fileLog(`task ${row.taskId} marked lost after restart (requester=${requester ? '有' : '无'})`)
       await deliverReceipt(receipt, { requester, requesterSessionId, requesterInferred: inferred })
     }
@@ -4030,7 +4409,7 @@ export function apply(ctx, config) {
       injectedDuringTurn: task.injectedDuringTurn === true,
       source: details.source ?? task.source ?? 'observed',
     })
-    writeReceiptFile(receipt)
+    writeReceiptFile(receipt, task.recordDir ?? receiptDirFor(receipt))
     // Registry status mirrors the receipt: not-started is the stall path, everything else
     // settled. Registry durationMs is measured from startedAt when the task was seen
     // starting (falling back to injection time); the receipt keeps its own duration.
@@ -4090,11 +4469,15 @@ export function apply(ctx, config) {
     }
     // Receipts go back to whoever dispatched the task; receiptTo is only the fallback.
     const requester = resolveRequester(meta?.requester, target)
+    // LCA routing (T-282): same workspace -> ws/<slug>/, cross-workspace -> local/.
+    const route = routeForCwds(target.cwd ?? sessionCwdOf(target.id), requester.sessionId ? sessionCwdOf(requester.sessionId) : null)
     const task = {
       sessionId: target.id,
       requester: requester.requester,
       requesterSessionId: requester.sessionId,
       requesterInferred: requester.inferred === true,
+      recordDir: route.dir,
+      ...scopeFields(route),
       injectedAt: Date.now(),
       baselineTurn,
       injectedDuringTurn,
@@ -4113,7 +4496,9 @@ export function apply(ctx, config) {
       batchId,
       thread: normalizeThread(meta?.thread),
       requester: requester.requester,
+      requesterSessionId: requester.sessionId,
       deadlineMs: Number(meta?.deadlineMs) || null,
+      route,
       // Persist the actual mode so a restart can still notify the dispatcher (T-273).
       receiptMode,
     })
@@ -4389,7 +4774,7 @@ export function apply(ctx, config) {
       endedAt: now,
       summaryChars: c.receiptSummaryChars,
     })
-    writeReceiptFile(record)
+    writeReceiptFile(record, receiptDirFor(record))
     lastReceipt = { taskId: batchId, status: partial ? 'partial' : 'completed', at: now, deliveredTo: null }
     state.lastReceipt = lastReceipt
     state.pendingBatches = batches.size
@@ -4513,15 +4898,18 @@ export function apply(ctx, config) {
         if (batch.alerted.has(key)) continue
         batch.alerted.add(key)
         const at = Date.now()
-        writeReceiptFile({
-          kind: 'batch-alert',
-          batchId,
-          taskId,
-          sessionId: row.sessionId,
-          state: derived.state,
-          detail: derived.detail,
-          at,
-        })
+        writeReceiptFile(
+          {
+            kind: 'batch-alert',
+            batchId,
+            taskId,
+            sessionId: row.sessionId,
+            state: derived.state,
+            detail: derived.detail,
+            at,
+          },
+          receiptDirFor({ sessionId: row.sessionId }),
+        )
         saveBatches()
         void deliverNotice(
           batch.alertMode,
@@ -4989,6 +5377,10 @@ export function apply(ctx, config) {
   // package resolves, otherwise the same JSON Schema definition. Question traffic is
   // consumed by the pull loop; the tool waits for one inbox reply or reports unanswered.
   // Restore batches before the listener comes up, then poll liveness for early alerts.
+  loadWorkspaces()
+  registerWorkspacesFromSessions()
+  // Split legacy single files into tier files before anything loads or rewrites rows.
+  migrateLegacyStorage()
   loadTaskRegistry()
   loadThreads()
   // Migrate inline bodies before anything reads or rewrites rows (idempotent, T-277).
@@ -5048,6 +5440,25 @@ export function apply(ctx, config) {
     }
 
     // Task registry API (0.7.11): list without bodies, detail with body, DELETE = cancel.
+    if (path === '/mesh/workspaces' && req.method === 'GET') {
+      // Read-only registry: who is on this machine and which workspace owns which cwd.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(
+        JSON.stringify({
+          ok: true,
+          machine: workspaces.machine,
+          count: Object.keys(workspaces.workspaces).length,
+          workspaces: workspaces.workspaces,
+        }),
+      )
+      return
+    }
+
     if (path === '/mesh/tasks/complete' && req.method === 'POST') {
       // Same logic as the mesh_complete tool, for scripts (0.7.31).
       if (!fromLoopback(req)) {

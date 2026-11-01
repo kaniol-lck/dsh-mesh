@@ -77,8 +77,9 @@ function seedSession(sessionsRoot, { id, title, workspace = 'ws-test' }) {
  * and standalone boots must not touch the network. Pass `config` to boot a hub-mode
  * install (bootstrap / pull) and `writeToken: false` to start with no stored token.
  */
-async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null, archivedIds = [], toolsDelayCalls = 0, tasksSeed = null, prepareHome = null } = {}) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-endpoints-'))
+async function startHarness({ seedSessions = [], conversations = null, config = {}, writeToken = true, batches = null, archivedIds = [], toolsDelayCalls = 0, tasksSeed = null, prepareHome = null, tmpRoot = null } = {}) {
+  const ownsTmp = !tmpRoot
+  const tmp = tmpRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), 'waker-endpoints-'))
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
   const home = path.join(tmp, 'home')
@@ -291,7 +292,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
         }
       }
       try {
-        fs.rmSync(tmp, { recursive: true, force: true })
+        if (ownsTmp) fs.rmSync(tmp, { recursive: true, force: true })
       } catch {
         /* temp cleanup is best effort */
       }
@@ -2028,8 +2029,9 @@ async function main() {
       return snapshot.json?.lastReceipt?.deliveredTo === 'session-orch' ? snapshot : null
     }, 4000)
     const holderPrompts = h.state.prompts.filter((prompt) => prompt.sessionId === 'session-holder').length
-    const ok = Boolean(delivered) && holderPrompts === 0 && status.json?.lastReceipt?.deliveredTo === 'session-orch'
-    report('receipt: a requester receives the receipt instead of receiptTo', ok, `deliveredTo=${status.json?.lastReceipt?.deliveredTo ?? '-'} holderPrompts=${holderPrompts} orchPrompts=${h.state.prompts.filter((p) => p.sessionId === 'session-orch').length}`)
+    const snapshot = status ?? (await request(h.base, '/mesh/status'))
+    const ok = Boolean(delivered) && holderPrompts === 0 && snapshot.json?.lastReceipt?.deliveredTo === 'session-orch'
+    report('receipt: a requester receives the receipt instead of receiptTo', ok, `deliveredTo=${snapshot.json?.lastReceipt?.deliveredTo ?? '-'} holderPrompts=${holderPrompts} orchPrompts=${h.state.prompts.filter((p) => p.sessionId === 'session-orch').length}`)
   })
 
   await runCase('receipt: an unresolved requester falls back to receiptTo and says so', async (boot) => {
@@ -2692,12 +2694,27 @@ async function main() {
 
   // 126-130. Thread identity (0.7.21): follow-ups resolve their target from the binding.
   const threadSeeds = [{ id: 'session-ops', title: 'mesh · ops' }, { id: 'session-other', title: 'mesh · other' }]
-  const readTaskRows = (h) =>
-    fs
-      .readFileSync(path.join(h.home, '.dsh', 'mesh-waker', 'tasks.jsonl'), 'utf8')
-      .split('\n')
-      .filter((line) => line.trim())
-      .map((line) => JSON.parse(line))
+  const readTaskRows = (h) => {
+    const home = path.join(h.home, '.dsh', 'mesh-waker')
+    const files = []
+    const add = (file) => {
+      if (fs.existsSync(file)) files.push(file)
+    }
+    add(path.join(home, 'tasks.jsonl'))
+    add(path.join(home, 'local', 'tasks.jsonl'))
+    try {
+      for (const name of fs.readdirSync(path.join(home, 'ws'))) add(path.join(home, 'ws', name, 'tasks.jsonl'))
+    } catch {
+      /* no ws dir yet */
+    }
+    return files.flatMap((file) =>
+      fs
+        .readFileSync(file, 'utf8')
+        .split('\n')
+        .filter((line) => line.trim())
+        .map((line) => JSON.parse(line)),
+    )
+  }
   const readThreadsFile = (h) => JSON.parse(fs.readFileSync(path.join(h.home, '.dsh', 'mesh-waker', 'threads.json'), 'utf8'))
   // The default log target rotates at 2 MiB and the suite writes more than that, so these
   // cases pin their own logFile and read the rotated copy together with the current one.
@@ -3607,6 +3624,8 @@ async function main() {
     let before = ''
     const h = await boot({
       tasksSeed: [seededTask('T-MIG-FAIL', { status: 'settled', settledAt: Date.now() - 1000, text: '不能被破坏的正文' })],
+      // Keep the legacy single file so this case is about text compaction, not tier splitting.
+      config: { storageTiers: false },
       prepareHome: (home) => {
         const registry = path.join(home, '.dsh', 'mesh-waker')
         fs.mkdirSync(registry, { recursive: true })
@@ -3844,6 +3863,214 @@ async function main() {
     report('stall: a task that starts immediately is unchanged', ok, `status=${settled?.json?.task?.status ?? '-'} receipts=${receipts.length}`)
   })
 
+  // 186-192. Storage tiers (T-282): records live at the LCA of both ends; legacy files split
+  // once into ws/<slug>/ and local/, and reads aggregate every layer.
+  const meshOf = (h) => path.join(h.home, '.dsh', 'mesh-waker')
+  const linesOf = (file) => {
+    try {
+      return fs.readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line))
+    } catch {
+      return []
+    }
+  }
+  const bootSessions = (cwdA, cwdB) => [
+    { id: 'session-coord', title: 'mesh · 协调', cwd: cwdB ?? cwdA },
+    { id: 'session-worker', title: 'worker', cwd: cwdA },
+  ]
+
+  await runCase('storage: same-workspace tasks stay in ws/<slug>/', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'wt-same-zone')
+    const h = await boot({ seedSessions: bootSessions(cwd, cwd) })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'same zone work', meta: { taskId: 'T-SAME-1', requester: 'session-coord' } },
+    })
+    const wsRow = linesOf(path.join(meshOf(h), 'ws', 'wt-same-zone', 'tasks.jsonl')).find((row) => row.taskId === 'T-SAME-1')
+    const localRows = linesOf(path.join(meshOf(h), 'local', 'tasks.jsonl'))
+    const registry = JSON.parse(fs.readFileSync(path.join(meshOf(h), 'workspaces.json'), 'utf8'))
+    const api = await request(h.base, '/mesh/workspaces')
+    const ok =
+      wsRow?.scope === 'workspace' &&
+      wsRow?.workspace === 'wt-same-zone' &&
+      localRows.length === 0 &&
+      registry.workspaces?.['wt-same-zone']?.cwd === cwd &&
+      registry.workspaces?.['wt-same-zone']?.coordinator === 'session-coord' &&
+      api.json?.count === 1
+    report('storage: same-workspace tasks stay in ws/<slug>/', ok, `wsRow=${Boolean(wsRow)} localRows=${localRows.length} workspaces=${api.json?.count ?? '-'}`)
+  })
+
+  await runCase('storage: cross-workspace tasks go to local/ with scope=machine and peers', async (boot) => {
+    const cwdA = path.join(os.tmpdir(), 'wt-cross-a')
+    const cwdB = path.join(os.tmpdir(), 'wt-cross-b')
+    const h = await boot({ seedSessions: bootSessions(cwdA, cwdB) })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'cross zone work', meta: { taskId: 'T-CROSS-1', requester: 'session-coord' } },
+    })
+    const localRow = linesOf(path.join(meshOf(h), 'local', 'tasks.jsonl')).find((row) => row.taskId === 'T-CROSS-1')
+    const wsRows = linesOf(path.join(meshOf(h), 'ws', 'wt-cross-a', 'tasks.jsonl')).filter((row) => row.taskId === 'T-CROSS-1')
+    const machine = JSON.parse(fs.readFileSync(path.join(meshOf(h), 'workspaces.json'), 'utf8')).machine
+    const ok =
+      localRow?.scope === 'machine' &&
+      localRow?.origin === `${machine}/wt-cross-b` &&
+      JSON.stringify(localRow?.peers) === JSON.stringify([`${machine}/wt-cross-a`]) &&
+      wsRows.length === 0
+    report('storage: cross-workspace tasks go to local/ with scope=machine and peers', ok, `scope=${localRow?.scope ?? '-'} origin=${localRow?.origin ?? '-'} peers=${JSON.stringify(localRow?.peers ?? [])}`)
+  })
+
+  await runCase('storage: legacy files migrate into tier files and are kept as legacy', async (boot) => {
+    const cwdA = path.join(os.tmpdir(), 'wt-mig-a')
+    const cwdB = path.join(os.tmpdir(), 'wt-mig-b')
+    // Pin the log target: logTarget is global, so a previous case's logFile would swallow
+    // this boot's migration line (the suite reuses one process).
+    const logFile = path.join(os.tmpdir(), `waker-tier-mig-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile },
+      seedSessions: [
+        { id: 'session-a', title: 'worker a', cwd: cwdA },
+        { id: 'session-b', title: 'worker b', cwd: cwdB },
+      ],
+      tasksSeed: [
+        seededTask('T-MIG-A', { targetSessionId: 'session-a' }),
+        seededTask('T-MIG-B', { targetSessionId: 'session-b' }),
+        seededTask('T-MIG-UNK', { targetSessionId: 'session-unknown' }),
+      ],
+      prepareHome: (home) => {
+        const registry = path.join(home, '.dsh', 'mesh-waker')
+        const receipts = [
+          { taskId: 'T-MIG-A', sessionId: 'session-a', status: 'completed' },
+          { taskId: 'T-MIG-B', sessionId: 'session-b', status: 'completed' },
+          { taskId: 'T-MIG-UNK', sessionId: 'session-unknown', status: 'completed' },
+        ]
+        fs.writeFileSync(path.join(registry, 'receipts.jsonl'), receipts.map((row) => JSON.stringify(row)).join('\n') + '\n')
+      },
+    })
+    const wsA = [...new Set(linesOf(path.join(meshOf(h), 'ws', 'wt-mig-a', 'tasks.jsonl')).map((row) => row.taskId))]
+    const wsB = [...new Set(linesOf(path.join(meshOf(h), 'ws', 'wt-mig-b', 'tasks.jsonl')).map((row) => row.taskId))]
+    const local = linesOf(path.join(meshOf(h), 'local', 'tasks.jsonl'))
+    const legacyTasks = fs.existsSync(path.join(meshOf(h), 'tasks.legacy.jsonl'))
+    const receiptA = [...new Set(linesOf(path.join(meshOf(h), 'ws', 'wt-mig-a', 'receipts.jsonl')).map((row) => row.taskId))]
+    const receiptLocal = [...new Set(linesOf(path.join(meshOf(h), 'local', 'receipts.jsonl')).map((row) => row.taskId))]
+    const legacyReceipts = fs.existsSync(path.join(meshOf(h), 'receipts.legacy.jsonl'))
+    const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+    const conditions = {
+      wsA: wsA.includes('T-MIG-A'),
+      wsB: wsB.includes('T-MIG-B'),
+      unk: local.some((row) => row.taskId === 'T-MIG-UNK' && row.scopeUncertain === true),
+      legacyTasks,
+      receiptA: receiptA.includes('T-MIG-A'),
+      receiptLocal: receiptLocal.includes('T-MIG-UNK'),
+      legacyReceipts,
+      log: /storage tiers: migrated tasks=3 receipts=3/.test(log),
+    }
+    const ok = Object.values(conditions).every(Boolean)
+    const bad = Object.entries(conditions).filter(([, value]) => !value).map(([key]) => key)
+    report('storage: legacy files migrate into tier files and are kept as legacy', ok, `wsA=${wsA.length} wsB=${wsB.length} local=${local.length} legacy=${legacyTasks}/${legacyReceipts} bad=${bad.join(',') || '-'}`)
+  })
+
+  await runCase('storage: a second boot does not migrate or duplicate again', async (boot) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-tier-idem-'))
+    const cwd = path.join(os.tmpdir(), 'wt-idem-zone')
+    try {
+      const first = await boot({
+        tmpRoot,
+        seedSessions: [{ id: 'session-idem', title: 'worker', cwd }],
+        tasksSeed: [seededTask('T-IDEM-1', { targetSessionId: 'session-idem' })],
+      })
+      await request(first.base, '/mesh/tasks')
+      first.close()
+      const afterFirst = new Set(
+        linesOf(path.join(tmpRoot, 'home', '.dsh', 'mesh-waker', 'ws', 'wt-idem-zone', 'tasks.jsonl'))
+          .filter((row) => row.taskId === 'T-IDEM-1')
+          .map((row) => row.taskId),
+      ).size
+      const second = await boot({ tmpRoot, seedSessions: [{ id: 'session-idem', title: 'worker', cwd }] })
+      await request(second.base, '/mesh/tasks')
+      const afterSecond = new Set(
+        linesOf(path.join(tmpRoot, 'home', '.dsh', 'mesh-waker', 'ws', 'wt-idem-zone', 'tasks.jsonl'))
+          .filter((row) => row.taskId === 'T-IDEM-1')
+          .map((row) => row.taskId),
+      ).size
+      const legacyGone = !fs.existsSync(path.join(tmpRoot, 'home', '.dsh', 'mesh-waker', 'tasks.jsonl'))
+      const ok = afterFirst === 1 && afterSecond === 1 && legacyGone
+      report('storage: a second boot does not migrate or duplicate again', ok, `first=${afterFirst} second=${afterSecond} legacyGone=${legacyGone}`)
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('storage: a failed migration leaves the legacy file untouched', async (boot) => {
+    let before = ''
+    const cwd = path.join(os.tmpdir(), 'wt-fail-zone')
+    const h = await boot({
+      seedSessions: [{ id: 'session-fail', title: 'worker', cwd }],
+      config: { compactTaskText: false },
+      tasksSeed: [seededTask('T-FAIL-MIG', { targetSessionId: 'session-fail', status: 'settled', settledAt: Date.now() - 1000 })],
+      prepareHome: (home) => {
+        const registry = path.join(home, '.dsh', 'mesh-waker')
+        before = fs.readFileSync(path.join(registry, 'tasks.jsonl'), 'utf8')
+        // A file where the ws/ directory should be makes every tier write fail.
+        fs.writeFileSync(path.join(registry, 'ws'), 'not a directory')
+      },
+    })
+    const legacyPath = path.join(meshOf(h), 'tasks.jsonl')
+    const after = fs.existsSync(legacyPath) ? fs.readFileSync(legacyPath, 'utf8') : ''
+    const listed = await request(h.base, '/mesh/tasks')
+    const ok = before.length > 0 && after === before && listed.json?.total === 1
+    report('storage: a failed migration leaves the legacy file untouched', ok, `unchanged=${after === before} listed=${listed.json?.total ?? '-'}`)
+  })
+
+  await runCase('storage: the task API aggregates local/ and every ws/ layer', async (boot) => {
+    const cwdA = path.join(os.tmpdir(), 'wt-agg-a')
+    const cwdB = path.join(os.tmpdir(), 'wt-agg-b')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-agg-a', title: 'worker a', cwd: cwdA },
+        { id: 'session-agg-b', title: 'worker b', cwd: cwdB },
+      ],
+      tasksSeed: [
+        seededTask('T-AGG-A', { targetSessionId: 'session-agg-a' }),
+        seededTask('T-AGG-B', { targetSessionId: 'session-agg-b' }),
+        seededTask('T-AGG-UNK', { targetSessionId: 'session-unknown' }),
+      ],
+    })
+    const listed = await request(h.base, '/mesh/tasks?limit=50')
+    const ids = (listed.json?.tasks ?? []).map((row) => row.taskId).sort()
+    const ok = listed.json?.total === 3 && JSON.stringify(ids) === JSON.stringify(['T-AGG-A', 'T-AGG-B', 'T-AGG-UNK'])
+    report('storage: the task API aggregates local/ and every ws/ layer', ok, `total=${listed.json?.total ?? '-'} ids=${ids.join(',')}`)
+  })
+
+  await runCase('storage: workspaces.json keeps human edits and only adds new cwds', async (boot) => {
+    const cwdA = path.join(os.tmpdir(), 'wt-keep-a')
+    const cwdB = path.join(os.tmpdir(), 'wt-keep-b')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-keep-a', title: 'worker a', cwd: cwdA },
+        { id: 'session-keep-b', title: 'worker b', cwd: cwdB },
+      ],
+      prepareHome: (home) => {
+        const registry = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(registry, { recursive: true })
+        const seededRegistry = {
+          machine: 'test-machine',
+          workspaces: {
+            'wt-keep-a': { cwd: cwdA, coordinator: 'session-keep-a', roles: ['custom-role'] },
+          },
+        }
+        fs.writeFileSync(path.join(registry, 'workspaces.json'), `${JSON.stringify(seededRegistry, null, 2)}\n`)
+      },
+    })
+    const registry = JSON.parse(fs.readFileSync(path.join(meshOf(h), 'workspaces.json'), 'utf8'))
+    const ok =
+      registry.machine === 'test-machine' &&
+      JSON.stringify(registry.workspaces?.['wt-keep-a']?.roles) === JSON.stringify(['custom-role']) &&
+      registry.workspaces?.['wt-keep-a']?.coordinator === 'session-keep-a' &&
+      Boolean(registry.workspaces?.['wt-keep-b'])
+    report('storage: workspaces.json keeps human edits and only adds new cwds', ok, `machine=${registry.machine} aRoles=${JSON.stringify(registry.workspaces?.['wt-keep-a']?.roles)} b=${Boolean(registry.workspaces?.['wt-keep-b'])}`)
+  })
+
+
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
@@ -3866,6 +4093,9 @@ main()
       await new Promise((resolveWait) => setTimeout(resolveWait, 25))
     }
     if (relevant.length) console.error(`LEFTOVER RESOURCES: ${[...new Set(relevant)].join(',')}`)
+    // A leaked handle must not hang the runner forever: the diagnostics above are the
+    // actionable part, and a non-zero exit still fails CI.
+    process.exit(process.exitCode ?? (relevant.length ? 1 : 0))
   })
   .catch((error) => {
     console.error(error)
