@@ -9,6 +9,15 @@
 
 ---
 
+## v0.7.30（2026-11-01，重启补发的 `lost` 回执真正投给等待方）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | 0.7.26 的启动孤儿检测生效了（`marked lost` + 生成回执），但回执日志是 `lost → file only`：`recordTaskPending` 从来没把 `receiptMode` 写进任务行，恢复逻辑只能回落全局 `c.receiptMode`（`file`）。原本 `receipt=queue` 的派活方仍然收不到通知——检测到了却没人知道 |
+| 修法 | ① 注册任务时把**实际生效**的 receiptMode（批次覆盖 / `meta.receipt` / 全局配置）写进任务行；② 启动扫孤儿时若行内没有该字段：有 requester → 按 `queue` 处理（对方明确指定了收件人，就该通知到），无 requester → 保持 `file`；③ 回执通知格式不变（0.7.28 的状态行规则） |
+| 测试 | +4（共 166/166）：任务行记录 `receiptMode=queue`（配置 queue）；孤儿行 `receiptMode=queue` + 全局 file → 仍注入给 requester；老行无字段但有 requester → 按 queue 注入；老行无 requester → file only、回执行记 `receiptMode=file`、零注入。既有 162 例全绿 |
+| 真机 | 本机 `T4F-20261101-07` 已在 05:29 被上一版消费为 `lost`（行内 `receiptMode=null`），无法再次验证；下次重启请用一条新孤儿验证（日志应为 `delivered to session-…`，不再是 `file only`） |
+
 ## v0.7.29（2026-11-01，测试套件偶发挂死/静默 exit=1）
 
 | 项 | 内容 |

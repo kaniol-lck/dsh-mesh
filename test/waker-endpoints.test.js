@@ -3311,10 +3311,13 @@ async function main() {
     const ok =
       lost?.json?.task?.status === 'lost' &&
       /requester inference ambiguous: 2 coordinator sessions share cwd/.test(log) &&
-      /delivery skipped: no requester, receiptTo is empty/.test(log) &&
+      // No requester survives inference -> the lost receipt falls back to file-only + WARN.
+      /receipt T-ORPH-AMB lost → file only \(requester=无/.test(log) &&
+      /nobody was notified/.test(log) &&
       receipts.length === 1 &&
+      receipts[0].receiptMode === 'file' &&
       h.state.prompts.length === 0
-    report('restart: an ambiguous workspace stays undelivered without failing', ok, `lost=${lost?.json?.task?.status ?? '-'} receipts=${receipts.length} prompts=${h.state.prompts.length}`)
+    report('restart: an ambiguous workspace stays undelivered without failing', ok, `lost=${lost?.json?.task?.status ?? '-'} receipts=${receipts.length} mode=${receipts[0]?.receiptMode ?? '-'} prompts=${h.state.prompts.length}`)
   })
 
   // 154-157. Receipt summaries must come from this task's own turn (T-267): turn numbers
@@ -3435,6 +3438,61 @@ async function main() {
     const text = receiptNoticeText({ taskId: 'T-NOTICE-EMPTY', status: 'completed', durationMs: 1, summary: '' })
     const ok = text === '[RECEIPT] T-NOTICE-EMPTY completed 1ms' && !text.endsWith('\n')
     report('receipt notice: an empty summary leaves a single clean line', ok, `text=${JSON.stringify(text)}`)
+  })
+
+  // 163-166. A lost receipt must reach the dispatcher (T-273): the registry row now records
+  // receiptMode, and pre-0.7.30 rows with a requester default to queue.
+  await runCase('tasks: the registry row records the effective receiptMode', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-mode-target', title: 'mode target' }], config: { receiptMode: 'queue' } })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'mode target', text: 'persist mode', taskId: 'T-MODE-1', requester: 'session-mode-target' }, { sessionId: 'session-coord' })
+    const row = readTaskRows(h).find((entry) => entry.taskId === 'T-MODE-1' && entry.status === 'pending')
+    const ok = row?.receiptMode === 'queue'
+    report('tasks: the registry row records the effective receiptMode', ok, `receiptMode=${String(row?.receiptMode)}`)
+  })
+
+  await runCase('restart: a lost receipt honours the row receiptMode=queue', async (boot) => {
+    const h = await boot({
+      seedSessions: [{ id: 'session-mode-coord', title: 'mode · 协调' }],
+      tasksSeed: [seedOrphan('T-LOST-QUEUE', { status: 'started', startedAt: Date.now() - 9000, requester: 'session-mode-coord', receiptMode: 'queue' })],
+      // The global config stays file: the row's recorded mode must win.
+      config: { receiptMode: 'file', receiptTo: '' },
+    })
+    const delivered = await waitFor(
+      () => h.state.prompts.find((prompt) => prompt.sessionId === 'session-mode-coord' && JSON.stringify(prompt).includes('T-LOST-QUEUE')),
+      5000,
+    )
+    const ok = Boolean(delivered)
+    report('restart: a lost receipt honours the row receiptMode=queue', ok, `deliveredTo=${delivered?.sessionId ?? '-'} prompts=${h.state.prompts.length}`)
+  })
+
+  await runCase('restart: an old row without receiptMode but with a requester defaults to queue', async (boot) => {
+    const h = await boot({
+      seedSessions: [{ id: 'session-old-coord', title: 'old · 协调' }],
+      tasksSeed: [seedOrphan('T-LOST-OLD', { status: 'started', startedAt: Date.now() - 9000, requester: 'session-old-coord' })],
+      config: { receiptMode: 'file', receiptTo: '' },
+    })
+    const delivered = await waitFor(
+      () => h.state.prompts.find((prompt) => prompt.sessionId === 'session-old-coord' && JSON.stringify(prompt).includes('T-LOST-OLD')),
+      5000,
+    )
+    const ok = Boolean(delivered) && JSON.stringify(delivered).includes('lost')
+    report('restart: an old row without receiptMode but with a requester defaults to queue', ok, `deliveredTo=${delivered?.sessionId ?? '-'}`)
+  })
+
+  await runCase('restart: an old row without requester stays file only and warns', async (boot) => {
+    const h = await boot({
+      tasksSeed: [seedOrphan('T-LOST-FILE', { status: 'started', startedAt: Date.now() - 9000 })],
+      config: { receiptMode: 'file', receiptTo: '' },
+    })
+    const lost = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-LOST-FILE')
+      return snapshot.json?.task?.status === 'lost' ? snapshot : null
+    }, 5000)
+    const receipts = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-LOST-FILE' && receipt.status === 'lost')
+    const ok = lost?.json?.task?.status === 'lost' && receipts.length === 1 && receipts[0].receiptMode === 'file' && h.state.prompts.length === 0
+    report('restart: an old row without requester stays file only and warns', ok, `status=${lost?.json?.task?.status ?? '-'} receiptMode=${receipts[0]?.receiptMode ?? '-'} prompts=${h.state.prompts.length}`)
   })
 
   const failed = results.filter((result) => !result.ok)

@@ -3562,6 +3562,7 @@ export function apply(ctx, config) {
       startedAt: null,
       settledAt: null,
       durationMs: null,
+      receiptMode: extra.receiptMode ?? null,
       receiptRef: null,
       ...(reusedId ? { reusedId: true } : {}),
       refs: Array.isArray(meta?.refs)
@@ -3782,7 +3783,9 @@ export function apply(ctx, config) {
         injectedAt: row.createdAt ?? null,
         endedAt: settledAt,
         summary,
-        receiptMode: ['file', 'queue', 'wake'].includes(row.receiptMode) ? row.receiptMode : c.receiptMode,
+        // Rows written before 0.7.30 have no receiptMode. A named requester asked to be told,
+        // so default those to queue; without a requester a file-only notice has no value (T-273).
+        receiptMode: ['file', 'queue', 'wake'].includes(row.receiptMode) ? row.receiptMode : requester ? 'queue' : 'file',
         summaryChars: c.receiptSummaryChars,
       })
       writeReceiptFile(receipt)
@@ -3913,6 +3916,8 @@ export function apply(ctx, config) {
       thread: normalizeThread(meta?.thread),
       requester: requester.requester,
       deadlineMs: Number(meta?.deadlineMs) || null,
+      // Persist the actual mode so a restart can still notify the dispatcher (T-273).
+      receiptMode,
     })
     const timer = setTimeout(() => {
       receiptTimers.delete(timer)

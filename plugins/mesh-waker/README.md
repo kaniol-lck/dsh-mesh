@@ -246,7 +246,7 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 **存储**（`~/.dsh/mesh-waker/`，0600）：
 
-- `tasks.jsonl`：append-only，一行一条；字段 `taskId / batchId / thread / requester / targetSessionId / targetTitle / subject（正文首行 ≤120 字）/ textBytes / createdAt / deadlineMs / status / startedAt / settledAt / durationMs / receiptRef / receiptSummary / refs[] / reusedId?`（`reusedId: true` 表示同一 taskId 在 24 小时内重复注册）；
+- `tasks.jsonl`：append-only，一行一条；字段 `taskId / batchId / thread / requester / targetSessionId / targetTitle / subject（正文首行 ≤120 字）/ textBytes / createdAt / deadlineMs / status / startedAt / settledAt / durationMs / receiptMode / receiptRef / receiptSummary / refs[] / reusedId?`（`reusedId: true` 表示同一 taskId 在 24 小时内重复注册；`receiptMode` 是投递时实际生效的回执模式，重启补发 `lost` 时据此通知等待方）；
 - 正文 ≤8 KiB 直接存 `text`；>8 KiB 落 `tasks/<taskId>.md`，jsonl 只记 `textPath`；
 - **保留策略**：`tasksRetentionDays`（默认 30 天）与 `tasksMaxRows`（默认 5000 条），启动时按「超龄或超量」裁最旧的，并压实 jsonl（被裁任务的正文文件一并清理）；
 - **正文隐私**：日志只打 `textBytes` 与 `subject`，**从不打印正文**；列表 API 不含正文，只有详情 API 返回全文。
