@@ -61,11 +61,15 @@ async function request(base, route, { method = 'GET', body } = {}) {
   return { status: response.status, json, text }
 }
 
-function seedSession(sessionsRoot, { id, title, workspace = 'ws-test' }) {
+function seedSession(sessionsRoot, { id, title, workspace = 'ws-test', mtime = null }) {
   const dir = path.join(sessionsRoot, workspace, id)
   fs.mkdirSync(dir, { recursive: true })
   const log = path.join(dir, 'session.v4.jsonl.zstd')
   fs.writeFileSync(log, '')
+  if (mtime) {
+    const at = new Date(mtime)
+    fs.utimesSync(log, at, at)
+  }
   return { id, title, workspace, log, mtime: fs.statSync(log).mtimeMs }
 }
 
@@ -4045,7 +4049,7 @@ async function main() {
     const cwdB = path.join(os.tmpdir(), 'wt-keep-b')
     const h = await boot({
       seedSessions: [
-        { id: 'session-keep-a', title: 'worker a', cwd: cwdA },
+        { id: 'session-keep-a', title: 'mesh · 协调', cwd: cwdA },
         { id: 'session-keep-b', title: 'worker b', cwd: cwdB },
       ],
       prepareHome: (home) => {
@@ -4176,6 +4180,168 @@ async function main() {
       report('stale: refresh=1 recomputes past the five-second cache', ok, `cached=${cached.codeStale} refreshed=${refreshed.codeStale} hashes=${first.diskCodeHash}/${refreshed.diskCodeHash}`)
     })
   })
+
+  // 198-204. Workspace registry quality (T-286): meaningful slugs, newest coordinator,
+  // ephemeral cleanup, and idempotent convergence of registries written before this change.
+  const registryOf = (h) => JSON.parse(fs.readFileSync(path.join(h.home, '.dsh', 'mesh-waker', 'workspaces.json'), 'utf8'))
+  const wsDirOf = (h, slug) => path.join(h.home, '.dsh', 'mesh-waker', 'ws', slug)
+
+  await runCase('workspaces: a generic basename uses the parent project name', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'dsh-mesh', 'public')
+    const h = await boot({ seedSessions: [{ id: 'session-generic', title: 'worker', cwd }] })
+    const registry = registryOf(h)
+    const ok = Boolean(registry.workspaces?.['dsh-mesh']) && !registry.workspaces?.public
+    report('workspaces: a generic basename uses the parent project name', ok, `slugs=${Object.keys(registry.workspaces ?? {}).join(',')}`)
+  })
+
+  await runCase('workspaces: a specific basename keeps its own name', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'util4freesub')
+    const h = await boot({ seedSessions: [{ id: 'session-specific', title: 'worker', cwd }] })
+    const registry = registryOf(h)
+    const ok = Boolean(registry.workspaces?.util4freesub)
+    report('workspaces: a specific basename keeps its own name', ok, `slugs=${Object.keys(registry.workspaces ?? {}).join(',')}`)
+  })
+
+  await runCase('workspaces: one realpath under two spellings collapses to one entry', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'same-repo')
+    const variant = `${cwd.toUpperCase()}${path.sep}`
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-spell-a', title: 'worker a', cwd },
+        { id: 'session-spell-b', title: 'worker b', cwd: variant },
+      ],
+    })
+    const registry = registryOf(h)
+    const entries = Object.values(registry.workspaces ?? {}).filter((entry) => /same-repo/i.test(entry.cwd ?? ''))
+    const ok = entries.length === 1
+    report('workspaces: one realpath under two spellings collapses to one entry', ok, `entries=${entries.length} slugs=${Object.keys(registry.workspaces ?? {}).join(',')}`)
+  })
+
+  await runCase('workspaces: an all-selftest cwd is dropped and its empty ws directory pruned', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'ask3-selftest-abc123')
+    const h = await boot({
+      seedSessions: [{ id: 'session-ephemeral', title: 'test-ask-ephemeral', cwd }],
+      prepareHome: (home) => {
+        const registryDir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(path.join(registryDir, 'ws', 'ask3-selftest-abc123'), { recursive: true })
+        fs.writeFileSync(path.join(registryDir, 'ws', 'ask3-selftest-abc123', 'tasks.jsonl'), '')
+        fs.writeFileSync(
+          path.join(registryDir, 'workspaces.json'),
+          `${JSON.stringify({ machine: 'm', workspaces: { 'ask3-selftest-abc123': { cwd, roles: [] } } }, null, 2)}\n`,
+        )
+      },
+    })
+    const registry = registryOf(h)
+    const ok = !registry.workspaces?.['ask3-selftest-abc123'] && !fs.existsSync(wsDirOf(h, 'ask3-selftest-abc123'))
+    report('workspaces: an all-selftest cwd is dropped and its empty ws directory pruned', ok, `entries=${Object.keys(registry.workspaces ?? {}).join(',')}`)
+  })
+
+  await runCase('workspaces: coordinator is the most recently active matching session', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'coord-repo')
+    const now = Date.now()
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-coord-old', title: 'mesh · 协调', cwd, mtime: now - 10 * 24 * 60 * 60 * 1000 },
+        { id: 'session-coord-new', title: 'mesh · 协调', cwd, mtime: now - 60 * 60 * 1000 },
+        { id: 'session-coord-worker', title: 'mesh · ops', cwd, mtime: now },
+      ],
+    })
+    const entry = registryOf(h).workspaces?.['coord-repo']
+    const ok = entry?.coordinator === 'session-coord-new' && entry?.coordinatorStale !== true && JSON.stringify(entry?.roles) === JSON.stringify(['ops'])
+    report('workspaces: coordinator is the most recently active matching session', ok, `coordinator=${entry?.coordinator ?? '-'} stale=${entry?.coordinatorStale ?? false}`)
+  })
+
+  await runCase('workspaces: a coordinator idle for over a week is marked stale', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'stale-coord-repo')
+    const logFile = path.join(os.tmpdir(), `waker-ws-stale-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile },
+      seedSessions: [{ id: 'session-coord-idle', title: 'mesh · coordinator', cwd, mtime: Date.now() - 8 * 24 * 60 * 60 * 1000 }],
+    })
+    const registry = registryOf(h)
+    const entry = registry.workspaces?.['stale-coord-repo']
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok = entry?.coordinator === 'session-coord-idle' && entry?.coordinatorStale === true && /coordinator idle for 8d/.test(log)
+    report('workspaces: a coordinator idle for over a week is marked stale', ok, `coordinator=${entry?.coordinator ?? '-'} stale=${entry?.coordinatorStale ?? false} warned=${/coordinator idle/.test(log)}`)
+  })
+
+  await runCase('workspaces: a human slug and roles survive restarts', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'custom-repo')
+    const h = await boot({
+      seedSessions: [{ id: 'session-custom', title: 'worker', cwd }],
+      prepareHome: (home) => {
+        const registryDir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(registryDir, { recursive: true })
+        fs.writeFileSync(
+          path.join(registryDir, 'workspaces.json'),
+          `${JSON.stringify({ machine: 'm', workspaces: { legacy: { cwd, slug: 'my-custom', roles: ['keep-role'] } } }, null, 2)}\n`,
+        )
+      },
+    })
+    const registry = registryOf(h)
+    const entry = registry.workspaces?.['my-custom']
+    const ok =
+      Boolean(entry) &&
+      entry?.slug === 'my-custom' &&
+      JSON.stringify(entry?.roles) === JSON.stringify(['keep-role']) &&
+      !registry.workspaces?.legacy
+    report('workspaces: a human slug and roles survive restarts', ok, `slug=${entry?.slug ?? '-'} roles=${JSON.stringify(entry?.roles ?? [])} keys=${Object.keys(registry.workspaces ?? {}).join(',')}`)
+  })
+
+  await runCase('workspaces: convergence merges a reslug and is idempotent', async (boot) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-ws-converge-'))
+    const cwdPublic = path.join(tmpRoot, 'work', 'dsh-mesh', 'public')
+    const cwdOther = path.join(tmpRoot, 'work', 'other', 'dsh-mesh')
+    const logFile1 = path.join(tmpRoot, 'first.log')
+    const logFile2 = path.join(tmpRoot, 'second.log')
+    try {
+      const first = await boot({
+        tmpRoot,
+        config: { logFile: logFile1 },
+        seedSessions: [
+          { id: 'session-public', title: 'worker public', cwd: cwdPublic },
+          { id: 'session-other', title: 'worker other', cwd: cwdOther },
+        ],
+        prepareHome: (home) => {
+          const registryDir = path.join(home, '.dsh', 'mesh-waker')
+          fs.mkdirSync(path.join(registryDir, 'ws', 'public'), { recursive: true })
+          fs.writeFileSync(path.join(registryDir, 'ws', 'public', 'tasks.jsonl'), `${JSON.stringify(seededTask('T-RESLUG'))}\n`)
+          fs.writeFileSync(
+            path.join(registryDir, 'workspaces.json'),
+            `${JSON.stringify({ machine: 'm', workspaces: { public: { cwd: cwdPublic, roles: [] }, other: { cwd: cwdOther, roles: [] } } }, null, 2)}\n`,
+          )
+        },
+      })
+      const registryAfterFirst = registryOf(first)
+      const migratedRow = fs.existsSync(path.join(wsDirOf(first, 'dsh-mesh'), 'tasks.jsonl'))
+        ? fs.readFileSync(path.join(wsDirOf(first, 'dsh-mesh'), 'tasks.jsonl'), 'utf8')
+        : ''
+      const firstLog = fs.readFileSync(logFile1, 'utf8')
+      first.close()
+      const second = await boot({
+        tmpRoot,
+        config: { logFile: logFile2 },
+        seedSessions: [
+          { id: 'session-public', title: 'worker public', cwd: cwdPublic },
+          { id: 'session-other', title: 'worker other', cwd: cwdOther },
+        ],
+      })
+      const registryAfterSecond = registryOf(second)
+      const secondLog = fs.readFileSync(logFile2, 'utf8')
+      const ok =
+        Object.keys(registryAfterFirst.workspaces ?? {}).length === 1 &&
+        Boolean(registryAfterFirst.workspaces?.['dsh-mesh']) &&
+        !fs.existsSync(wsDirOf(first, 'public')) &&
+        /T-RESLUG/.test(migratedRow) &&
+        /workspaces: converged merged=1 ephemeral=0 reslugged=1/.test(firstLog) &&
+        JSON.stringify(registryAfterFirst) === JSON.stringify(registryAfterSecond) &&
+        /workspaces: converged merged=0 ephemeral=0 reslugged=0 \(no changes\)/.test(secondLog)
+      report('workspaces: convergence merges a reslug and is idempotent', ok, `keys=${Object.keys(registryAfterFirst.workspaces ?? {}).join(',')} secondSame=${JSON.stringify(registryAfterFirst) === JSON.stringify(registryAfterSecond)}`)
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
 
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)

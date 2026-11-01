@@ -17,7 +17,7 @@
  *    normal session-start inbox check picks it up later.
  */
 import { createServer } from 'node:http'
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir, networkInterfaces, homedir, hostname } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -3462,17 +3462,45 @@ export function apply(ctx, config) {
     }
   }
 
-  /** Stable slug from a cwd's basename (never changes for the same directory). */
+  /**
+   * Workspace slugs (T-286): a generic basename says nothing about the project, so use the
+   * parent directory instead (`…\dsh-mesh\public` -> `dsh-mesh`). Everything is normalised
+   * to [a-z0-9-]; an explicit `slug` in the registry wins and is never rewritten.
+   */
+  const GENERIC_SLUG_BASES = new Set(['public', 'src', 'dist', 'app', 'main', 'build'])
+
+  function normalizePath(input) {
+    try {
+      return realpathSync.native ? realpathSync.native(input) : realpathSync(input)
+    } catch {
+      try {
+        return resolve(String(input ?? ''))
+      } catch {
+        return String(input ?? '')
+      }
+    }
+  }
+
+  function workspaceKeyPath(input) {
+    const path = normalizePath(input)
+    return process.platform === 'win32' ? path.toLowerCase() : path
+  }
+
+  function sanitizeSlug(value) {
+    return String(value ?? '')
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+  }
+
   function slugifyCwd(cwd) {
-    const base = String(cwd ?? '')
+    const parts = String(cwd ?? '')
       .replace(/[\\/]+$/, '')
       .split(/[\\/]/)
       .filter(Boolean)
-      .pop()
-    return String(base ?? 'workspace')
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, '-')
-      .replace(/^-+|-+$/g, '') || 'workspace'
+    let base = parts.pop() ?? 'workspace'
+    if (GENERIC_SLUG_BASES.has(base.toLowerCase())) base = parts.pop() ?? base
+    return sanitizeSlug(base) || 'workspace'
   }
 
   function loadWorkspaces() {
@@ -3485,65 +3513,282 @@ export function apply(ctx, config) {
       workspaces.workspaces[slug] = {
         cwd: String(value.cwd ?? ''),
         ...(value.coordinator ? { coordinator: String(value.coordinator) } : {}),
+        ...(value.coordinatorStale === true ? { coordinatorStale: true } : {}),
         ...(Array.isArray(value.roles) ? { roles: value.roles.map(String) } : {}),
+        ...(typeof value.slug === 'string' && value.slug ? { slug: String(value.slug) } : {}),
+        ...(value.ephemeral === true ? { ephemeral: true } : {}),
       }
     }
   }
 
-  /** Register a cwd once. Existing entries stay byte-identical (human edits win). */
+  /** The slug a registry entry is known by: an explicit human `slug` wins over the key. */
+  function canonicalSlugOf(slug, entry) {
+    if (entry && typeof entry.slug === 'string' && entry.slug) return sanitizeSlug(entry.slug) || slug
+    return sanitizeSlug(slug) || slug
+  }
+
+  /** Register a cwd once. Existing entries (and human edits) stay byte-identical. */
   function ensureWorkspace(cwd) {
     const path = String(cwd ?? '').trim()
     if (!path) return null
+    const keyPath = workspaceKeyPath(path)
     for (const [slug, value] of Object.entries(workspaces.workspaces)) {
-      if (value.cwd === path) return slug
+      if (workspaceKeyPath(value.cwd) === keyPath) return canonicalSlugOf(slug, value)
     }
     const base = slugifyCwd(path)
+    for (const [slug, value] of Object.entries(workspaces.workspaces)) {
+      if (canonicalSlugOf(slug, value) === base) return base
+    }
     let slug = base
     let suffix = 2
-    while (workspaces.workspaces[slug]) slug = `${base}-${suffix++}`
+    const taken = (candidate) =>
+      Object.entries(workspaces.workspaces).some(([key, entry]) => canonicalSlugOf(key, entry) === candidate)
+    while (taken(slug)) slug = `${base}-${suffix++}`
     workspaces.workspaces[slug] = { cwd: path, coordinator: null, roles: [] }
     saveWorkspaces()
     fileLog(`workspace registered: ${slug} (${path})`)
     return slug
   }
 
-  /** Seed the registry from the host session index: one entry per distinct cwd. */
-  function registerWorkspacesFromSessions() {
+  const EPHEMERAL_TITLE = /(-selftest-|^test-|-test$|^tooltest$|^dshtest$)/i
+  const EPHEMERAL_CWD = /(-selftest-|^test-|-test$|^tooltest$|^dshtest$)/i
+
+  function taskFilesWithRows() {
+    return taskRecordFiles().filter((file) => {
+      try {
+        return statSync(file).size > 0
+      } catch {
+        return false
+      }
+    })
+  }
+
+  function sessionsHaveTasks(sessionIds) {
+    if (!sessionIds.size) return false
+    for (const file of taskFilesWithRows()) {
+      try {
+        for (const line of readFileSync(file, 'utf8').split('\n')) {
+          if (!line.trim()) continue
+          try {
+            const row = JSON.parse(line)
+            if (row && sessionIds.has(String(row.targetSessionId))) return true
+          } catch {
+            /* torn line */
+          }
+        }
+      } catch {
+        /* unreadable tier */
+      }
+    }
+    return false
+  }
+
+  /** A cwd whose sessions are all throwaway tests and that never produced task data. */
+  function isEphemeralGroup(cwd, sessions) {
+    if (sessionsHaveTasks(new Set(sessions.map((session) => session.id)))) return false
+    const base = String(cwd ?? '').replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() ?? ''
+    const pathLooksTemp = EPHEMERAL_CWD.test(base)
+    let cwdExists = false
+    try {
+      cwdExists = existsSync(cwd)
+    } catch {
+      cwdExists = false
+    }
+    if (sessions.length) {
+      return sessions.every((session) => EPHEMERAL_TITLE.test(String(session.title ?? ''))) || pathLooksTemp
+    }
+    return pathLooksTemp || !cwdExists
+  }
+
+  /** Move/merge ws/<old> into ws/<new>; an empty source directory is removed. */
+  function migrateWsDir(oldSlug, newSlug) {
+    if (!oldSlug || oldSlug === newSlug) return false
+    const from = wsDirFor(oldSlug)
+    const to = wsDirFor(newSlug)
+    if (!existsSync(from)) return false
+    mkdirSync(wsRoot, { recursive: true })
+    if (!existsSync(to)) {
+      renameSync(from, to)
+      return true
+    }
+    for (const name of readdirSync(from)) {
+      const source = join(from, name)
+      const target = join(to, name)
+      if (!existsSync(target)) {
+        renameSync(source, target)
+        continue
+      }
+      if (statSync(source).isFile()) {
+        appendFileSync(target, readFileSync(source))
+        rmSync(source, { force: true })
+      }
+    }
+    rmSync(from, { recursive: true, force: true })
+    return true
+  }
+
+  /** Remove an empty ws/<slug>/ left behind by an ephemeral entry (or by a reslug move). */
+  function pruneEmptyWsDir(slug) {
+    const dir = wsDirFor(slug)
+    try {
+      if (!existsSync(dir)) return false
+      for (const name of readdirSync(dir)) {
+        const file = join(dir, name)
+        if (statSync(file).isFile() && statSync(file).size > 0) return false
+      }
+      rmSync(dir, { recursive: true, force: true })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * One-time-per-boot convergence of registry entries written before T-286: merge duplicate
+   * realpaths / slugs, drop ephemeral workspaces, and reslug generic names (`public` ->
+   * `dsh-mesh`) while migrating their ws/ directory. Idempotent: a clean registry logs zeros.
+   */
+  function convergeWorkspaces() {
     let sessions = []
     try {
       sessions = listLocalSessions()
     } catch {
       sessions = []
     }
-    const bySlug = new Map()
+    const sessionsByCwd = new Map()
     for (const session of sessions) {
       if (!session.cwd) continue
-      const slug = ensureWorkspace(session.cwd)
-      if (!slug) continue
-      const list = bySlug.get(slug) ?? []
+      const key = workspaceKeyPath(session.cwd)
+      const list = sessionsByCwd.get(key) ?? []
       list.push(session)
-      bySlug.set(slug, list)
+      sessionsByCwd.set(key, list)
+    }
+
+    const entries = Object.entries(workspaces.workspaces).map(([key, value]) => ({ key, value }))
+    const byReal = new Map()
+    for (const entry of entries) {
+      if (!entry.value.cwd) continue
+      const key = workspaceKeyPath(entry.value.cwd)
+      const list = byReal.get(key) ?? []
+      list.push(entry)
+      byReal.set(key, list)
+    }
+    // Same realpath appearing under several keys: keep the most specific entry.
+    const mergedEntries = []
+    let merged = 0
+    for (const [, group] of byReal) {
+      const survivor = group.find((entry) => typeof entry.value.slug === 'string') ?? group[0]
+      const roles = new Set()
+      for (const entry of group) for (const role of entry.value.roles ?? []) roles.add(role)
+      if (group.length > 1) merged += group.length - 1
+      mergedEntries.push({ key: survivor.key, value: { ...survivor.value, ...(roles.size ? { roles: [...roles] } : {}) } })
+    }
+
+    // Different realpaths that resolve to the same desired slug (public vs dsh-mesh).
+    const bySlug = new Map()
+    for (const entry of mergedEntries) {
+      const desired =
+        typeof entry.value.slug === 'string' && entry.value.slug
+          ? sanitizeSlug(entry.value.slug)
+          : sanitizeSlug(slugifyCwd(entry.value.cwd)) || canonicalSlugOf(entry.key, entry.value)
+      const list = bySlug.get(desired) ?? []
+      list.push(entry)
+      bySlug.set(desired, list)
+    }
+    const next = {}
+    let ephemeral = 0
+    let reslugged = 0
+    for (const [desired, group] of bySlug) {
+      const survivor =
+        group.find((entry) => entry.key === desired) ??
+        group.find((entry) => typeof entry.value.slug === 'string') ??
+        group[0]
+      if (group.length > 1) merged += group.length - 1
+      const roles = new Set()
+      for (const entry of group) for (const role of entry.value.roles ?? []) roles.add(role)
+      const cwdList = group.map((entry) => entry.value.cwd)
+      const groupSessions = []
+      for (const cwd of cwdList) groupSessions.push(...(sessionsByCwd.get(workspaceKeyPath(cwd)) ?? []))
+      const entry = { ...survivor.value, ...(roles.size ? { roles: [...roles] } : {}) }
+      if (isEphemeralGroup(entry.cwd, groupSessions)) {
+        ephemeral += 1
+        pruneEmptyWsDir(desired)
+        for (const cwd of cwdList) pruneEmptyWsDir(slugifyCwd(cwd))
+        continue
+      }
+      for (const old of new Set([survivor.key, ...group.map((item) => item.key)])) {
+        if (old !== desired && migrateWsDir(old, desired)) reslugged += 1
+      }
+      for (const cwd of cwdList) {
+        const oldSlug = slugifyCwd(cwd)
+        if (oldSlug !== desired) migrateWsDir(oldSlug, desired)
+      }
+      next[desired] = entry
+    }
+
+    const before = JSON.stringify(workspaces.workspaces)
+    workspaces.workspaces = next
+    const changed = JSON.stringify(workspaces.workspaces) !== before
+    if (changed) saveWorkspaces()
+    fileLog(`workspaces: converged merged=${merged} ephemeral=${ephemeral} reslugged=${reslugged}${changed ? '' : ' (no changes)'}`)
+    return { merged, ephemeral, reslugged }
+  }
+
+  /** Seed/refresh the registry from the host session index: one entry per real workspace. */
+  function registerWorkspacesFromSessions() {
+    localSessionsCache = { at: 0, list: null }
+    const sessions = cachedLocalSessions()
+    const byCwd = new Map()
+    for (const session of sessions) {
+      if (!session.cwd) continue
+      const key = workspaceKeyPath(session.cwd)
+      const list = byCwd.get(key) ?? []
+      list.push(session)
+      byCwd.set(key, list)
+    }
+    const sessionsBySlug = new Map()
+    for (const [, list] of byCwd) {
+      const cwd = list[0].cwd
+      if (isEphemeralGroup(cwd, list)) continue
+      const slug = ensureWorkspace(cwd)
+      if (!slug) continue
+      const merged = sessionsBySlug.get(slug) ?? []
+      merged.push(...list)
+      sessionsBySlug.set(slug, merged)
     }
     let changed = false
-    for (const [slug, list] of bySlug) {
+    for (const [slug, list] of sessionsBySlug) {
       const entry = workspaces.workspaces[slug]
       if (!entry) continue
-      if (!entry.coordinator) {
-        const coordinators = list.filter((session) => /·\s*协调\s*$/.test(String(session.title ?? '')))
-        if (coordinators.length) {
-          coordinators.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
-          entry.coordinator = coordinators[0].id
-          if (coordinators.length > 1) {
-            fileLog(`WARN workspace ${slug} has ${coordinators.length} coordinators; using ${coordinators[0].id}`)
-          }
+      const coordinators = list.filter((session) => /·\s*(协调|coordinator)\s*$/i.test(String(session.title ?? '')))
+      coordinators.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
+      const coordinator = coordinators[0] ?? null
+      const nextCoordinator = coordinator ? coordinator.id : null
+      if ((entry.coordinator ?? null) !== nextCoordinator) {
+        if (nextCoordinator) entry.coordinator = nextCoordinator
+        else delete entry.coordinator
+        changed = true
+      }
+      if (nextCoordinator) {
+        const idleMs = Date.now() - Number(coordinator.last_active ?? 0)
+        const stale = idleMs > 7 * 24 * 60 * 60 * 1000
+        if (stale && entry.coordinatorStale !== true) {
+          entry.coordinatorStale = true
+          changed = true
+          fileLog(`WARN workspace ${slug} coordinator idle for ${Math.round(idleMs / 86400000)}d: ${nextCoordinator}`)
+        } else if (!stale && entry.coordinatorStale === true) {
+          delete entry.coordinatorStale
           changed = true
         }
+      } else if (entry.coordinatorStale === true) {
+        delete entry.coordinatorStale
+        changed = true
       }
       if (!Array.isArray(entry.roles) || entry.roles.length === 0) {
         const roles = new Set()
         for (const session of list) {
           const match = /·\s*([^\s·]+)\s*$/.exec(String(session.title ?? ''))
-          if (match && match[1] !== '协调') roles.add(match[1])
+          if (match && !/^(协调|coordinator)$/i.test(match[1])) roles.add(match[1])
         }
         if (roles.size) {
           entry.roles = [...roles]
@@ -3553,6 +3798,7 @@ export function apply(ctx, config) {
     }
     if (changed) saveWorkspaces()
   }
+
 
   let localSessionsCache = { at: 0, list: null }
 
@@ -5414,6 +5660,9 @@ export function apply(ctx, config) {
   // consumed by the pull loop; the tool waits for one inbox reply or reports unanswered.
   // Restore batches before the listener comes up, then poll liveness for early alerts.
   loadWorkspaces()
+  // Converge old registries before new cwds are added (T-286): merge duplicates, drop
+  // ephemeral test workspaces, reslug generic names and migrate their ws/ directories.
+  convergeWorkspaces()
   registerWorkspacesFromSessions()
   // Split legacy single files into tier files before anything loads or rewrites rows.
   migrateLegacyStorage()
