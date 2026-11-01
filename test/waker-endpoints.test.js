@@ -3311,6 +3311,72 @@ async function main() {
     report('restart: an ambiguous workspace stays undelivered without failing', ok, `lost=${lost?.json?.task?.status ?? '-'} receipts=${receipts.length} prompts=${h.state.prompts.length}`)
   })
 
+  // 154-157. Receipt summaries must come from this task's own turn (T-267): turn numbers
+  // alone are not enough, the assistant snapshot must also be newer than the injection.
+  const readReceipt = async (h, taskId) => {
+    const settled = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/' + taskId)
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    return settled?.json?.task?.receiptSummary ?? null
+  }
+  const seedReply = (h, sessionId, turn, text) => {
+    h.emit('session/event', { id: sessionId }, { type: 'assistant/message', turn, message: { content: [{ type: 'text', text }] } })
+  }
+  const finishTurn = (h, sessionId, turn) => {
+    h.emit('session/event', { id: sessionId }, { type: 'turn/start', turn })
+    h.emit('session/event', { id: sessionId }, { type: 'turn/end', turn, reason: { kind: 'completed' } })
+  }
+
+  await runCase('receipt: text written before the injection is never used as the summary', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-old-text', title: 'old text target' }] })
+    // Same turn number as the task will settle in, but written before injection.
+    seedReply(h, 'session-old-text', 2, '验收成立，接下来等三单收尾。')
+    await sleep(20)
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'old text target', text: 'only answer one line', taskId: 'T-OLD-TEXT' }, { sessionId: 'session-coord' })
+    finishTurn(h, 'session-old-text', 2)
+    const summary = await readReceipt(h, 'T-OLD-TEXT')
+    const ok = summary === ''
+    report('receipt: text written before the injection is never used as the summary', ok, `summary=${JSON.stringify(summary)}`)
+  })
+
+  await runCase('receipt: a fresh snapshot from the same turn is used as the summary', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-fresh-text', title: 'fresh text target' }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'fresh text target', text: 'answer one line', taskId: 'T-FRESH-TEXT' }, { sessionId: 'session-coord' })
+    seedReply(h, 'session-fresh-text', 2, 'T4F-ROUTE-OK 20261101-1208')
+    finishTurn(h, 'session-fresh-text', 2)
+    const summary = await readReceipt(h, 'T-FRESH-TEXT')
+    const ok = summary === 'T4F-ROUTE-OK 20261101-1208'
+    report('receipt: a fresh snapshot from the same turn is used as the summary', ok, `summary=${JSON.stringify(summary)}`)
+  })
+
+  await runCase('receipt: a fresh snapshot from another turn is still rejected', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-other-turn', title: 'other turn target' }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'other turn target', text: 'answer in turn 3', taskId: 'T-OTHER-TURN' }, { sessionId: 'session-coord' })
+    seedReply(h, 'session-other-turn', 9, '这段属于另一个回合')
+    finishTurn(h, 'session-other-turn', 3)
+    const summary = await readReceipt(h, 'T-OTHER-TURN')
+    const ok = summary === ''
+    report('receipt: a fresh snapshot from another turn is still rejected', ok, `summary=${JSON.stringify(summary)}`)
+  })
+
+  await runCase('receipt: no assistant snapshot keeps the summary empty', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-no-shot', title: 'no snapshot target' }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'no snapshot target', text: 'no answer text', taskId: 'T-NO-SHOT' }, { sessionId: 'session-coord' })
+    finishTurn(h, 'session-no-shot', 1)
+    const summary = await readReceipt(h, 'T-NO-SHOT')
+    const ok = summary === ''
+    report('receipt: no assistant snapshot keeps the summary empty', ok, `summary=${JSON.stringify(summary)}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

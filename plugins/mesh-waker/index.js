@@ -3786,10 +3786,13 @@ export function apply(ctx, config) {
     clearPending(task)
     pendingTasks.delete(taskId)
     const shot = assistantText.get(task.sessionId)
-    const summary =
-      shot && (details.turn === null || details.turn === undefined || shot.turn === null || shot.turn === details.turn)
-        ? shot.text
-        : ''
+    // Turn numbers advance out of step between assistant/message and turn/end, so equality
+    // alone can attach a previous turn's prose to this task (T-267). The snapshot must also
+    // be newer than the injection; otherwise the summary stays empty (never wrong prose).
+    const turnMatches =
+      Boolean(shot) && (details.turn === null || details.turn === undefined || shot.turn === null || shot.turn === details.turn)
+    const textIsFresh = Boolean(shot) && Number.isFinite(shot.at) && Number.isFinite(task.injectedAt) && shot.at >= task.injectedAt
+    const summary = turnMatches && textIsFresh ? shot.text : ''
     const receipt = buildReceipt({
       taskId,
       sessionId: task.sessionId,
@@ -4023,7 +4026,7 @@ export function apply(ctx, config) {
       }
       if (type === 'assistant/message') {
         const text = messageText(d.message)
-        if (text) assistantText.set(sessionId, { turn, text })
+        if (text) assistantText.set(sessionId, { turn, text, at: Date.now() })
         return
       }
       if (type === 'turn/end') {
