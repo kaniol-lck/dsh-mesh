@@ -7,6 +7,9 @@
  * when at least one copy is a thin shell: <= 30 lines, forwards through
  * spawnSync/execFileSync, and names another copy (path string or path segments).
  *
+ * Defaults to the repository this script lives in; --root scans another checkout
+ * (so downstream projects can call this implementation instead of copying it).
+ *
  * Exit codes: 0 all groups are shells, 1 a real duplicate exists, 2 usage error.
  * `--json` prints { groups: [{ basename, files, shells, ok, reason }], ok }.
  */
@@ -15,10 +18,47 @@ import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+let ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const SCAN_ROOTS = ['scripts', 'skills', 'plugins', 'hub', 'test', '.worklog/bin']
 const EXTENSIONS = new Set(['.mjs', '.js', '.py', '.ps1'])
 const SHELL_MAX_LINES = 30
+const USAGE = `check-duplicates.mjs — one tool, one implementation
+
+Usage:
+  node check-duplicates.mjs [--root <dir>] [--json]
+
+Options:
+  --root <dir>   repository to scan (default: the repo this script lives in)
+  --json         machine-readable output
+  -h, --help     show this help
+
+Exit codes: 0 all groups are thin shells, 1 a real duplicate exists, 2 usage
+error (bad --root, unknown flag).`
+
+function parseArgs(argv) {
+  const options = { root: null, json: false }
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    if (arg === '--json') {
+      options.json = true
+    } else if (arg === '--root') {
+      const value = argv[index + 1]
+      if (value === undefined) {
+        console.error(`--root requires a value\n\n${USAGE}`)
+        process.exit(2)
+      }
+      options.root = value
+      index += 1
+    } else if (arg === '-h' || arg === '--help') {
+      console.log(USAGE)
+      process.exit(0)
+    } else {
+      console.error(`unknown argument: ${arg}\n\n${USAGE}`)
+      process.exit(2)
+    }
+  }
+  return options
+}
 
 function walk(relDir, out) {
   const abs = path.join(ROOT, relDir)
@@ -40,19 +80,20 @@ function walk(relDir, out) {
 }
 
 function collect() {
-  const roots = [
-    ...SCAN_ROOTS.filter((root) => root !== 'skills'),
-    ...readdirSync(path.join(ROOT, 'skills'), { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => `skills/${entry.name}/scripts`)
-      .filter((rel) => {
-        try {
-          return statSync(path.join(ROOT, rel)).isDirectory()
-        } catch {
-          return false
-        }
-      }),
-  ]
+  const roots = [...SCAN_ROOTS.filter((root) => root !== 'skills')]
+  try {
+    for (const entry of readdirSync(path.join(ROOT, 'skills'), { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      const rel = `skills/${entry.name}/scripts`
+      try {
+        if (statSync(path.join(ROOT, rel)).isDirectory()) roots.push(rel)
+      } catch {
+        /* skill without scripts/ */
+      }
+    }
+  } catch {
+    /* no skills/ */
+  }
   const files = []
   for (const root of roots) {
     try {
@@ -93,7 +134,22 @@ function isShell(file, others) {
 }
 
 function main() {
-  const json = process.argv.includes('--json')
+  const options = parseArgs(process.argv.slice(2))
+  const json = options.json
+  if (options.root) {
+    ROOT = path.resolve(options.root)
+    let isDir = false
+    try {
+      isDir = statSync(ROOT).isDirectory()
+    } catch {
+      isDir = false
+    }
+    if (!isDir) {
+      console.error(`--root is not a directory: ${ROOT}`)
+      process.exit(2)
+    }
+  }
+
   const byName = new Map()
   for (const rel of collect()) {
     const base = path.posix.basename(rel)
@@ -119,7 +175,7 @@ function main() {
 
   const failed = groups.filter((group) => !group.ok)
   if (json) {
-    console.log(JSON.stringify({ groups, ok: failed.length === 0 }, null, 2))
+    console.log(JSON.stringify({ root: ROOT, groups, ok: failed.length === 0 }, null, 2))
   } else {
     for (const group of groups) {
       if (group.ok) {
