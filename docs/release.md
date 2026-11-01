@@ -6,7 +6,7 @@
 
 - 平时不改版本号：bug 修复、文档、测试、重构都不动 `version`，版本号只在发版时跳；
 - 发版时一次改齐（漏一处就会出现 drift）：
-  - hub：`HUB_VERSION`（`hub/server.mjs`）+ `hub/package.json` + `hub/package-lock.json` + `CHANGES.md` 条目；
+  - hub：`HUB_VERSION`（`hub/server.mjs`）+ `hub/package.json` + `hub/package-lock.json` + `CHANGELOG.md` 条目；
   - waker：`plugins/mesh-waker/package.json` + `CHANGELOG.md` 新版本条目；
 - 发版前必须全绿：`node scripts/check-paths.mjs`、`python scripts/check-secrets.py`、
   `python scripts/release.py --preflight`；
@@ -64,7 +64,7 @@ python scripts/release.py --promote
 | 轴 | 校验内容 |
 |---|---|
 | **waker 轴** | `plugins/mesh-waker/package.json` 的 `version` 与 `CHANGELOG.md` 顶部 `## v<版本>` 条目一致 |
-| **hub 轴** | `hub/server.mjs` 的 `HUB_VERSION` == `hub/package.json` 的 `version`，且 `hub/CHANGES.md` 顶部有 `## v<版本>` 条目 |
+| **hub 轴** | `hub/server.mjs` 的 `HUB_VERSION` == `hub/package.json` 的 `version`，且 `hub/CHANGELOG.md` 顶部有 `## [<版本>] - <日期>` 条目 |
 
 预检失败时**先改版本文件，不要改脚本**：把上面涉及的常量、`package.json` 与变更记录顶部条目对齐到同一个版本号，再重跑预检。
 为什么要它：版本号散落在多个文件里，靠人记必出错；三处不一致时部署出去，`/health` 与仓库对不上，排查成本远高于这条检查。
@@ -75,7 +75,7 @@ CI（`.github/workflows/plugin-check.yml`）在 push / PR 时跑前两项，失�
 
 hub 不走 npm，按下面的通用步骤发布；部署目标（本机、容器平台、云主机）由部署者自行选择。
 
-1. **bump 三处**：`HUB_VERSION`、`hub/package.json`、`hub/package-lock.json`，并补 `CHANGES.md`；
+1. **bump 三处**：`HUB_VERSION`、`hub/package.json`、`hub/package-lock.json`，并补 `CHANGELOG.md`；
 2. **预检**：`python scripts/release.py --preflight`（版本一致性、密钥扫描、无 stray `.npmrc`）；
 3. **构建镜像**：用仓库 `hub/Dockerfile` 构建，镜像 tag 用版本号（不要只留 `latest`，回滚才有抓手）；
 4. **部署并验证**：`/health` 返回的版本等于新版本；若经反代/隧道暴露，再验一次公网入口返回 200；
