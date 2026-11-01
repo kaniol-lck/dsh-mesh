@@ -396,8 +396,9 @@ tail -n 2 ~/.dsh/mesh-waker/receipts.jsonl
 | `batchId` | `--batch [id]` | 同批次 barrier：全部结束只回执一次 |
 | `receipt` | `--receipt` | `file`/`queue`/`wake`，覆盖插件默认 |
 | `deadline` | `--deadline` | `30m`/`2h`/`600s`，默认 `batchDeadlineMs` |
-| `subject` | `--subject` | 任务库/面板显示的可读标题（≤120 字）；省略时由正文首行清洗（优先加粗片段、去掉 `任务（…）：`/`【…】` 前缀与 `**`） |
+| `subject` | （CLI 暂缺） | 任务库/面板显示的可读标题（≤120 字）；省略时由正文首行清洗（优先加粗片段、去掉 `任务（…）：`/`【…】` 前缀与 `**`）。目前只有工具参数支持 |
 | `thread` | `--thread` | 线索 id（≤128 字节，如 `TH-1`）：已知 thread 可省略 `target`，后续补丁续派到同一会话；显式 target 会改绑 |
+| `requester` | `--requester` | 回执收件人：会话 id 或标题，服务端解析（CLI 原样透传，不自己解析）。不传时 waker 先按**目标会话的 cwd** 推断同工作区协调会话（唯一或明显最新者），推断不出才回退 `receiptTo`；`receipt` 为 `file`（默认）时只写 `receipts.jsonl`，不注入任何会话 |
 
 工具描述里明确写了：投递后**不要轮询等待**，插件会在回合结束时写回执；要「全部完成再叫我」就用同一个 `batchId`。
 

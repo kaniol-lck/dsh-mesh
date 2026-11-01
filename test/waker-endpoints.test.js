@@ -1225,6 +1225,62 @@ async function main() {
     report('CLI: --help documents --thread without side effects', ok, `help=${options.help} threadDoc=${/--thread/.test(USAGE)}`)
   })
 
+  // 236-240. bin CLI parity (T-298): --requester names the receipt target at the body top
+  // level (where /mesh/inject reads it), stays absent when omitted, and coexists with thread.
+  await runCase('CLI: --requester is sent at the body top level', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--target', 'mesh · hub', '--text', 'hi', '--requester', 'session-req'])
+    const originalFetch = globalThis.fetch
+    let body = null
+    globalThis.fetch = async (_url, init) => {
+      body = JSON.parse(init.body)
+      return new Response(JSON.stringify({ ok: true, sessionId: 'session-hub', taskId: 'T-x', mode: 'queue', created: false }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    let result
+    try {
+      result = await run(options)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+    const ok = body?.requester === 'session-req' && body?.meta?.requester === undefined && result?.sessionId === 'session-hub'
+    report('CLI: --requester is sent at the body top level', ok, `bodyRequester=${body?.requester ?? '-'} metaRequester=${body?.meta?.requester ?? '-'}`)
+  })
+
+  await runCase('CLI: --requester accepts a title verbatim', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--target', 'mesh · hub', '--text', 'hi', '--requester', 'mesh · 协调 2'])
+    const plan = await run({ ...options, dryRun: true }, noFetch)
+    const ok = plan.payload?.requester === 'mesh · 协调 2'
+    report('CLI: --requester accepts a title verbatim', ok, `requester=${plan.payload?.requester ?? '-'}`)
+  })
+
+  await runCase('CLI: without --requester the body keeps no requester field', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--target', 'mesh · hub', '--text', 'hi'])
+    const plan = await run({ ...options, dryRun: true }, noFetch)
+    const ok = !('requester' in (plan.payload ?? {}))
+    report('CLI: without --requester the body keeps no requester field', ok, `keys=${Object.keys(plan.payload ?? {}).join(',')}`)
+  })
+
+  await runCase('CLI: --requester and --thread coexist', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--text', 'hi', '--thread', 'TH-1', '--requester', 'session-req'])
+    const plan = await run({ ...options, dryRun: true }, noFetch)
+    const payload = plan.payload ?? {}
+    const ok = payload.requester === 'session-req' && payload.thread === 'TH-1' && !('session' in payload)
+    report('CLI: --requester and --thread coexist', ok, `requester=${payload.requester ?? '-'} thread=${payload.thread ?? '-'} keys=${Object.keys(payload).join(',')}`)
+  })
+
+  await runCase('CLI: --help explains the requester default', async () => {
+    const { parseArgs, USAGE } = await import(cliUrl)
+    const options = parseArgs(['--help'])
+    const ok = options.help === true && /--requester/.test(USAGE) && /receiptTo/.test(USAGE) && /file mode only writes receipts\.jsonl/.test(USAGE)
+    report('CLI: --help explains the requester default', ok, `help=${options.help} requesterDoc=${/--requester/.test(USAGE)} defaultDoc=${/receiptTo/.test(USAGE)}`)
+  })
+
   // 42-44. Regression: injection during a running turn must not settle on that turn's end.
   await runCase('task receipt: queue injection during a running turn waits for the next turn', async (boot) => {
     const h = await boot({ seedSessions: [{ id: 'session-running', title: 'running target' }] })

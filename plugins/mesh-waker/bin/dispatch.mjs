@@ -30,6 +30,9 @@ Options:
   --mode <m>         queue (default) or steer
   --thread <id>      follow-up thread id (at most 128 UTF-8 bytes); a known thread lets
                      you omit --target and keeps the binding on the same session
+  --requester <s>    session id or title that should receive the receipt; when omitted the
+                     waker infers the target workspace's coordinator, then falls back to
+                     its receiptTo (queue/wake); file mode only writes receipts.jsonl
   --task [id]        receipt task id; "--task" alone generates T-<base36 timestamp>
   --batch [id]       batch barrier id; "--batch" alone generates B-<base36 timestamp>
   --receipt <m>      file | queue | wake (waker default when omitted)
@@ -79,6 +82,7 @@ export function parseArgs(argv) {
     file: undefined,
     mode: 'queue',
     thread: undefined,
+    requester: undefined,
     task: undefined,
     batch: undefined,
     receipt: undefined,
@@ -104,6 +108,12 @@ export function parseArgs(argv) {
       case '--file': options.file = takeValue(); break
       case '--mode': options.mode = takeValue(); break
       case '--thread': options.thread = takeValue(); break
+      case '--requester': {
+        const value = String(takeValue()).trim()
+        if (!value) fail('--requester requires a non-empty value')
+        options.requester = value
+        break
+      }
       case '--task': {
         const next = argv[index + 1]
         options.task = next !== undefined && !String(next).startsWith('--') ? String(next) : ''
@@ -187,6 +197,8 @@ export async function run(options, fetchImpl = fetch) {
     mode: options.mode,
     // Top level, exactly like the mesh_dispatch tool: /mesh/inject reads draft.thread.
     ...(options.thread ? { thread: options.thread } : {}),
+    // Same place /mesh/inject reads the receipt target (draft.requester ?? meta.requester).
+    ...(options.requester ? { requester: options.requester } : {}),
     ...(meta ? { meta } : {}),
   })
 
@@ -239,6 +251,7 @@ async function main(argv = process.argv.slice(2)) {
     }
     const parts = ['dry-run']
     parts.push(options.target ? `target=${options.target}` : 'target=(via thread)')
+    parts.push(`requester=${plan.requester ?? '-'}`)
     parts.push(`task=${plan.meta?.taskId ?? '-'}`)
     if (plan.meta?.batchId) parts.push(`batch=${plan.meta.batchId}`)
     if (plan.thread) parts.push(`thread=${plan.thread}`)
