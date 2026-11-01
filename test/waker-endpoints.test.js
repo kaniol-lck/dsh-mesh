@@ -4471,6 +4471,172 @@ async function main() {
     report('coordinator: indistinguishable candidates stay ambiguous', ok, `receipts=${settles.length} prompts=${prompts.length} ambiguous=${/inference ambiguous/.test(log)}`)
   })
 
+  // 212-218. Log tiering (T-288): same LCA shape as tasks, local day files, retention,
+  // legacy migration and a read-only merged view.
+  const { localDayName } = await import(pathToFileURL(ENTRY).href)
+  const logsOf = (h) => {
+    const root = path.join(h.home, '.dsh', 'mesh-waker')
+    const files = []
+    const add = (dir, label) => {
+      try {
+        for (const name of fs.readdirSync(dir)) if (name.endsWith('.log')) files.push({ file: path.join(dir, name), label })
+      } catch {
+        /* layer absent */
+      }
+    }
+    add(path.join(root, 'local', 'logs'), 'local')
+    try {
+      for (const slug of fs.readdirSync(path.join(root, 'ws'))) add(path.join(root, 'ws', slug, 'logs'), slug)
+    } catch {
+      /* no workspace layers yet */
+    }
+    return files
+  }
+  const readLogFile = (h, label, day = localDayName()) => {
+    const root = path.join(h.home, '.dsh', 'mesh-waker')
+    const file = label === 'local' ? path.join(root, 'local', 'logs', `${day}.log`) : path.join(root, 'ws', label, 'logs', `${day}.log`)
+    try {
+      return fs.readFileSync(file, 'utf8')
+    } catch {
+      return ''
+    }
+  }
+
+  await runCase('logs: a session event lands in its workspace day file', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'log-ws')
+    const h = await boot({ seedSessions: [{ id: 'session-log-ws', title: 'log worker', cwd }] })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'log worker', text: 'workspace log line', meta: { taskId: 'T-LOG-WS' } },
+    })
+    const day = localDayName()
+    const text = readLogFile(h, 'log-ws', day)
+    const ok = /injected .*session-log-ws/.test(text) && logsOf(h).some((entry) => entry.label === 'log-ws')
+    report('logs: a session event lands in its workspace day file', ok, `files=${logsOf(h).map((entry) => entry.label).join(',')}`)
+  })
+
+  await runCase('logs: a cross-workspace task event lands in local', async (boot) => {
+    const cwdA = path.join(os.tmpdir(), 'Projects', 'log-cross-a')
+    const cwdB = path.join(os.tmpdir(), 'Projects', 'log-cross-b')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-log-cross', title: 'log cross worker', cwd: cwdA },
+        { id: 'session-log-coord', title: 'mesh · 协调', cwd: cwdB },
+      ],
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'log cross worker', text: 'cross log', meta: { taskId: 'T-LOG-CROSS', requester: 'session-log-coord' } },
+    })
+    const local = readLogFile(h, 'local')
+    const ws = readLogFile(h, 'log-cross-a')
+    const ok = /T-LOG-CROSS/.test(local) && !/T-LOG-CROSS/.test(ws)
+    report('logs: a cross-workspace task event lands in local', ok, `localHasTask=${/T-LOG-CROSS/.test(local)}`)
+  })
+
+  await runCase('logs: global startup events land in local', async (boot) => {
+    const h = await boot({})
+    const local = readLogFile(h, 'local')
+    const ok = /logs retention: removed \d+ files/.test(local) && /task registry loaded/.test(local)
+    report('logs: global startup events land in local', ok, `localLines=${local.split('\n').filter(Boolean).length}`)
+  })
+
+  await runCase('logs: a day change starts a new file instead of appending', async (boot) => {
+    const previous = process.env.MESH_WAKER_LOG_DAY
+    try {
+      process.env.MESH_WAKER_LOG_DAY = '2030-01-01'
+      const h = await boot({ seedSessions: [{ id: 'session-log-day', title: 'day worker', cwd: path.join(os.tmpdir(), 'Projects', 'log-day') }] })
+      await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'day worker', text: 'day one', meta: { taskId: 'T-LOG-D1' } } })
+      process.env.MESH_WAKER_LOG_DAY = '2030-01-02'
+      await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'day worker', text: 'day two', meta: { taskId: 'T-LOG-D2' } } })
+      const root = path.join(h.home, '.dsh', 'mesh-waker')
+      const dayOne = fs.existsSync(path.join(root, 'ws', 'log-day', 'logs', '2030-01-01.log'))
+        ? fs.readFileSync(path.join(root, 'ws', 'log-day', 'logs', '2030-01-01.log'), 'utf8')
+        : ''
+      const dayTwo = fs.existsSync(path.join(root, 'ws', 'log-day', 'logs', '2030-01-02.log'))
+        ? fs.readFileSync(path.join(root, 'ws', 'log-day', 'logs', '2030-01-02.log'), 'utf8')
+        : ''
+      const ok = /T-LOG-D1/.test(dayOne) && !/T-LOG-D2/.test(dayOne) && /T-LOG-D2/.test(dayTwo)
+      report('logs: a day change starts a new file instead of appending', ok, `day1=${Boolean(dayOne)} day2=${Boolean(dayTwo)}`)
+    } finally {
+      if (previous === undefined) delete process.env.MESH_WAKER_LOG_DAY
+      else process.env.MESH_WAKER_LOG_DAY = previous
+    }
+  })
+
+  await runCase('logs: retention removes only files older than the window', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'log-retain')
+    const h = await boot({
+      seedSessions: [{ id: 'session-log-retain', title: 'retain worker', cwd }],
+      config: { logsRetentionDays: 30 },
+      prepareHome: (home) => {
+        const root = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(path.join(root, 'local', 'logs'), { recursive: true })
+        fs.mkdirSync(path.join(root, 'ws', 'log-retain', 'logs'), { recursive: true })
+        fs.writeFileSync(path.join(root, 'local', 'logs', '2020-01-01.log'), 'old\n')
+        fs.writeFileSync(path.join(root, 'ws', 'log-retain', 'logs', '2020-01-02.log'), 'old ws\n')
+        fs.writeFileSync(path.join(root, 'local', 'logs', `${localDayName()}.log`), 'recent\n')
+      },
+    })
+    const root = path.join(h.home, '.dsh', 'mesh-waker')
+    const ok =
+      !fs.existsSync(path.join(root, 'local', 'logs', '2020-01-01.log')) &&
+      !fs.existsSync(path.join(root, 'ws', 'log-retain', 'logs', '2020-01-02.log')) &&
+      fs.existsSync(path.join(root, 'local', 'logs', `${localDayName()}.log`)) &&
+      /logs retention: removed 2 files/.test(readLogFile(h, 'local'))
+    report('logs: retention removes only files older than the window', ok, `removed2=${/removed 2 files/.test(readLogFile(h, 'local'))}`)
+  })
+
+  await runCase('logs: the legacy waker.log is preserved once as legacy-waker.log', async (boot) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-log-legacy-'))
+    try {
+      const first = await boot({
+        tmpRoot,
+        prepareHome: (home) => {
+          const root = path.join(home, '.dsh', 'mesh-waker')
+          fs.mkdirSync(root, { recursive: true })
+          fs.writeFileSync(path.join(root, 'waker.log'), 'legacy line one\n')
+        },
+      })
+      const legacy = path.join(first.home, '.dsh', 'mesh-waker', 'local', 'logs', 'legacy-waker.log')
+      const afterFirst = fs.existsSync(legacy) ? fs.readFileSync(legacy, 'utf8') : ''
+      const rootGone = !fs.existsSync(path.join(first.home, '.dsh', 'mesh-waker', 'waker.log'))
+      first.close()
+      const second = await boot({ tmpRoot })
+      const afterSecond = fs.existsSync(legacy) ? fs.readFileSync(legacy, 'utf8') : ''
+      const ok = /legacy line one/.test(afterFirst) && rootGone && afterSecond === afterFirst
+      report('logs: the legacy waker.log is preserved once as legacy-waker.log', ok, `migrated=${/legacy line one/.test(afterFirst)} rootGone=${rootGone} idempotent=${afterSecond === afterFirst}`)
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('logs: the merged view lists both layers with their source', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'log-view')
+    const day = localDayName()
+    const h = await boot({
+      seedSessions: [{ id: 'session-log-view', title: 'view worker', cwd }],
+      prepareHome: (home) => {
+        const root = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(path.join(root, 'local', 'logs'), { recursive: true })
+        fs.mkdirSync(path.join(root, 'ws', 'log-view', 'logs'), { recursive: true })
+        fs.writeFileSync(path.join(root, 'local', 'logs', `${day}.log`), `2026-11-01T00:00:00.000Z local line\n`)
+        fs.writeFileSync(path.join(root, 'ws', 'log-view', 'logs', `${day}.log`), `2026-11-01T00:00:01.000Z workspace line\n`)
+      },
+    })
+    const view = await request(h.base, `/mesh/logs?day=${day}&scope=all&tail=50`)
+    const entries = view.json?.entries ?? []
+    const files = entries.map((entry) => entry.file).join(',')
+    const ok =
+      view.json?.ok === true &&
+      entries.some((entry) => entry.scope === 'local' && /local-log|local line/.test(entry.line)) &&
+      entries.some((entry) => entry.scope === 'log-view' && /workspace line/.test(entry.line)) &&
+      files.includes('local/logs/') &&
+      files.includes('ws/log-view/logs/')
+    report('logs: the merged view lists both layers with their source', ok, `count=${view.json?.count ?? '-'} files=${files}`)
+  })
+
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
@@ -4495,7 +4661,8 @@ main()
     if (relevant.length) console.error(`LEFTOVER RESOURCES: ${[...new Set(relevant)].join(',')}`)
     // A leaked handle must not hang the runner forever: the diagnostics above are the
     // actionable part, and a non-zero exit still fails CI.
-    process.exit(process.exitCode ?? (relevant.length ? 1 : 0))
+    const code = process.exitCode ?? (relevant.length ? 1 : 0)
+    setTimeout(() => process.exit(code), 25)
   })
   .catch((error) => {
     console.error(error)

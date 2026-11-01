@@ -84,11 +84,36 @@ const LOG_MAX_BYTES_DEFAULT = 2 * 1024 * 1024
 let logTarget = LOG_FILE
 let logMaxBytes = LOG_MAX_BYTES_DEFAULT
 let logBytes = 0
+// Tiered mode (T-288): local/logs/YYYY-MM-DD.log + ws/<slug>/logs/YYYY-MM-DD.log. A custom
+// logFile keeps the historical single-file behaviour (tests and old installs).
+let logMode = 'single'
+let logLocalDir = null
+let logWorkspaceDirFor = null
+let logScopeResolver = null
+const logFileSizes = new Map()
+const logHeartbeatState = new Map()
 /** This bundle's own patch file: the persistence fallback when the Loader's config editor
  *  does not expose bundle rows (it currently only lists rows it authored). */
 const PATCH_PATH = fileURLToPath(new URL('./cordis.patch.yml', import.meta.url))
 
+/** Local (not UTC) day name for log files; MESH_WAKER_LOG_DAY is the test seam. */
+export function localDayName(date = new Date()) {
+  if (process.env.MESH_WAKER_LOG_DAY) return String(process.env.MESH_WAKER_LOG_DAY)
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+function localHourKey(date = new Date()) {
+  return `${localDayName(date)}T${String(date.getHours()).padStart(2, '0')}`
+}
+
 function configureLog(file, maxBytes) {
+  // A fresh apply() with an explicit file means single-file mode; tiered mode is opted in
+  // explicitly right after this, and module state must not leak between boots (tests).
+  logMode = 'single'
+  logLocalDir = null
+  logWorkspaceDirFor = null
+  logScopeResolver = null
+  logHeartbeatState.clear()
   if (file) logTarget = String(file)
   if (Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0) logMaxBytes = Number(maxBytes)
   try {
@@ -96,6 +121,14 @@ function configureLog(file, maxBytes) {
   } catch {
     logBytes = 0
   }
+}
+
+function configureTieredLog({ localDir, workspaceDirFor, resolver, maxBytes }) {
+  logMode = 'tiered'
+  logLocalDir = localDir
+  logWorkspaceDirFor = workspaceDirFor
+  logScopeResolver = resolver
+  if (Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0) logMaxBytes = Number(maxBytes)
 }
 
 function rotateLog() {
@@ -110,9 +143,71 @@ function rotateLog() {
   logBytes = 0
 }
 
+/**
+ * Collapse identical periodic heartbeats: a changed line is written immediately, an
+ * unchanged one only once per local hour with `(unchanged, <n> repeats)`. Only the two
+ * fixed heartbeat shapes are affected — every other event is logged as before.
+ */
+function heartbeatFilter(message) {
+  if (!/^(registered\s+https?:\/\/|history sync: )/.test(message)) return message
+  const hour = localHourKey()
+  const entry = logHeartbeatState.get(message) ?? { count: 0, hour: null }
+  if (entry.hour === hour) {
+    entry.count += 1
+    logHeartbeatState.set(message, entry)
+    return null
+  }
+  const repeats = entry.count
+  logHeartbeatState.set(message, { count: 0, hour })
+  return repeats > 0 ? `${message} (unchanged, ${repeats} repeats)` : message
+}
+
+function logScopeFor(message) {
+  try {
+    if (logScopeResolver) return logScopeResolver(String(message))
+  } catch {
+    /* classification must never break logging */
+  }
+  return { kind: 'machine' }
+}
+
+function writeTieredLog(message, line) {
+  const scope = logScopeFor(message)
+  const base =
+    scope.kind === 'workspace' && scope.slug && logWorkspaceDirFor ? logWorkspaceDirFor(scope.slug) : logLocalDir
+  const logsDir = join(base, 'logs')
+  mkdirSync(logsDir, { recursive: true })
+  const day = localDayName()
+  const size = Buffer.byteLength(line)
+  for (let seq = 1; seq < 1000; seq += 1) {
+    const file = join(logsDir, seq === 1 ? `${day}.log` : `${day}-${seq}.log`)
+    let existing = 0
+    try {
+      existing = statSync(file).size
+    } catch {
+      existing = 0
+    }
+    if (logMaxBytes <= 0 || existing === 0 || existing + size <= logMaxBytes) {
+      appendFileSync(file, line)
+      logFileSizes.set(file, existing + size)
+      // Test seam: the suite's MESH_WAKER_LOG target still receives a mirror so legacy
+      // assertions keep working; production does not set it.
+      if (process.env.MESH_WAKER_LOG) appendFileSync(logTarget, line)
+      return
+    }
+  }
+  appendFileSync(join(logsDir, `${day}-overflow.log`), line)
+}
+
 function fileLog(message) {
   try {
-    const line = `${new Date().toISOString()} ${message}\n`
+    const filtered = heartbeatFilter(String(message))
+    if (filtered === null) return
+    const line = `${new Date().toISOString()} ${filtered}\n`
+    if (logMode === 'tiered' && logLocalDir) {
+      writeTieredLog(filtered, line)
+      return
+    }
     const size = Buffer.byteLength(line)
     if (logMaxBytes > 0 && logBytes > 0 && logBytes + size > logMaxBytes) rotateLog()
     appendFileSync(logTarget, line)
@@ -1105,6 +1200,8 @@ function normalizeBase(config) {
     compactTaskText: c.compactTaskText !== false,
     // LCA storage tiers (T-282): same workspace -> ws/<slug>/, cross-workspace -> local/.
     storageTiers: c.storageTiers !== false,
+    // Log tiering follows tasks (T-288); retention is file-name based (local day).
+    logsRetentionDays: clampInterval(c.logsRetentionDays, 30, 1, 3650),
     // Diagnostics: a dedicated log file outside the temp directory survives reboots, and a
     // single rotated copy keeps it bounded without a logging dependency.
     logFile: c.logFile ? String(c.logFile) : undefined,
@@ -3888,6 +3985,98 @@ export function apply(ctx, config) {
     return routeForRow(row).dir
   }
 
+
+  // ---------------------------------------------------------------- tiered logging
+  //
+  // Same LCA shape as tasks (docs storage-tiers §4): global events -> local/logs/, events
+  // about a workspace's session or task -> ws/<slug>/logs/. Day files switch at local
+  // midnight; the legacy single waker.log is preserved as local/logs/legacy-waker.log.
+
+  function resolveLogScopeFor(message) {
+    const text = String(message ?? '')
+    for (const match of text.matchAll(/\b(T-[A-Za-z0-9._:-]{1,80})\b/g)) {
+      const taskId = match[1]
+      const row = taskRows.get(taskId)
+      if (row) {
+        return row.scope === 'workspace' && row.workspace
+          ? { kind: 'workspace', slug: row.workspace }
+          : { kind: 'machine' }
+      }
+      const pending = pendingTasks.get(taskId)
+      if (pending && pending.scope === 'workspace' && pending.workspace) {
+        return { kind: 'workspace', slug: pending.workspace }
+      }
+    }
+    for (const match of text.matchAll(/\bsession-[A-Za-z0-9_-]+/g)) {
+      const cwd = sessionCwdOf(match[0])
+      if (!cwd) continue
+      const found = Object.entries(workspaces.workspaces).find(
+        ([, value]) => workspaceKeyPath(value.cwd) === workspaceKeyPath(cwd),
+      )
+      return { kind: 'workspace', slug: found ? canonicalSlugOf(found[0], found[1]) : slugifyCwd(cwd) }
+    }
+    return { kind: 'machine' }
+  }
+
+  function migrateLegacyLog(defaultLogFile) {
+    const target = join(localDir, 'logs', 'legacy-waker.log')
+    if (!existsSync(defaultLogFile) || existsSync(target)) return
+    try {
+      mkdirSync(dirname(target), { recursive: true })
+      renameSync(defaultLogFile, target)
+      fileLog('logs: migrated waker.log -> local/logs/legacy-waker.log')
+    } catch (error) {
+      fileLog(`logs: legacy migration failed: ${error.message}`)
+    }
+  }
+
+  function cleanupOldLogs() {
+    const days = Number(c.logsRetentionDays)
+    if (!Number.isFinite(days) || days < 1) return
+    const cutoff = localDayName(new Date(Date.now() - days * 24 * 60 * 60 * 1000))
+    const dirs = [join(localDir, 'logs')]
+    try {
+      for (const name of readdirSync(wsRoot)) dirs.push(join(wsRoot, name, 'logs'))
+    } catch {
+      /* no ws dir yet */
+    }
+    let removed = 0
+    for (const dir of dirs) {
+      let names = []
+      try {
+        names = readdirSync(dir)
+      } catch {
+        continue
+      }
+      for (const name of names) {
+        if (!/^\d{4}-\d{2}-\d{2}(-\d+)?\.log$/.test(name)) continue
+        if (name.slice(0, 10) >= cutoff) continue
+        try {
+          rmSync(join(dir, name), { force: true })
+          removed += 1
+        } catch {
+          /* best effort */
+        }
+      }
+    }
+    fileLog(`logs retention: removed ${removed} files`)
+  }
+
+  function setupTieredLogging() {
+    const defaultLogFile = join(homedir(), '.dsh', 'mesh-waker', 'waker.log')
+    // No explicit logFile (or the historical default) -> tiered. A custom path stays a
+    // single file so existing installs/tests keep their exact target.
+    if (c.logFile && resolve(String(c.logFile)) !== resolve(defaultLogFile)) return
+    configureTieredLog({
+      localDir,
+      workspaceDirFor: wsDirFor,
+      maxBytes: c.logMaxBytes,
+      resolver: resolveLogScopeFor,
+    })
+    migrateLegacyLog(defaultLogFile)
+    cleanupOldLogs()
+  }
+
   /** A record's routing fields, shared by tasks and receipts (docs §5). */
   function scopeFields(route) {
     return {
@@ -5685,6 +5874,8 @@ export function apply(ctx, config) {
   // package resolves, otherwise the same JSON Schema definition. Question traffic is
   // consumed by the pull loop; the tool waits for one inbox reply or reports unanswered.
   // Restore batches before the listener comes up, then poll liveness for early alerts.
+  // Switch on tiered logs before the registry loaders start writing (T-288).
+  setupTieredLogging()
   loadWorkspaces()
   // Converge old registries before new cwds are added (T-286): merge duplicates, drop
   // ephemeral test workspaces, reslug generic names and migrate their ws/ directories.
@@ -5747,6 +5938,63 @@ export function apply(ctx, config) {
         res.writeHead(500, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: error.message }))
       }
+      return
+    }
+
+    if (path === '/mesh/logs' && req.method === 'GET') {
+      // Read-only merged view over the tiered day files (T-288): never writes.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      const day = (url.searchParams.get('day') || localDayName()).replace(/[^0-9-]/g, '')
+      const scope = (url.searchParams.get('scope') || 'all').trim()
+      const tail = Math.max(1, Math.min(2000, Number(url.searchParams.get('tail')) || 200))
+      const entries = []
+      const readLayer = (dir, scopeName) => {
+        let names = []
+        try {
+          names = readdirSync(dir)
+        } catch {
+          return
+        }
+        for (const name of names) {
+          if (!name.startsWith(day) || !name.endsWith('.log')) continue
+          try {
+            for (const line of readFileSync(join(dir, name), 'utf8').split('\n')) {
+              if (!line.trim()) continue
+              const space = line.indexOf(' ')
+              const at = space > 0 ? line.slice(0, space) : ''
+              entries.push({
+                at,
+                scope: scopeName,
+                file: scopeName === 'local' ? `local/logs/${name}` : `ws/${scopeName}/logs/${name}`,
+                line: space > 0 ? line.slice(space + 1) : line,
+              })
+            }
+          } catch {
+            /* unreadable day file: skip */
+          }
+        }
+      }
+      if (scope === 'all' || scope === 'local') readLayer(join(localDir, 'logs'), 'local')
+      if (scope === 'all' || scope !== 'local') {
+        let slugs = []
+        try {
+          slugs = readdirSync(wsRoot)
+        } catch {
+          slugs = []
+        }
+        for (const slug of slugs) {
+          if (scope !== 'all' && slug !== scope) continue
+          readLayer(join(wsRoot, slug, 'logs'), slug)
+        }
+      }
+      entries.sort((left, right) => String(left.at).localeCompare(String(right.at)))
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(JSON.stringify({ ok: true, day, scope, count: entries.length, entries: entries.slice(-tail) }))
       return
     }
 

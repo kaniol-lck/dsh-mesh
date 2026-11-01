@@ -172,6 +172,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `tasksMaxRows` | `5000` | 任务库最多保留条数（超量裁最旧） |
 | `compactTaskText` | `true` | 启动时把仍内嵌正文的任务行迁移为 `textRef`（内容寻址存 `texts/<sha256>.txt`）；迁移失败不改写任务库 |
 | `storageTiers` | `true` | 任务/回执按工作区分层存放（区内 `ws/<slug>/`、跨区 `local/`）；首次启动把旧单文件拆分并保留 `*.legacy.jsonl` |
+| `logsRetentionDays` | `30` | 日志保留天数：启动时删除 `local/logs/` 与 `ws/*/logs/` 下超期的按天文件（与 `tasksRetentionDays` 对齐） |
 | `entryLabel` | `Mesh 信箱` | 信箱入口显示名（侧栏 tooltip、页面标题、设置页跳转文案共用；≤40 字） |
 
 ### 信任与权限
@@ -256,6 +257,7 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 - **保留策略**：`tasksRetentionDays`（默认 30 天）与 `tasksMaxRows`（默认 5000 条），启动时对**所有层合并后**按「超龄或超量」裁最旧的，并压实各层文件（被裁任务的正文文件一并清理）；
 - **读取聚合**：`GET /mesh/tasks`、`GET /mesh/batches`、`/mesh/status.pendingTaskList` 与面板都读取「`local/` + 全部 `ws/*/`」的聚合结果，对外行为不变；按 id 查找时先本工作区、再 `local/`，都没有就明确说不存在；
 - **正文隐私**：日志只打 `textBytes` 与 `subject`，**从不打印正文**；列表 API 默认不含正文，只有详情 API（或 `?include=text`）经解析器返回全文。
+- **日志分层（0.7.31，与任务同构）**：全局事件（启动、注册、同步、无归属错误）进 `local/logs/YYYY-MM-DD.log`；某工作区会话/任务的事件进 `ws/<slug>/logs/YYYY-MM-DD.log`。文件按**本地日期**每天一个（跨零点自动换文件），单文件超 `logMaxBytes` 时追加序号 `YYYY-MM-DD-2.log`；启动时按 `logsRetentionDays`（默认 30）清理过期按天文件；旧 `waker.log` 不逐行拆分，直接保留为 `local/logs/legacy-waker.log`。`registered …` / `history sync …` 两类固定心跳只在内容变化时立即记，未变化时每小时记一次 `(unchanged, <n> repeats)`；其它事件照常逐条记录。排查用只读 `GET /mesh/logs?day=&scope=all|local|<slug>&tail=N` 拿跨层合并视图（每条带 `file`/`scope`）。
 
 **API**（仅本机 loopback）：
 

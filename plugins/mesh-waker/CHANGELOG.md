@@ -21,6 +21,7 @@
 
 ### Changed
 
+- 日志按工作区分层（`local/logs/` 与 `ws/<slug>/logs/`）并按本地日期切分，旧 `waker.log` 保留为 `legacy-waker.log`；`registered` / `history sync` 心跳只在变化或每小时记一次。
 - 工作区注册表自动收敛：slug 用项目名（`…\public` → `dsh-mesh`）、coordinator 取最近活跃并标记过期、临时测试工作区不再占位，旧 `ws/` 目录随 slug 迁移。
 - 任务与回执按工作区分层存放（区内 `ws/<slug>/`、跨区 `local/`），旧单文件首次启动自动迁移并保留 `.legacy.jsonl`；README 与 `GET /mesh/tasks` 等接口仍按聚合结果工作。
 - 注入的回执通知默认只发状态行（`error` / `lost` 附一行原因）；需要摘要时设 `receiptNoticeSummary: true`。
