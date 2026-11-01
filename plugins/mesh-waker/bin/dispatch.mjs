@@ -9,26 +9,33 @@
  *   dsh-mesh-dispatch --target "mesh · hub" --file task.txt
  *   dsh-mesh-dispatch --target session-abc --text "fix x" --task --batch B-1
  *   dsh-mesh-dispatch --target "new worker" --create --text "bootstrap" --json
+ *   dsh-mesh-dispatch --thread TH-1 --text "follow-up"   (target comes from the thread binding)
  */
 import { readFile } from 'node:fs/promises'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
 
+import { normalizeThread } from '../lib/session.mjs'
+
 export const USAGE = `dsh-mesh-dispatch — dispatch a task into a local DSH session (waker :8795)
 
 Usage:
   dsh-mesh-dispatch --target <id|title> (--text <s> | --file <path>) [options]
+  dsh-mesh-dispatch --thread <id> (--text <s> | --file <path>) [options]
 
 Options:
   --target <s>       session id, full title, or a unique title substring
   --text <s>         task text (exactly one of --text / --file)
   --file <path>      UTF-8 task file (exactly one of --text / --file)
   --mode <m>         queue (default) or steer
+  --thread <id>      follow-up thread id (at most 128 UTF-8 bytes); a known thread lets
+                     you omit --target and keeps the binding on the same session
   --task [id]        receipt task id; "--task" alone generates T-<base36 timestamp>
   --batch [id]       batch barrier id; "--batch" alone generates B-<base36 timestamp>
   --receipt <m>      file | queue | wake (waker default when omitted)
   --deadline <d>     batch deadline such as 30m / 2h / 600s
   --create           create the session (titled with --target) when it does not resolve
+  --dry-run          print the request that would be sent; send nothing
   --json             print the structured result
   --waker <url>      waker base URL (default http://127.0.0.1:8795)
   -h, --help         show this help
@@ -49,6 +56,21 @@ export function durationMs(value) {
   return Number(match[1]) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[match[2].toLowerCase()]
 }
 
+/**
+ * `--thread` follows the same rule as the tool and /mesh/inject (lib/session.mjs), so an
+ * invalid id is rejected before any request is made instead of failing server-side.
+ */
+function normalizeCliThread(value) {
+  try {
+    const thread = normalizeThread(value)
+    if (!thread) fail('--thread requires a non-empty id')
+    return thread
+  } catch (error) {
+    if (error.usage) throw error
+    fail(`invalid --thread: ${error.message}`)
+  }
+}
+
 /** Parse argv into options; throws an Error whose message includes usage text. */
 export function parseArgs(argv) {
   const options = {
@@ -56,12 +78,14 @@ export function parseArgs(argv) {
     text: undefined,
     file: undefined,
     mode: 'queue',
+    thread: undefined,
     task: undefined,
     batch: undefined,
     receipt: undefined,
     deadline: undefined,
     deadlineMs: undefined,
     create: false,
+    dryRun: false,
     json: false,
     waker: DEFAULT_WAKER,
     help: false,
@@ -79,6 +103,7 @@ export function parseArgs(argv) {
       case '--text': options.text = takeValue(); break
       case '--file': options.file = takeValue(); break
       case '--mode': options.mode = takeValue(); break
+      case '--thread': options.thread = takeValue(); break
       case '--task': {
         const next = argv[index + 1]
         options.task = next !== undefined && !String(next).startsWith('--') ? String(next) : ''
@@ -94,6 +119,7 @@ export function parseArgs(argv) {
       case '--receipt': options.receipt = takeValue(); break
       case '--deadline': options.deadline = takeValue(); break
       case '--create': options.create = true; break
+      case '--dry-run': options.dryRun = true; break
       case '--json': options.json = true; break
       case '--waker': options.waker = takeValue(); break
       case '-h':
@@ -105,7 +131,10 @@ export function parseArgs(argv) {
     }
   }
   if (options.help) return options
-  if (!options.target) fail('pass --target')
+  if (options.thread !== undefined) options.thread = normalizeCliThread(options.thread)
+  // A known thread resolves the target server-side, so --target may be omitted (T-296).
+  if (!options.target && options.thread === undefined) fail('pass --target (or --thread for a known thread)')
+  if (options.create && !options.target) fail('--create needs --target')
   const hasText = options.text !== undefined
   const hasFile = options.file !== undefined
   if (hasText === hasFile) fail('pass exactly one of --text or --file')
@@ -153,11 +182,15 @@ export async function run(options, fetchImpl = fetch) {
       }
     : undefined
   const payload = (session) => ({
-    ...(session ? { session } : { session: options.target, title: options.target }),
+    ...(session ? { session } : options.target ? { session: options.target, title: options.target } : {}),
     text,
     mode: options.mode,
+    // Top level, exactly like the mesh_dispatch tool: /mesh/inject reads draft.thread.
+    ...(options.thread ? { thread: options.thread } : {}),
     ...(meta ? { meta } : {}),
   })
+
+  if (options.dryRun) return { dryRun: true, url: `${base}/mesh/inject`, payload: payload(null) }
 
   let created = false
   let sent = await postJson(`${base}/mesh/inject`, payload(null))
@@ -197,6 +230,22 @@ async function main(argv = process.argv.slice(2)) {
     }
     console.error(error.message)
     process.exit(1)
+  }
+  if (options.dryRun) {
+    const plan = result.payload ?? {}
+    if (options.json) {
+      console.log(JSON.stringify(plan, null, 2))
+      return
+    }
+    const parts = ['dry-run']
+    parts.push(options.target ? `target=${options.target}` : 'target=(via thread)')
+    parts.push(`task=${plan.meta?.taskId ?? '-'}`)
+    if (plan.meta?.batchId) parts.push(`batch=${plan.meta.batchId}`)
+    if (plan.thread) parts.push(`thread=${plan.thread}`)
+    parts.push(`mode=${plan.mode ?? options.mode}`)
+    parts.push(`textBytes=${Buffer.byteLength(String(plan.text ?? ''))}`)
+    console.log(parts.join(' '))
+    return
   }
   if (options.json) {
     console.log(JSON.stringify(result, null, 2))

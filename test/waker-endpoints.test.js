@@ -1162,6 +1162,69 @@ async function main() {
     report('CLI: parses deadline/task flags and refuses unknown args', ok, `deadline=${parsed.deadlineMs} task=${JSON.stringify(parsed.task)} usage=${/Usage/.test(unknown)}`)
   })
 
+  // 230-235. bin CLI parity (T-296): --thread reaches the body top level like the tool,
+  // a bad id never touches the network, --dry-run prints the plan, --help documents it.
+  const cliUrl = pathToFileURL(path.join(REPO, 'plugins', 'mesh-waker', 'bin', 'dispatch.mjs')).href
+  const noFetch = async () => {
+    throw new Error('no fetch expected')
+  }
+
+  await runCase('CLI: --thread is parsed and kept at the body top level', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--target', 'mesh · hub', '--text', 'hi', '--thread', 'TH-1'])
+    const plan = await run({ ...options, dryRun: true }, noFetch)
+    const ok = options.thread === 'TH-1' && plan.dryRun === true && plan.payload?.thread === 'TH-1' && plan.payload?.meta === undefined
+    report('CLI: --thread is parsed and kept at the body top level', ok, `thread=${options.thread ?? '-'} payloadThread=${plan.payload?.thread ?? '-'}`)
+  })
+
+  await runCase('CLI: a thread over 128 bytes is rejected before any request', async () => {
+    const { parseArgs } = await import(cliUrl)
+    let message = ''
+    try {
+      parseArgs(['--target', 'x', '--text', 'hi', '--thread', 'T'.repeat(129)])
+    } catch (error) {
+      message = error.message
+    }
+    const ok = /invalid --thread/.test(message) && /128 UTF-8 bytes/.test(message) && /Usage/.test(message)
+    report('CLI: a thread over 128 bytes is rejected before any request', ok, `error=${message.split('\n')[0]}`)
+  })
+
+  await runCase('CLI: without --thread the body keeps no thread field', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--target', 'mesh · hub', '--text', 'hi'])
+    const plan = await run({ ...options, dryRun: true }, noFetch)
+    const ok = !('thread' in (plan.payload ?? {})) && plan.payload?.session === 'mesh · hub'
+    report('CLI: without --thread the body keeps no thread field', ok, `keys=${Object.keys(plan.payload ?? {}).join(',')}`)
+  })
+
+  await runCase('CLI: --thread alone omits session and title', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--text', 'hi', '--thread', 'TH-2'])
+    const plan = await run({ ...options, dryRun: true }, noFetch)
+    const payload = plan.payload ?? {}
+    const ok = options.target === undefined && !('session' in payload) && !('title' in payload) && payload.thread === 'TH-2'
+    report('CLI: --thread alone omits session and title', ok, `keys=${Object.keys(payload).join(',')}`)
+  })
+
+  await runCase('CLI: --dry-run sends nothing and reports the thread', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--thread', 'TH-1', '--text', 'hi', '--dry-run'])
+    let calls = 0
+    const plan = await run(options, async () => {
+      calls += 1
+      throw new Error('no fetch expected')
+    })
+    const ok = options.dryRun === true && calls === 0 && plan.payload?.thread === 'TH-1'
+    report('CLI: --dry-run sends nothing and reports the thread', ok, `calls=${calls} thread=${plan.payload?.thread ?? '-'}`)
+  })
+
+  await runCase('CLI: --help documents --thread without side effects', async () => {
+    const { parseArgs, USAGE } = await import(cliUrl)
+    const options = parseArgs(['--help'])
+    const ok = options.help === true && /--thread/.test(USAGE) && /--dry-run/.test(USAGE) && /omit --target/.test(USAGE)
+    report('CLI: --help documents --thread without side effects', ok, `help=${options.help} threadDoc=${/--thread/.test(USAGE)}`)
+  })
+
   // 42-44. Regression: injection during a running turn must not settle on that turn's end.
   await runCase('task receipt: queue injection during a running turn waits for the next turn', async (boot) => {
     const h = await boot({ seedSessions: [{ id: 'session-running', title: 'running target' }] })

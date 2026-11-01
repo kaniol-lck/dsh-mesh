@@ -18,6 +18,7 @@
 - 重启后自动把上一进程遗留的任务标为 `lost` 并通知派活方，不再无声消失。
 - 任务可由执行会话主动声明完成：`mesh_complete`（`done` / `partial` / `blocked`），回执标注 `(declared)`；未声明的任务仍按回合结束自动结算并标注 `(observed)`。
 - 回执可投给派活方（`requester`），而不是只投全局 `receiptTo`。
+- `bin/dispatch.mjs` 支持 `--thread`，命令行派活可加入同一线程。
 
 ### Changed
 
