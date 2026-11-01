@@ -1239,6 +1239,36 @@ function lanAddress() {
 }
 
 export function apply(ctx, config) {
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // 子系统地图（apply() 内部闭包，T-290）
+  //
+  // 这个文件是一个大闭包：下列 173 个内层函数共享 ctx / c / state 与若干 Map。
+  // 修改前按三步走：
+  //   1) 在下面的清单里定位职责所属的子系统；
+  //   2) 看该子系统注释块的「共享闭包」行，判断还会波及哪些子系统；
+  //   3) 只改对应区块，跨块改动先确认共享闭包变量的语义没有分叉。
+  //
+  // 清单（函数数）：
+  //   · 会话索引与历史（27）
+  //   · Topic 路由（5）
+  //   · 审批桥（6）
+  //   · 提问桥（mesh_ask）（6）
+  //   · 会话生命周期（3）
+  //   · 唤醒投递与提示词（26）
+  //   · 管理面配置与 hub 引导（12）
+  //   · 状态账本辅助（2）
+  //   · 存储分层（工作区 / 日志 / 记录）（39）
+  //   · 线程（8）
+  //   · 任务账本（5）
+  //   · 回执投递（5）
+  //   · 任务生命周期与结算（7）
+  //   · 批次（13）
+  //   · 工具入口（派活 / 线程 / 完成声明）（5）
+  //   · 工具注册与代码自检（4）
+  //
+  // 合计 173；未归类 0。注释块以「══ 子系统：」开头，可据此跳转。
+  // ════════════════════════════════════════════════════════════════════════════
   let c = normalize(config)
   const log = ctx.logger ?? console
   // Point the file logger at the configured path before anything else logs.
@@ -1308,6 +1338,12 @@ export function apply(ctx, config) {
   const MAP_PATH = c.tokenFile
     ? join(dirname(c.tokenFile), 'conversations.json')
     : join(tmpdir(), 'mesh-waker-conversations.json')
+
+  // ══ 子系统：会话索引与历史 ══════════════════════════════════════════════════
+  // 职责：conversations.json / 消息历史同步、sessions-index 发现与归档、标题与 cwd 解析
+  // 共享闭包：conversations, history, sessionIndex, archivedTombstones, c.tokenFile, ctx.workspaceRegistry
+  // 对外入口：resolveLocalSession / listLocalSessions / historyThread（被派活、面板、回执复用）
+  // 注意：改索引格式会波及归档/删除判断与所有按标题寻址的调用
 
   function loadConversations() {
     try {
@@ -1832,6 +1868,12 @@ export function apply(ctx, config) {
     })
   }
 
+  // ══ 子系统：Topic 路由 ══════════════════════════════════════════════════
+  // 职责：按 label 绑定/自动绑定会话、投递记录、拒绝审计
+  // 共享闭包：topics, conversations, topicDenied, state
+  // 对外入口：ensureTopicBinding / recordTopicDelivery（被 wake 与 pull 调用）
+  // 注意：autoBindTopics 在启动和每次 pull 后都会跑
+
   function matchTopicSession(topic, active) {
     const exact = active.filter((session) => session.title === topic.titlePattern)
     if (exact.length === 1) return exact[0]
@@ -1920,6 +1962,12 @@ export function apply(ctx, config) {
   // Conversations currently awaited by the bridge; the pull loop must not consume them.
   const bridgeWaiting = new Map()
   const bridgeOutcome = (value) => (['allowed-once', 'rejected', 'cancelled', 'unavailable'].includes(value) ? value : 'unavailable')
+
+  // ══ 子系统：审批桥 ══════════════════════════════════════════════════
+  // 职责：宿主 approval 请求投递到 mesh 收件箱、回收决议、待决去重
+  // 共享闭包：bridgeWaiting, ctx, state, hub 通道
+  // 对外入口：handleApprovalRequest / consumeApprovalTraffic
+  // 注意：与 mesh_ask 共用收件箱语义，claim/去重规则不要单独改
 
   function approvalNotice(request, conversation) {
     const toolName = String(request?.toolName ?? 'tool')
@@ -2097,6 +2145,12 @@ export function apply(ctx, config) {
   const questionWaiting = new Map()
   // Ignored replies are re-evaluated on every poll; keep the log to one line per message.
   const questionDeniedSeen = new Set()
+
+  // ══ 子系统：提问桥（mesh_ask） ══════════════════════════════════════════════════
+  // 职责：userQuestions seam 探测、问题投递与答复消费、超时/拒绝处理
+  // 共享闭包：questionWaiting, questionDeniedSeen, state
+  // 对外入口：askViaMesh / handleUserQuestion / consumeQuestionTraffic
+  // 注意：seam 缺失时必须降级为只读可用，不要抛错
 
   function truncateAnswer(value) {
     return String(value ?? '').replace(/\s+$/, '').trim().slice(0, 2000)
@@ -2279,6 +2333,12 @@ export function apply(ctx, config) {
     }
   }
 
+  // ══ 子系统：会话生命周期 ══════════════════════════════════════════════════
+  // 职责：停止/删除会话后的绑定清理与 throttle 摘要
+  // 共享闭包：conversations, topics, liveness, ctx.agents
+  // 对外入口：dropConversationBindings / stopLiveSession
+  // 注意：删除会话必须同时清 topic 绑定与 archived tombstone
+
   /**
    * Drop every conversations.json binding that points at one session: the delivery target
    * (`deliverTo`), the panel binding and a conversation's own session. Without this the
@@ -2358,6 +2418,12 @@ export function apply(ctx, config) {
         cap: entry.capOverride ?? c.throttleMaxWakesPerWindow,
       }))
   }
+
+  // ══ 子系统：唤醒投递与提示词 ══════════════════════════════════════════════════
+  // 职责：trust 过滤、wake secret/注册、收件箱抓取与渲染、prompt 构建、wake/catchUp、目标会话创建/分支/标题
+  // 共享闭包：c, state, conversations, history, throttle, trustOverrides, ctx.workspaceRegistry
+  // 对外入口：wake / catchUp / promptWithResume / buildPromptText
+  // 注意：投递模式（steer/queue）与 trust 过滤同时影响回执投递路径
 
   function loadTrustOverrides() {
     try {
@@ -3117,6 +3183,12 @@ export function apply(ctx, config) {
     return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
   }
 
+  // ══ 子系统：管理面配置与 hub 引导 ══════════════════════════════════════════════════
+  // 职责：/mesh/admin 配置读写、cordis patch 回写、CA 采用、joinCode 自举、pull 循环与 hub 后台任务生命周期
+  // 共享闭包：ctx.configEditor, patch, c, state, hubUrl/token
+  // 对外入口：saveConfig / bootstrapWithJoinCode / pullOnce / startHubFeatures
+  // 注意：disposeHubWork 必须停掉 pull 与 wake 定时器
+
   function listDirs(basePath) {
     const target = resolve(basePath || c.workspacePath || c.sessionCwd || homedir())
     const entries = readdirSync(target, { withFileTypes: true })
@@ -3502,6 +3574,12 @@ export function apply(ctx, config) {
   const batches = new Map()
   let batchSweepTimer = null
 
+  // ══ 子系统：状态账本辅助 ══════════════════════════════════════════════════
+  // 职责：liveness ledger 取用与最大 turn 查询
+  // 共享闭包：liveness, turnStartedAt, pendingTasks
+  // 对外入口：livenessFor / maxTurnFor（被任务生命周期与回执调用）
+  // 注意：turn 语义与 started 认领 / baseline 绑定，改动会牵连 T-253/T-279
+
   function livenessFor(sessionId) {
     let ledger = liveness.get(sessionId)
     if (!ledger) {
@@ -3547,6 +3625,12 @@ export function apply(ctx, config) {
   const receiptsFileIn = (dir) => join(dir, 'receipts.jsonl')
   const wsDirFor = (slug) => join(wsRoot, slug)
   const locationOf = (slug) => `${workspaces.machine}/${slug}`
+
+  // ══ 子系统：存储分层（工作区 / 日志 / 记录） ══════════════════════════════════════════════════
+  // 职责：workspaces.json 收敛与 slug、LCA 路由、日志分层与保留、tasks/receipts 迁移、正文内容寻址、record 文件定位
+  // 共享闭包：workspaces, taskRows, taskFiles, localDir/wsRoot, c.storageTiers, c.logsRetentionDays
+  // 对外入口：ensureWorkspace / routeForCwds / dirForRow / setupTieredLogging
+  // 注意：迁移失败必须保持旧文件原样；slug 与路由被任务、回执、日志三处共用
 
   function readJsonOr(file, fallback) {
     try {
@@ -4292,6 +4376,12 @@ export function apply(ctx, config) {
   const threadsFile = join(homedir(), '.dsh', 'mesh-waker', 'threads.json')
   const threadRows = new Map()
 
+  // ══ 子系统：线程 ══════════════════════════════════════════════════
+  // 职责：threads.json 读写、mesh_thread 动作、绑定与线程列表
+  // 共享闭包：threadRows, threadsFile, pendingTasks, taskRows
+  // 对外入口：bindThread / listThreads / subscribeThread / releaseThread
+  // 注意：只有成功投递才绑定；release 后无 target 派活必须报 unknown thread
+
   function loadThreads() {
     try {
       const raw = JSON.parse(readFileSync(threadsFile, 'utf8'))
@@ -4417,6 +4507,12 @@ export function apply(ctx, config) {
     fileLog(`thread ${thread} released by ${sessionId}`)
     return { thread, released: true }
   }
+
+  // ══ 子系统：任务账本 ══════════════════════════════════════════════════
+  // 职责：任务行追加/更新、启动加载与保留策略、任务 API 投影
+  // 共享闭包：taskRows, taskFiles, taskFilesWithRows, c.tasksRetentionDays / tasksMaxRows
+  // 对外入口：recordTaskPending / updateTaskRow / loadTaskRegistry / taskRowForApi
+  // 注意：jsonl 是追加式事件日志，同 taskId 取最后一条为准
 
   function appendTaskRow(row) {
     const file = taskFiles.get(row.taskId) ?? tasksFileIn(dirForRow(row))
@@ -4595,6 +4691,12 @@ export function apply(ctx, config) {
     if (!withText) return base
     return { ...base, text: resolveTaskText(row, taskTextsDir) }
   }
+
+  // ══ 子系统：回执投递 ══════════════════════════════════════════════════
+  // 职责：requester 解析与同 cwd 推断、queue/file/wake 投递、重启 lost 补发
+  // 共享闭包：pendingTasks, taskRows, assistantText, state.lastReceipt, c.receiptTo
+  // 对外入口：settleTask（调用）/ reconcileOrphanTasks（启动）
+  // 注意：推断取同 cwd 最新协调会话，mtime 无法区分才按歧义处理（T-287）
 
   /**
    * Resolve a requester id/title once. When the dispatcher named nobody, infer a coordinator
@@ -4778,6 +4880,12 @@ export function apply(ctx, config) {
       await deliverReceipt(receipt, { requester, requesterSessionId, requesterInferred: inferred })
     }
   }
+
+  // ══ 子系统：任务生命周期与结算 ══════════════════════════════════════════════════
+  // 职责：pending 登记、started 认领、not-started 看门狗与 dormant 恢复、settle、turn 事件入口
+  // 共享闭包：pendingTasks, taskRows, liveness, assistantText, receiptTimers, c.receiptStallMs
+  // 对外入口：registerPendingTask / settleTask / handleSessionEvent
+  // 注意：排队 re-arm 与 dormant 恢复不能删（T-279）；结算后回执交给「回执投递」
 
   function clearPending(task) {
     if (!task) return
@@ -5129,6 +5237,12 @@ export function apply(ctx, config) {
       fileLog(`session/event handling failed: ${error.message}`)
     }
   }
+
+  // ══ 子系统：批次 ══════════════════════════════════════════════════
+  // 职责：batches.json、屏障聚合、deadline/告警、取消与恢复
+  // 共享闭包：batches, batchTimers, taskRows, pendingTasks
+  // 对外入口：registerBatchTask / updateBatchTask / finalizeBatch / sweepBatches
+  // 注意：批次成员回执强制 file，只有聚合结果投递一次
 
   // ---------------------------------------------------------------- batches
   //
@@ -5514,6 +5628,12 @@ export function apply(ctx, config) {
     }
   }
 
+  // ══ 子系统：工具入口（派活 / 线程 / 完成声明） ══════════════════════════════════════════════════
+  // 职责：目标会话解析、caller 提取、本地派活、mesh_thread 与 mesh_complete 行为
+  // 共享闭包：pendingTasks, threadRows, taskRows, ctx.agents
+  // 对外入口：dispatchLocalTask / meshThreadAction / completeTaskDeclared
+  // 注意：三个工具共用 callerSessionFrom；拿不到调用会话必须报错，不猜默认
+
   // ---------------------------------------------------------------- model tool
   //
   // mesh_dispatch exposes the /mesh/inject pipeline to the model so any project (this repo
@@ -5731,6 +5851,12 @@ export function apply(ctx, config) {
     thread: { ok: false, error: null },
     complete: { ok: false, error: null },
   }
+
+  // ══ 子系统：工具注册与代码自检 ══════════════════════════════════════════════════
+  // 职责：tools 服务探测、schema 校验、defineTool 降级、自身代码 hash 缓存
+  // 共享闭包：ctx.tools, toolState, bootedCodeHash, diskCodeCache
+  // 对外入口：installModelTool / buildToolDefinition / diskCodeHash（/mesh/status 用）
+  // 注意：schema 只允许单类型；注册失败写 state/lastError，不抛错
 
   function toolsService() {
     const viaGet = typeof ctx.get === 'function' ? ctx.get('tools') : undefined
