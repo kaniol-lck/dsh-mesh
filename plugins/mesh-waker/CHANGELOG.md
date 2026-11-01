@@ -9,6 +9,15 @@
 
 ---
 
+## v0.7.26（2026-11-01，重启不再留下无声的孤儿任务：启动对账补发 `lost`）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | 待办任务只在内存 `pendingTasks` 里；宿主重启清空内存，但 `tasks.jsonl` 留下 `status=started` / `settledAt=null` 的孤儿行（2026-11-01 本机 `T4F-20261101-07` 实证）。派活方永等不到回执，且无法区分「还在跑」与「已经丢了」；日志里也毫无异常 |
+| 修法 | 启动加载任务库后**一次性**对账（不进定时器）：按 taskId 取最后一行，`status ∈ {pending, started}` 且 `settledAt == null` 的判为上一进程的孤儿；逐条 `updateTaskRow({status:'lost', settledAt, reasonKind:'lost', reasonDetail:'host restart', receiptSummary})`，写一条 `status=lost` 回执（摘要 `session restarted before this task finished; resend if still needed`），并 `fileLog('task <id> marked lost after restart (requester=有/无)')`。requester 缺失时沿用 0.7.24 的 cwd 推断：唯一协调会话才投，歧义则 file-only（`delivery skipped`），不猜 |
+| 边界 | 只跑一个进程生命周期一次；`done`/`error`/`lost` 等已结束行不动、不补发；已 settled 的任务不回头补回执；回执文件格式与 0.7.24 投递/推断逻辑均未改（只调用） |
+| 测试 | +5（共 153/153）：pending+started 孤儿都变 `lost` 且各一条 `lost` 回执（摘要匹配）；`error` 行不动且零回执；有 requester 的孤儿回执投给该会话；无 requester 同 cwd 唯一协调会话 → 推断投递；同 cwd 两个协调会话 → `ambiguous`、回执落文件、不投递不报错。既有 148 例全绿（列表筛选夹具改用已有 `lost` 行以适配启动对账） |
+
 ## v0.7.25（2026-11-01，回执摘要不再包含思考/工具块）
 
 | 项 | 内容 |

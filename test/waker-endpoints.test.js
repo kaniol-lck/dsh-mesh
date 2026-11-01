@@ -2392,12 +2392,13 @@ async function main() {
     const now = Date.now()
     const h = await boot({
       tasksSeed: [
-        seededTask('T-a', { status: 'pending', targetSessionId: 'session-a', createdAt: now - 3000 }),
+        // A pre-existing 'lost' row (not pending/started) must survive startup reconciliation.
+        seededTask('T-a', { status: 'lost', targetSessionId: 'session-a', createdAt: now - 3000, settledAt: now - 2500 }),
         seededTask('T-b', { status: 'settled', targetSessionId: 'session-b', createdAt: now - 2000, settledAt: now - 1000, durationMs: 1000 }),
         seededTask('T-c', { status: 'settled', targetSessionId: 'session-b', createdAt: now - 1000, settledAt: now - 500, durationMs: 500 }),
       ],
     })
-    const byStatus = await request(h.base, '/mesh/tasks?status=pending')
+    const byStatus = await request(h.base, '/mesh/tasks?status=lost')
     const bySession = await request(h.base, '/mesh/tasks?session=session-b')
     const page = await request(h.base, '/mesh/tasks?limit=1&offset=1')
     const ok =
@@ -3182,6 +3183,132 @@ async function main() {
     const text = messageText({ content: [{ type: 'text', text: '第一段' }, { type: 'text', text: '第二段' }] })
     const ok = text === '第一段\n第二段'
     report('receipt: multiple text blocks still join with newlines', ok, `text=${JSON.stringify(text)}`)
+  })
+
+  // 149-153. A restart leaves pending/started rows from the previous process; startup marks
+  // them lost and sends the receipt the dispatcher was still waiting for (T-265).
+  const seedOrphan = (taskId, patch = {}) =>
+    seededTask(taskId, { targetSessionId: 'session-orphan-target', targetTitle: 'orphan target', createdAt: Date.now() - 60 * 1000, ...patch })
+  const orphanReceipts = (h) => {
+    try {
+      return fs
+        .readFileSync(h.receiptsPath, 'utf8')
+        .split('\n')
+        .filter((line) => line.trim())
+        .map((line) => JSON.parse(line))
+    } catch {
+      return []
+    }
+  }
+
+  await runCase('restart: pending and started orphans both become lost and get receipts', async (boot) => {
+    const logFile = fileLogFile()
+    const h = await boot({
+      seedSessions: [{ id: 'session-orphan-target', title: 'orphan target' }],
+      tasksSeed: [seedOrphan('T-ORPH-P', { status: 'pending' }), seedOrphan('T-ORPH-S', { status: 'started', startedAt: Date.now() - 30 * 1000 })],
+      config: { logFile, receiptMode: 'file' },
+    })
+    const pending = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-ORPH-P')
+      return snapshot.json?.task?.status === 'lost' ? snapshot : null
+    }, 5000)
+    const started = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-ORPH-S')
+      return snapshot.json?.task?.status === 'lost' ? snapshot : null
+    }, 5000)
+    const receipts = orphanReceipts(h).filter((receipt) => receipt.status === 'lost')
+    const log = threadLog(logFile)
+    const ok =
+      pending?.json?.task?.status === 'lost' &&
+      started?.json?.task?.status === 'lost' &&
+      pending.json.task.settledAt !== null &&
+      receipts.length === 2 &&
+      receipts.every((receipt) => /session restarted before this task finished/.test(receipt.summary ?? '')) &&
+      /task T-ORPH-P marked lost after restart/.test(log) &&
+      /task T-ORPH-S marked lost after restart/.test(log)
+    report(
+      'restart: pending and started orphans both become lost and get receipts',
+      ok,
+      `pending=${pending?.json?.task?.status}/${String(pending?.json?.task?.settledAt)} started=${started?.json?.task?.status} receipts=${receipts.length}`,
+    )
+  })
+
+  await runCase('restart: a finished row is untouched and gets no receipt', async (boot) => {
+    const logFile = fileLogFile()
+    const h = await boot({
+      tasksSeed: [seedOrphan('T-ORPH-ERR', { status: 'error', settledAt: Date.now() - 10 * 1000, reasonKind: 'error' })],
+      config: { logFile, receiptMode: 'file' },
+    })
+    await request(h.base, '/mesh/tasks')
+    await new Promise((resolveWait) => setTimeout(resolveWait, 300))
+    const row = await request(h.base, '/mesh/tasks/T-ORPH-ERR')
+    const receipts = orphanReceipts(h)
+    const log = threadLog(logFile)
+    const ok = row.json?.task?.status === 'error' && receipts.length === 0 && !/T-ORPH-ERR marked lost/.test(log)
+    report('restart: a finished row is untouched and gets no receipt', ok, `status=${row.json?.task?.status} receipts=${receipts.length}`)
+  })
+
+  await runCase('restart: an orphan with a requester delivers its lost receipt there', async (boot) => {
+    const logFile = fileLogFile()
+    const h = await boot({
+      seedSessions: [{ id: 'session-orph-coord', title: 'orphan · 协调' }],
+      tasksSeed: [seedOrphan('T-ORPH-REQ', { status: 'started', startedAt: Date.now() - 20 * 1000, requester: 'session-orph-coord' })],
+      config: { logFile, receiptMode: 'queue', receiptTo: '', receiptSummaryChars: 300 },
+    })
+    const delivered = await waitFor(
+      () => h.state.prompts.find((prompt) => prompt.sessionId === 'session-orph-coord' && JSON.stringify(prompt).includes('T-ORPH-REQ')),
+      5000,
+    )
+    const ok = Boolean(delivered) && JSON.stringify(delivered).includes('lost')
+    report('restart: an orphan with a requester delivers its lost receipt there', ok, `deliveredTo=${delivered?.sessionId ?? '-'}`)
+  })
+
+  await runCase('restart: a requester-less orphan uses the unique coordinator from its cwd', async (boot) => {
+    const logFile = fileLogFile()
+    const cwd = workspaceCwd()
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-orphan-target', title: 'orphan target', cwd },
+        { id: 'session-orph-coord', title: 'orphan · 协调', cwd },
+      ],
+      tasksSeed: [seedOrphan('T-ORPH-INFER', { status: 'pending' })],
+      config: { logFile, receiptMode: 'queue', receiptTo: '' },
+    })
+    const delivered = await waitFor(
+      () => h.state.prompts.find((prompt) => prompt.sessionId === 'session-orph-coord' && JSON.stringify(prompt).includes('T-ORPH-INFER')),
+      5000,
+    )
+    const log = threadLog(logFile)
+    const ok = Boolean(delivered) && /requester inferred from workspace: orphan · 协调/.test(log)
+    report('restart: a requester-less orphan uses the unique coordinator from its cwd', ok, `deliveredTo=${delivered?.sessionId ?? '-'} inferred=${/requester inferred/.test(log)}`)
+  })
+
+  await runCase('restart: an ambiguous workspace stays undelivered without failing', async (boot) => {
+    const logFile = fileLogFile()
+    const cwd = workspaceCwd()
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-orphan-target', title: 'orphan target', cwd },
+        { id: 'session-orph-a', title: 'orphan · 协调', cwd },
+        { id: 'session-orph-b', title: 'orphan · coordinator', cwd },
+      ],
+      tasksSeed: [seedOrphan('T-ORPH-AMB', { status: 'pending' })],
+      config: { logFile, receiptMode: 'queue', receiptTo: '' },
+    })
+    const lost = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-ORPH-AMB')
+      return snapshot.json?.task?.status === 'lost' ? snapshot : null
+    }, 5000)
+    await new Promise((resolveWait) => setTimeout(resolveWait, 300))
+    const log = threadLog(logFile)
+    const receipts = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-ORPH-AMB')
+    const ok =
+      lost?.json?.task?.status === 'lost' &&
+      /requester inference ambiguous: 2 coordinator sessions share cwd/.test(log) &&
+      /delivery skipped: no requester, receiptTo is empty/.test(log) &&
+      receipts.length === 1 &&
+      h.state.prompts.length === 0
+    report('restart: an ambiguous workspace stays undelivered without failing', ok, `lost=${lost?.json?.task?.status ?? '-'} receipts=${receipts.length} prompts=${h.state.prompts.length}`)
   })
 
   const failed = results.filter((result) => !result.ok)

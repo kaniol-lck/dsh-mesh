@@ -3717,6 +3717,60 @@ export function apply(ctx, config) {
   }
 
 
+  /**
+   * A host restart clears pendingTasks but leaves pending/started rows in tasks.jsonl.
+   * Those rows belong to the previous process (this one never registered them in memory),
+   * so they can never settle: mark each lost and send the receipt its dispatcher is still
+   * waiting for. Runs once at startup; finished rows are never touched (T-265).
+   */
+  async function reconcileOrphanTasks() {
+    const orphans = [...taskRows.values()].filter(
+      (row) => (row.status === 'pending' || row.status === 'started') && (row.settledAt === null || row.settledAt === undefined),
+    )
+    if (orphans.length === 0) return
+    fileLog(`restart reconciliation: ${orphans.length} orphan task(s) from the previous process`)
+    for (const row of orphans) {
+      const settledAt = Date.now()
+      const summary = 'session restarted before this task finished; resend if still needed'
+      updateTaskRow(row.taskId, {
+        status: 'lost',
+        settledAt,
+        reasonKind: 'lost',
+        reasonDetail: 'host restart',
+        receiptSummary: summary,
+      })
+      let requester = row.requester ?? null
+      let requesterSessionId = null
+      let inferred = false
+      if (row.requester) {
+        const resolved = resolveRequester(row.requester, null)
+        requesterSessionId = resolved.sessionId
+      } else {
+        const target =
+          listLocalSessions().find((session) => session.id === row.targetSessionId) ?? { id: row.targetSessionId, cwd: null }
+        const resolved = resolveRequester(null, target)
+        requester = resolved.requester
+        requesterSessionId = resolved.sessionId
+        inferred = resolved.inferred === true
+      }
+      const receipt = buildReceipt({
+        taskId: row.taskId,
+        sessionId: row.targetSessionId ?? null,
+        status: 'lost',
+        reasonKind: 'lost',
+        reasonDetail: 'host restart',
+        injectedAt: row.createdAt ?? null,
+        endedAt: settledAt,
+        summary,
+        receiptMode: ['file', 'queue', 'wake'].includes(row.receiptMode) ? row.receiptMode : c.receiptMode,
+        summaryChars: c.receiptSummaryChars,
+      })
+      writeReceiptFile(receipt)
+      fileLog(`task ${row.taskId} marked lost after restart (requester=${requester ? '有' : '无'})`)
+      await deliverReceipt(receipt, { requester, requesterSessionId, requesterInferred: inferred })
+    }
+  }
+
   function clearPending(task) {
     if (!task) return
     if (task.stallTimer) {
@@ -4649,6 +4703,8 @@ export function apply(ctx, config) {
   // Restore batches before the listener comes up, then poll liveness for early alerts.
   loadTaskRegistry()
   loadThreads()
+  // Once per process: pending/started rows from a previous host process can never settle.
+  void reconcileOrphanTasks()
   restoreBatches()
   autoBindTopics()
   batchSweepTimer = setInterval(sweepBatches, Math.max(1000, Math.min(30000, Math.floor(c.waitLongMs / 2))))
