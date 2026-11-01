@@ -9,6 +9,16 @@
 
 ---
 
+## v0.7.29（2026-11-01，测试套件偶发挂死/静默 exit=1）
+
+| 项 | 内容 |
+|---|---|
+| 症状 | 同一命令 3 次里 1 次 exit=1 且**没有** `FAIL` / `N/M passed`；5 连跑时整体 13 分钟不结束（不是断言失败，是进程中途崩或挂着不退出） |
+| 根因 | ① 插件 dispose 只调 `server.close()`：keep-alive 客户端连接会让 close 一直等、监听句柄不释放，事件循环不退出（CI runner 被占死）；② 启动对账 `void reconcileOrphanTasks()` 与结算里的 `void deliverReceipt()` 是 fire-and-forget，一旦 reject 就是**未处理拒绝**，Node 直接退出 → 没有汇总行；③ 测试用 `fetch`（undici 连接池，默认 keep-alive）复用连接，进一步拖住 server.close |
+| 修复 | ① dispose 里 `server.close()` 后补 `server.closeAllConnections?.()`；② 两处 fire-and-forget 都加 `.catch` 写 waker 日志；③ 测试 `request()` 一律发 `connection: close`，每个 harness 的 server 不再被连接池拖住；④ 测试末尾诊断 `process.getActiveResourcesInfo()`（等 3 秒排空后仍残留才报），并注册 `unhandledRejection` 处理：记 stderr + `exitCode=1`，不再静默猝死 |
+| 验证 | 修复后连续 5 次 `node test/waker-endpoints.test.js`：`exit=0`、`162/162 passed`、每次 38–40s（跑两轮共 10 次全部一致）；`node --test --test-timeout=60000 test/waker-endpoints.test.js` → `✔ 1 test / pass 1 / fail 0`、40s，无超时、无 `LEFTOVER RESOURCES` |
+| CI | 建议 docs 在 `.github/workflows/plugin-check.yml` 的 test 步骤加 `--test-timeout=60000`（当前命令 `node --test test/*.test.js test/*.test.mjs` 无超时，挂死会占满 runner）；本单未改 CI 文件 |
+
 ## v0.7.28（2026-11-01，注入的回执通知只发状态行，治「对刷回执」的病根）
 
 | 项 | 内容 |

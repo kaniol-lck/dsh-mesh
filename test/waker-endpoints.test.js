@@ -23,6 +23,12 @@ process.env.MESH_WAKER_LOG = path.join(os.tmpdir(), 'waker-endpoints-test.log')
 const TEST_LOG = process.env.MESH_WAKER_LOG
 
 const results = []
+// A stray rejection used to kill the process before the summary line, which looked like a
+// random exit=1. Surface it as a failure instead of a silent crash (T-272).
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION', reason && reason.stack ? reason.stack : reason)
+  process.exitCode = 1
+})
 function report(name, ok, detail) {
   results.push({ name, ok })
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `: ${detail}` : ''}`)
@@ -42,7 +48,7 @@ function freePort() {
 async function request(base, route, { method = 'GET', body } = {}) {
   const response = await fetch(`${base}${route}`, {
     method,
-    headers: body ? { 'content-type': 'application/json' } : undefined,
+    headers: { connection: 'close', ...(body ? { 'content-type': 'application/json' } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   })
   const text = await response.text()
@@ -3439,7 +3445,22 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error)
-  process.exitCode = 1
-})
+main()
+  .then(async () => {
+    // If the process still holds server/socket handles after the last case, name them instead
+    // of letting a CI runner hang until its global timeout (T-272). Give closers a moment:
+    // server.closeAllConnections() is async on the socket side.
+    const deadline = Date.now() + 3000
+    let relevant = []
+    for (;;) {
+      const active = typeof process.getActiveResourcesInfo === 'function' ? process.getActiveResourcesInfo() : []
+      relevant = active.filter((name) => /TCPServer|TCPSocket/.test(name))
+      if (relevant.length === 0 || Date.now() >= deadline) break
+      await new Promise((resolveWait) => setTimeout(resolveWait, 25))
+    }
+    if (relevant.length) console.error(`LEFTOVER RESOURCES: ${[...new Set(relevant)].join(',')}`)
+  })
+  .catch((error) => {
+    console.error(error)
+    process.exitCode = 1
+  })

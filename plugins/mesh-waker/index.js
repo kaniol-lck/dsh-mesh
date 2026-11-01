@@ -3845,7 +3845,9 @@ export function apply(ctx, config) {
     state.lastReceipt = lastReceipt
     state.pendingTasks = pendingTasks.size
     fileLog(`receipt ${taskId} ${receipt.status} turn=${receipt.turn ?? '-'} duration=${receipt.durationMs}ms`)
-    void deliverReceipt(receipt, task)
+    void deliverReceipt(receipt, task).catch((error) => {
+      fileLog(`receipt ${taskId} delivery crashed: ${error && error.message ? error.message : error}`)
+    })
     updateBatchTask(taskId, receipt)
     return receipt
   }
@@ -4727,7 +4729,9 @@ export function apply(ctx, config) {
   loadTaskRegistry()
   loadThreads()
   // Once per process: pending/started rows from a previous host process can never settle.
-  void reconcileOrphanTasks()
+  void reconcileOrphanTasks().catch((error) => {
+    fileLog(`restart reconciliation failed: ${error && error.message ? error.message : error}`)
+  })
   restoreBatches()
   autoBindTopics()
   batchSweepTimer = setInterval(sweepBatches, Math.max(1000, Math.min(30000, Math.floor(c.waitLongMs / 2))))
@@ -5804,6 +5808,13 @@ export function apply(ctx, config) {
         server.close()
       } catch {
         /* already closed */
+      }
+      // Keep-alive sockets from clients otherwise hold the listener open and the host process
+      // alive long after the plugin is disposed (the 2026-11-01 test-hang symptom).
+      try {
+        server.closeAllConnections?.()
+      } catch {
+        /* older runtime */
       }
     }
   })
