@@ -19,7 +19,7 @@
 import { createServer } from 'node:http'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir, networkInterfaces, homedir, hostname } from 'node:os'
-import { join, dirname, resolve } from 'node:path'
+import { join, dirname, resolve, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { getCACertificates, setDefaultCACertificates } from 'node:tls'
@@ -226,6 +226,16 @@ export function realignReceiptTiers({ meshHome, storageTiers = true, log = () =>
   }
   log(`tiers: receipts realigned ${moves.length}${skipped ? ` (skipped ${skipped})` : ''}`)
   return { moved: moves.length, skipped }
+}
+
+/** A task id already used by a different target in the same tier file (T-301). */
+export class TaskIdCollisionError extends Error {
+  constructor(message, details = {}) {
+    super(message)
+    this.name = 'TaskIdCollisionError'
+    this.status = 409
+    this.details = details
+  }
 }
 
 export const name = 'mesh-waker'
@@ -561,6 +571,9 @@ function normalizeBase(config) {
     compactTaskText: c.compactTaskText !== false,
     // LCA storage tiers (T-282): same workspace -> ws/<slug>/, cross-workspace -> local/.
     storageTiers: c.storageTiers !== false,
+    // Cross-workspace ids share local/tasks.jsonl between coordinators; a bare `T-…` can
+    // collide. Warn by default, reject when set true (T-301).
+    requireNamespacedIds: c.requireNamespacedIds === true,
     // Log tiering follows tasks (T-288); retention is file-name based (local day).
     logsRetentionDays: clampInterval(c.logsRetentionDays, 30, 1, 3650),
     // Diagnostics: a dedicated log file outside the temp directory survives reboots, and a
@@ -3753,6 +3766,31 @@ export function apply(ctx, config) {
     return null
   }
 
+  /** The last row for a task id in one physical file, or null (torn lines are skipped). */
+  function findTaskRowInFile(file, taskId) {
+    try {
+      let found = null
+      for (const line of readFileSync(file, 'utf8').split('\n')) {
+        if (!line.trim()) continue
+        try {
+          const row = JSON.parse(line)
+          if (row && row.taskId === taskId) found = row
+        } catch {
+          /* skip torn line */
+        }
+      }
+      return found
+    } catch {
+      return null
+    }
+  }
+
+  /** Human-readable layer name for a record directory (`local/` or `ws/<slug>/`). */
+  function layerLabel(dir) {
+    if (dir === localDir) return 'local/'
+    return dirname(dir) === wsRoot ? `ws/${basename(dir)}/` : String(dir)
+  }
+
   function writeReceiptFile(receipt, dir = null) {
     const files = []
     if (dir) files.push(receiptsFileIn(dir))
@@ -4472,7 +4510,13 @@ export function apply(ctx, config) {
 
   function registerPendingTask(target, meta, mode = 'queue', text = '') {
     const taskId = String(meta?.taskId ?? '').trim()
-    if (!/^[A-Za-z0-9._:-]{1,80}$/.test(taskId)) throw new Error('meta.taskId must match [A-Za-z0-9._:-]{1,80}')
+    // A namespaced cross-workspace id may carry one `<slug>/` prefix (T-301). `.`/`..`
+    // segments are rejected so an id can never double as a path.
+    const namespacedId = /^[A-Za-z0-9._-]{1,40}\/[A-Za-z0-9._:-]{1,80}$/
+    if (!/^[A-Za-z0-9._:-]{1,80}$/.test(taskId) && !namespacedId.test(taskId)) {
+      throw new Error('meta.taskId must match [A-Za-z0-9._:-]{1,80} or <slug>/<id>')
+    }
+    if (/(^|\/)\.\.?(\/|$)/.test(taskId)) throw new Error('meta.taskId must not contain . or .. segments')
     const requested = String(meta?.receipt ?? '')
     const batchId = meta?.batchId ? String(meta.batchId).trim() : null
     // Batch members never disturb the coordinator one by one: only the aggregate goes out.
@@ -4509,6 +4553,48 @@ export function apply(ctx, config) {
     const requester = resolveRequester(meta?.requester, target)
     // LCA routing (T-282): same workspace -> ws/<slug>/, cross-workspace -> local/.
     const route = routeForCwds(target.cwd ?? sessionCwdOf(target.id), requester.sessionId ? sessionCwdOf(requester.sessionId) : null)
+    // Same-layer uniqueness (T-301): findRecord only sees this workspace + local, so a
+    // duplicate id in the same file is ambiguous and silently resolves to the last row.
+    // A retry/re-dispatch to the SAME target keeps working; a different target is rejected.
+    const recordFile = join(route.dir, 'tasks.jsonl')
+    const existingRow = findTaskRowInFile(recordFile, taskId)
+    if (existingRow && String(existingRow.targetSessionId ?? '') !== String(target.id ?? '')) {
+      fileLog(`task id collision rejected: ${taskId}`)
+      throw new TaskIdCollisionError(
+        `task id ${taskId} already exists in ${layerLabel(route.dir)} for target ${existingRow.targetSessionId ?? '-'}; refusing to overwrite it with target ${target.id}`,
+        {
+          taskId,
+          existingTarget: existingRow.targetSessionId ?? null,
+          requestedTarget: target.id,
+          layer: route.scope === 'machine' ? 'local' : `ws:${route.workspace}`,
+        },
+      )
+    }
+    // The same id in another layer is a different file (not a collision), but an upward
+    // lookup can shadow it, so it must be visible.
+    if (!existingRow) {
+      for (const file of taskRecordFiles()) {
+        if (dirname(file) === route.dir) continue
+        if (findTaskRowInFile(file, taskId)) {
+          fileLog(`WARN task id ${taskId} also exists in ${layerLabel(dirname(file))} (cross-layer duplicate; lookups may shadow)`)
+          break
+        }
+      }
+    }
+    // Cross-workspace ids share local/tasks.jsonl between coordinators. `T4F-…` and
+    // `<slug>/T-…` count as namespaced; a bare `T-…` warns, and is rejected when
+    // requireNamespacedIds is on (opt-in so historical ids stay addressable).
+    let idWarning = null
+    if (route.scope === 'machine' && /^T-/i.test(taskId)) {
+      if (c.requireNamespacedIds === true) {
+        fileLog(`task id rejected (not namespaced): ${taskId}`)
+        throw new Error(
+          `cross-workspace task id ${taskId} must be namespaced (e.g. dsh-mesh/${taskId}); set requireNamespacedIds:false to allow bare ids`,
+        )
+      }
+      idWarning = 'cross-workspace task ids should be namespaced (e.g. dsh-mesh/T-123)'
+      fileLog(`WARN cross-workspace task id ${taskId} is not namespaced`)
+    }
     const task = {
       sessionId: target.id,
       requester: requester.requester,
@@ -4526,6 +4612,7 @@ export function apply(ctx, config) {
       batchId,
       settled: false,
       stallTimer: null,
+      ...(idWarning ? { idWarning } : {}),
     }
     pendingTasks.set(taskId, task)
     state.pendingTasks = pendingTasks.size
@@ -5218,6 +5305,7 @@ export function apply(ctx, config) {
       requester: requester || null,
       mode: args.mode === 'steer' ? 'steer' : 'queue',
       created: createdSession,
+      ...(taskId && pendingTasks.get(taskId)?.idWarning ? { warning: pendingTasks.get(taskId).idWarning } : {}),
     }
   }
 
@@ -6045,10 +6133,29 @@ export function apply(ctx, config) {
         if (thread) bindThread(thread, target, taskId)
         fileLog(`injected ${text.length} chars (delivered ${deliveredText.length}) into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}${thread ? ` thread=${thread}` : ''}${explicitTarget ? '' : ' via-thread'} header=${c.injectHeader}`)
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-        res.end(JSON.stringify({ ok: true, sessionId: target.id, title: target.title, mode, taskId, batchId: taskId ? batchId : null, thread: thread ?? null }))
+        res.end(
+          JSON.stringify({
+            ok: true,
+            sessionId: target.id,
+            title: target.title,
+            mode,
+            taskId,
+            batchId: taskId ? batchId : null,
+            thread: thread ?? null,
+            ...(taskId && pendingTasks.get(taskId)?.idWarning ? { warning: pendingTasks.get(taskId).idWarning } : {}),
+          }),
+        )
       } catch (error) {
-        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-        res.end(JSON.stringify({ ok: false, error: error.message }))
+        // A task id already used by another target is a conflict, not a bad request (T-301).
+        const status = Number.isInteger(error?.status) ? error.status : 400
+        res.writeHead(status, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error: error.message,
+            ...(error?.details ? { conflict: error.details } : {}),
+          }),
+        )
       }
       return
     }

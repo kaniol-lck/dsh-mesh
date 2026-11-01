@@ -83,6 +83,7 @@ export const DISPATCH_OUTPUT = {
       batchId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
       mode: { type: 'string' },
       created: { type: 'boolean' },
+      warning: { oneOf: [{ type: 'string' }, { type: 'null' }] },
     },
     required: ['ok', 'sessionId', 'taskId', 'mode', 'created'],
   },

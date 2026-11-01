@@ -172,6 +172,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `tasksMaxRows` | `5000` | 任务库最多保留条数（超量裁最旧） |
 | `compactTaskText` | `true` | 启动时把仍内嵌正文的任务行迁移为 `textRef`（内容寻址存 `texts/<sha256>.txt`）；迁移失败不改写任务库 |
 | `storageTiers` | `true` | 任务/回执按工作区分层存放（区内 `ws/<slug>/`、跨区 `local/`）；首次启动把旧单文件拆分并保留 `*.legacy.jsonl` |
+| `requireNamespacedIds` | `false` | 跨区任务（落 `local/`）的单号建议带命名空间（如 `dsh-mesh/T-123`）；默认只 WARN，设 `true` 时拒绝裸 `T-…` 单号 |
 | `logsRetentionDays` | `30` | 日志保留天数：启动时删除 `local/logs/` 与 `ws/*/logs/` 下超期的按天文件（与 `tasksRetentionDays` 对齐） |
 | `entryLabel` | `Mesh 信箱` | 信箱入口显示名（侧栏 tooltip、页面标题、设置页跳转文案共用；≤40 字） |
 

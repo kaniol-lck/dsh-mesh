@@ -4494,6 +4494,123 @@ async function main() {
     report('storage: a failed realign leaves the source receipt intact', ok, `unchanged=${sourceAfter === sourceBefore} aborted=${/realign aborted/.test(log)}`)
   })
 
+  // 247-251. Task id uniqueness (T-301): a duplicate id in the same tier file is ambiguous,
+  // so it is rejected for a different target, allowed for the same one, and cross-workspace
+  // bare ids carry a namespacing warning (opt-in rejection via requireNamespacedIds).
+  await runCase('tasks: re-dispatching the same id to the same target is allowed', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-dup-a', title: 'worker a' }] })
+    const first = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker a', text: 'one', meta: { taskId: 'T-DUP-SAME' } },
+    })
+    const second = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker a', text: 'two', meta: { taskId: 'T-DUP-SAME' } },
+    })
+    const ok = first.status === 200 && second.status === 200 && second.json?.taskId === 'T-DUP-SAME'
+    report('tasks: re-dispatching the same id to the same target is allowed', ok, `first=${first.status} second=${second.status}`)
+  })
+
+  await runCase('tasks: the same id for a different target is rejected with a conflict', async (boot) => {
+    const logFile = path.join(os.tmpdir(), `waker-collision-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile },
+      seedSessions: [
+        { id: 'session-dup-x', title: 'worker x' },
+        { id: 'session-dup-y', title: 'worker y' },
+      ],
+    })
+    const first = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker x', text: 'mine', meta: { taskId: 'T-DUP-CONFLICT' } },
+    })
+    const conflict = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker y', text: 'not mine', meta: { taskId: 'T-DUP-CONFLICT' } },
+    })
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok =
+      first.status === 200 &&
+      conflict.status === 409 &&
+      conflict.json?.conflict?.taskId === 'T-DUP-CONFLICT' &&
+      conflict.json?.conflict?.existingTarget === 'session-dup-x' &&
+      conflict.json?.conflict?.requestedTarget === 'session-dup-y' &&
+      /task id collision rejected: T-DUP-CONFLICT/.test(log)
+    report('tasks: the same id for a different target is rejected with a conflict', ok, `status=${conflict.status} existing=${conflict.json?.conflict?.existingTarget ?? '-'} logged=${/collision rejected/.test(log)}`)
+  })
+
+  await runCase('tasks: the same id in two layers is allowed but warns', async (boot) => {
+    const cwdA = path.join(os.tmpdir(), 'wt-idlayer-a')
+    const cwdB = path.join(os.tmpdir(), 'wt-idlayer-b')
+    const logFile = path.join(os.tmpdir(), `waker-idlayer-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile },
+      seedSessions: [
+        { id: 'session-idlayer-coord', title: 'mesh · 协调', cwd: cwdB },
+        { id: 'session-idlayer-worker', title: 'worker', cwd: cwdA },
+      ],
+    })
+    // Cross-workspace first: the row goes to local/. Then the same id inside the
+    // coordinator's own workspace goes to ws/<slugB>/ — a different file, so no conflict.
+    const cross = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'cross', meta: { taskId: 'T-SHARED-ID', requester: 'session-idlayer-coord' } },
+    })
+    const same = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'mesh · 协调', text: 'same layer', meta: { taskId: 'T-SHARED-ID', requester: 'session-idlayer-coord' } },
+    })
+    const localRows = linesOf(path.join(meshOf(h), 'local', 'tasks.jsonl')).filter((row) => row.taskId === 'T-SHARED-ID')
+    const wsRows = linesOf(path.join(meshOf(h), 'ws', 'wt-idlayer-b', 'tasks.jsonl')).filter((row) => row.taskId === 'T-SHARED-ID')
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok =
+      cross.status === 200 &&
+      same.status === 200 &&
+      localRows.length === 1 &&
+      wsRows.length === 1 &&
+      /WARN task id T-SHARED-ID also exists in local\//.test(log)
+    report('tasks: the same id in two layers is allowed but warns', ok, `cross=${cross.status} same=${same.status} local=${localRows.length} ws=${wsRows.length} warned=${/also exists in local/.test(log)}`)
+  })
+
+  await runCase('tasks: a bare cross-workspace id carries a namespacing warning', async (boot) => {
+    const cwdA = path.join(os.tmpdir(), 'wt-ns-a')
+    const cwdB = path.join(os.tmpdir(), 'wt-ns-b')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-ns-coord', title: 'mesh · 协调', cwd: cwdB },
+        { id: 'session-ns-worker', title: 'worker', cwd: cwdA },
+      ],
+    })
+    const res = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'cross work', meta: { taskId: 'T-NONAME', requester: 'session-ns-coord' } },
+    })
+    const ok = res.status === 200 && /namespaced/.test(res.json?.warning ?? '')
+    report('tasks: a bare cross-workspace id carries a namespacing warning', ok, `status=${res.status} warning=${res.json?.warning ?? '-'}`)
+  })
+
+  await runCase('tasks: requireNamespacedIds rejects bare cross-workspace ids', async (boot) => {
+    const cwdA = path.join(os.tmpdir(), 'wt-ns2-a')
+    const cwdB = path.join(os.tmpdir(), 'wt-ns2-b')
+    const h = await boot({
+      config: { requireNamespacedIds: true },
+      seedSessions: [
+        { id: 'session-ns2-coord', title: 'mesh · 协调', cwd: cwdB },
+        { id: 'session-ns2-worker', title: 'worker', cwd: cwdA },
+      ],
+    })
+    const bare = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'cross work', meta: { taskId: 'T-BARE', requester: 'session-ns2-coord' } },
+    })
+    const namespaced = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'cross work', meta: { taskId: 'dsh-mesh/T-BARE2', requester: 'session-ns2-coord' } },
+    })
+    const ok = bare.status === 400 && /must be namespaced/.test(bare.json?.error ?? '') && namespaced.status === 200
+    report('tasks: requireNamespacedIds rejects bare cross-workspace ids', ok, `bare=${bare.status} namespaced=${namespaced.status}`)
+  })
+
   // 193-197. Code fingerprint staleness (T-284): same-version code changes must be visible.
   // A temp copy of index.js + package.json is used through MESH_WAKER_SELF_FILE so the suite
   // never touches the real plugin file.
@@ -5322,26 +5439,31 @@ async function main() {
   }
 }
 
-main()
-  .then(async () => {
-    // If the process still holds server/socket handles after the last case, name them instead
-    // of letting a CI runner hang until its global timeout (T-272). Give closers a moment:
-    // server.closeAllConnections() is async on the socket side.
-    const deadline = Date.now() + 3000
-    let relevant = []
-    for (;;) {
-      const active = typeof process.getActiveResourcesInfo === 'function' ? process.getActiveResourcesInfo() : []
-      relevant = active.filter((name) => /TCPServer|TCPSocket/.test(name))
-      if (relevant.length === 0 || Date.now() >= deadline) break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 25))
-    }
-    if (relevant.length) console.error(`LEFTOVER RESOURCES: ${[...new Set(relevant)].join(',')}`)
-    // A leaked handle must not hang the runner forever: the diagnostics above are the
-    // actionable part, and a non-zero exit still fails CI.
-    const code = process.exitCode ?? (relevant.length ? 1 : 0)
-    setTimeout(() => process.exit(code), 25)
-  })
-  .catch((error) => {
-    console.error(error)
-    process.exitCode = 1
-  })
+if (require.main === module) {
+  main()
+    .then(async () => {
+      // If the process still holds server/socket handles after the last case, name them instead
+      // of letting a CI runner hang until its global timeout (T-272). Give closers a moment:
+      // server.closeAllConnections() is async on the socket side.
+      const deadline = Date.now() + 3000
+      let relevant = []
+      for (;;) {
+        const active = typeof process.getActiveResourcesInfo === 'function' ? process.getActiveResourcesInfo() : []
+        relevant = active.filter((name) => /TCPServer|TCPSocket/.test(name))
+        if (relevant.length === 0 || Date.now() >= deadline) break
+        await new Promise((resolveWait) => setTimeout(resolveWait, 25))
+      }
+      if (relevant.length) console.error(`LEFTOVER RESOURCES: ${[...new Set(relevant)].join(',')}`)
+      // A leaked handle must not hang the runner forever: the diagnostics above are the
+      // actionable part, and a non-zero exit still fails CI.
+      const code = process.exitCode ?? (relevant.length ? 1 : 0)
+      setTimeout(() => process.exit(code), 25)
+    })
+    .catch((error) => {
+      console.error(error)
+      process.exitCode = 1
+    })
+} else {
+  // One-off verification scripts can boot the same harness against real data (T-301).
+  module.exports = { startHarness }
+}
