@@ -61,11 +61,29 @@ Options:
   --repo <path>      repo root used to filter by cwd (default: process.cwd())
   --dry-run          resolve and print the target, send nothing
   -h, --help         show this help
+
+Exit codes:
+  0  success
+  1  general error (network failure, unparsable response, target not found)
+  2  server refused (HTTP 4xx, e.g. 409 task-id conflict) or usage error
 `
 
+class DispatchError extends Error {
+  constructor(message, code = 1) {
+    super(message)
+    this.code = code
+  }
+}
+
 function fail(message, code = 1) {
-  console.error(message)
-  process.exit(code)
+  // Never process.exit() while a fetch body or keep-alive handle is still open:
+  // on Windows that aborts the process with a libuv UV_HANDLE_CLOSING assertion.
+  throw new DispatchError(message, code)
+}
+
+/** HTTP status -> exit code: 4xx means "the server refused", everything else is a general error. */
+function httpCode(status) {
+  return status >= 400 && status < 500 ? 2 : 1
 }
 
 function parseArgs(argv) {
@@ -182,7 +200,7 @@ async function main() {
   }
 
   const response = await fetch(`${BASE}/mesh/sessions`)
-  if (!response.ok) fail(`GET /mesh/sessions -> HTTP ${response.status}`)
+  if (!response.ok) fail(`GET /mesh/sessions -> HTTP ${response.status}`, httpCode(response.status))
   const payload = await response.json()
   if (!payload?.ok) fail(`GET /mesh/sessions -> unexpected body: ${JSON.stringify(payload).slice(0, 300)}`)
 
@@ -249,7 +267,7 @@ async function main() {
     const last = Number(dedupeEntries[dedupeKey] ?? 0)
     if (last && now - last < WAKE_DEBOUNCE_MS) {
       console.log('deduped: same payload within 60s')
-      process.exit(0)
+      return
     }
   }
 
@@ -263,10 +281,13 @@ async function main() {
   try {
     result = JSON.parse(raw)
   } catch {
-    fail(`POST /mesh/inject -> HTTP ${sent.status}: ${raw.slice(0, 300)}`)
+    // 4xx bodies are already fully consumed, so print them verbatim; others are truncated.
+    const shown = sent.status >= 400 && sent.status < 500 ? raw : raw.slice(0, 300)
+    fail(`POST /mesh/inject -> HTTP ${sent.status}: ${shown}`, httpCode(sent.status))
   }
   if (sent.status !== 200 || result.ok === false) {
-    fail(`POST /mesh/inject -> HTTP ${sent.status}: ${raw.slice(0, 300)}`)
+    const shown = sent.status >= 400 && sent.status < 500 ? raw : raw.slice(0, 300)
+    fail(`POST /mesh/inject -> HTTP ${sent.status}: ${shown}`, httpCode(sent.status))
   }
 
   if (dedupeFile && dedupeKey) {
@@ -283,4 +304,12 @@ async function main() {
   )
 }
 
-main().catch((error) => fail(error?.message ?? String(error)))
+main().catch((error) => {
+  if (error instanceof DispatchError) {
+    console.error(error.message)
+    process.exitCode = error.code
+    return
+  }
+  console.error(error?.stack ?? String(error))
+  process.exitCode = 1
+})
