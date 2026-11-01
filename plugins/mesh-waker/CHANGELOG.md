@@ -9,6 +9,15 @@
 
 ---
 
+## v0.7.25（2026-11-01，回执摘要不再包含思考/工具块）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | `messageText()` 的过滤条件是 `part.type === 'text' || typeof part.text === 'string'`，本意兼容无 `type` 的文本块，但 thinking/reasoning 块同样带 `text`；于是内部推理被当成「任务摘要」写进回执，投给了另一个工作区的会话（2026-11-01 T4F-20261101-03 的 `[RECEIPT]` 里出现英文推理原文） |
+| 修法 | 显式排除 `thinking` / `reasoning` / `analysis` / `redacted_thinking` / `tool_use` / `tool_result` / `tool-call` / `tool-result`；只保留 `type==='text'` 与「无 `type` 且带 `text`」的块（老 provider 兼容）；消息本身 `type` 命中排除集时直接返回空。判据：宁可摘要为空（`buildReceipt` 已有兜底），也不把思考当答复 |
+| 测试 | +5（共 148/148）：thinking+text → 只含答复；仅 thinking → 空串；tool_use/tool_result+text → 只含结果；`{text}` 无 type 仍收；多段 text 仍按 `\n` 拼接。既有 143 例全绿 |
+| 未改 | 回执投递逻辑（T-255/T-257）与 `receiptSummaryChars` 截断（300 字）保持不变 |
+
 ## v0.7.24（2026-11-01，回执不再静默丢失 + 工作区推断 + taskId 复用防护）
 
 | 项 | 内容 |

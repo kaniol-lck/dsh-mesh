@@ -3136,6 +3136,54 @@ async function main() {
     report('receipt: a reused taskId is flagged on the row and in the log', ok, `rows=${rows.length} firstReused=${String(pendings[0]?.reusedId)} secondReused=${String(pendings[1]?.reusedId)}`)
   })
 
+  // 144-148. Receipt summaries must contain answers only (T-260): thinking blocks also
+  // carry `text`, and treating them as the answer leaked internal reasoning into receipts.
+  await runCase('receipt: thinking blocks are excluded from the assistant summary', async () => {
+    const { messageText } = await import(pathToFileURL(ENTRY).href)
+    const text = messageText({
+      content: [
+        { type: 'thinking', text: '内部推理：先看看日志' },
+        { type: 'text', text: '答复正文' },
+      ],
+    })
+    const ok = text === '答复正文' && !text.includes('内部推理')
+    report('receipt: thinking blocks are excluded from the assistant summary', ok, `text=${JSON.stringify(text)}`)
+  })
+
+  await runCase('receipt: a message with only thinking yields an empty summary', async () => {
+    const { messageText } = await import(pathToFileURL(ENTRY).href)
+    const text = messageText({ content: [{ type: 'thinking', text: '只有思考' }] })
+    const ok = text === ''
+    report('receipt: a message with only thinking yields an empty summary', ok, `text=${JSON.stringify(text)}`)
+  })
+
+  await runCase('receipt: tool blocks are excluded and a bare text block still answers', async () => {
+    const { messageText } = await import(pathToFileURL(ENTRY).href)
+    const text = messageText({
+      content: [
+        { type: 'tool_use', text: '{"path":"x"}' },
+        { type: 'tool_result', text: 'tool output' },
+        { type: 'text', text: '结果' },
+      ],
+    })
+    const ok = text === '结果'
+    report('receipt: tool blocks are excluded and a bare text block still answers', ok, `text=${JSON.stringify(text)}`)
+  })
+
+  await runCase('receipt: a block with text but no type is still accepted', async () => {
+    const { messageText } = await import(pathToFileURL(ENTRY).href)
+    const text = messageText({ parts: [{ text: '无 type 的文本' }] })
+    const ok = text === '无 type 的文本'
+    report('receipt: a block with text but no type is still accepted', ok, `text=${JSON.stringify(text)}`)
+  })
+
+  await runCase('receipt: multiple text blocks still join with newlines', async () => {
+    const { messageText } = await import(pathToFileURL(ENTRY).href)
+    const text = messageText({ content: [{ type: 'text', text: '第一段' }, { type: 'text', text: '第二段' }] })
+    const ok = text === '第一段\n第二段'
+    report('receipt: multiple text blocks still join with newlines', ok, `text=${JSON.stringify(text)}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

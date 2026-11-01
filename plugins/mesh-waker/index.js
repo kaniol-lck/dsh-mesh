@@ -284,14 +284,39 @@ export function buildReceipt({
   }
 }
 
-/** Plain text of one assistant message: string, {text}, or content/parts parts. */
+/** Content block types that are never an answer: reasoning and tool traffic. */
+const NON_ANSWER_PART_TYPES = new Set([
+  'thinking',
+  'reasoning',
+  'analysis',
+  'redacted_thinking',
+  'tool_use',
+  'tool_result',
+  'tool-call',
+  'tool-result',
+])
+
+/**
+ * Plain text of one assistant message: string, {text}, or content/parts parts.
+ * Only real answer text is collected: thinking/reasoning/analysis and tool blocks also carry
+ * a `text` field, and treating them as the answer leaked internal reasoning into receipts
+ * (T-260). No `type` but `text` is still kept for older providers; everything else is dropped.
+ */
 export function messageText(message) {
   if (!message) return ''
   if (typeof message === 'string') return message.trim()
+  const messageType = typeof message.type === 'string' ? message.type : ''
+  if (NON_ANSWER_PART_TYPES.has(messageType)) return ''
   if (typeof message.text === 'string') return message.text.trim()
   const parts = Array.isArray(message.content) ? message.content : Array.isArray(message.parts) ? message.parts : []
   return parts
-    .filter((part) => part && (part.type === 'text' || typeof part.text === 'string'))
+    .filter((part) => {
+      if (!part) return false
+      const partType = typeof part.type === 'string' ? part.type : ''
+      if (NON_ANSWER_PART_TYPES.has(partType)) return false
+      if (partType === 'text') return true
+      return partType === '' && typeof part.text === 'string'
+    })
     .map((part) => String(part.text ?? ''))
     .join('\n')
     .trim()
