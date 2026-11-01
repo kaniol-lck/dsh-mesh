@@ -80,9 +80,10 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   fs.mkdirSync(tokenDir, { recursive: true })
   fs.mkdirSync(home, { recursive: true })
 
-  const seeded = seedSessions.map((seed) => seedSession(sessionsRoot, seed))
+  const seeded = seedSessions.map((seed) => ({ ...seedSession(sessionsRoot, seed), cwd: seed.cwd ?? null }))
   const sessionIndex = {}
-  for (const seed of seeded) sessionIndex[seed.id] = { mtime: seed.mtime, title: seed.title, cwd: null }
+  // Seed cwd when the case needs workspace-scoped behaviour (e.g. requester inference).
+  for (const seed of seeded) sessionIndex[seed.id] = { mtime: seed.mtime, title: seed.title, cwd: seed.cwd }
   fs.writeFileSync(path.join(tokenDir, 'sessions-index.json'), JSON.stringify(sessionIndex))
   const tokenFile = path.join(tokenDir, 'token')
   if (writeToken) fs.writeFileSync(tokenFile, 'test' + '-token')
@@ -2986,6 +2987,153 @@ async function main() {
       ok,
       `subscribe=${subscribed.status}/${subscribed.json?.subscribedBy ?? '-'} conflict=${conflict.status} release=${released.status} again=${again.status}`,
     )
+  })
+
+  // 139-143. Receipts must never vanish (T-255): file mode logs, the requester can be
+  // inferred from the target's cwd, and a reused taskId is flagged.
+  const fileLogFile = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'waker-file-log-')), 'waker.log')
+  const workspaceCwd = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-cwd-'))
+    const cwd = path.join(root, 'project')
+    fs.mkdirSync(cwd, { recursive: true })
+    return cwd
+  }
+  const settleOnTurn = (h, sessionId, turn = 1) => {
+    h.emit('session/event', { id: sessionId }, { type: 'turn/start', turn })
+    h.emit('session/event', { id: sessionId }, { type: 'turn/end', turn, reason: { kind: 'completed' } })
+  }
+
+  await runCase('receipt: file mode logs the outcome and still does not inject', async (boot) => {
+    const logFile = fileLogFile()
+    const cwd = workspaceCwd()
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-pipeline', title: 'util4freesub · pipeline', cwd },
+        { id: 'session-pipe-coord', title: 'util4freesub · 协调', cwd },
+      ],
+      config: { logFile, receiptMode: 'file', receiptTo: '' },
+    })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute(
+      { target: 'util4freesub · pipeline', text: 'file-mode receipt', taskId: 'T-FILE-1', requester: 'session-pipe-coord' },
+      { sessionId: 'session-pipe-coord' },
+    )
+    settleOnTurn(h, 'session-pipeline')
+    const settled = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-FILE-1')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const log = threadLog(logFile)
+    const fileLine = (log.match(/receipt T-FILE-1 completed → file only[^\n]*/) ?? ['-'])[0]
+    const injectedReceipt = h.state.prompts.some((prompt) => JSON.stringify(prompt).includes('[RECEIPT] T-FILE-1'))
+    const ok = settled?.json?.task?.status === 'settled' && /file only \(requester=有/.test(log) && injectedReceipt === false
+    report('receipt: file mode logs the outcome and still does not inject', ok, `fileLine=${fileLine} injectedReceipt=${injectedReceipt}`)
+  })
+
+  await runCase('receipt: file mode without any target warns that nobody was notified', async (boot) => {
+    const logFile = fileLogFile()
+    const h = await boot({
+      seedSessions: [{ id: 'session-silent', title: 'quiet worker' }],
+      config: { logFile, receiptMode: 'file', receiptTo: '' },
+    })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'quiet worker', text: 'no requester at all', taskId: 'T-SILENT-1' })
+    settleOnTurn(h, 'session-silent')
+    await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-SILENT-1')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const log = threadLog(logFile)
+    const fileLine = (log.match(/receipt T-SILENT-1 completed → file only[^\n]*/) ?? ['-'])[0]
+    const warnLine = (log.match(/WARN receipt T-SILENT-1 has no delivery target; nobody was notified/) ?? ['-'])[0]
+    const ok = /file only \(requester=无/.test(fileLine) && /nobody was notified/.test(warnLine)
+    report('receipt: file mode without any target warns that nobody was notified', ok, `fileLine=${fileLine} warn=${warnLine}`)
+  })
+
+  await runCase('receipt: a missing requester is inferred from the unique coordinator in the same cwd', async (boot) => {
+    const logFile = fileLogFile()
+    const cwd = workspaceCwd()
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-infer-target', title: 'pilot · pipeline', cwd },
+        { id: 'session-infer-coord', title: 'pilot · 协调', cwd },
+      ],
+      config: { logFile, receiptMode: 'file', receiptTo: '' },
+    })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'pilot · pipeline', text: 'infer from workspace', taskId: 'T-INFER-1' })
+    const stored = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-INFER-1')
+      return snapshot.json?.task?.requester ? snapshot : null
+    }, 4000)
+    const log = threadLog(logFile)
+    const ok =
+      stored.json?.task?.requester === 'pilot · 协调' &&
+      stored.json?.task?.requester !== null &&
+      /requester inferred from workspace: pilot · 协调/.test(log)
+    report('receipt: a missing requester is inferred from the unique coordinator in the same cwd', ok, `requester=${JSON.stringify(stored.json?.task?.requester ?? null)} inferredLine=${/requester inferred/.test(log)}`)
+  })
+
+  await runCase('receipt: two coordinators in the same cwd stay ambiguous and are not guessed', async (boot) => {
+    const logFile = fileLogFile()
+    const cwd = workspaceCwd()
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-amb-target', title: 'pilot · pipeline', cwd },
+        { id: 'session-amb-a', title: 'pilot · 协调', cwd },
+        { id: 'session-amb-b', title: 'pilot · coordinator', cwd },
+      ],
+      config: { logFile, receiptMode: 'file', receiptTo: '' },
+    })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'pilot · pipeline', text: 'ambiguous requester', taskId: 'T-AMB-1' })
+    settleOnTurn(h, 'session-amb-target')
+    await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-AMB-1')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const stored = await request(h.base, '/mesh/tasks/T-AMB-1')
+    const log = threadLog(logFile)
+    const ok =
+      stored.json?.task?.requester === null &&
+      /requester inference ambiguous: 2 coordinator sessions share cwd/.test(log) &&
+      /nobody was notified/.test(log)
+    report('receipt: two coordinators in the same cwd stay ambiguous and are not guessed', ok, `requester=${String(stored.json?.task?.requester)} ambiguous=${/requester inference ambiguous: 2/.test(log)} warn=${/nobody was notified/.test(log)}`)
+  })
+
+  await runCase('receipt: a reused taskId is flagged on the row and in the log', async (boot) => {
+    const logFile = fileLogFile()
+    const cwd = workspaceCwd()
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-reuse', title: 'reuse worker', cwd },
+        { id: 'session-reuse-coord', title: 'reuse · 协调', cwd },
+      ],
+      config: { logFile, receiptMode: 'file', receiptTo: '' },
+    })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    if (!tool) throw new Error('mesh_dispatch was not registered')
+    await tool.execute({ target: 'reuse worker', text: 'first use', taskId: 'T-REUSE', requester: 'session-reuse-coord' }, { sessionId: 'session-reuse-coord' })
+    settleOnTurn(h, 'session-reuse')
+    await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-REUSE')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    await tool.execute({ target: 'reuse worker', text: 'second use', taskId: 'T-REUSE', requester: 'session-reuse-coord' }, { sessionId: 'session-reuse-coord' })
+    // Two dispatches append pending+settled each; compare the two pending rows.
+    const rows = readTaskRows(h).filter((row) => row.taskId === 'T-REUSE')
+    const pendings = rows.filter((row) => row.status === 'pending')
+    const log = threadLog(logFile)
+    const ok =
+      pendings.length === 2 &&
+      pendings[0].reusedId === undefined &&
+      pendings[1].reusedId === true &&
+      /WARN taskId T-REUSE reused \(previous settled at /.test(log)
+    report('receipt: a reused taskId is flagged on the row and in the log', ok, `rows=${rows.length} firstReused=${String(pendings[0]?.reusedId)} secondReused=${String(pendings[1]?.reusedId)}`)
   })
 
   const failed = results.filter((result) => !result.ok)

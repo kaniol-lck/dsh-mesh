@@ -227,7 +227,7 @@ npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task --receipt
 
 回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode / baselineTurn / settledTurn / injectedDuringTurn`。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。`baselineTurn`/`settledTurn` 是结算诊断：`queue` 注入发生在回合进行中时 `baselineTurn` 等于该回合，只有更晚回合的 `turn/end` 才会结算（`settledTurn > baselineTurn`），`steer` 则同一回合即可。注入给接收方的正文首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`，第二行是摘要。
 
-**回执投递给谁（0.7.7）**：优先投给**派活方**（requester），否则 `receiptTo`，都没有才只写文件。
+**回执投递给谁（0.7.7 / 0.7.24 收紧）**：优先投给**派活方**（requester），否则 `receiptTo`，都没有才只写文件。0.7.24 起 file 模式也会在 waker 日志留一行 `receipt <id> <status> → file only (requester=有/无, receiptTo=有/无)`；两者都缺时额外写 `WARN … nobody was notified`。requester 缺失时按**目标会话的 cwd** 推断同工作区唯一的协调会话（标题以 `· 协调`/`· coordinator` 结尾）：恰好 1 个才用，0 个或多个不猜（日志写 `requester inference ambiguous`）；**不会**拿全局 `receiptTo` 跨工作区兜底。
 
 1. `requester`（`/mesh/inject` 的 body 字段或 `mesh_dispatch` 的工具参数，CLI `--requester` 会带）解析成功 → 只投给该会话；`mesh_dispatch` 被模型调用时若宿主把调用方 session 传给 handler（`_extra`/第二参数），自动用它；
 2. requester 解析失败 → 记录 `lastError`（`requester not resolved … falling back to receiptTo`）后回退 `receiptTo`；
@@ -245,7 +245,7 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 **存储**（`~/.dsh/mesh-waker/`，0600）：
 
-- `tasks.jsonl`：append-only，一行一条；字段 `taskId / batchId / thread / requester / targetSessionId / targetTitle / subject（正文首行 ≤120 字）/ textBytes / createdAt / deadlineMs / status / startedAt / settledAt / durationMs / receiptRef / receiptSummary / refs[]`；
+- `tasks.jsonl`：append-only，一行一条；字段 `taskId / batchId / thread / requester / targetSessionId / targetTitle / subject（正文首行 ≤120 字）/ textBytes / createdAt / deadlineMs / status / startedAt / settledAt / durationMs / receiptRef / receiptSummary / refs[] / reusedId?`（`reusedId: true` 表示同一 taskId 在 24 小时内重复注册）；
 - 正文 ≤8 KiB 直接存 `text`；>8 KiB 落 `tasks/<taskId>.md`，jsonl 只记 `textPath`；
 - **保留策略**：`tasksRetentionDays`（默认 30 天）与 `tasksMaxRows`（默认 5000 条），启动时按「超龄或超量」裁最旧的，并压实 jsonl（被裁任务的正文文件一并清理）；
 - **正文隐私**：日志只打 `textBytes` 与 `subject`，**从不打印正文**；列表 API 不含正文，只有详情 API 返回全文。

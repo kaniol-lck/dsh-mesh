@@ -9,6 +9,16 @@
 
 ---
 
+## v0.7.24（2026-11-01，回执不再静默丢失 + 工作区推断 + taskId 复用防护）
+
+| 项 | 内容 |
+|---|---|
+| 为什么 | util4freesub 的协调会话用 `/mesh/inject` 派活时没带 `requester`，waker 的 `receiptMode='file'` 且 `receiptTo=''`；`deliverReceipt()` 在 file 分支直接 return，连日志都没有。16.8 秒的 turn 以 `error/SERVER` 结束，派活方**完全不知道**，只能事后翻 `receipts.jsonl`。同一 `T-208` 还在 10-31 用过一次（completed），11-01 又写一条 error，同一 id 两条矛盾记录 |
+| file 模式留痕 | `receiptMode==='file'` 仍不注入，但必写 `receipt <id> <status> → file only (requester=有/无[ (inferred)], receiptTo=有/无)`；既无 requester 也无 receiptTo 时再写 `WARN receipt <id> has no delivery target; nobody was notified` 并记入 `lastError` |
+| 工作区推断 | requester 为空时，按**目标会话 cwd** 找同工作区、标题以 `· 协调` / `· coordinator` 结尾的本地会话：恰好 1 个 → 用它做回执目标（日志 `requester inferred from workspace: <title> (<id>)`，任务行记录该 requester）；0 个 → 不猜，保持 file-only；多个 → 日志 `requester inference ambiguous: N coordinator sessions share cwd …` 且不猜。**不读全局 `receiptTo` 做跨工作区兜底**（一个 waker 可能服务多个仓，pilot 的回执不能投到 dsh-mesh 的协调会话） |
+| taskId 复用 | 注册任务时若同 `taskId` 在 24 小时内已有记录：行上加 `reusedId: true`，写 `WARN taskId <id> reused (previous settled at <iso>)`，**不拒绝**（允许有意重派）；`GET /mesh/tasks` 与详情透出 `reusedId` |
+| 测试 | +5（共 143/143）：file+有 requester 记 `file only` 且不注入；file+无 requester 无 receiptTo 出现 `nobody was notified`；同 cwd 唯一协调会话推断成功并写进任务行；同 cwd 两个协调会话 → `ambiguous` + WARN 且 requester 保持 null；首次使用无 `reusedId`、二次使用有 `reusedId:true` + WARN。既有 138 例全绿 |
+
 ## v0.7.23（2026-11-01，worker 可主动接管/交回线程：`mesh_thread`）
 
 | 项 | 内容 |

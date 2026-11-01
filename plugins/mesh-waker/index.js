@@ -3490,6 +3490,18 @@ export function apply(ctx, config) {
   function recordTaskPending(taskId, target, meta, text, extra = {}) {
     const body = String(text ?? '')
     const textBytes = Buffer.byteLength(body)
+    // Reusing an id is allowed (a deliberate re-dispatch), but never silent: two rows with
+    // contradictory outcomes under one id make reconciliation lie (T-255).
+    const previousRow = taskRows.get(taskId)
+    let reusedId = false
+    if (previousRow && Number.isFinite(Number(previousRow.createdAt))) {
+      const age = Date.now() - Number(previousRow.createdAt)
+      if (age <= 24 * 60 * 60 * 1000) {
+        reusedId = true
+        const settledAt = Number(previousRow.settledAt ?? previousRow.createdAt)
+        fileLog(`WARN taskId ${taskId} reused (previous settled at ${new Date(settledAt).toISOString()})`)
+      }
+    }
     const row = {
       taskId,
       batchId: extra.batchId ?? null,
@@ -3506,6 +3518,7 @@ export function apply(ctx, config) {
       settledAt: null,
       durationMs: null,
       receiptRef: null,
+      ...(reusedId ? { reusedId: true } : {}),
       refs: Array.isArray(meta?.refs)
         ? meta.refs
             .filter((ref) => typeof ref === 'string' && ref.trim())
@@ -3549,6 +3562,7 @@ export function apply(ctx, config) {
       receiptRef: row.receiptRef ?? null,
       receiptSummary: row.receiptSummary ?? null,
       refs: Array.isArray(row.refs) ? row.refs : [],
+      reusedId: row.reusedId === true,
       hasTextFile: Boolean(row.textPath),
     }
     if (!withText) return base
@@ -3563,17 +3577,54 @@ export function apply(ctx, config) {
     return { ...base, text }
   }
 
-  /** Resolve a requester id/title once; a miss falls back to receiptTo with a loud note. */
-  function resolveRequester(raw) {
+  /**
+   * Resolve a requester id/title once. When the dispatcher named nobody, infer a coordinator
+   * from the *target's* cwd (exactly one `· 协调` / `· coordinator` session there). The global
+   * receiptTo is deliberately not consulted: one waker can serve several workspaces, and a
+   * receipt must never cross into another project's coordinator (T-255).
+   */
+  function inferRequesterFromWorkspace(target) {
+    const cwd = String(target?.cwd ?? '').trim()
+    if (!cwd) return { kind: 'no-cwd' }
+    let sessions = []
+    try {
+      sessions = listLocalSessions()
+    } catch {
+      return { kind: 'none' }
+    }
+    const matches = sessions.filter(
+      (session) =>
+        session.id !== target.id &&
+        !session.archived &&
+        String(session.cwd ?? '').trim() === cwd &&
+        /·\s*(协调|coordinator)\s*$/i.test(String(session.title ?? '')),
+    )
+    if (matches.length === 1) return { kind: 'one', session: matches[0] }
+    return { kind: matches.length === 0 ? 'none' : 'ambiguous', candidates: matches, cwd }
+  }
+
+  function resolveRequester(raw, target = null) {
     const requester = String(raw ?? '').trim()
-    if (!requester) return { requester: null, sessionId: null }
+    if (!requester) {
+      const inferred = inferRequesterFromWorkspace(target)
+      if (inferred.kind === 'one') {
+        fileLog(`requester inferred from workspace: ${inferred.session.title} (${inferred.session.id})`)
+        return { requester: inferred.session.title || inferred.session.id, sessionId: inferred.session.id, inferred: true }
+      }
+      if (inferred.kind === 'ambiguous') {
+        fileLog(
+          `requester inference ambiguous: ${inferred.candidates.length} coordinator sessions share cwd ${inferred.cwd}; receipt stays file-only`,
+        )
+      }
+      return { requester: null, sessionId: null, inferred: false }
+    }
     try {
       const target = resolveLocalSession({ session: requester, title: requester })
-      return { requester, sessionId: target.id }
+      return { requester, sessionId: target.id, inferred: false }
     } catch (error) {
       state.lastError = `requester not resolved (${requester}): ${error.message}; falling back to receiptTo`
       fileLog(`requester ${requester} not resolved (${error.message}); receipts fall back to receiptTo`)
-      return { requester, sessionId: null }
+      return { requester, sessionId: null, inferred: false }
     }
   }
 
@@ -3616,7 +3667,18 @@ export function apply(ctx, config) {
   }
 
   async function deliverReceipt(receipt, task) {
-    if (receipt.receiptMode === 'file') return
+    const hasRequester = Boolean(task?.requesterSessionId || task?.requester)
+    if (receipt.receiptMode === 'file') {
+      // File mode never injects, but it must never be silent either (T-255: a 16.8s turn
+      // ended in error and nobody was told because this branch returned without a log line).
+      const requesterLabel = hasRequester ? (task?.requesterInferred ? '有 (inferred)' : '有') : '无'
+      fileLog(`receipt ${receipt.taskId} ${receipt.status} → file only (requester=${requesterLabel}, receiptTo=${c.receiptTo ? '有' : '无'})`)
+      if (!hasRequester && !c.receiptTo) {
+        fileLog(`WARN receipt ${receipt.taskId} has no delivery target; nobody was notified`)
+        state.lastError = `receipt ${receipt.taskId} has no delivery target; nobody was notified`
+      }
+      return
+    }
     const deliveredTo = await deliverNotice(
       receipt.receiptMode,
       receiptBody(receipt),
@@ -3722,11 +3784,12 @@ export function apply(ctx, config) {
       sameTurnInjected = queuedAhead > 0
     }
     // Receipts go back to whoever dispatched the task; receiptTo is only the fallback.
-    const requester = resolveRequester(meta?.requester)
+    const requester = resolveRequester(meta?.requester, target)
     const task = {
       sessionId: target.id,
       requester: requester.requester,
       requesterSessionId: requester.sessionId,
+      requesterInferred: requester.inferred === true,
       injectedAt: Date.now(),
       baselineTurn,
       injectedDuringTurn,
