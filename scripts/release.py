@@ -4,14 +4,16 @@
     python scripts/release.py                 # preflight + npm publish --tag next
     python scripts/release.py --promote       # move the published version to latest
     python scripts/release.py --preflight     # check only, publish nothing
+    python scripts/release.py --check-versions  # version/changelog consistency only
 
 Rules this script enforces (learned the hard way):
   * node --check on both halves of the plugin;
   * the client bundle must resolve its module id from the boot manifest (test/);
   * the secret scan must come back clean;
   * no .npmrc may live inside the repository — npm is pointed at a temp userconfig;
-  * version consistency: HUB_VERSION == hub/package.json, hub/CHANGES has that heading,
-    and the waker CHANGELOG has an entry for the plugin version being released;
+  * version consistency: HUB_VERSION == hub/package.json, hub/CHANGELOG.md has a
+    `## [<version>] - YYYY-MM-DD` section for it, and the waker CHANGELOG has an
+    entry for the plugin version being released;
   * publishing goes to the `next` dist-tag first; `latest` is promoted by hand after the
     local link install has booted once and the plugin was seen working for a turn.
 """
@@ -33,7 +35,7 @@ TEST = ROOT / "test" / "dynamic-id.test.js"
 SECRET_SCAN = ROOT / "scripts" / "check-secrets.py"
 SERVER = ROOT / "hub" / "server.mjs"
 HUB_PKG = ROOT / "hub" / "package.json"
-HUB_CHANGES = ROOT / "hub" / "CHANGES.md"
+HUB_CHANGELOG = ROOT / "hub" / "CHANGELOG.md"
 PLUGIN_CHANGELOG = PLUGIN / "CHANGELOG.md"
 
 
@@ -89,19 +91,24 @@ def version_checks() -> int:
 
     ok = False
     if hub_version:
-        try:
-            changes = HUB_CHANGES.read_text(encoding="utf-8")
-        except OSError as exc:
-            print(f"   FAIL cannot read hub/CHANGES.md: {exc}")
+        if not HUB_CHANGELOG.exists():
+            print("   FAIL MISSING: hub/CHANGELOG.md (required before a release)")
         else:
-            ok = bool(re.search(rf"^## v{re.escape(hub_version)}\b", changes, re.MULTILINE))
-            print(f"   {'PASS' if ok else 'FAIL'} hub/CHANGES.md heading '## v{hub_version}'")
+            try:
+                changelog = HUB_CHANGELOG.read_text(encoding="utf-8")
+            except OSError as exc:
+                print(f"   FAIL cannot read hub/CHANGELOG.md: {exc}")
+            else:
+                ok = bool(re.search(rf"^## \[{re.escape(hub_version)}\](?:\s*-\s*\d{{4}}-\d{{2}}-\d{{2}})?\s*$", changelog, re.MULTILINE))
+                print(f"   {'PASS' if ok else 'FAIL'} hub/CHANGELOG.md heading '## [{hub_version}]'")
+                if not ok:
+                    print(f"   hint: add '## [{hub_version}] - YYYY-MM-DD' above the previous release (the unreleased section is not a release)")
     failures += 0 if ok else 1
 
     waker_pkg = read_json(PLUGIN / "package.json")
     waker_version = waker_pkg.get("version") if isinstance(waker_pkg, dict) else None
     if not PLUGIN_CHANGELOG.exists():
-        print(f"   SKIP {PLUGIN_CHANGELOG.relative_to(ROOT)} 不存在（先补 CHANGELOG）")
+        print(f"   SKIP {PLUGIN_CHANGELOG.relative_to(ROOT).as_posix()} missing (add a CHANGELOG first)")
     elif not waker_version:
         print("   FAIL plugins/mesh-waker/package.json has no version")
         failures += 1
@@ -109,11 +116,13 @@ def version_checks() -> int:
         try:
             changelog = PLUGIN_CHANGELOG.read_text(encoding="utf-8")
         except OSError as exc:
-            print(f"   FAIL cannot read {PLUGIN_CHANGELOG.relative_to(ROOT)}: {exc}")
+            print(f"   FAIL cannot read {PLUGIN_CHANGELOG.relative_to(ROOT).as_posix()}: {exc}")
             failures += 1
         else:
-            ok = bool(re.search(rf"^## v{re.escape(waker_version)}\b", changelog, re.MULTILINE))
-            print(f"   {'PASS' if ok else 'FAIL'} plugins/mesh-waker/CHANGELOG.md heading '## v{waker_version}'")
+            ok = bool(re.search(rf"^## \[{re.escape(waker_version)}\](?:\s*-\s*\d{{4}}-\d{{2}}-\d{{2}})?\s*$", changelog, re.MULTILINE))
+            print(f"   {'PASS' if ok else 'FAIL'} plugins/mesh-waker/CHANGELOG.md heading '## [{waker_version}]'")
+            if not ok:
+                print("   hint: add the released version section before publishing (the unreleased section is not a release)")
             failures += 0 if ok else 1
     return failures
 
@@ -195,10 +204,15 @@ def main(argv=None) -> int:
     parser.add_argument("--tag", default="next", help="dist-tag to publish under (default next)")
     parser.add_argument("--promote", action="store_true", help="point latest at the current version")
     parser.add_argument("--preflight", action="store_true", help="run the gate only")
+    parser.add_argument("--check-versions", action="store_true", help="version/changelog consistency only (no build/test steps)")
     args = parser.parse_args(argv)
 
     if args.promote:
         return promote()
+    if args.check_versions:
+        failures = version_checks()
+        print("\n== version check:", "PASS" if failures == 0 else f"FAIL ({failures})")
+        return 0 if failures == 0 else 1
     if preflight():
         print("\nrelease blocked by preflight")
         return 1
