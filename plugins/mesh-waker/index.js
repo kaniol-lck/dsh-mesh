@@ -276,7 +276,7 @@ export function buildReceipt({
     endedAt: at,
     durationMs: injectedAt ? Math.max(0, at - injectedAt) : null,
     summary: truncateText(summary, summaryChars),
-    source: source === 'declared' ? 'declared' : 'observed',
+    source: source === 'declared' || source === 'resumed' ? source : 'observed',
     receiptMode,
     // Diagnostics: a receipt whose settledTurn equals baselineTurn (queue mode) means the
     // task was injected while that turn was already running — useful when auditing.
@@ -3937,13 +3937,71 @@ export function apply(ctx, config) {
       receiptTimers.delete(task.stallTimer)
       task.stallTimer = null
     }
+    if (task.dormantTimer) {
+      clearTimeout(task.dormantTimer)
+      receiptTimers.delete(task.dormantTimer)
+      task.dormantTimer = null
+    }
+  }
+
+  function discardDormant(taskId) {
+    const task = pendingTasks.get(taskId)
+    if (!task || !task.dormant) return
+    clearPending(task)
+    pendingTasks.delete(taskId)
+    state.pendingTasks = pendingTasks.size
+    fileLog(`task ${taskId} dropped: dormant and the session stayed idle`)
+  }
+
+  /**
+   * Stall watchdog: a queued task behind another running task is not "not-started", it is
+   * simply waiting — re-arm instead of settling it (T-279). A real miss still reports
+   * not-started once, but the task stays dormant so a late turn/start can resume tracking.
+   */
+  function armStallTimer(taskId, task) {
+    const timer = setTimeout(() => {
+      receiptTimers.delete(timer)
+      if (task.settled || task.dormant) return
+      const busy = [...pendingTasks.values()].some(
+        (other) => other !== task && other.sessionId === task.sessionId && !other.settled && Number.isFinite(other.startedAt),
+      )
+      if (busy) {
+        fileLog(`task ${taskId} stall re-armed: another task is still running on ${task.sessionId}`)
+        task.stallTimer = armStallTimer(taskId, task)
+        return
+      }
+      fileLog(`task ${taskId} not-started after ${c.receiptStallMs}ms; kept dormant for resume`)
+      settleTask(taskId, task, {
+        turn: null,
+        status: 'not-started',
+        reasonKind: 'not-started',
+        reasonDetail: `no turn/start within ${c.receiptStallMs}ms`,
+        keepTracking: true,
+      })
+      if (task.settled) return
+      task.dormant = true
+      task.dormantSince = Date.now()
+      const drop = setTimeout(() => discardDormant(taskId), c.receiptStallMs)
+      drop.unref?.()
+      receiptTimers.add(drop)
+      task.dormantTimer = drop
+    }, c.receiptStallMs)
+    timer.unref?.()
+    task.stallTimer = timer
+    receiptTimers.add(timer)
+    return timer
   }
 
   function settleTask(taskId, task, details) {
     if (!task || task.settled) return null
-    task.settled = true
+    // A not-started receipt is advisory: the task may still run later, so keep it in
+    // pendingTasks (dormant) instead of deleting the only tracking record (T-279).
+    const keepTracking = details.keepTracking === true
+    if (!keepTracking) {
+      task.settled = true
+      pendingTasks.delete(taskId)
+    }
     clearPending(task)
-    pendingTasks.delete(taskId)
     const shot = assistantText.get(task.sessionId)
     // Turn numbers advance out of step between assistant/message and turn/end, so equality
     // alone can attach a previous turn's prose to this task (T-267). The snapshot must also
@@ -3970,7 +4028,7 @@ export function apply(ctx, config) {
       baselineTurn: task.baselineTurn ?? null,
       settledTurn: details.turn ?? null,
       injectedDuringTurn: task.injectedDuringTurn === true,
-      source: details.source ?? 'observed',
+      source: details.source ?? task.source ?? 'observed',
     })
     writeReceiptFile(receipt)
     // Registry status mirrors the receipt: not-started is the stall path, everything else
@@ -3991,7 +4049,7 @@ export function apply(ctx, config) {
     void deliverReceipt(receipt, task).catch((error) => {
       fileLog(`receipt ${taskId} delivery crashed: ${error && error.message ? error.message : error}`)
     })
-    updateBatchTask(taskId, receipt)
+    if (!keepTracking) updateBatchTask(taskId, receipt)
     return receipt
   }
 
@@ -4059,19 +4117,8 @@ export function apply(ctx, config) {
       // Persist the actual mode so a restart can still notify the dispatcher (T-273).
       receiptMode,
     })
-    const timer = setTimeout(() => {
-      receiptTimers.delete(timer)
-      if (task.settled) return
-      settleTask(taskId, task, {
-        turn: null,
-        status: 'not-started',
-        reasonKind: 'not-started',
-        reasonDetail: `no turn/start within ${c.receiptStallMs}ms`,
-      })
-    }, c.receiptStallMs)
-    timer.unref?.()
+    const timer = armStallTimer(taskId, task)
     task.stallTimer = timer
-    receiptTimers.add(timer)
     fileLog(
       `task ${taskId} pending on ${target.id} baselineTurn=${task.baselineTurn ?? 'unknown'} duringTurn=${injectedDuringTurn} mode=${task.mode} receipt=${receiptMode} requester=${task.requester ?? '-'}${batchId ? ` batch=${batchId}` : ''}`,
     )
@@ -4167,13 +4214,27 @@ export function apply(ctx, config) {
           // configured window after injection, then record the baseline so settlement and
           // later turns behave like the normal path. Outside the window: never invent
           // progress (the task stays pending/stalled).
+          const resumed = task.dormant === true
           const withinWindow =
             Number.isFinite(task.injectedAt) && now - task.injectedAt <= c.startedClaimWindowMs
-          const ownsTurn =
-            task.baselineTurn !== null
+          const ownsTurn = resumed
+            ? turn !== null &&
+              (task.baselineTurn === null ||
+                (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn))
+            : task.baselineTurn !== null
               ? turn !== null && (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn)
               : turn !== null && withinWindow
           if (!ownsTurn) continue
+          if (resumed) {
+            task.dormant = false
+            task.source = 'resumed'
+            if (task.dormantTimer) {
+              clearTimeout(task.dormantTimer)
+              receiptTimers.delete(task.dormantTimer)
+              task.dormantTimer = null
+            }
+            fileLog(`task ${taskId} resumed at turn=${turn} (not-started was advisory)`)
+          }
           if (task.baselineTurn === null) {
             // A queued task owns strictly later turns; the claim turn itself is the start.
             task.baselineTurn = turn - 1

@@ -782,7 +782,13 @@ async function main() {
     await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'stall target', text: 'never starts', meta: { taskId: 'T-stall' } } })
     const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-stall'), 4000)
     const status = await request(h.base, '/mesh/status')
-    const ok = Boolean(receipt) && receipt.status === 'not-started' && receipt.reasonKind === 'not-started' && /receiptStallMs|1000ms/.test(receipt.reasonDetail ?? '') && status.json?.pendingTasks === 0
+    const ok =
+      Boolean(receipt) &&
+      receipt.status === 'not-started' &&
+      receipt.reasonKind === 'not-started' &&
+      /receiptStallMs|1000ms/.test(receipt.reasonDetail ?? '') &&
+      // 0.7.31: the miss is advisory — the task stays dormant so a late turn can resume it.
+      status.json?.pendingTasks === 1
     report('receipt: stalled task becomes not-started', ok, `status=${receipt?.status ?? '-'} detail=${receipt?.reasonDetail ?? '-'} pending=${status.json?.pendingTasks}`)
   })
 
@@ -3739,6 +3745,103 @@ async function main() {
       declared === '[RECEIPT] T-NOTICE-D completed 1234ms (declared)' &&
       observed === '[RECEIPT] T-NOTICE-O completed 300100ms (observed)'
     report('complete: the receipt notice marks declared and observed sources', ok, `declared=${JSON.stringify(declared)} observed=${JSON.stringify(observed)}`)
+  })
+
+  // 180-185. A queued task must not be killed by the stall watchdog (T-279): re-arm while
+  // another task runs, and keep a reported task dormant so a late turn can resume it.
+  const stallConfig = { receiptStallMs: 1000, receiptMode: 'file' }
+  const pendingCount = async (h) => (await request(h.base, '/mesh/status')).json?.pendingTasks ?? -1
+
+  await runCase('stall: a queued task behind a running one is re-armed, not reported', async (boot) => {
+    const logFile = fileLogFile()
+    const h = await boot({ seedSessions: [{ id: 'session-queue', title: 'queue target' }], config: { ...stallConfig, logFile } })
+    await dispatchTo(h, 'queue target', 'first long task', 'T-QA')
+    h.emit('session/event', { id: 'session-queue' }, { type: 'turn/start', turn: 1 })
+    await dispatchTo(h, 'queue target', 'queued behind first', 'T-QB')
+    await sleep(1300)
+    const receipts = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-QB')
+    const log = threadLog(logFile)
+    const stillPending = await pendingCount(h)
+    const ok =
+      receipts.length === 0 &&
+      /task T-QB stall re-armed: another task is still running on session-queue/.test(log) &&
+      stillPending === 2
+    report('stall: a queued task behind a running one is re-armed, not reported', ok, `receipts=${receipts.length} pending=${stillPending} rearmed=${/T-QB stall re-armed/.test(log)}`)
+  })
+
+  await runCase('stall: the queued task starts after the first finishes and settles normally', async (boot) => {
+    const logFile = fileLogFile()
+    const h = await boot({ seedSessions: [{ id: 'session-queue2', title: 'queue2 target' }], config: { ...stallConfig, logFile } })
+    await dispatchTo(h, 'queue2 target', 'first task', 'T-QC')
+    h.emit('session/event', { id: 'session-queue2' }, { type: 'turn/start', turn: 1 })
+    await dispatchTo(h, 'queue2 target', 'second task', 'T-QD')
+    h.emit('session/event', { id: 'session-queue2' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    h.emit('session/event', { id: 'session-queue2' }, { type: 'turn/start', turn: 2 })
+    h.emit('session/event', { id: 'session-queue2' }, { type: 'turn/end', turn: 2, reason: { kind: 'completed' } })
+    const settled = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-QD')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const receipts = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-QD')
+    const notStarted = receipts.filter((receipt) => receipt.status === 'not-started').length
+    const ok = settled?.json?.task?.status === 'settled' && receipts.length === 1 && receipts[0].status === 'completed' && notStarted === 0
+    report('stall: the queued task starts after the first finishes and settles normally', ok, `status=${settled?.json?.task?.status ?? '-'} receipts=${receipts.length} notStarted=${notStarted}`)
+  })
+
+  await runCase('stall: a genuinely silent session still gets not-started', async (boot) => {
+    const logFile = fileLogFile()
+    const h = await boot({ seedSessions: [{ id: 'session-silent-stall', title: 'silent target' }], config: { ...stallConfig, logFile } })
+    await dispatchTo(h, 'silent target', 'nobody will run this', 'T-NS')
+    const receipt = await waitFor(() => orphanReceipts(h).find((entry) => entry.taskId === 'T-NS'), 4000)
+    const ok = receipt?.status === 'not-started' && /task T-NS not-started after 1000ms/.test(threadLog(logFile))
+    report('stall: a genuinely silent session still gets not-started', ok, `status=${receipt?.status ?? '-'}`)
+  })
+
+  await runCase('stall: a reported task resumes on a late turn and settles with source=resumed', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-resume', title: 'resume target' }], config: stallConfig })
+    await dispatchTo(h, 'resume target', 'runs much later', 'T-RES')
+    await waitFor(() => orphanReceipts(h).find((entry) => entry.taskId === 'T-RES' && entry.status === 'not-started'), 4000)
+    h.emit('session/event', { id: 'session-resume' }, { type: 'turn/start', turn: 5 })
+    h.emit('session/event', { id: 'session-resume' }, { type: 'turn/end', turn: 5, reason: { kind: 'completed' } })
+    const settled = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-RES')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const receipts = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-RES')
+    const notStarted = receipts.filter((receipt) => receipt.status === 'not-started')
+    const completed = receipts.filter((receipt) => receipt.status === 'completed')
+    const ok =
+      settled?.json?.task?.status === 'settled' &&
+      notStarted.length === 1 &&
+      completed.length === 1 &&
+      completed[0].source === 'resumed'
+    report('stall: a reported task resumes on a late turn and settles with source=resumed', ok, `notStarted=${notStarted.length} completed=${completed.length} source=${completed[0]?.source ?? '-'}`)
+  })
+
+  await runCase('stall: a dormant task is dropped after the session stays idle', async (boot) => {
+    const logFile = fileLogFile()
+    const h = await boot({ seedSessions: [{ id: 'session-dormant', title: 'dormant target' }], config: { ...stallConfig, logFile } })
+    await dispatchTo(h, 'dormant target', 'never resumes', 'T-DORM')
+    await waitFor(() => orphanReceipts(h).find((entry) => entry.taskId === 'T-DORM' && entry.status === 'not-started'), 4000)
+    const afterReport = await pendingCount(h)
+    await sleep(1300)
+    const afterIdle = await pendingCount(h)
+    const ok = afterReport === 1 && afterIdle === 0 && /task T-DORM dropped: dormant and the session stayed idle/.test(threadLog(logFile))
+    report('stall: a dormant task is dropped after the session stays idle', ok, `pendingAfterReport=${afterReport} pendingAfterIdle=${afterIdle}`)
+  })
+
+  await runCase('stall: a task that starts immediately is unchanged', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-fast', title: 'fast target' }], config: stallConfig })
+    await dispatchTo(h, 'fast target', 'starts at once', 'T-FAST')
+    h.emit('session/event', { id: 'session-fast' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-fast' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const settled = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-FAST')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const receipts = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-FAST')
+    const ok = settled?.json?.task?.status === 'settled' && receipts.length === 1 && receipts[0].status === 'completed' && receipts[0].source === 'observed'
+    report('stall: a task that starts immediately is unchanged', ok, `status=${settled?.json?.task?.status ?? '-'} receipts=${receipts.length}`)
   })
 
   const failed = results.filter((result) => !result.ok)
