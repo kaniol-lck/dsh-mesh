@@ -22,6 +22,7 @@
     "cordis.bundle.yml",
     "cordis.patch.example.yml",
     "README.md",
+    "CHANGELOG.md",
     "locale/*.json",
     "icon.svg"
   ],

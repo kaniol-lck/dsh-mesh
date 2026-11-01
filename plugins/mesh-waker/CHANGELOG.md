@@ -1,467 +1,139 @@
-# 变更记录
-
-本文件记录 `dsh-mesh-waker` 的变更。格式仿 `hub/CHANGES.md`：每节写清改了什么、怎么复验。
-
-> **发版状态**：最新发布为 `0.5.6`（`npm dist-tags` 的 `latest` 与 `next` 均指向它，tag 与 GitHub Release 已建）。
-> `0.5.5` 未单独发布（版本号跳过）；后续发版由维护者通过 `scripts/release.py` 执行（先 `next`，验证后 `--promote`）。
-
-复验方式：`node test/dynamic-id.test.js`（客户端 id 解析）、`node test/waker-endpoints.test.js`（本机会话端点 + 激活矩阵 + 回执 + 批次/liveness + 真实事件信封 + 标题解析 + `mesh_dispatch`/CLI 参数 + 结算基线 + 主题路由 + 远程审批 + 提问桥 + status 待办字段 + 桥会话预留 + 分页/日志 + 归档面板/残留清理 + 回执按 requester 路由 + 工具注册自检 + 内联截断/接缝状态）。
-
----
-
-## v0.7.30（2026-11-01，重启补发的 `lost` 回执真正投给等待方）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | 0.7.26 的启动孤儿检测生效了（`marked lost` + 生成回执），但回执日志是 `lost → file only`：`recordTaskPending` 从来没把 `receiptMode` 写进任务行，恢复逻辑只能回落全局 `c.receiptMode`（`file`）。原本 `receipt=queue` 的派活方仍然收不到通知——检测到了却没人知道 |
-| 修法 | ① 注册任务时把**实际生效**的 receiptMode（批次覆盖 / `meta.receipt` / 全局配置）写进任务行；② 启动扫孤儿时若行内没有该字段：有 requester → 按 `queue` 处理（对方明确指定了收件人，就该通知到），无 requester → 保持 `file`；③ 回执通知格式不变（0.7.28 的状态行规则） |
-| 测试 | +4（共 166/166）：任务行记录 `receiptMode=queue`（配置 queue）；孤儿行 `receiptMode=queue` + 全局 file → 仍注入给 requester；老行无字段但有 requester → 按 queue 注入；老行无 requester → file only、回执行记 `receiptMode=file`、零注入。既有 162 例全绿 |
-| 真机 | 本机 `T4F-20261101-07` 已在 05:29 被上一版消费为 `lost`（行内 `receiptMode=null`），无法再次验证；下次重启请用一条新孤儿验证（日志应为 `delivered to session-…`，不再是 `file only`） |
-
-## v0.7.29（2026-11-01，测试套件偶发挂死/静默 exit=1）
-
-| 项 | 内容 |
-|---|---|
-| 症状 | 同一命令 3 次里 1 次 exit=1 且**没有** `FAIL` / `N/M passed`；5 连跑时整体 13 分钟不结束（不是断言失败，是进程中途崩或挂着不退出） |
-| 根因 | ① 插件 dispose 只调 `server.close()`：keep-alive 客户端连接会让 close 一直等、监听句柄不释放，事件循环不退出（CI runner 被占死）；② 启动对账 `void reconcileOrphanTasks()` 与结算里的 `void deliverReceipt()` 是 fire-and-forget，一旦 reject 就是**未处理拒绝**，Node 直接退出 → 没有汇总行；③ 测试用 `fetch`（undici 连接池，默认 keep-alive）复用连接，进一步拖住 server.close |
-| 修复 | ① dispose 里 `server.close()` 后补 `server.closeAllConnections?.()`；② 两处 fire-and-forget 都加 `.catch` 写 waker 日志；③ 测试 `request()` 一律发 `connection: close`，每个 harness 的 server 不再被连接池拖住；④ 测试末尾诊断 `process.getActiveResourcesInfo()`（等 3 秒排空后仍残留才报），并注册 `unhandledRejection` 处理：记 stderr + `exitCode=1`，不再静默猝死 |
-| 验证 | 修复后连续 5 次 `node test/waker-endpoints.test.js`：`exit=0`、`162/162 passed`、每次 38–40s（跑两轮共 10 次全部一致）；`node --test --test-timeout=60000 test/waker-endpoints.test.js` → `✔ 1 test / pass 1 / fail 0`、40s，无超时、无 `LEFTOVER RESOURCES` |
-| CI | 建议 docs 在 `.github/workflows/plugin-check.yml` 的 test 步骤加 `--test-timeout=60000`（当前命令 `node --test test/*.test.js test/*.test.mjs` 无超时，挂死会占满 runner）；本单未改 CI 文件 |
-
-## v0.7.28（2026-11-01，注入的回执通知只发状态行，治「对刷回执」的病根）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | `receiptMode=queue` 时注入的通知是「状态行 + 最多 300 字摘要」，回执长得像一封回信；两个协调会话 15 分钟内刷出 35 条任务 / 18 条回执 / 63KB 正文（平均 26 秒一条）。规则层已写「回执不是对话轮次」，机制层还没跟上 |
-| 修法 | 新增导出纯函数 `receiptNoticeText(receipt, { includeSummary })`：默认只输出 `[RECEIPT] <id> <status> <durationMs>ms` 一行；`status ∈ {error, lost}` 始终附一行 `reasonDetail`（空白折叠、≤120 字截断，供处置）；`includeSummary: true` 恢复旧的「状态行 + 摘要」 |
-| 配置 | 新增 `receiptNoticeSummary: false`（老配置缺失即新行为）；`cordis.patch.example.yml` 与 README 配置表已同步 |
-| 不变 | 摘要仍完整写入 `receipts.jsonl`；任务 API / 面板 / 批次回执不受影响；T-255/T-257/T-260/T-265/T-267 逻辑未动 |
-| 测试 | +5（共 162/162）：completed 只发状态行且 `indexOf(summary)===-1`；error 恰好附一行 reasonDetail；lost 带原因且不带旧摘要；`includeSummary:true` 恢复旧文本；空摘要不产生空行。既有 157 例全绿 |
-
-## v0.7.27（2026-11-01，回执摘要不再抓上一个回合的正文）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | 摘要归属只看回合号：`assistant/message` 与 `turn/end` 两侧的回合号推进并不同步；pilot 的 `T4F-20261101-08` 要的是一行标记，回执却抓到了**注入前**写下的「验收成立，接下来等三单收尾。…」。回合号相等 ≠ 文本属于本任务 |
-| 修法 | `assistantText` 快照增加 `at: Date.now()`；`settleTask()` 采用摘要必须同时满足两道：① 回合号匹配（保留原判断）；② `shot.at >= task.injectedAt`（文本写于注入之后）。任一不满足 → `summary=''`（宁可空，不引用注入前文本） |
-| 测试 | +4（共 157/157）：注入前文本（回合号恰好相同）→ 摘要空；注入后同回合文本 → 正常取用；注入后但回合号不一致 → 仍空；无快照 → 空。既有 153 例全绿 |
-| 边界 | 未动 T-265 的启动孤儿对账；未改回执投递逻辑与截断口径 |
-
-## v0.7.26（2026-11-01，重启不再留下无声的孤儿任务：启动对账补发 `lost`）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | 待办任务只在内存 `pendingTasks` 里；宿主重启清空内存，但 `tasks.jsonl` 留下 `status=started` / `settledAt=null` 的孤儿行（2026-11-01 本机 `T4F-20261101-07` 实证）。派活方永等不到回执，且无法区分「还在跑」与「已经丢了」；日志里也毫无异常 |
-| 修法 | 启动加载任务库后**一次性**对账（不进定时器）：按 taskId 取最后一行，`status ∈ {pending, started}` 且 `settledAt == null` 的判为上一进程的孤儿；逐条 `updateTaskRow({status:'lost', settledAt, reasonKind:'lost', reasonDetail:'host restart', receiptSummary})`，写一条 `status=lost` 回执（摘要 `session restarted before this task finished; resend if still needed`），并 `fileLog('task <id> marked lost after restart (requester=有/无)')`。requester 缺失时沿用 0.7.24 的 cwd 推断：唯一协调会话才投，歧义则 file-only（`delivery skipped`），不猜 |
-| 边界 | 只跑一个进程生命周期一次；`done`/`error`/`lost` 等已结束行不动、不补发；已 settled 的任务不回头补回执；回执文件格式与 0.7.24 投递/推断逻辑均未改（只调用） |
-| 测试 | +5（共 153/153）：pending+started 孤儿都变 `lost` 且各一条 `lost` 回执（摘要匹配）；`error` 行不动且零回执；有 requester 的孤儿回执投给该会话；无 requester 同 cwd 唯一协调会话 → 推断投递；同 cwd 两个协调会话 → `ambiguous`、回执落文件、不投递不报错。既有 148 例全绿（列表筛选夹具改用已有 `lost` 行以适配启动对账） |
-
-## v0.7.25（2026-11-01，回执摘要不再包含思考/工具块）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | `messageText()` 的过滤条件是 `part.type === 'text' || typeof part.text === 'string'`，本意兼容无 `type` 的文本块，但 thinking/reasoning 块同样带 `text`；于是内部推理被当成「任务摘要」写进回执，投给了另一个工作区的会话（2026-11-01 T4F-20261101-03 的 `[RECEIPT]` 里出现英文推理原文） |
-| 修法 | 显式排除 `thinking` / `reasoning` / `analysis` / `redacted_thinking` / `tool_use` / `tool_result` / `tool-call` / `tool-result`；只保留 `type==='text'` 与「无 `type` 且带 `text`」的块（老 provider 兼容）；消息本身 `type` 命中排除集时直接返回空。判据：宁可摘要为空（`buildReceipt` 已有兜底），也不把思考当答复 |
-| 测试 | +5（共 148/148）：thinking+text → 只含答复；仅 thinking → 空串；tool_use/tool_result+text → 只含结果；`{text}` 无 type 仍收；多段 text 仍按 `\n` 拼接。既有 143 例全绿 |
-| 未改 | 回执投递逻辑（T-255/T-257）与 `receiptSummaryChars` 截断（300 字）保持不变 |
-
-## v0.7.24（2026-11-01，回执不再静默丢失 + 工作区推断 + taskId 复用防护）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | util4freesub 的协调会话用 `/mesh/inject` 派活时没带 `requester`，waker 的 `receiptMode='file'` 且 `receiptTo=''`；`deliverReceipt()` 在 file 分支直接 return，连日志都没有。16.8 秒的 turn 以 `error/SERVER` 结束，派活方**完全不知道**，只能事后翻 `receipts.jsonl`。同一 `T-208` 还在 10-31 用过一次（completed），11-01 又写一条 error，同一 id 两条矛盾记录 |
-| file 模式留痕 | `receiptMode==='file'` 仍不注入，但必写 `receipt <id> <status> → file only (requester=有/无[ (inferred)], receiptTo=有/无)`；既无 requester 也无 receiptTo 时再写 `WARN receipt <id> has no delivery target; nobody was notified` 并记入 `lastError` |
-| 工作区推断 | requester 为空时，按**目标会话 cwd** 找同工作区、标题以 `· 协调` / `· coordinator` 结尾的本地会话：恰好 1 个 → 用它做回执目标（日志 `requester inferred from workspace: <title> (<id>)`，任务行记录该 requester）；0 个 → 不猜，保持 file-only；多个 → 日志 `requester inference ambiguous: N coordinator sessions share cwd …` 且不猜。**不读全局 `receiptTo` 做跨工作区兜底**（一个 waker 可能服务多个仓，pilot 的回执不能投到 dsh-mesh 的协调会话） |
-| taskId 复用 | 注册任务时若同 `taskId` 在 24 小时内已有记录：行上加 `reusedId: true`，写 `WARN taskId <id> reused (previous settled at <iso>)`，**不拒绝**（允许有意重派）；`GET /mesh/tasks` 与详情透出 `reusedId` |
-| 测试 | +5（共 143/143）：file+有 requester 记 `file only` 且不注入；file+无 requester 无 receiptTo 出现 `nobody was notified`；同 cwd 唯一协调会话推断成功并写进任务行；同 cwd 两个协调会话 → `ambiguous` + WARN 且 requester 保持 null；首次使用无 `reusedId`、二次使用有 `reusedId:true` + WARN。既有 138 例全绿 |
-
-## v0.7.23（2026-11-01，worker 可主动接管/交回线程：`mesh_thread`）
-
-| 项 | 内容 |
-|---|---|
-| 任务头带 thread | `withTaskHeader()` 输出改为 `[TASK <id> · THREAD <id\|-> · BATCH <id\|-> · FROM <requester>] <时间>`：带 thread 时写线程 id，不传稳定写 `-`（派活/注入两条路径都传 thread） |
-| 新工具 `mesh_thread` | 一个工具三个动作（schema 只用单类型）：`list`（`scope=mine` 默认 / `all`）、`subscribe`（把**调用方会话**绑到线程；已被别的会话占用 → 拒绝并报占用者，不抢）、`release`（只有当前绑定者能解绑；解绑即从 `threads.json` 移除，之后不带 target 的派活报 `unknown thread` = 交回协调）。调用方会话取自宿主 caller（`extra.agent.id`/`sessionId`），拿不到明确报错，不猜默认会话 |
-| 绑定来源 | `threads.json` 每条新增 `subscribedBy`（`dispatch` / `self`，旧文件按 `dispatch` 兼容）；`GET /mesh/threads` 每条返回 `subscribedBy` 与 `taskIds[]` |
-| HTTP 对账 | 新增 loopback `POST /mesh/threads/subscribe`、`POST /mesh/threads/release`（body `{thread, sessionId}`），与工具共用 `subscribeThread`/`releaseThread` |
-| 回执 | 仍按 `requester` 返回，未改动；任务头变化只影响首行，正文逐字不变 |
-| 测试 | +6（共 138/138）：任务头含 `THREAD TH-HDR` 与 `THREAD -`；worker 订阅后 `/mesh/threads` 显示 `self`+targetTitle；被他人占用时拒绝且错误带占用者；非绑定者 release 被拒、绑定者 release 后不再列出；解绑后不带 target 派活报 `unknown thread` 且零投递；HTTP subscribe/release 与工具同规则（冲突 400、二次 release 400）。原 132 例全绿 |
-
-## v0.7.22（2026-11-01，`baselineTurn=null` 的任务也能标 `started`）
-
-| 项 | 内容 |
-|---|---|
-| 根因 | `turn/start` 的 `ownsTurn` 要求 `task.baselineTurn !== null`。注入瞬间插件还没有回合信息时 `baselineTurn` 为 null，于是即使回合真的开始了也永远不写 `started`/`startedAt`：任务在 `/mesh/status.pendingTaskList` 与 `/mesh/tasks` 里一直显示 `pending`，而被 task-audit 的「pending 超 30 分钟」判成长尾误报。T-248 期间实测 `turn/start turn=58` 已触发但 `startedAt` 为空 |
-| 修法 | `baselineTurn` 为 null 时给一个保守认领窗口：`turn/start` 距 `task.injectedAt` ≤ `startedClaimWindowMs`（默认 30000，可配置 1000–300000）才认领；认领时把 `baselineTurn` 补记为 `turn - 1`，让结算/后续回合与正常路径一致。超窗不认领（保持「不得凭空造进度」） |
-| 测试 | +2（共 132/132）：null baseline + 5 秒内 `turn/start` → `started` + `startedAt` 非空、`turn/end` 正常 `settled`、日志含 `claimed null baseline … baselineTurn=0`；把窗口设为 1000ms、等 1300ms 后 `turn/start` → 仍 `pending`、`startedAt=null`、日志无认领记录。原 130 例全绿 |
-| 边界 | 未动 `task-audit`（ops 的）与 thread 逻辑（0.7.21）；新增配置 docs 已写入 README 参数表 |
-
-## v0.7.21（2026-11-01，派活线程身份：`thread` 参数 + 续派 + `/mesh/threads`）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | 派活是一次性注入，同一件事补一句只能新开一单，worker 看到两条互不相关的任务；协调会话 10 小时派 12 单里至少 3 组本属同一线索，全靠人脑记 |
-| `thread` 参数 | `mesh_dispatch` 新增可选 `thread`（≤128 UTF-8 字节，`normalizeThread()` 校验）；`target` 从必填改为「target 或已知 thread 二选一」，不传 thread 时行为完全不变（`required` 数组只剩 `text`） |
-| 任务记录 | `tasks.jsonl` / `GET /mesh/tasks` 每条新增 `thread`（未传为 `null`）；任务详情同样返回 |
-| 绑定文件 | `~/.dsh/mesh-waker/threads.json`（0600，原子写）：`{ "TH-1": { targetSessionId, targetTitle, lastTaskId, count, updatedAt } }`；只在**成功投递**后写，失败不写 |
-| 续派 | 不传 `target` 时从 `threads.json` 解析目标并投递；未知 thread **直接报错**并列出已知 thread（`unknown thread "TH-x"; pass target to create it (known threads: …)`），不猜、不回落到默认会话；显式 `target` 以 target 为准并**重新绑定**，日志写 `thread TH-x rebound: <old> -> <new>` |
-| `GET /mesh/threads` | loopback-only，返回 `{ ok, total, threads: [{ thread, targetSessionId, targetTitle, count, lastTaskId, updatedAt, taskIds[] }] }`，`taskIds` 从任务库派生（按 createdAt 升序） |
-| 回执 | 沿用原 `requester` 机制，未改动；续派任务仍回执给派活方 |
-| 测试 | +5（共 130/130）：续派命中（两条都进同一会话、thread 落库、requester 正确、日志含 `via-thread`）；未知 thread 报错且零投递；不传 thread 保持 `thread: null` 且不建 threads.json；显式 target 改绑并写日志；`/mesh/threads` 输出形状（count/targetTitle/taskIds）。原 125 例全绿 |
-
-## v0.7.20（2026-10-31，修 output schema 的 type 数组，mesh_dispatch 才能注册；**需重启宿主生效**）
-
-| 项 | 内容 |
-|---|---|
-| 根因 | `/mesh/status.toolsError` 原文：`dispatch: unsupported JSON schema: schema.properties.title.type must be a single type string (type arrays are not supported); schema.properties.batchId.type …`。宿主只接受**单标量 type**、`oneOf`、object properties/required、array items、标量 enum/const 与注解，`type: ['string','null']` 虽合法但不在子集内 → `defineTool` 抛错，重试 5 次也只是重试同一个非法定义 |
-| 修法 | `DISPATCH_OUTPUT.title/batchId` 改为宿主支持的 `oneOf: [{type:'string'},{type:'null'}]`（宿主子集明确支持 exact-one `oneOf`）；`ASK_OUTPUT` 本就没有 type 数组，保持不变；两个 output schema 从 apply 内提升到模块级并导出，便于测试 |
-| 防复发 | 新增导出纯函数 `validateToolSchema(definition)`，按宿主子集校验（禁止 type 数组、禁止 anyOf 等子集外关键字、要求 object root 等），返回 `{ok, issues}`；测试对 dispatch/ask 两个定义各跑一遍，并断言 type 数组/anyOf 被拒且错误措辞含 `type arrays are not supported` |
-| 验证 | 重启宿主后预期：`/mesh/status.tools.dispatch=true`、`toolsError=null`，日志出现 `registered tool mesh_dispatch`（本单未重启，协调会话负责） |
-| 测试 | +2（共 125/125）：两个 output schema 通过宿主子集校验；`type: ['string','null']` 与 `anyOf` 被 `validateToolSchema` 拒绝。既有 123 例全绿 |
-
-## v0.7.19（2026-10-31，两个「打开任务面板」入口真跳转；**需重启宿主生效**）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | 右栏 tab 与设置页的「打开任务面板/去任务面板」点了毫无反应：前者只静默写剪贴板，后者只 `setNote` 且该区域不渲染 note |
-| 探测 | 宿主 `ctx.layout` 提供 `selectPanel(id)`（`main` 槽位注册表的 key 选择，宿主文档原文：`selectPanel(id)` checks the live `main` registry before changing selection; `beginNavigation()` returns an abort signal…）；我们的 main 面板 key 是 `mesh-inbox` |
-| 方案 1（采用） | 新增共享 tab store（`inboxTab` + `subscribeInboxTab`）与 `requestTasksPanel()`：先置任务 tab，再 `ctx.layout.selectPanel('mesh-inbox')`；返回 `ok / failed / no-layout`。右栏按钮与设置页按钮都调用它，并根据结果在**按钮附近**渲染可见反馈（右栏组件内 feedback 行、设置页 note 行） |
-| 依赖 | client 运行时 `inject` 增加 `layout`；`dsh.client.inject` 增加 `@deepseek-ai/dsh-client-ui-layout`（仍**需重启宿主**才生效） |
-| 兜底 | 右栏额外提供「复制入口」按钮并显示复制结果；`no-layout`/`failed` 两种情况文案明确写出「宿主导航不可用/切换失败」，不再无声 |
-| 测试 | +1（共 123/123）：静态断言 `selectPanel('mesh-inbox')`、`layout` 注入、package inject 含 ui-layout、两个入口都调用 `requestTasksPanel`（≥3 处引用）。既有 122 例全绿 |
-
-## v0.7.18（2026-10-31，声明 ui-workspace 依赖，「打开会话」真跳转；**需重启宿主生效**）
-
-| 项 | 内容 |
-|---|---|
-| 根因（协调会话从 asar 核实） | `uiWorkspace` 由 `@deepseek-ai/dsh-client-ui-workspace` 提供；本插件 `package.json` 的 `dsh.client.inject` 只列了两个 settings 包，没注入 ui-workspace → `ctx.uiWorkspace` 是 undefined，按钮只能走兜底。上一单在 client `inject` 里加 `uiWorkspace` 只是 Cordis 服务声明，**包未注入服务仍不存在** |
-| 修法 | `dsh.client.inject` 增加 `@deepseek-ai/dsh-client-ui-workspace`（架子包会带入它自己的 session/workspace/layout 依赖）；client 运行时 `inject` 保持 `['slots','uiWorkspace']`，两者缺一不可 |
-| target 形状 | 宿主用裸 **session id 字符串**：`replaceMain(summary.id, …)`、`openSession(target)` 都如此（也接受 subagent address 对象）。任务库的 `targetSessionId` 直接作为 target 传入，无需 workspaceId；若会话已归档/不在当前工作区，宿主可能不切换，前端给明确提示 |
-| 探测 | 面板挂载时打印一次 `[mesh-waker] uiWorkspace available: … keys=… openSession=…`；点击时打印 `openSession target <id>`，失败打印错误原文（不再静默） |
-| 兜底 | 「复制会话 id」「复制任务标记 `[TASK T-xxx]`」两个次按钮保留；无会话 id / 无 API / 调用抛错三种情况都有可见文案 |
-| 测试 | +1（共 122/122）：静态断言 package.json 的 `dsh.client.inject` 含 `@deepseek-ai/dsh-client-ui-workspace`。既有 121 例全绿 |
-| 生效条件 | **必须重启宿主**（以及按需同步安装目录）后 `ctx.uiWorkspace` 才存在；本单不重启、不部署 |
-
-## v0.7.17（2026-10-31，「打开会话」真的能跳转）
-
-| 项 | 内容 |
-|---|---|
-| 根因 | client 插件的 `inject` 只声明了 `slots`，Cordis 插件上下文里没有 `uiWorkspace` 属性 → 任务详情里 `hostCtx?.uiWorkspace?.openSession` 永远 falsy，按钮一直静默走「复制会话 id」分支（owner 点了毫无反应）。宿主实现（asar 静态核对）确认 `UiWorkspaceService.openSession(target) { this.replaceMain(target, signal, 'reveal') }` 是**导航**语义，可用 |
-| 修法 | `inject: ['slots', 'uiWorkspace']` 声明依赖；`openSession(taskId, sessionId)` 同时兼容 `hostCtx.uiWorkspace` 与 `hostCtx.get('uiWorkspace')`，`await` 调用并给出可见反馈：「已切换到会话 …（若主界面未切换：可能已归档或不属于当前工作区）」；异常/无 API 时显示明确提示，不再无声 |
-| 退路 | 详情操作区新增「复制会话 id」「复制任务标记（`[TASK T-xxx]`）」两个次按钮；无会话 id、无导航 API、调用抛错三种情况都有可见文案 |
-| 探测结论 | ① `uiWorkspace.openSession` 可用（实现为 replaceMain reveal，宿主文档写明同步替换 mainView 并返回 Conversation）；② 无会话深链（GUI 状态存 `dsh.sessions.current`，asar 里没有 `#/session` 路由，PDF.js 的 pushState 与业务无关）；③ `openWorkspace/startSession` 可用但语义是「打开工作区空白会话/新建」，不用于会话跳转，故未采用 |
-| 测试 | +1（共 121/121）：静态断言 client bundle 的 `inject` 含 `uiWorkspace`、handler 同时含导航与复制退路。既有 120 例全绿 |
-
-## v0.7.16（2026-10-31，派活任务面板视觉/交互重做）
-
-| 项 | 内容 |
-|---|---|
-| 左右分栏 | `TaskRegistryPanel` 改为与「信箱」一致的左右分栏：左=批次聚合列表，右=选中任务详情（标题、创建→开始→结束时间线、正文全文、回执摘要、refs、打开会话/取消任务）；右侧空态「选择左侧任务查看详情」；`useIsNarrow()` 在 <900px 退化为上下布局 |
-| 批次聚合 | 新增纯函数 `groupTasksByBatch()`：按 `batchId` 分组、组头 `B-xxx · done/total · 总耗时 …`、组默认展开可折叠、最近批次在上、无 batchId 归「未分组」置底、组内按 createdAt 排序 |
-| 人读耗时 | 新增 `formatDuration()`（`340毫秒` / `12.0秒` / `12分09秒` / `1小时01分`，null → `-`）与 `formatStamp()`（本地 `MM-DD HH:mm:ss`），列表/详情/组头统一使用 |
-| 按钮三档 | 定义 `buttonPrimary`（实底）/`buttonSecondary`（描边）/`buttonDanger`（红描边），任务面板内全部按钮改用这三档；取消任务用危险按钮（`DELETE /mesh/tasks/:id` 仅 pending） |
-| 右栏入口 | 新增 `TaskTabSummary` 组件挂在右栏 tab 顶部：`派活任务：N 条待办/进行中` + 「打开任务面板」按钮（宿主无主页面导航 API，复制 `入口名 → 派活任务` 作为提示，不做假跳转） |
-| 布局修复 | Row/SettingsSection 标题与说明加 `wordBreak:keep-all` + 已有 `nowrap/ellipsis`，修设置页「本机会话」被挤成竖排断字（「本归」）的问题 |
-| 测试 | +3（共 120/120）：`formatDuration` 五组样例；`formatStamp` 格式与非法值；`groupTasksByBatch` 分组/排序/完成数/总耗时/未分组置底。既有 117 例全绿 |
-
-## v0.7.15（2026-10-31，任务列表显示可读标题）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | 面板/列表的 `subject` 取正文首行，而派活正文首行是长说明（`任务（协调会话，**…**）：把设置页按…`），列表里只剩一条被截断的半句话，看不出这单在干什么 |
-| 显式标题 | `mesh_dispatch` 新增 `subject` 参数、`/mesh/inject` 接受 body 或 `meta.subject`；传入时规范化（去 `**`、折叠空白、≤120 字）后作为 `subject` |
-| 推断清洗 | 新增纯函数 `cleanTaskSubject()` / `resolveTaskSubject()`：优先取首个加粗片段（≥4 字才算标题），否则去掉 `任务（…）：` / `【…】` / `[...]` 前缀、`**`/`__`、装饰行（`---`/`***`），按 `。`/`——`/较早的 `：` 截短；首行只有符号时回退下一行；仍为空则存空串（面板显示「(未命名任务)」） |
-| 面板 | 任务表新增「摘要」列（`ID / 批次 / 目标会话 / 摘要 / 状态 / 耗时 / 创建时间`），空值显示 `(未命名任务)` |
-| 测试 | +5（共 117/117）：清洗器取加粗标题并去前缀；去 Markdown + 装饰行回退第二行 + 全符号返回空；显式标题优先/trim/≤120；API 带 `meta.subject` 落库并列出；未传时落库为清洗后的首行标题。既有 112 例全绿 |
-
-## v0.7.14（2026-10-31，任务状态机补 `started`，运行时能看到进度）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | T-228 跑了 823 秒，期间 `/mesh/tasks` 一直是 `pending` 然后突然 `settled`——owner 拿任务列表验收运行时效果时，看不到「进行中」 |
-| 状态机 | `pending → started → settled`；取消/停滞仍可从 `pending` 或 `started` 发生；`started` 只在目标会话 `turn/start` 且该 turn **确实归属此任务**时写入（沿用现有 `baselineTurn` 语义：queue 要 `turn > baselineTurn`，steer 允许同轮），不制造假状态 |
-| 落盘/API | 任务行新增 `startedAt`（字段初始 `null`）；append-only 追加一条 `status=started` 行；`GET /mesh/tasks` 列表与详情返回 `startedAt`；面板状态列显示「待执行 / 进行中 / 已完成 / 已取消 / 停滞」 |
-| durationMs 口径 | 任务库 `durationMs = settledAt - startedAt`（从未观测到开始的回退到 `createdAt`）；回执自带的 `durationMs` 不变（仍从投递时算）。已写进 README |
-| 测试 | +3（共 112/112）：`pending` → `turn/start` → `started` 且有 `startedAt`；`started` 后 `turn/end` → `settled` 且 `durationMs === settledAt - startedAt`；未等到 `turn/start` 直接 `turn/end` → 明确结算、`startedAt=null`、服务不崩。既有 109 例全绿 |
-
-## v0.7.13（2026-10-31，设置页五章聚合 + 字段真能改 + 行布局）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | owner：「既然是设置页面，应当要能具备设置的能力……设置项按功能类目分章节聚合」；截图里设置页是平铺状态行、本机会话行重叠。此前 `save()` 只把 `result.config` 塞回本地 state，`note` 也从未渲染——改了看不到反馈，也看不出是否落盘 |
-| 五章 | 新增可折叠 `SettingsSection`（标题 + 一句说明 + `▾/▸` 切换，默认展开）：**接入**（中枢登记/控制台/唤醒端口/接入向导占位）、**唤醒行为**（信任级别、投递方式、`maxWakes`、`resetAfterHours`、启动补收、投递模式、发送方指定、按设备信任表）、**界面**（`entryLabel`、收件箱目录、本机会话归档）、**任务与回执**（回执状态、任务库保留策略只读、去任务面板）、**维护**（本地缓存同步/刷新/清空、轮换令牌、右栏状态） |
-| 真能改 | 白名单字段全部有控件；`maxWakes`/`resetAfterHours` 改数字输入 + 每行「保存」，保存走 `POST /mesh/config`；成功显示「已保存」（未落盘时附 `仅本次运行：原因`），失败显示服务端错误原文；**保存后重新 `reload()` 拉 `/mesh/status`**，控件值以服务端为准（不再只改本地 state） |
-| 只读标注 | 非白名单项（`entryLabel`、`tasksRetentionDays`、`tasksMaxRows`）灰显 + tooltip「需改配置文件并重启」；`/mesh/status.config` 增加后两者作为只读投影（不加入 `saveConfig` 白名单） |
-| 布局 | `Row` 改为 `min-height:32px`、`padding:6px 0`，标题/说明 `flex:1; min-width:0; ellipsis; nowrap`，控件容器 `flex-shrink:0`，行级 `title` 放完整文本；本机会话行沿用 T-228 的 flex + 56×24 归档按钮 |
-| 测试 | 服务端 109/109 全绿（仅 client 与只读投影；`check-loadable` 校验 client 可加载） |
-
-## v0.7.12（2026-10-31，任务面板移到信箱页；入口名可配；修本机会话行布局）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | owner 反馈「这个 UI 不行，期望与 Mesh 信箱共用入口」：任务列表挤在设置页，且截图里「本机会话」行与归档按钮重叠 |
-| 页面结构 | `MeshInboxPage` 顶部新增「信箱 / 派活任务」标签（沿用页面内的按钮式 segment，不新造视觉语言）；「派活任务」渲染新组件 `TaskRegistryPanel()`（统计 + 状态/会话过滤 + 表格 + 点行展开正文/回执/打开会话）；设置页删掉任务表格与详情，只留一行「去任务面板」说明 |
-| 入口名 | 新配置 `entryLabel`（默认 `Mesh 信箱`，≤40 字）：页面标题、侧栏 SVG `<title>` tooltip、右栏标签标题、设置页跳转文案共用；README 配置表已收录 |
-| 布局 | 「本机会话」每行改为 `display:flex; align-items:center; gap:8px; height:28px; min-width:0`，标题 `flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap`，归档按钮 `flex-shrink:0; width:56px; height:24px`，行级 `title` 放完整标题 |
-| 宿主探测 | 客户端 apply 一次性 `console.info('[mesh-waker] uiWorkspace keys: …')`；静态核对 asar：`startSession, openSession, openWorkspace, listDirectory, createDirectory, pickDirectory, connectWorkspace, unarchiveSession, pinSession, unpinSession, archiveSession, forkSession`——**没有**「打开自定义主页面」的 API，所以设置页跳转按钮只给文案提示，不假装能导航 |
-| 测试 | 服务端 109/109 全绿（本次只改 client 与配置键；无新增服务端用例，`node scripts/check-loadable.mjs` 校验 client 可加载） |
-
-## v0.7.11（2026-10-31，层1 任务库：正文落盘 + 可查询索引 + 面板）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | 任务正文不落盘（投递完就没了）、没有 task→回执→会话→产物的索引、跨会话不可见：今天只能靠比 summary 字符串发现 T-220 假回执，也无法回看「这单要求了什么」 |
-| 存储 | `~/.dsh/mesh-waker/tasks.jsonl`（append-only，0600），字段含 `taskId/batchId/requester/targetSessionId/targetTitle/subject/textBytes/createdAt/deadlineMs/status/settledAt/durationMs/receiptRef/receiptSummary/refs[]`；正文 ≤8 KiB 存 `text`，>8 KiB 落 `tasks/<taskId>.md` 只记 `textPath`；`refs[]` 由 `meta.refs` 传入、只存字符串 |
-| 保留 | `tasksRetentionDays`（默认 30）、`tasksMaxRows`（默认 5000）；启动时按超龄/超量裁最旧的并压实 jsonl，同时清理被裁任务的正文文件；日志只打长度与 subject，**从不打印正文** |
-| 写入点 | 两条派活路径（`mesh_dispatch`、`/mesh/inject`）登记 `pending`；结算 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；stall → `stalled`；`DELETE`/批次取消 → `cancelled` |
-| API | `GET /mesh/tasks?status=&session=&batch=&limit=&offset=`（默认 50、createdAt 倒序、`total`；不含正文）、`GET /mesh/tasks/:id`（全文 + 回执摘要 + 目标会话 `{sessionId,title,live}`）、`DELETE /mesh/tasks/:id`（仅 pending → cancelled，已结算返回 409）；全部 loopback-only |
-| 面板 | 设置页「派活任务」：列 `ID/批次/目标会话/状态/耗时/创建时间/摘要`，按状态与目标会话过滤，点行展开正文与回执摘要、「打开会话」（`uiWorkspace.openSession`，不可用时复制 id），顶部 `pending N · 今日完成 M · 失败 K` |
-| 测试 | +6（共 108/108）：派活后列表含 pending/subject/targetSessionId 且列表不含正文；结算后 settled + settledAt/durationMs/receiptRef；DELETE pending→cancelled、DELETE settled→409；9000 字节约 8 KiB 落 `tasks/<id>.md` 且详情返回全文；超龄行启动被裁只留 fresh；status/session 过滤与 `limit/offset/total` 分页正确。既有 102 例全绿 |
-
-## v0.7.10（2026-10-31，注入正文带上 taskId/batchId 表头）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | `promptWithResume` 原样投递派活正文，`taskId` 只存在于 waker 回执元数据里：目标会话不知道「我这一单叫 T-220」，无法在自己的账本/WORKLOG 里引用；假回执时也无法自查处理过哪几单 |
-| 做法 | 新增 `withTaskHeader()`：投递前在正文前加**一行** `[TASK <taskId> · BATCH <batchId 或 -> · FROM <requester 或 unknown>] <本地 ISO 时间>`，空行后是**逐字不变**的原文；工具路径（`mesh_dispatch`）与 HTTP 路径（`/mesh/inject`）都生效；新配置 `injectHeader`（默认 `true`，设 `false` 退回零差异投递）；表头不参与 `maxBytes` 校验；taskId 缺失时写 `-`，不阻断投递 |
-| 文档 | `MESH_DISPATCH_TOOL` 的 `text` 描述改为「delivered verbatim after a one-line [TASK …] header」；README 的 `text` 行与「多会话分工」补说明（账本可直接引用该 ID） |
-| 测试 | +3（共 102/102）：默认配置表头前缀 `[TASK T-hdr · BATCH B-hdr · FROM worker]` + 时间行 + 原文逐字出现在其后；`injectHeader:false` 时投递文本与原文**完全相等**；同 batch 两单表头 BATCH 相同、TASK 各自不同。既有 99 例全绿 |
-
-## v0.7.9（2026-10-31，maxInlineBytes 真正生效；接缝与运维错误可见；同轮多任务不再假回执）
-
-| 项 | 内容 |
-|---|---|
-| **假回执复发（0.5.6 同类）** | T-220 是在 T-219 的 turn 41 **进行中**注入的第二个 queue 任务，但两条任务 `baselineTurn` 都记成 41，于是 turn 42 的 `turn/end` 把两条一起结算，T-220 从未执行却收到 `completed`。修法：queue 任务在开放轮内注入时按**同轮队列位次**抬高 baseline（`baselineTurn = openTurn + 排在前面的同轮 queue 任务数`），第二个任务必须等 turn 43；新增 `injectedAtTurn`/`sameTurnInjected` 诊断；位次判断不确定时宁可 pending（由 `receiptStallMs` 报 stall），绝不假回执。`steer` 语义不变 |
-| 文档承诺 vs 实况 | `maxInlineBytes` 此前只在配置里解析、全文没有任何使用点，README 却承诺「超过该大小的正文不再内联」→ 已实现：`renderMessages` 逐条调用 `inlineBodyText(body, c.maxInlineBytes)`，超限时按 UTF-8 字符边界安全截断（`truncateUtf8`，不会切出 U+FFFD），并在末尾追加「…（正文已截断：原文 N 字节，超过 maxInlineBytes=M；完整内容请用 mesh_inbox 或 GET /api/inbox 读取）」；只影响回合内联文本，收件箱原文不变 |
-| 接缝日志 | approval 接缝挂载前后各一行：成功 `approval seam attached (approvalBridge enabled)`、未启用 `approval bridge disabled; approvals stay local`、失败 `approval seam attach failed: <原因>; approvals fall through to the local UI`（user-questions 原有三行不动） |
-| 运维错误进日志 | 注册 wakeUrl 失败（带状态码与 URL）、注册 wake endpoint 抛错（带 URL）、wake 失败（带 conversation/sender）、请求处理失败（带 method/path）四处补齐 `fileLog`，同时保留 `log.warn`；预期降级（`defineTool unavailable`、topic 配置告警）仍保持原级别 |
-| 可观测 | `/mesh/status` 增 `limits: { maxInlineBytes }` 与 `seams: { approval, questions }`（attached/disabled/failed/absent）；`pendingTaskList` 增 `injectedAtTurn`/`sameTurnInjected`/`baselineTurn` |
-| 测试 | +6（共 99/99）：同轮先后注入 T-same-A/T-same-B → A 在 turn 42 结算、B 在 turn 42 结束后仍 pending（`sameTurnInjected=true`、`baselineTurn=42`）、turn 43 才结算；跨轮注入 → `injectedAtTurn=null`、baseline=5、turn 6 结算；9000 字节正文按 4096 截断且不含 U+FFFD、标记含「原文 9000 字节」与 `maxInlineBytes=4096`、多字节边界安全；短/空正文逐字节不变；默认 seams disabled/absent + limits 4096；启用 approvalBridge 后 attached。既有 93 例全绿 |
-
-## v0.7.8（2026-10-31，mesh_dispatch 注册不再静默失败）
-
-| 项 | 内容 |
-|---|---|
-| 缺陷 | 真机日志每次启动只有 `registered tool mesh_ask`、**从未**出现 `registered tool mesh_dispatch`，失败分支只走 `log.warn`（宿主日志里也找不到）→ 所有会话都拿不到 `mesh_dispatch`，只能退回项目级 CLI，与「任何项目都能派活」冲突 |
-| 根因 | 两个工具各自复制了一份注册逻辑：dispatch 的 IIFE 先执行，`ctx.get('tools')` 在宿主 tools 服务就绪前返回 undefined，`ctx.tools` 又没被用作兜底，异常只写 `log.warn`；mesh_ask 的第二次查询恰好赶上服务就绪所以成功。现已统一：`ctx.get('tools') ?? ctx.tools` 兜底 + `installModelTool()` 共享安装器，服务未就绪时**重试 5 次、间隔 500ms**（`ctx.effect` 管理定时器），成功即停 |
-| 可见性 | 每次尝试写 waker 日志（`tool mesh_dispatch not registered yet: …; retry n/5`，放弃时 `tool mesh_dispatch NOT registered: <reason> (gave up after 5 retries)`，成功 `registered tool mesh_dispatch`）；`/mesh/status` 增 `tools: {dispatch, ask}` 与 `toolsError`，任何会话可自查 |
-| 测试 | +3（共 93/93）：tools 服务延迟 3 次后出现 → 重试成功且 status 两项 true、state.tools 有 dispatch/ask；服务永远缺失 → status 两项 false、`toolsError` 含 `host exposes no tools service`、8795 仍存活不抛；正常宿主两项 true 且 `toolsError=null`。既有 90 例全绿 |
-
-## v0.7.7（2026-10-31，回执投给派活方而不是单一 receiptTo）
-
-| 项 | 内容 |
-|---|---|
-| 事故 | 多工作区试点：`util4freesub` 的协调会话派 `T-OPS-001`（batch `B-OPS-001`），回执与 batch 聚合都投给了 `receiptTo`（dsh-mesh 协调会话 `session-7fa21aa4…`），派活方 `session-6dc757df…` 永远收不到自己的回执 |
-| 修法 | ① `mesh_dispatch` 新增 `requester` 参数（CLI 传；模型可省略），handler 第二参数若带调用方 session 自动使用（`extra.sessionId`/`session.id`/`agent.id`/`agentId`/`context.sessionId`，首次打一行 `tool extra keys:` 探测）；`/mesh/inject` 接受 body `requester` 或 `meta.requester`；② 投递优先级：解析成功的 requester → `receiptTo` → 只写文件 + `lastError`；requester 解析失败退回 `receiptTo` 并写明原因；③ batch 聚合与 batch alert 投给该 batch 第一个 requester，混合 requester 记日志；④ `/mesh/status` 增 `pendingTaskList`（每行 `requester`/`requesterSessionId`），`lastReceipt.deliveredTo` 记录实际投到的会话 |
-| 测试 | +5（共 90/90）：requester 命中只投 requester（`deliveredTo=session-orch`，receiptTo 0 次）；requester 解析失败回退 receiptTo 且 `lastError` 含 `requester not resolved`、`pendingTaskList` 两字段正确；无 requester 走 receiptTo（向后兼容）；batch 聚合投给 requester（`/BATCH/` 只到 orch）；工具 handler 第二参数 `{sessionId}` 被用作 requester。既有 85 例全绿 |
-
-## v0.7.6（2026-10-31，归档态可见与可操作；删除后清理残留归档 id）
-
-| 项 | 内容 |
-|---|---|
-| 面板 | 设置页新增「本机会话」列表（数据来自 `/mesh/sessions`）：`archived` 行置灰（`opacity 0.55`）并显示「已归档」标签、不提供归档按钮；活跃行有「归档」按钮（`POST /mesh/sessions/archive`，成功后刷新列表）。**删除仍只走 CLI**，面板不提供，避免误删会话目录；`staleVersionNotice` 逻辑未动 |
-| 残留 id | 宿主探测（2026-10-31）：`dsh-workspace` 的 `ctx.workspaceRegistry` 有 `archiveSession`/`deleteKnown`/`archivedSessionIds`，**没有** unarchive/移除 API（`unarchiveSession` 只存在于 workspace-controller 的命令/远程面，插件不可见）。修法：waker 自维护 tombstone 文件 `~/.dsh/mesh-waker/archived-tombstones.json`（0600），删除已归档会话时记入、上报归档列表时减掉；该 id 被重新归档时自动清除 tombstone |
-| 测试 | +3（共 85/85）：`formatSessionRow`（archived=true → `已归档`/disabled/0.55；false → 空标签/可操作）；`archiveSessionRequest` 用 stub fetch 断言恰好一次 `POST /mesh/sessions/archive` 且 body 带 session id；删除已归档会话后重播同 id，`archived=1` 不再包含它且默认列表 `archived=false`。既有 82 例全绿 |
-
-## v0.7.5（2026-10-31，/mesh/sessions 分页过滤 + 独立日志文件与滚动）
-
-| 项 | 内容 |
-|---|---|
-| 分页 | `discoverSessions()` 不再固定 `slice(0,80)`（上限放到 5000 防病态目录）；`GET /mesh/sessions` 支持 `limit`（默认 80，夹取 1–500）、`offset`（默认 0）、`archived`（1/0/省略）、`cwd`（精确）、`q`（标题子串、大小写不敏感）；响应为 `{ok,total,limit,offset,sessions}`，`total` 是过滤后总数；无参数时仍是前 80 条（多出三个元数据字段）；`?live=1` 语义不变（先过滤未归档再分页） |
-| 日志 | 新增 `logFile`（默认 `<tmpdir>/mesh-waker.log`，推荐 `~/.dsh/mesh-waker/waker.log`）与 `logMaxBytes`（默认 2 MiB，下限 1 KiB）；`fileLog` 在写入前按大小滚动为 `<logFile>.1`（只留 1 份，无第三方库）；`/mesh/status` 增 `logFile`/`logBytes` |
-| 测试 | +8（共 82/82）：默认页 `total=3 limit=80 offset=0`；`limit=1&offset=1` 与全量切片一致；`archived=1/0` 各命中；`q=alp` 大小写不敏感命中 1 条；`limit=0`→1、`limit=999`→500；自定义 `logFile` 收到 `injected` 行且 status 的 `logFile/logBytes` 与之相符；预置 3000B 日志 + `logMaxBytes=1024` 触发 `.1`（3000B）且新文件从空开始并含新行；status 两字段存在。既有 74 例全绿 |
-
-## v0.7.4（2026-10-31，修 exports：loader 读不到清单）
-
-| 项 | 内容 |
-|---|---|
-| 事故 | DSH 启动后 waker 未加载（8795 无响应），loader 报 `ERR_PACKAGE_PATH_NOT_EXPORTED`：`package.json` 的 `exports` 没有暴露 `./package.json` 与 `./cordis.patch.yml`，宿主读清单时被 exports 拦下 |
-| 修法 | `exports` 增加 `"./package.json": "./package.json"` 与 `"./cordis.patch.yml": "./cordis.patch.yml"` |
-| 防复发 | `sync-local-waker.mjs` 增加自检：安装目录的 `exports` 必须含这两个键，否则 `SELF-CHECK` 失败并拒绝同步 |
-| 验证 | 重启 DSH 后 `/mesh/status` 返回 200 且 `pluginVersions.process = 0.7.4` |
-## v0.7.3（2026-10-31，桥会话发送前预留，杜绝 pull/push 抢走问题与回复）
-
-| 项 | 内容 |
-|---|---|
-| 缺陷 | 真机 00:28：`question/q-ad774b89` 被常规 wake 链路当成新对话，创建 `mesh · question/q-ad774b89` 会话并把问题投了进去；运营者的回复随后被该会话 wake 链路 claim/read，提问桥轮询看不到 → 90s 后 `unanswered`，agent 拿到 `answer: null`。根因是**先发送后登记**：`/api/send` 落库后、`questionWaiting.add` 之前，pull（或 push/catch-up）可能已经取走消息 |
-| 修法 | ① 提问桥：`questionWaiting` 在 `/api/send` **之前**登记（conversation 发送前已生成），发送失败删除回滚；② 审批桥同样改为发送前 `bridgeWaiting` 预留，失败回滚；③ 防御性拦截收口到 `wakeConversation` 入口：`question/` 前缀无论是否在等待集合都只 `consumeQuestionTraffic` 后返回，`approval/` 前缀（启用时）同理——pull、签名 push ping、catch-up 三条入口都覆盖，不会建会话、不会注入 |
-| 遗留数据 | 历史上被误建的 `mesh · question/…` 会话需运营者手工归档；插件不自动删（避免误删真实会话） |
-| 测试 | +4（共 74/74）：发送被 mock 延迟 1.2s 期间 `/api/send` 回调让 pull 立刻看到问题消息 → `reservedDuringSend=true`、`claimedByPull=false`、`created=0`、`prompts=0`，随后真回复仍能命中；发送 500 → 预留回滚（`pendingQuestions=[]`）；审批桥同样验证发送前预留（`pendingApprovals=1`）与失败回滚。既有 70 例全绿 |
-
-## v0.7.2（2026-10-30，`/mesh/status` 暴露待答问题与待批审批）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | 提问桥自己用 `claim=1` 轮询，问题消息在收件箱里被 claim；`to` 指向本机时运营者甚至看不到，只能翻日志猜「有没有在等我回答」 |
-| 新字段 | `pendingQuestions: [{conversation, askedAt, expiresAt, preview, options}]`、`pendingApprovals: [{conversation, askedAt, expiresAt, preview, toolName}]`；`preview` 单行、≤80 字符、不含 token/路径；无待答时是 `[]`（字段始终存在）；条目随等待集合进出自动出现/消失 |
-| 语义 | 仅本机 `GET /mesh/status` 可读；不改变投递/超时/隔离逻辑，纯状态暴露；`questionWaiting`/`bridgeWaiting` 由 Set 改为 Map 携带元数据，pull 跳过的判断不变 |
-| 测试 | +4（共 70/70）：提问进行中 status 一条（前缀 `question/`、preview 去换行且 ≤80、options 正确、askedAt/expiresAt 是数字）→ 回答后清空；默认两字段均为 `[]`；审批进行中 `pendingApprovals` 一条（`approval/` 前缀、`toolName=bash`、preview 含 bash）→ deny 后清空；`previewText` 截断到 80 且无换行。既有 66 例全绿 |
-
-## v0.7.1（2026-10-30，修复 mesh_ask 把自己的问题当回答）
-
-| 项 | 内容 |
-|---|---|
-| 缺陷 | 真机 `question answered … by=<本机 agent> ms=949`：`to` 指向本机 agent 时，`/api/send` 的问题告示会落进**自己的**收件箱；轮询把这条告示当回复，`sender` 又命中 `allowFrom`，于是 949ms「答完」，答案就是问题原文 |
-| 修法 | ① 保存 `/api/send` 响应里的 `id` 为 `sentId`，轮询遇同 id 只标记已读、**不当作答案**；② 跳过 `created_at <= started-1000ms` 的历史消息（1 秒时钟容差，防止旧消息被当回复）；③ 正文与本次告示完全相同的消息一律跳过；④ 被排除的消息**不标记已读**（保留审计），只有自己的 `sentId` 可以顺手读掉；⑤ 只有「发送之后 + allowFrom 内 + 非自己发出」的消息才算回答 |
-| 测试 | +3（共 66/66）：自问自答回归（推入 `m-sent-1` 告示后 800ms 仍未 resolved，随后真回复 `2` → 返回「收工」）、发送前的历史回复被忽略（`unanswered`）、只有自己的告示直到超时仍 `unanswered`；既有 63 例全绿 |
-
-## v0.7.0（2026-10-30，提问桥：agent 经 mesh 收件箱向人提问）
-
-| 项 | 内容 |
-|---|---|
-| 定位 | **提问是商量，不是安全闸门**：危险命令仍走 approval（fail-closed）；`mesh_ask` 只承载「发不发版 / 选哪个方案 / 继续还是停」这类协调决策，超时返回未回答而不是挑默认值 |
-| 主路径 | 新增模型工具 `mesh_ask`（`question` 必填 ≤2000、`options` 2–6、`to`、`timeoutSeconds`）：经中枢发 `silent: true` 消息（不唤醒 agent），`conversation = question/<id 前 10 位>`；轮询该会话回复，数字映射到选项文本，否则原样返回（去空白、截 2000）；返回 `{status:'answered'|'unanswered', answer?, by?, ms?, questionId, timeoutSeconds?}` |
-| 可选接缝 | 运行时探测 `ctx.userQuestions` 服务；存在才挂 `ctx.on('user-questions/request')`（形状不认识/超时/未回答一律 `next()` 交回本地 UI），缺失则日志 `user-questions seam absent; mesh_ask only` 并继续提供工具。**不 import `@deepseek-ai/dsh-user-questions` 或 `dsh-user-approval`**，缺包不影响加载 |
-| 配置 | `questionBridge: { enabled, to, allowFrom, timeoutSeconds(1–3600, 默认 300), conversationPrefix('question/'), pollMs, diag }`；`enabled` 只控制接缝与默认收件人，工具可显式传 `to` 直接使用 |
-| 隔离与安全 | pull 循环遇 `question/` 前缀只 claim+read 消费，不进入 `wakeConversation`、不建会话；`allowFrom` 外 sender 的回复忽略且保持未读（日志 `question ignored`，按 message id 去重）；工具返回体不含 token/内部路径；与 approval 前缀、allowFrom 完全独立 |
-| 测试 | +7（共 63/63）：工具元数据（含「NOT a security gate」）、silent+前缀+数字 2→第二个选项、自由文本原样、超时 unanswered 且无 answer、名单外回复忽略后超时、`question/` 流量 `prompts=0 created=0 unread=0`、无接缝时插件与工具仍可用。既有 56 例全绿 |
-
-## v0.6.0（2026-10-30，远程审批：通过 mesh 收件箱回复 approve/deny）
-
-| 项 | 内容 |
-|---|---|
-| 能力 | 启用后挂 `ctx.on('approval/request', …)`：把 DSH 的审批请求转发给 `to`（**silent 消息，不唤醒任何 agent**），等待 `allowFrom` 名单里的 peer 回复一个词，返回 `allowed-once` / `rejected` |
-| 内核契约 | 请求形状以 `@deepseek-ai/dsh-user-approval` 类型为准：`{ agent, toolName, callId?, reason?, signal? }`（`agent.id` 即会话 id）；`ApprovalOutcome = allowed-once | rejected | cancelled | unavailable`；`approvalBridge.diag:true` 时 `fileLog` 打印 `Object.keys`、字段类型与 `reason` 长度/前 40 字符（不含命令全文） |
-| 配置 | `enabled`（默认 false，零影响）、`to`、`allowFrom`、`timeoutSeconds`（1–3600，默认 120）、`conversationPrefix`（默认 `approval/`）、`pollMs`（250–60000，默认 2000）、`diag` |
-| 消息 | `conversation = <prefix><callId 前 8 位>`，正文含工具名、会话标题、`reason` 摘要（去换行、截 400 字符）、request_id、回复方式、超时说明；`silent: true` 防 agent 自批 |
-| 判定 | `approve/allow/同意/批准/放行` → `allowed-once`；`deny/reject/拒绝/不同意/驳回` → `rejected`；两者同时出现 → **rejected（fail-closed）**；其它内容 → rejected |
-| 超时 | 到 `timeoutSeconds` 一律 `next()` 透传本地提示框——**绝不自动放行，也不静默 rejected**（避免无人值守误杀长任务）；`allowFrom` 为空时只通知、不等待，直接 `next()` |
-| 防自批 | ① 通知 silent；② `allowFrom` 外 sender 的回复忽略且保持未读（日志 `approval ignored`）；③ pull 循环遇 `<prefix>` 会话直接消费（claim+read），**不进入 `wakeConversation`**；bridge 正在等待的会话跳过消费，避免抢答 |
-| 审计 | 每次决定 `fileLog('approval decision call=… by=… outcome=… ms=…')`；超时/忽略/通知失败均有单行原因；不含命令全文 |
-| 测试 | +7（共 56/56）：未启用→`next()`；approve→`allowed-once` 且 `silent=true`、conversation 前缀正确；deny→`rejected`；超时→`next()`；名单外 sender 忽略并最终超时；approve+deny 混淆→`rejected`；`approval/` 消息不建会话不注入（`prompts=0 created=0 unread=0`）。既有 49 例全绿（`enabled:false` 零变化） |
-
-## v0.5.8（2026-10-30，拒绝的主题投递不得消费消息；拒绝日志收敛）
-
-| 项 | 内容 |
-|---|---|
-| 缺陷 | 真机 `ops/selftest-guarded`（`allowFrom` 外发送方）投递被拒后，消息 `read_at` 仍被写上（约 10s 后），运营者无法在收件箱审计「谁试图投递、投了什么」 |
-| 定位 | waker 日志：`10:22:25.606 topic denied …` → `10:22:25.607 woke conversation … in 133ms`，期间**没有** `marked N message(s) read`；`read_at` 出现在 10s+ 后、同一批正常投递回合结束附近（该回合的 agent 侧 `mesh_inbox(mark_read)` 会清空整个未读收件箱）。waker 的拒绝分支原本就在任何 markRead 之前 return，本次把它写成**硬约束**并消除相邻触发面 |
-| 修法 | ① 拒绝路径显式约定：不 claim、不 read、不注入、不建会话，消息保持 `read_at=null`（注释固化意图）；② 投递提示加强：内联消息时明确「无需调用 mesh_inbox，也不要把收件箱里其它消息标记为已读（不是本轮任务）」，减少 agent 顺手清箱；③ 拒绝日志收敛：按 `(label|sender|message id)` 去重，新消息立即记一条，重复拒绝累计，每 50 次才补一条 `suppressed` |
-| 测试 | 共 49/49：拒绝用例改为跨**两次轮询**断言 `prompts=0 unread=1 read_at=null(true) deniedLines=1`（即无 `/api/read`、消息未消费、日志只一条）；新增「重复 label 只保留第一个定义」用例。原有 48 例全绿 |
-
-## v0.5.7（2026-10-30，主题路由：远程按标签投递，不暴露会话 id/标题）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | 远程需要把运维问题投到「对应本地会话」，但会话 id 是内部句柄且易失，运维会话能执行 shell——把 id 上报中枢等于开放提权面。改为上报/寻址**稳定标签** |
-| 配置 | `topics: [{ label, titlePattern, allowFrom?, mode? }]`；`label` 须匹配 `^[a-z0-9][a-z0-9/_-]{1,40}$`（非法/重复/空 pattern 启动 WARN 并忽略）；远端把 `conversation` 写成 `label` 即可 |
-| 绑定 | 启动时与每次投递前，按 `titlePattern`（精确或唯一子串）在**未归档**会话里解析并等价 `/mesh/bind` 自动绑定；绑定的会话归档/删除后，下次投递自动重绑到新同名会话；解析不到只记 `topic unresolved`，落回原有收件箱/新建兜底 |
-| 白名单 | `allowFrom` 非空时只允许名单 peer；其他人投递不注入、消息保持未读，日志 `topic denied label=… peer=…`；不覆盖仍存活的用户手工绑定 |
-| 对外 | `GET /mesh/status` 增 `topics: [{ label, bound, lastDeliveredAt }]`，**不含 session id 与标题**（本地细节仍在 `/mesh/admin/bindings`） |
-| 兼容 | 不配 `topics` 时行为与 0.5.6 完全一致；`mode: steer` 可插当前轮，默认 queue |
-| 测试 | +5（共 48/48）：标签命中 A（B 不受影响）、归档后重绑到同名新会话（id 不同）、allowFrom 外 sender 被拒且消息仍未读、非法 label 启动忽略、status 输出不含 `session-`/标题；零配置回归即原 43 例 |
-
-## v0.5.6（2026-10-30，修复「注入发生在回合进行中时被上一轮 turn/end 提前结算」）
-
-| 项 | 内容 |
-|---|---|
-| 事故 | 真机 17:15:05 把 T-130 注给正在跑 turn 36 的会话；17:15:59 turn 36 结束，插件就给 T-130 写了 `status=completed`，summary 是上一单 T-129 的内容，T-130 一行没做（`scripts/roadmap.gates.json` 不存在） |
-| 根因 | `baselineTurn = maxTurnFor()` 取的是「已开始的最大 turn」，正在跑的回合也在内；结算条件用 `turn < baselineTurn`，于是 `36 < 36 === false` → 同一轮 turn/end 直接结算 |
-| 修法 | ① 注入时看 liveness 的 `openTurn`：进行中 → `baselineTurn = openTurn` 且 `injectedDuringTurn=true`；空闲 → 沿用 `maxTurnFor`，`injectedDuringTurn=false`。② 结算改严格：`queue` 仅 `turn > baselineTurn`；`steer`（插进当前轮）`turn >= baselineTurn`；`baselineTurn === null` 保持任意 `turn/end` 可结算。③ 回执新增诊断字段 `baselineTurn / settledTurn / injectedDuringTurn`（不打印正文） |
-| 测试 | 新增 3 例（真实信封 `{type,data}`，共 43/43）：**回归**——`turn/start{turn:5}` → queue 注入 → `turn/end{turn:5}` 不产生回执（`premature=0`）→ `turn/start{6}`+`turn/end{6}` 才结算且 `turn=6/baselineTurn=5/injectedDuringTurn=true`；steer 同轮结算（`turn=5`）；无回合历史仍第一次 `turn/end` 即结算（`baselineTurn=null`） |
-| 版本 | 0.5.6；README 回执字段与说明同步；未 publish、未部署 |
-
-## v0.5.5（2026-10-30，派活能力进插件：`mesh_dispatch` 工具 + `dsh-mesh-dispatch` CLI）
-
-| 项 | 内容 |
-|---|---|
-| 为什么 | 以前派活靠本仓 `dsh-mesh-dispatch`，别的项目装了 waker 也没有这个能力；现在工具与 CLI 都随 npm 包发布 |
-| 工具 | `mesh_dispatch`（`ctx.tools.register` + `@deepseek-ai/dsh-tools` 的 `defineTool`）：`target`/`text` 必填，`createIfMissing` 解析不到时按 target 当标题新建会话再投，`mode` queue/steer，可选 `taskId`（缺省 `T-<base36>`）、`batchId`（barrier）、`receipt`、`deadline`（`30m`/`2h`/`600s`）。返回 `{ok, sessionId, title, taskId, batchId, mode, created}`；描述写明「投递后不要轮询，回合结束写回执；要全部完成再叫就用 batchId」 |
-| 兼容 | `@deepseek-ai/dsh-tools` 是可选 peer；链接安装解析不到时用同一份 JSON Schema 定义注册，插件不因 import 失败而挂掉 |
-| CLI | `bin/dispatch.mjs` → `dsh-mesh-dispatch`（`bin` 已进 `files`）：零外部依赖（Node 内置 fetch），`--target/--text|--file/--mode/--task [id]/--batch [id]/--receipt/--deadline/--create/--json/--waker`；成功打印 `sent session=… task=… batch=…`，`--json` 结构化；连不上默认 8795 → 退出码 2；未知参数 → 退出码 1 + 用法 |
-| 测试 | `node test/waker-endpoints.test.js` 新增 5 例：工具元数据（必填 target/text、描述含 batchId）、`createIfMissing=false` 报错含 createIfMissing、`createIfMissing=true` 调 create 后投递成功、taskId 自动 `T-` 前缀与显式透传、CLI 参数解析（`--deadline 30m`→1800000、裸 `--task` 自动生成、未知参数抛用法）；离线、不起真实 HTTP |
-| 文档 | README 新增「多会话分工（任何项目可用）」：3 步示例（列会话 → 派活带 taskId → 读回执/批次）、工具与 CLI 对照表、`createIfMissing` 用途 |
-
-## v0.5.4（2026-10-30，标题解析优先活跃会话；`/mesh/sessions?live=1`）
-
-| 项 | 内容 |
-|---|---|
-| 修复 | 标题匹配歧义：`resolveLocalSession` 的标题匹配把**已归档**同名会话也算进候选，导致 `receiptTo` 永久歧义、聚合回执只能落文件。现在标题（精确与唯一子串）先只在**未归档**会话里找：恰好 1 个即命中；多个仍报错列候选；未归档 0 个但归档里唯一 1 个时允许退回 |
-| 提示 | 歧义与找不到的报错文案补「可用 `GET /mesh/sessions` 查看 `archived` 字段，或直接配置 session id」 |
-| 新增 | `GET /mesh/sessions?live=1` 只返回未归档会话（面板/脚本便捷过滤），默认行为不变 |
-| 验证 | `node --check` exit 0；`node test/waker-endpoints.test.js` 35/35（新增 4 例：活跃 + 多个同名归档 → 命中活跃；全部归档且唯一 → 仍命中；两个活跃同名 → 400 且带 archived 提示；`?live=1` 只留未归档） |
-
-## v0.5.3（2026-10-29，修复 session/event 信封层级）
-
-| 项 | 内容 |
-|---|---|
-| 修复 | DSH 的 `ctx.on('session/event', (session, event))` 传来的是信封 `{ type, seq, time, data }`，`turn` / `reason` / `message` / `callId` / `jobId` / `approval` 全在 `event.data` 下。0.5.2 直接读 `event.*`，导致真机上回执 `turn:null`、`summary:""`，且 `waiting-tool` / `waiting-job` / `waiting-approval` 三态永远不触发 |
-| 修法 | `handleSessionEvent` 顶部统一取 `const d = event.data ?? event`（真实信封优先，保留扁平对象兼容），所有字段改从 `d` 读取；`event.type` 仍取顶层 |
-| 测试 | 新增 5 例真实信封形态：`turn/end data → turn=1/status=completed`、`assistant/message data → summary="OK"`、`tool/call data → waiting-tool(bash)`、`approval/asked data → waiting-approval(bash)`、`job/registered data → waiting-job(job-9)`；连同原有 26 例共 31/31 |
-| 验证 | `node --check` 两文件 exit 0；`node test/waker-endpoints.test.js` 31/31；真机批次待本机进程重启到 0.5.3 后复验（安装目录同步需手动执行） |
-
-## v0.5.2（2026-10-29，批次屏障 + 事件驱动 liveness）
-
-| 项 | 内容 |
-|---|---|
-| 批次屏障 | `/mesh/inject` 的 `meta` 增 `batchId` / `deadlineMs`（响应回显 `batchId`）；`dsh-mesh-dispatch` 增 `--batch [id]`（缺省 `B-<base36>`，同 id 复用）与 `--deadline 2h\|90m\|600s`；全部任务结算 → **一条**聚合回执（文本 + JSONL `{kind:"batch",…, done, total}`），deadline 到点仍有关键未结 → 部分完成聚合，未结项带 liveness；批次内单任务只写自己的 JSONL、不 queue/wake；完成判定有 300ms grace，允许连续派发的下一单加入 |
-| liveness | 每会话账本（openTurn / lastEventAt / openCalls / openJobs / openApprovals / lastLlmAt），事件面覆盖 `turn/start|end`、`step/*`、`assistant/message`、`tool/call|result`、`job/registered|settled`、`approval/asked|decided`、`llm/retry*`、`agent/error`；`deriveLivenessState` 纯函数按 `not-started → lost → waiting-approval → waiting-job → waiting-tool → stalled → idle → working` 判定 |
-| 卡住先报 | 批次内任务处于 stalled / waiting-approval / waiting-job 且超过 `waitLongMs` → 发一次 `[BATCH-ALERT]`（同批次+任务+状态只发一次），不结算，继续等 `turn/end` 或 deadline |
-| 持久化与端点 | 批次写入 `batchFile`（0600，启动恢复、>24h 清理；恢复时 open 任务按 `lost` 结算）；`GET /mesh/batches`、`GET /mesh/batches/<id>`（含逐任务 liveness）、`DELETE /mesh/batches/<id>`（取消且不再回执） |
-| 配置 | `stallQuietMs` 300000 / `waitLongMs` 1800000 / `batchDeadlineMs` 7200000 / `barrierMode` wake / `alertMode` queue / `batchFile` `~/.dsh/mesh-waker/batches.json` |
-| 状态 | `/mesh/status` 增 `pendingBatches`、`batchFile`、`barrierMode`；面板「任务回执」行追加批次数 |
-| 验证 | `node test/waker-endpoints.test.js` 26/26：新增 4 例 liveness 派生（approval/job/tool/stalled）、batch 单次聚合（done=2/2、只剩一条 batch 行、批次清空）、deadline 部分完成（未结项 `not-started`）、stalled 告警只发一次且不结算、重启恢复按 `lost` 结算、`DELETE` 后无聚合；`node --check` 三文件 exit 0 |
-
-## v0.5.1（2026-10-29，插件级任务回执）
-
-| 项 | 内容 |
-|---|---|
-| meta 透传 | `/mesh/inject` 支持可选 `meta { taskId, receipt }`（不污染正文），响应回显 `taskId`；`dsh-mesh-dispatch` 新增 `--task [id]`（缺省自动 `T-<base36 时间戳>`，`--receipt` 隐含开启）与 `--receipt file\|queue\|wake`，成功输出打印 `task=<id>` |
-| 结算 | 订阅 `ctx.on('session/event')`：`turn/start` 维护每个会话的最大 turn 并解除「未开工」判定，`assistant/message` 记住本 turn 最后一条文本，`turn/end` 按 `turn >= baselineTurn` 结算 pending 任务；一个 taskId 只结算一次 |
-| 回执字段 | `taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode`；`status` 覆盖 `completed / aborted / blocked / error / max-tokens / interrupted / forked / not-started`；摘要按码点截断 |
-| 三档去向 | `receiptMode=file`（默认，只追加 `receiptFile`）→ `queue`（再把 `[RECEIPT]` 注入 `receiptTo`）→ `wake`（再唤醒；无 `wakeSecret` 时降级 queue 并 WARN）；`receiptTo` 解析不到只写文件 + `lastError`，绝不打扰其他会话 |
-| 未开工检测 | 注入后 `receiptStallMs`（默认 600000）内无 `turn/start` → `status:"not-started"` 并清理 pending；插件 dispose 时清理全部 pending 与计时器 |
-| 可见性 | `/mesh/status` 增 `pendingTasks`、`lastReceipt`、`receiptMode`、`receiptFile`；面板设置区显示只读「任务回执」行（方式 + 最近一条 + 等待数） |
-| 验证 | `node test/waker-endpoints.test.js` 17/17：新增 4 例（completed + 摘要截断、单次结算、error 带 `provider_error`、stall 1s → not-started）；另一轮手工实例写出 `receipts.jsonl` 且默认 file 模式未打扰任何会话 |
-
-## v0.5.0（2026-10-29，pull 默认 + 自举接入 + standalone）
-
-| 项 | 内容 |
-|---|---|
-| pull 默认 | 新增 pull 循环：`GET /api/inbox?unread=1&order=desc&limit=20&claim=1&claim_ttl_ms=…` → 按 conversation 分组 → **复用现有唤醒路径**（冷却、去重、`mark_read`）→ 间隔自适应（有信 `pollBusyIntervalMs` / 连续 3 次空 `pollIdleIntervalMs` / 其余 `pollIntervalMs`），失败按 `5s × 2^n` 退避、上限 5 分钟；push 与 pull 并存时共用同一套去重，不重复开 turn |
-| 自举接入 | `hubUrl` + `joinCode` 且无 token 时：`GET /api/bootstrap`（含可选 CA）→ `POST /api/enroll {code,name,host}` → token 写 `tokenFile`（0600）→ 继续启动；没配 `tokenFile` 直接报错要求配置 |
-| standalone | 无 `hubUrl` 只监听本机（默认 `127.0.0.1`），`/mesh/status.mode="standalone"`，**不发任何网络请求**；有 `hubUrl` 但 token 与 joinCode 都缺时同样降级，`lastError` 写明 `missing token (provide joinCode or tokenFile)`，不静默退出 |
-| CA 信任 | `caFile` 走 `tls.setDefaultCACertificates`（不依赖 `NODE_EXTRA_CA_CERTS`）；bootstrap 返回 `tls.ca_pem` 且未配 `caFile` 时自动采用（仅内存）；`caSha256` 指纹钉扎，不符即拒绝联网；日志只记 sha256 前 16 位 |
-| 状态与面板 | `/mesh/status` 增 `mode`、`lastPullAt`、`pollIntervalMs`、`nextPollIn`、`caFingerprint`、`hubConnected`；面板状态区显示「同步方式」「上次拉取」，standalone 时提示填 `hubUrl` + `joinCode` |
-| wakeSecret | 从「必需」降为**仅 push 需要**；pull 模式缺它不报错、不阻塞 |
-| 验证 | `node test/waker-endpoints.test.js` 11/11（含 standalone 零网络请求、缺凭据 lastError、`caSha256` 不匹配、joinCode 自举 + pull 真拉信、间隔自适应）；手工 bootstrap 实测：token 落盘且与签发值一致，日志只有 `fp=tok-ma… len=24`，未出现完整 token |
-
-## v0.4.60（2026-10-29，设置面板「打开中枢控制台」）
-
-| 项 | 内容 |
-|---|---|
-| 新增 | 设置 → Mesh 在「中枢登记」下多一行「中枢控制台 → 打开」，只做跳转：`window.open(hubConsoleUrl, '_blank', 'noopener,noreferrer')`；`/mesh/status` 新增只读字段 `hubConsoleUrl`（由 `hubUrl` 去尾斜杠拼 `/console` 派生，未配置 `hubUrl` 时为 `null`，此时整行不渲染） |
-| 不引入 | 不改 `editable()` 白名单、不新增任何端点、不碰 token / wakeSecret 的暴露方式：admin token 是全权凭据，面板走 loopback 且无鉴权，cordis patch 明文落盘，管理动作留在中枢控制台（会话鉴权 + CSRF） |
-| 验证 | `node test/waker-endpoints.test.js` 全过；面板可见性自测：`hubConsoleUrl=null` 时无该行，有值时按钮的 `window.open` 参数为 `[url, '_blank', 'noopener,noreferrer']` |
-
-## v0.4.59（2026-10-28，会话删除、archived 标记、cwd 指引）
-
-| 项 | 内容 |
-|---|---|
-| 新增 | `POST /mesh/sessions/delete { session }`：删除本机会话——先停掉在跑的 agent、摘掉 `conversations.json` 里指向它的绑定，再删会话目录；停不下来的返回 409（本轮修复随本批未发布版本一起交付） |
-| 会话列表 | `GET /mesh/sessions` 每条新增 `archived` 字段（来自 `workspaceRegistry.archivedSessionIds`，旧宿主降级为恒 `false`） |
-| 文档 | `docs/local-sessions.md` 增加「cwd 必须指向具体仓库根」的说明（两个仓并存时见过踩坑） |
-| 验证 | 删除后 `GET /mesh/sessions` 不再列出该 id；`node test/waker-endpoints.test.js` 的 delete 用例覆盖失败路径与绑定清理 |
-
-## v0.4.58（2026-10-28，created 会话绑定工作区；新增归档）
-
-| 项 | 内容 |
-|---|---|
-| 修复 | `POST /mesh/sessions/create` 生成的会话原先没有 workspaceId，侧栏（按工作区分组）看不到；现在先 `resolveByPath`、找不到再 `create`，并把 workspaceId 交给 `sessionController.create` |
-| 新增 | `POST /mesh/sessions/archive { session }`：归档会话（文件保留、侧栏隐藏）；存活会话由宿主拒绝 |
-| 验证 | 创建后侧栏出现在对应工作区；归档后列表 `archived=true` 且不再出现在侧栏 |
-
-## v0.4.57（2026-10-28，可创建执行会话）
-
-| 项 | 内容 |
-|---|---|
-| 新增 | `POST /mesh/sessions/create { title, cwd?, prompt?, mode? }`：新建会话 → rename → 可选首轮 prompt（`queue` / `steer`）；返回 `sessionId` / `title` / `workspaceId` / `workspacePath` / `prompted` |
-| 验证 | 空 `prompt` 返回 201 且 `GET /mesh/sessions` 立即可见；带 `prompt` 时目标会话真的跑一轮 |
-
-## v0.4.56（2026-10-28，本机会话列表与进程内注入）
-
-| 项 | 内容 |
-|---|---|
-| 新增 | `GET /mesh/sessions`：枚举 `~/.dsh/sessions/<workspace>/<session-id>/`，标题从会话日志的 zstd 帧恢复并缓存在 `sessions-index.json`；返回 `id` / `title` / `cwd` / `workspace` / `last_active` / `live` |
-| 新增 | `POST /mesh/inject { session\|title, text, mode? }`：向已加载或冷会话投一轮任务（`queue` 等回合结束 / `steer` 打断），冷会话自动 `agents.resume` |
-| 安全 | 两个端点都只接受 loopback（`fromLoopback`）；正文上限 `MAX_BODY` |
-| 验证 | `curl /mesh/sessions` 列出现有会话；按标题注入进入目标会话；同名标题返回 400 且不投递；`node test/waker-endpoints.test.js` |
+# Changelog
+
+本项目从 0.1.0 开始记录。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 SemVer。
+
+> 最新发布：`0.7.5`（npm `latest` / `next`）。`0.7.6` 之后的改动见「未发布」。
+
+## [未发布]
+
+### Added
+
+- 设置页按章节聚合（收件箱 / 投递 / 回执 / 任务 / 诊断），字段改完即生效。
+- 「派活任务」面板：批次聚合、人读耗时、左右分栏详情、取消任务、打开会话。
+- 任务库：`GET /mesh/tasks` 列表与详情、`DELETE /mesh/tasks/:id` 取消，任务正文与回执可事后查。
+- 任务显示可读标题（可显式传 `subject`，否则从正文首行清洗）。
+- 任务状态增加「进行中」（`started` / `startedAt`）。
+- 线程身份：`mesh_dispatch` 的 `thread` 参数可续派到同一会话，任务头带 `THREAD`，`GET /mesh/threads` 查看绑定。
+- `mesh_thread` 工具：`list` / `subscribe` / `release`，worker 可主动接管或交回线索。
+- 重启后自动把上一进程遗留的任务标为 `lost` 并通知派活方，不再无声消失。
+- 回执可投给派活方（`requester`），而不是只投全局 `receiptTo`。
+
+### Changed
+
+- 注入的回执通知默认只发状态行（`error` / `lost` 附一行原因）；需要摘要时设 `receiptNoticeSummary: true`。
+- 任务面板按钮统一为主/次/危险三档样式。
+
+### Fixed
+
+- `mesh_dispatch` 从未注册成功（output schema 用了宿主不支持的 `type` 数组）。
+- 「打开会话」点了没反应（未注入 `ui-workspace`；现可真正切换）。
+- 「打开任务面板」/「去任务面板」入口点了没反应（现切主视图并落在任务标签）。
+- 回执静默丢失：file 模式也会写日志，无投递目标时给出 WARN；requester 缺失时按目标会话工作区推断协调会话。
+- 同一 `taskId` 在 24 小时内复用会在任务记录里标记 `reusedId`。
+- 回执摘要混入思考/工具块，或抓到上一个回合的正文（现在只取本任务开始后的答复）。
+- 重启前未完成的任务不再一直等待（启动补发 `lost` 回执，并按任务记录的回执模式投递）。
+- 归档会话在列表中置灰标注，删除后不再残留归档 id。
+
+### Known limitations
+
+- 面板、设置页等客户端改动需要重启 DSH 宿主（并在安装目录同步插件）后才可见。
+
+## [0.7.5] - 2026-10-31
+
+### Added
+
+- `/mesh/sessions` 支持分页、标题/工作区过滤与 `archived` 过滤。
+- 插件日志可写入独立文件并按大小滚动，`/mesh/status` 显示日志路径与大小。
+
+## [0.7.4] - 2026-10-31
+
+### Fixed
+
+- 插件清单 `exports` 缺项导致宿主 loader 读不到客户端/CLI 入口。
+
+## [0.7.3] - 2026-10-31
+
+### Fixed
+
+- 桥会话在发送回复前先预留，避免拉取/推送循环把问题或回复抢走。
+
+## [0.7.2] - 2026-10-30
+
+### Added
+
+- `/mesh/status` 暴露待答问题与待批审批，面板可一眼看到卡住的事。
+
+## [0.7.1] - 2026-10-30
+
+### Fixed
+
+- `mesh_ask` 把自己的提问误当成回答返回。
+
+## [0.7.0] - 2026-10-30
+
+### Added
+
+- 提问桥：agent 运行中可通过 mesh 收件箱向人提问并等待回答（超时不猜默认值）。
+
+## [0.6.0] - 2026-10-30
+
+### Added
+
+- 远程审批：通过 mesh 收件箱回复 approve/deny 即可应答审批请求（fail-closed）。
+
+## [0.5.8] - 2026-10-30
+
+### Fixed
+
+- 被主题路由拒绝的消息不再被误消费，拒绝原因记入日志。
+
+## [0.5.7] - 2026-10-30
+
+### Added
+
+- 主题路由：远程按标签投递，不暴露会话 id 或标题。
+
+## [0.5.6] - 2026-10-30
+
+### Fixed
+
+- 注入发生在回合进行中时，不再被上一轮 `turn/end` 提前结算成完成。
+
+## [0.5.5] - 2026-10-30
+
+### Added
+
+- 派活能力进插件：`mesh_dispatch` 工具与 `dsh-mesh-dispatch` CLI。
+
+## [0.5.4] - 2026-10-30
+
+### Changed
+
+- 标题解析优先活跃会话；`/mesh/sessions?live=1` 只列运行中的会话。
+
+## [0.5.2] - 2026-10-29
+
+### Added
+
+- 批次屏障：同一 `batchId` 的多个任务全部结束只回执一次；事件驱动的会话活跃度。
+
+## [0.5.1] - 2026-10-29
+
+### Added
+
+- 插件级任务回执：任务结束时生成结构化回执（状态、耗时、摘要）。
+
+## [0.5.0] - 2026-10-29
+
+### Added
+
+- 以 pull 为主要收信方式，支持 joinCode 自举接入与完全 standalone 运行。
+
+## 早期版本（0.1.0–0.4.x）
+
+### Added
+
+- 本机唤醒端点：中枢发来「有信」信号即在运行中的 DSH 里创建/唤醒会话并投递。
+- 中枢注册、断线追信与多会话协同（收件箱、主题、回复、peer 列表）。
+- 设置面板：连接配置、本机会话列表与进程内注入。
+- 会话管理：创建执行会话、绑定工作区、删除与归档标记。
