@@ -78,6 +78,156 @@ function sha256OfFile(file) {
   }
 }
 
+/**
+ * One-time realignment (T-300): a receipt must live in the same tier as its task row.
+ * Older code routed receipts from the target session's cwd at settle/migration time while
+ * the task used LCA(origin, target), so a cross-workspace receipt landed in a workspace
+ * layer and the dispatcher's upward lookup (ws -> local) never found it.
+ *
+ * Append to the destination and prove the line count grew, then rewrite the source without
+ * the moved lines. Receipts whose task row is missing or appears in several task files are
+ * left alone: the layer cannot be proven, and guessing would move data to the wrong place.
+ * Exported so verification can run this exact code over a copy of the live data.
+ */
+export function realignReceiptTiers({ meshHome, storageTiers = true, log = () => {} } = {}) {
+  if (storageTiers !== true || !meshHome) return { moved: 0, skipped: 0 }
+  const localDir = join(meshHome, 'local')
+  const wsRoot = join(meshHome, 'ws')
+  const receiptsFileIn = (dir) => join(dir, 'receipts.jsonl')
+
+  const receiptFiles = []
+  try {
+    for (const dir of [localDir, ...readdirSync(wsRoot).map((name) => join(wsRoot, name))]) {
+      const file = receiptsFileIn(dir)
+      if (existsSync(file)) receiptFiles.push(file)
+    }
+  } catch {
+    return { moved: 0, skipped: 0 }
+  }
+  if (!receiptFiles.length) return { moved: 0, skipped: 0 }
+
+  const taskFiles = []
+  const legacyTasks = join(meshHome, 'tasks.jsonl')
+  if (existsSync(legacyTasks)) taskFiles.push(legacyTasks)
+  const localTasks = join(localDir, 'tasks.jsonl')
+  if (existsSync(localTasks)) taskFiles.push(localTasks)
+  try {
+    for (const name of readdirSync(wsRoot)) {
+      const file = join(wsRoot, name, 'tasks.jsonl')
+      if (existsSync(file)) taskFiles.push(file)
+    }
+  } catch {
+    /* no ws dir */
+  }
+
+  // The task rows are authoritative. An id found in two task files is ambiguous.
+  const taskDir = new Map()
+  const ambiguous = new Set()
+  for (const file of taskFiles) {
+    let lines = []
+    try {
+      lines = readFileSync(file, 'utf8').split('\n')
+    } catch {
+      continue
+    }
+    for (const line of lines) {
+      if (!line.trim()) continue
+      let row = null
+      try {
+        row = JSON.parse(line)
+      } catch {
+        continue
+      }
+      const id = row?.taskId
+      if (!id) continue
+      const dir = dirname(file)
+      if (taskDir.has(id) && taskDir.get(id) !== dir) ambiguous.add(id)
+      taskDir.set(id, dir)
+    }
+  }
+
+  const moves = []
+  let skipped = 0
+  for (const from of receiptFiles) {
+    let lines = []
+    try {
+      lines = readFileSync(from, 'utf8').split('\n')
+    } catch {
+      continue
+    }
+    for (const line of lines) {
+      if (!line.trim()) continue
+      let row = null
+      try {
+        row = JSON.parse(line)
+      } catch {
+        continue
+      }
+      const id = row?.taskId
+      if (!id) continue
+      const to = taskDir.get(id)
+      if (!to || ambiguous.has(id)) {
+        skipped += 1
+        continue
+      }
+      if (dirname(from) === to) continue
+      moves.push({ line, row, from, to })
+    }
+  }
+  if (!moves.length) {
+    if (skipped) log(`tiers: receipt realign skipped ${skipped} (no unique task row)`)
+    return { moved: 0, skipped }
+  }
+
+  // Write first: a destination failure must leave every source byte-identical.
+  const byTarget = new Map()
+  for (const move of moves) {
+    if (!byTarget.has(move.to)) byTarget.set(move.to, [])
+    byTarget.get(move.to).push(move)
+  }
+  try {
+    for (const [dir, list] of byTarget) {
+      const file = receiptsFileIn(dir)
+      const existing = existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()) : []
+      const known = new Set(existing)
+      const fresh = list.filter((move) => !known.has(JSON.stringify(move.row)))
+      if (fresh.length) {
+        mkdirSync(dir, { recursive: true })
+        appendFileSync(file, fresh.map((move) => `${JSON.stringify(move.row)}\n`).join(''), { mode: 0o600 })
+      }
+      const after = existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).length : 0
+      if (after !== existing.length + fresh.length) {
+        throw new Error(`destination ${file} did not grow by ${fresh.length}`)
+      }
+    }
+  } catch (error) {
+    log(`tiers: receipt realign aborted before touching sources: ${error.message}`)
+    return { moved: 0, skipped, failed: true }
+  }
+
+  // Only now drop the moved lines from their sources (atomic rewrite, no data loss).
+  try {
+    const bySource = new Map()
+    for (const move of moves) {
+      if (!bySource.has(move.from)) bySource.set(move.from, new Set())
+      bySource.get(move.from).add(move.line)
+    }
+    for (const [file, movedLines] of bySource) {
+      const kept = readFileSync(file, 'utf8').split('\n').filter((line) => line.trim() && !movedLines.has(line))
+      const temp = `${file}.realign.tmp`
+      writeFileSync(temp, kept.join('\n') + (kept.length ? '\n' : ''), { mode: 0o600 })
+      renameSync(temp, file)
+    }
+  } catch (error) {
+    // The rows exist in both layers now; the next boot finds the destination row already
+    // present and only removes the source copy, so nothing is lost or duplicated.
+    log(`tiers: receipt realign moved rows but could not rewrite a source: ${error.message}`)
+    return { moved: 0, skipped, failed: true }
+  }
+  log(`tiers: receipts realigned ${moves.length}${skipped ? ` (skipped ${skipped})` : ''}`)
+  return { moved: moves.length, skipped }
+}
+
 export const name = 'mesh-waker'
 export const inject = ['sessionController', 'agents', 'workspaceRegistry', 'configEditor', 'commands', 'attachments']
 
@@ -3557,6 +3707,18 @@ export function apply(ctx, config) {
     return routeForCwds(sessionCwdOf(sessionId), null).dir
   }
 
+  /**
+   * The tier directory a receipt belongs to: the same one as its task row (T-300). Routing a
+   * receipt from the target session's cwd at settle time disagrees with LCA(origin, target)
+   * for cross-workspace tasks, so the dispatcher's upward lookup (ws -> local) missed it.
+   */
+  function receiptDirForTask(taskId) {
+    const pending = pendingTasks.get(taskId)
+    if (pending?.recordDir) return pending.recordDir
+    const file = taskFiles.get(taskId)
+    return file ? dirname(file) : null
+  }
+
   /** Physical file for a record kind/scope (docs §4); workspace scope needs the slug. */
   function resolveRecordFile(kind, scope, slug = null) {
     const dir = scope === 'workspace' && slug ? wsDirFor(slug) : localDir
@@ -3609,6 +3771,10 @@ export function apply(ctx, config) {
       state.lastError = `writing receipt failed: ${error.message}`
       return false
     }
+  }
+
+  function realignReceiptTiersAtBoot() {
+    return realignReceiptTiers({ meshHome, storageTiers: c.storageTiers, log: fileLog })
   }
 
 
@@ -4281,7 +4447,7 @@ export function apply(ctx, config) {
       injectedDuringTurn: task.injectedDuringTurn === true,
       source: details.source ?? task.source ?? 'observed',
     })
-    writeReceiptFile(receipt, task.recordDir ?? receiptDirFor(receipt))
+    writeReceiptFile(receipt, task.recordDir ?? receiptDirForTask(taskId) ?? receiptDirFor(receipt))
     // Registry status mirrors the receipt: not-started is the stall path, everything else
     // settled. Registry durationMs is measured from startedAt when the task was seen
     // starting (falling back to injection time); the receipt keeps its own duration.
@@ -4786,7 +4952,7 @@ export function apply(ctx, config) {
             detail: derived.detail,
             at,
           },
-          receiptDirFor({ sessionId: row.sessionId }),
+          receiptDirForTask(taskId) ?? receiptDirFor({ sessionId: row.sessionId }),
         )
         saveBatches()
         void deliverNotice(
@@ -5304,6 +5470,8 @@ export function apply(ctx, config) {
   // Split legacy single files into tier files before anything loads or rewrites rows.
   migrateLegacyStorage()
   loadTaskRegistry()
+  // A receipt must live with its task row (T-300): fix historical mismatches once, idempotently.
+  realignReceiptTiersAtBoot()
   loadThreads()
   // Migrate inline bodies before anything reads or rewrites rows (idempotent, T-277).
   compactTaskTexts()

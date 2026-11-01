@@ -4329,6 +4329,171 @@ async function main() {
 
 
 
+  // 242-246. Receipt tiers (T-300): a receipt must sit in the same layer as its task row,
+  // and historical mismatches are realigned once (append first, verify, then remove).
+  await runCase('storage: a cross-workspace receipt stays in local/ with its task', async (boot) => {
+    const cwdA = path.join(os.tmpdir(), 'wt-receipt-a')
+    const cwdB = path.join(os.tmpdir(), 'wt-receipt-b')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-receipt-req', title: 'mesh · 协调', cwd: cwdB },
+        { id: 'session-receipt-target', title: 'worker', cwd: cwdA },
+      ],
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'cross receipt work', meta: { taskId: 'T-RCPT-CROSS', requester: 'session-receipt-req' } },
+    })
+    h.emit('session/event', { id: 'session-receipt-target' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-receipt-target' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const localReceipt = await waitFor(
+      () => linesOf(path.join(meshOf(h), 'local', 'receipts.jsonl')).find((row) => row.taskId === 'T-RCPT-CROSS'),
+      4000,
+    )
+    const wsReceipts = linesOf(path.join(meshOf(h), 'ws', 'wt-receipt-a', 'receipts.jsonl')).filter((row) => row.taskId === 'T-RCPT-CROSS')
+    const taskRow = linesOf(path.join(meshOf(h), 'local', 'tasks.jsonl')).find((row) => row.taskId === 'T-RCPT-CROSS')
+    // The dispatcher lives in wt-receipt-b and looks up ws/wt-receipt-b/ then local/; the
+    // local hit is exactly what findRecord() returns for a scope=machine task.
+    const ok = Boolean(localReceipt) && wsReceipts.length === 0 && taskRow?.scope === 'machine'
+    report('storage: a cross-workspace receipt stays in local/ with its task', ok, `local=${Boolean(localReceipt)} ws=${wsReceipts.length} taskScope=${taskRow?.scope ?? '-'}`)
+  })
+
+  await runCase('storage: a same-workspace receipt stays in ws/<slug>/', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'wt-receipt-same')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-same-req', title: 'mesh · 协调', cwd },
+        { id: 'session-same-target', title: 'worker', cwd },
+      ],
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'same receipt work', meta: { taskId: 'T-RCPT-SAME', requester: 'session-same-req' } },
+    })
+    h.emit('session/event', { id: 'session-same-target' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-same-target' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const wsReceipt = await waitFor(
+      () => linesOf(path.join(meshOf(h), 'ws', 'wt-receipt-same', 'receipts.jsonl')).find((row) => row.taskId === 'T-RCPT-SAME'),
+      4000,
+    )
+    const localReceipts = linesOf(path.join(meshOf(h), 'local', 'receipts.jsonl')).filter((row) => row.taskId === 'T-RCPT-SAME')
+    const ok = Boolean(wsReceipt) && localReceipts.length === 0
+    report('storage: a same-workspace receipt stays in ws/<slug>/', ok, `ws=${Boolean(wsReceipt)} local=${localReceipts.length}`)
+  })
+
+  await runCase('storage: a historical mis-tiered receipt is realigned once', async (boot) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-realign-'))
+    const logFile = path.join(tmpRoot, 'realign.log')
+    const logFile2 = path.join(tmpRoot, 'realign-2.log')
+    const cwdA = path.join(os.tmpdir(), 'wt-realign-a')
+    const cwdB = path.join(os.tmpdir(), 'wt-realign-b')
+    const seeds = [
+      { id: 'session-realign-req', title: 'mesh · 协调', cwd: cwdB },
+      { id: 'session-realign-target', title: 'worker', cwd: cwdA },
+    ]
+    try {
+      const first = await boot({
+        tmpRoot,
+        config: { logFile },
+        seedSessions: seeds,
+        prepareHome: (home) => {
+          const registry = path.join(home, '.dsh', 'mesh-waker')
+          fs.mkdirSync(path.join(registry, 'local'), { recursive: true })
+          fs.mkdirSync(path.join(registry, 'ws', 'wt-realign-a'), { recursive: true })
+          fs.writeFileSync(
+            path.join(registry, 'local', 'tasks.jsonl'),
+            `${JSON.stringify(seededTask('T-RCPT-OLD', {
+              scope: 'machine',
+              origin: 'test-machine/wt-realign-b',
+              peers: ['test-machine/wt-realign-a'],
+              targetSessionId: 'session-realign-target',
+              status: 'settled',
+              settledAt: Date.now() - 1000,
+            }))}\n`,
+          )
+          fs.writeFileSync(
+            path.join(registry, 'ws', 'wt-realign-a', 'receipts.jsonl'),
+            `${JSON.stringify({ taskId: 'T-RCPT-OLD', sessionId: 'session-realign-target', status: 'completed', kind: 'task' })}\n`,
+          )
+        },
+      })
+      const localReceipt = linesOf(path.join(meshOf(first), 'local', 'receipts.jsonl')).filter((row) => row.taskId === 'T-RCPT-OLD')
+      const wsReceipt = linesOf(path.join(meshOf(first), 'ws', 'wt-realign-a', 'receipts.jsonl')).filter((row) => row.taskId === 'T-RCPT-OLD')
+      const firstLog = fs.readFileSync(logFile, 'utf8')
+      first.close()
+      const second = await boot({ tmpRoot, config: { logFile: logFile2 }, seedSessions: seeds })
+      const localAfter = linesOf(path.join(tmpRoot, 'home', '.dsh', 'mesh-waker', 'local', 'receipts.jsonl')).filter((row) => row.taskId === 'T-RCPT-OLD')
+      const secondLog = fs.readFileSync(logFile2, 'utf8')
+      const ok =
+        localReceipt.length === 1 &&
+        wsReceipt.length === 0 &&
+        /tiers: receipts realigned 1/.test(firstLog) &&
+        localAfter.length === 1 &&
+        !/tiers: receipts realigned/.test(secondLog)
+      report('storage: a historical mis-tiered receipt is realigned once', ok, `local=${localReceipt.length} ws=${wsReceipt.length} afterSecond=${localAfter.length} idempotent=${!/tiers: receipts realigned/.test(secondLog)}`)
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('storage: an orphan receipt is left alone and logged', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'wt-orphan-a')
+    const logFile = path.join(os.tmpdir(), `waker-orphan-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile },
+      seedSessions: [{ id: 'session-orphan-a', title: 'worker', cwd }],
+      prepareHome: (home) => {
+        const registry = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(path.join(registry, 'ws', 'wt-orphan-a'), { recursive: true })
+        fs.writeFileSync(
+          path.join(registry, 'ws', 'wt-orphan-a', 'receipts.jsonl'),
+          `${JSON.stringify({ taskId: 'T-ORPHAN-RCPT', status: 'completed' })}\n`,
+        )
+      },
+    })
+    const kept = linesOf(path.join(meshOf(h), 'ws', 'wt-orphan-a', 'receipts.jsonl')).filter((row) => row.taskId === 'T-ORPHAN-RCPT')
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok = kept.length === 1 && /tiers: receipt realign skipped 1/.test(log)
+    report('storage: an orphan receipt is left alone and logged', ok, `kept=${kept.length} logged=${/realign skipped 1/.test(log)}`)
+  })
+
+  await runCase('storage: a failed realign leaves the source receipt intact', async (boot) => {
+    const cwdA = path.join(os.tmpdir(), 'wt-realign-fail-a')
+    const cwdB = path.join(os.tmpdir(), 'wt-realign-fail-b')
+    const logFile = path.join(os.tmpdir(), `waker-realign-fail-${process.pid}-${Date.now()}.log`)
+    let sourceBefore = ''
+    const h = await boot({
+      config: { logFile },
+      seedSessions: [
+        { id: 'session-fail-req', title: 'mesh · 协调', cwd: cwdB },
+        { id: 'session-fail-target', title: 'worker', cwd: cwdA },
+      ],
+      prepareHome: (home) => {
+        const registry = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(path.join(registry, 'local'), { recursive: true })
+        fs.mkdirSync(path.join(registry, 'ws', 'wt-realign-fail-a'), { recursive: true })
+        fs.writeFileSync(
+          path.join(registry, 'local', 'tasks.jsonl'),
+          `${JSON.stringify(seededTask('T-RCPT-FAIL', {
+            scope: 'machine',
+            targetSessionId: 'session-fail-target',
+            status: 'settled',
+            settledAt: Date.now() - 1000,
+          }))}\n`,
+        )
+        const source = path.join(registry, 'ws', 'wt-realign-fail-a', 'receipts.jsonl')
+        sourceBefore = `${JSON.stringify({ taskId: 'T-RCPT-FAIL', status: 'completed' })}\n`
+        fs.writeFileSync(source, sourceBefore)
+        // A directory where the destination file must be makes the append fail (EISDIR).
+        fs.mkdirSync(path.join(registry, 'local', 'receipts.jsonl'), { recursive: true })
+      },
+    })
+    const sourceAfter = fs.readFileSync(path.join(meshOf(h), 'ws', 'wt-realign-fail-a', 'receipts.jsonl'), 'utf8')
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok = sourceAfter === sourceBefore && /tiers: receipt realign aborted before touching sources/.test(log)
+    report('storage: a failed realign leaves the source receipt intact', ok, `unchanged=${sourceAfter === sourceBefore} aborted=${/realign aborted/.test(log)}`)
+  })
+
   // 193-197. Code fingerprint staleness (T-284): same-version code changes must be visible.
   // A temp copy of index.js + package.json is used through MESH_WAKER_SELF_FILE so the suite
   // never touches the real plugin file.
