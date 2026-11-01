@@ -4071,6 +4071,112 @@ async function main() {
 
 
 
+  // 193-197. Code fingerprint staleness (T-284): same-version code changes must be visible.
+  // A temp copy of index.js + package.json is used through MESH_WAKER_SELF_FILE so the suite
+  // never touches the real plugin file.
+  const withFakePlugin = async (fn) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-self-'))
+    fs.copyFileSync(path.join(__dirname, '..', 'plugins', 'mesh-waker', 'index.js'), path.join(dir, 'index.js'))
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'dsh-mesh-waker', version: '0.7.31' }))
+    const previous = process.env.MESH_WAKER_SELF_FILE
+    process.env.MESH_WAKER_SELF_FILE = path.join(dir, 'index.js')
+    try {
+      return await fn(dir)
+    } finally {
+      if (previous === undefined) delete process.env.MESH_WAKER_SELF_FILE
+      else process.env.MESH_WAKER_SELF_FILE = previous
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+  const versionsOf = async (h) => (await request(h.base, '/mesh/status')).json?.pluginVersions ?? {}
+
+  await runCase('stale: a same-version code change on disk reports codeStale', async (boot) => {
+    await withFakePlugin(async (dir) => {
+      const h = await boot({})
+      const before = await versionsOf(h)
+      fs.appendFileSync(path.join(dir, 'index.js'), '\n// edited after boot\n')
+      const after = await versionsOf(h)
+      const forced = (await request(h.base, '/mesh/status?refresh=1')).json?.pluginVersions ?? {}
+      const ok =
+        before.codeStale === false &&
+        before.stale === false &&
+        after.codeStale === false && // 5s cache: no refresh yet
+        forced.codeStale === true &&
+        forced.stale === true &&
+        forced.versionStale === false &&
+        forced.codeHash !== forced.diskCodeHash
+      report('stale: a same-version code change on disk reports codeStale', ok, `before=${before.codeStale}/${before.stale} cached=${after.codeStale} forced=${forced.codeStale}/${forced.stale} hashes=${forced.codeHash}/${forced.diskCodeHash}`)
+    })
+  })
+
+  await runCase('stale: a version change still reports stale without a code change', async (boot) => {
+    await withFakePlugin(async (dir) => {
+      const h = await boot({})
+      const before = await versionsOf(h)
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'dsh-mesh-waker', version: '9.9.9' }))
+      const forced = (await request(h.base, '/mesh/status?refresh=1')).json?.pluginVersions ?? {}
+      const ok =
+        before.stale === false &&
+        forced.versionStale === true &&
+        forced.codeStale === false &&
+        forced.stale === true &&
+        forced.disk === '9.9.9'
+      report('stale: a version change still reports stale without a code change', ok, `versionStale=${forced.versionStale} codeStale=${forced.codeStale} disk=${forced.disk}`)
+    })
+  })
+
+  await runCase('stale: unchanged code and version stay quiet', async (boot) => {
+    await withFakePlugin(async () => {
+      const h = await boot({})
+      const versions = await versionsOf(h)
+      const ok =
+        versions.codeStale === false &&
+        versions.versionStale === false &&
+        versions.stale === false &&
+        typeof versions.codeHash === 'string' &&
+        versions.codeHash.length === 12 &&
+        versions.codeHash === versions.diskCodeHash &&
+        typeof versions.bootedAt === 'string'
+      report('stale: unchanged code and version stay quiet', ok, `codeStale=${versions.codeStale} stale=${versions.stale} hashes=${versions.codeHash}/${versions.diskCodeHash}`)
+    })
+  })
+
+  await runCase('stale: an unreadable own file reports null instead of throwing', async (boot) => {
+    const previous = process.env.MESH_WAKER_SELF_FILE
+    process.env.MESH_WAKER_SELF_FILE = path.join(os.tmpdir(), `missing-self-${process.pid}-${Date.now()}.js`)
+    try {
+      const h = await boot({})
+      const versions = await versionsOf(h)
+      const ok =
+        versions.codeStale === null &&
+        versions.stale === false &&
+        versions.codeHash === null &&
+        versions.diskCodeHash === null &&
+        versions.disk === null
+      report('stale: an unreadable own file reports null instead of throwing', ok, `codeStale=${versions.codeStale} codeHash=${versions.codeHash} disk=${versions.disk}`)
+    } finally {
+      if (previous === undefined) delete process.env.MESH_WAKER_SELF_FILE
+      else process.env.MESH_WAKER_SELF_FILE = previous
+    }
+  })
+
+  await runCase('stale: refresh=1 recomputes past the five-second cache', async (boot) => {
+    await withFakePlugin(async (dir) => {
+      const h = await boot({})
+      const first = await versionsOf(h)
+      fs.appendFileSync(path.join(dir, 'index.js'), '\n// cache probe\n')
+      const cached = await versionsOf(h)
+      const refreshed = (await request(h.base, '/mesh/status?refresh=1')).json?.pluginVersions ?? {}
+      const ok =
+        first.codeStale === false &&
+        cached.codeStale === false &&
+        cached.diskCodeHash === first.diskCodeHash &&
+        refreshed.codeStale === true &&
+        refreshed.diskCodeHash !== first.diskCodeHash
+      report('stale: refresh=1 recomputes past the five-second cache', ok, `cached=${cached.codeStale} refreshed=${refreshed.codeStale} hashes=${first.diskCodeHash}/${refreshed.diskCodeHash}`)
+    })
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

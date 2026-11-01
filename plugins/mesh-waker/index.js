@@ -55,9 +55,18 @@ export function hubConsoleUrlFor(hubUrl) {
   return base ? `${base}/console` : null
 }
 
-function readDiskVersion() {
+function readDiskVersion(dir = SELF_DIR) {
   try {
-    return String(JSON.parse(readFileSync(join(SELF_DIR, 'package.json'), 'utf8')).version ?? '0.0.0')
+    return String(JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version ?? '0.0.0')
+  } catch {
+    return null
+  }
+}
+
+/** sha256 of a file, or null when it cannot be read (never invents a fingerprint). */
+function sha256OfFile(file) {
+  try {
+    return createHash('sha256').update(readFileSync(file)).digest('hex')
   } catch {
     return null
   }
@@ -5374,6 +5383,33 @@ export function apply(ctx, config) {
   })()
 
   // mesh_ask (0.7.0): same registration path as mesh_dispatch — defineTool when the host
+  // ---------------------------------------------------------------- code fingerprint
+  //
+  // Not every change bumps the version (internal changes stay in [未发布]), so "loaded but
+  // not restarted" has to be visible from the code itself, not just the version string
+  // (T-284). The running copy is hashed once at startup; the status endpoint re-reads the
+  // file on demand with a short cache.
+  const selfFile = process.env.MESH_WAKER_SELF_FILE || fileURLToPath(import.meta.url)
+  const selfDir = dirname(selfFile)
+  const bootedAt = new Date().toISOString()
+  const bootedCodeHash = sha256OfFile(selfFile)
+  let diskCodeCache = { at: 0, computed: false, hash: null }
+  function diskCodeHash(refresh = false) {
+    const now = Date.now()
+    if (!refresh && diskCodeCache.computed && now - diskCodeCache.at < 5000) return diskCodeCache.hash
+    const hash = sha256OfFile(selfFile)
+    diskCodeCache = { at: now, computed: true, hash }
+    return hash
+  }
+  if (!bootedCodeHash) {
+    fileLog('WARN cannot read own index.js; code staleness will be unknown')
+  } else {
+    const current = sha256OfFile(selfFile)
+    if (current && current !== bootedCodeHash) {
+      fileLog('code on disk is newer than the running process; restart to apply')
+    }
+  }
+
   // package resolves, otherwise the same JSON Schema definition. Question traffic is
   // consumed by the pull loop; the tool waits for one inbox reply or reports unanswered.
   // Restore batches before the listener comes up, then poll liveness for early alerts.
@@ -5911,7 +5947,17 @@ export function apply(ctx, config) {
           // The settings panel runs in the browser on another origin; this route carries
           // no secrets (no token, no message body), so a permissive CORS header is fine.
           res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-          const diskVersion = readDiskVersion()
+          const diskVersion = readDiskVersion(selfDir)
+          let refresh = false
+          try {
+            refresh = new URL(req.url ?? '/', 'http://localhost').searchParams.get('refresh') === '1'
+          } catch {
+            refresh = false
+          }
+          const diskHash = diskCodeHash(refresh)
+          const versionStale = diskVersion !== null && diskVersion !== PLUGIN_INFO.version
+          // null means "cannot tell" (file unreadable); never pretend the code is fresh.
+          const codeStale = bootedCodeHash !== null && diskHash !== null ? diskHash !== bootedCodeHash : null
           res.end(
             JSON.stringify({
               ok: true,
@@ -5921,7 +5967,14 @@ export function apply(ctx, config) {
               pluginVersions: {
                 process: PLUGIN_INFO.version,
                 disk: diskVersion,
-                stale: diskVersion !== null && diskVersion !== PLUGIN_INFO.version,
+                stale: versionStale || codeStale === true,
+                // Keep the historical `stale` meaning (version diff) visible separately and
+                // say why a restart is needed: version and/or code changed on disk.
+                versionStale,
+                codeStale,
+                codeHash: bootedCodeHash ? bootedCodeHash.slice(0, 12) : null,
+                diskCodeHash: diskHash ? diskHash.slice(0, 12) : null,
+                bootedAt,
               },
               // Pull/standalone surface (contract sections 3 and 4): the panel shows the
               // sync mode and the last pull, and the countdown is handy when debugging.

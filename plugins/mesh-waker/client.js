@@ -34,6 +34,11 @@ function staleVersionNotice(status) {
   if (!versions || versions.stale !== true) return ''
   const disk = versions.disk || '?'
   const process = versions.process || '?'
+  // A version bump is the loud case; a same-version code change is the quiet one that used
+  // to stay invisible (T-284). Say which one so the user knows why a restart is needed.
+  if (versions.codeStale === true && versions.versionStale !== true) {
+    return `检测到磁盘代码已更新（版本仍为 ${process}）—— 重启 DSH 后生效`
+  }
   return `检测到磁盘版本 ${disk}，进程版本 ${process} —— 重启 DSH 后生效`
 }
 
