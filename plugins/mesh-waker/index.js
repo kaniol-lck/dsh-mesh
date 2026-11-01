@@ -91,6 +91,9 @@ function configureLog(file, maxBytes) {
 
 function rotateLog() {
   try {
+    // Windows rename does not overwrite: drop the previous rotated copy first, otherwise a
+    // second rotation silently keeps appending to the (now too large) current file.
+    rmSync(`${logTarget}.1`, { force: true })
     renameSync(logTarget, `${logTarget}.1`)
   } catch {
     /* a failed rename must not drop the line we are about to write */
@@ -522,6 +525,55 @@ export const ASK_OUTPUT = {
   render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
 }
 
+/**
+ * Worker-side thread tool (0.7.23): a worker can see, take over, or hand back a thread.
+ * `list` is read-only; `subscribe` binds the caller session (refuses to steal); `release`
+ * unbinds only for the current owner, after which dispatches without target hit
+ * "unknown thread" — that is the hand-back-to-coordinator semantics.
+ */
+export const MESH_THREAD_TOOL = {
+  name: 'mesh_thread',
+  description:
+    'Inspect or change thread bindings. list (scope mine|all) shows bindings; subscribe binds the calling session to a thread (refused when another session owns it); release unbinds a thread only for its current owner, after which dispatches without target report unknown thread.',
+  parameters: {
+    action: { type: 'string', required: true, enum: ['list', 'subscribe', 'release'], description: 'list | subscribe | release' },
+    thread: { type: 'string', description: 'Thread id for subscribe/release (≤128 bytes, e.g. TH-1).' },
+    scope: { type: 'string', enum: ['mine', 'all'], description: 'list scope: mine (default) or all.' },
+  },
+  required: ['action'],
+}
+
+export const THREAD_OUTPUT = {
+  schema: {
+    type: 'object',
+    properties: {
+      ok: { type: 'boolean' },
+      action: { type: 'string' },
+      thread: { type: 'string' },
+      released: { type: 'boolean' },
+      scope: { type: 'string' },
+      threads: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            thread: { type: 'string' },
+            targetSessionId: { type: 'string' },
+            targetTitle: { type: 'string' },
+            count: { type: 'number' },
+            lastTaskId: { type: 'string' },
+            updatedAt: { type: 'number' },
+            subscribedBy: { type: 'string' },
+            taskIds: { type: 'array', items: { type: 'string' } },
+          },
+        },
+      },
+    },
+    required: ['ok', 'action'],
+  },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+}
+
 const TOOL_SCHEMA_CONSTRAINTS = new Set(['type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const'])
 const TOOL_SCHEMA_ANNOTATIONS = new Set(['description', 'title', 'default', 'examples'])
 const TOOL_SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'])
@@ -703,16 +755,17 @@ export function normalizeThread(value) {
  * knows which task/batch it is running without guessing from prose. The body after the blank
  * line stays byte-for-byte unchanged.
  */
-export function withTaskHeader(text, { taskId, batchId, requester, now = new Date() } = {}) {
+export function withTaskHeader(text, { taskId, batchId, requester, thread, now = new Date() } = {}) {
   const pad = (value) => String(value).padStart(2, '0')
   const offset = -now.getTimezoneOffset()
   const sign = offset >= 0 ? '+' : '-'
   const abs = Math.abs(offset)
   const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`
   const task = taskId || '-'
+  const threadLabel = thread || '-'
   const batch = batchId || '-'
   const from = requester || 'unknown'
-  return `[TASK ${task} · BATCH ${batch} · FROM ${from}] ${stamp}\n\n${text}`
+  return `[TASK ${task} · THREAD ${threadLabel} · BATCH ${batch} · FROM ${from}] ${stamp}\n\n${text}`
 }
 
 export const SESSION_PAGE_DEFAULT = 80
@@ -3243,6 +3296,8 @@ export function apply(ctx, config) {
           lastTaskId: value.lastTaskId == null ? null : String(value.lastTaskId),
           count: Number.isFinite(Number(value.count)) ? Number(value.count) : 0,
           updatedAt: Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : 0,
+          // Older files predate subscribe: they were written by dispatches.
+          subscribedBy: value.subscribedBy == null ? 'dispatch' : String(value.subscribedBy),
         })
       }
     } catch {
@@ -3266,7 +3321,7 @@ export function apply(ctx, config) {
   }
 
   /** Bind (or re-bind) a thread after a successful delivery and persist it. */
-  function bindThread(thread, target, taskId) {
+  function bindThread(thread, target, taskId, source = 'dispatch') {
     const previous = threadRows.get(thread)
     const rebound = Boolean(previous && previous.targetSessionId && previous.targetSessionId !== target.id)
     threadRows.set(thread, {
@@ -3275,13 +3330,84 @@ export function apply(ctx, config) {
       lastTaskId: taskId ?? previous?.lastTaskId ?? null,
       count: (previous?.count ?? 0) + 1,
       updatedAt: Date.now(),
+      subscribedBy: previous?.subscribedBy && source === 'dispatch' ? previous.subscribedBy : source,
     })
     saveThreads()
     if (rebound) {
-      fileLog(`thread ${thread} rebound: ${previous.targetSessionId} -> ${target.id} (${target.title ?? 'no title'}) task=${taskId ?? '-'}`)
+      fileLog(`thread ${thread} rebound: ${previous.targetSessionId} -> ${target.id} (${target.title ?? 'no title'}) task=${taskId ?? '-'} by=${source}`)
     } else {
-      fileLog(`thread ${thread} bound to ${target.id} (${target.title ?? 'no title'}) count=${threadRows.get(thread).count} task=${taskId ?? '-'}`)
+      fileLog(`thread ${thread} bound to ${target.id} (${target.title ?? 'no title'}) count=${threadRows.get(thread).count} task=${taskId ?? '-'} by=${source}`)
     }
+  }
+
+  /** Resolve a title for an arbitrary session id; null when it is unknown to this host. */
+  function sessionForId(sessionId) {
+    const id = String(sessionId ?? '').trim()
+    if (!id) throw new Error('sessionId is required')
+    try {
+      const session = resolveLocalSession({ session: id })
+      return { id: session.id, title: session.title ?? null }
+    } catch {
+      return { id, title: null }
+    }
+  }
+
+  /** The public shape of one thread, including the tasks that carried it. */
+  function describeThread(thread) {
+    const value = threadRows.get(thread)
+    if (!value) return null
+    return {
+      thread,
+      targetSessionId: value.targetSessionId ?? null,
+      targetTitle: value.targetTitle ?? null,
+      count: value.count ?? 0,
+      lastTaskId: value.lastTaskId ?? null,
+      updatedAt: value.updatedAt ?? null,
+      subscribedBy: value.subscribedBy ?? 'dispatch',
+      taskIds: [...taskRows.values()]
+        .filter((row) => row.thread === thread)
+        .sort((left, right) => Number(left.createdAt) - Number(right.createdAt))
+        .map((row) => row.taskId),
+    }
+  }
+
+  function listThreads({ scope = 'all', sessionId = null } = {}) {
+    const wanted = scope === 'mine' ? sessionId : null
+    if (scope === 'mine' && !wanted) throw new Error('scope=mine needs a session (the host did not pass one)')
+    return [...threadRows.keys()]
+      .map((thread) => describeThread(thread))
+      .filter((row) => row && (!wanted || row.targetSessionId === wanted))
+      .sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0))
+  }
+
+  /** Bind a thread to a session. Refuses to steal an existing binding from another session. */
+  function subscribeThread(threadValue, session) {
+    const thread = normalizeThread(threadValue)
+    if (!thread) throw new Error('thread is required')
+    const owner = threadRows.get(thread)
+    if (owner && owner.targetSessionId && owner.targetSessionId !== session.id) {
+      const who = owner.targetTitle ? `${owner.targetSessionId} (${owner.targetTitle})` : owner.targetSessionId
+      throw new Error(`thread "${thread}" is already bound to ${who}; only that session can release it`)
+    }
+    bindThread(thread, session, owner?.lastTaskId ?? null, 'self')
+    return describeThread(thread)
+  }
+
+  /** Unbind a thread; only the current owner may release it. */
+  function releaseThread(threadValue, sessionId) {
+    const thread = normalizeThread(threadValue)
+    if (!thread) throw new Error('thread is required')
+    const owner = threadRows.get(thread)
+    if (!owner) throw new Error(`unknown thread "${thread}"`)
+    if (owner.targetSessionId !== sessionId) {
+      throw new Error(
+        `thread "${thread}" is bound to ${owner.targetSessionId ?? '(unknown)'}${owner.targetTitle ? ` (${owner.targetTitle})` : ''}, not ${sessionId}; only the current owner can release it`,
+      )
+    }
+    threadRows.delete(thread)
+    saveThreads()
+    fileLog(`thread ${thread} released by ${sessionId}`)
+    return { thread, released: true }
   }
 
   function taskTextPath(taskId) {
@@ -4257,7 +4383,7 @@ export function apply(ctx, config) {
       ...(resolved.deadlineMs ? { deadlineMs: resolved.deadlineMs } : {}),
     }
     const deliveredText = c.injectHeader
-      ? withTaskHeader(text, { taskId: meta.taskId, batchId: meta.batchId, requester })
+      ? withTaskHeader(text, { taskId: meta.taskId, batchId: meta.batchId, requester, thread })
       : text
     let taskId = null
     try {
@@ -4284,6 +4410,40 @@ export function apply(ctx, config) {
     }
   }
 
+  /** Worker-side thread actions: list / subscribe / release (T-254). */
+  async function meshThreadAction(args = {}, extra = null) {
+    const action = String(args.action ?? '').trim()
+    const caller = callerSessionFrom(extra)
+    if (!caller) {
+      throw new Error('mesh_thread needs the calling session; the host did not pass one (no default session is guessed)')
+    }
+    const session = sessionForId(caller)
+    if (action === 'list') {
+      const scope = args.scope === 'mine' ? 'mine' : 'all'
+      const threads = listThreads({ scope, sessionId: session.id })
+      fileLog(`mesh_thread list scope=${scope} by=${caller} threads=${threads.length}`)
+      return { ok: true, action, scope, threads }
+    }
+    if (action === 'subscribe') {
+      const row = subscribeThread(args.thread, session)
+      fileLog(`mesh_thread subscribe thread=${row.thread} by=${caller}`)
+      return {
+        ok: true,
+        action,
+        thread: row.thread,
+        targetSessionId: row.targetSessionId,
+        targetTitle: row.targetTitle,
+        subscribedBy: row.subscribedBy,
+      }
+    }
+    if (action === 'release') {
+      const result = releaseThread(args.thread, session.id)
+      fileLog(`mesh_thread release thread=${result.thread} by=${caller}`)
+      return { ok: true, action, thread: result.thread, released: true }
+    }
+    throw new Error(`action must be list | subscribe | release, got "${action || '(empty)'}"`)
+  }
+
   // Both model tools share one definition builder and one installer. Registration can lose
   // a race with the host's tools service (ctx.get('tools') is still undefined on the first
   // plugin turn), so it retries a few times instead of failing silently; every outcome goes
@@ -4291,6 +4451,7 @@ export function apply(ctx, config) {
   const toolState = {
     dispatch: { ok: false, error: null },
     ask: { ok: false, error: null },
+    thread: { ok: false, error: null },
   }
 
   function toolsService() {
@@ -4382,6 +4543,16 @@ export function apply(ctx, config) {
       },
     })
     installModelTool(askDefinition, 'ask')
+
+    const threadDefinition = await buildToolDefinition({
+      name: MESH_THREAD_TOOL.name,
+      description: MESH_THREAD_TOOL.description,
+      parameters: MESH_THREAD_TOOL.parameters,
+      required: MESH_THREAD_TOOL.required,
+      output: THREAD_OUTPUT,
+      execute: (args, extra) => meshThreadAction(args, extra),
+    })
+    installModelTool(threadDefinition, 'thread')
   })()
 
   // mesh_ask (0.7.0): same registration path as mesh_dispatch — defineTool when the host
@@ -4449,22 +4620,45 @@ export function apply(ctx, config) {
         res.end('{"error":"loopback only"}')
         return
       }
-      const threads = [...threadRows.entries()]
-        .map(([thread, value]) => ({
-          thread,
-          targetSessionId: value.targetSessionId ?? null,
-          targetTitle: value.targetTitle ?? null,
-          count: value.count ?? 0,
-          lastTaskId: value.lastTaskId ?? null,
-          updatedAt: value.updatedAt ?? null,
-          taskIds: [...taskRows.values()]
-            .filter((row) => row.thread === thread)
-            .sort((left, right) => Number(left.createdAt) - Number(right.createdAt))
-            .map((row) => row.taskId),
-        }))
-        .sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0))
+      const threads = listThreads({ scope: 'all' })
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
       res.end(JSON.stringify({ ok: true, total: threads.length, threads }))
+      return
+    }
+
+    if ((path === '/mesh/threads/subscribe' || path === '/mesh/threads/release') && req.method === 'POST') {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const chunks = []
+      let size = 0
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size > MAX_BODY) {
+          res.writeHead(413).end()
+          return
+        }
+        chunks.push(chunk)
+      }
+      try {
+        const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        const sessionId = String(draft.sessionId ?? '').trim()
+        if (!sessionId) throw new Error('sessionId is required')
+        if (path.endsWith('/subscribe')) {
+          const row = subscribeThread(draft.thread, sessionForId(sessionId))
+          res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+          res.end(JSON.stringify({ ok: true, thread: row.thread, targetSessionId: row.targetSessionId, targetTitle: row.targetTitle, subscribedBy: row.subscribedBy }))
+        } else {
+          const released = releaseThread(draft.thread, sessionId)
+          res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+          res.end(JSON.stringify({ ok: true, thread: released.thread, released: true }))
+        }
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
       return
     }
 
@@ -4810,7 +5004,7 @@ export function apply(ctx, config) {
         }
         const batchId = meta.batchId ? String(meta.batchId).trim() : null
         const deliveredText = c.injectHeader
-          ? withTaskHeader(text, { taskId: meta.taskId ? String(meta.taskId) : '-', batchId, requester })
+          ? withTaskHeader(text, { taskId: meta.taskId ? String(meta.taskId) : '-', batchId, requester, thread })
           : text
         // Register before prompting: a very fast turn can end before this request returns.
         let taskId = null
@@ -4901,8 +5095,8 @@ export function apply(ctx, config) {
                 }
               })(),
               // Model-tool self-check: a silent registration failure is visible here.
-              tools: { dispatch: toolState.dispatch.ok, ask: toolState.ask.ok },
-              toolsError: toolState.dispatch.error ?? toolState.ask.error ?? null,
+              tools: { dispatch: toolState.dispatch.ok, ask: toolState.ask.ok, thread: toolState.thread.ok },
+              toolsError: toolState.dispatch.error ?? toolState.ask.error ?? toolState.thread.error ?? null,
               // Effective limits and optional-seam state, so operators never have to guess.
               limits: { maxInlineBytes: c.maxInlineBytes },
               seams: { approval: seams.approval, questions: seams.questions },

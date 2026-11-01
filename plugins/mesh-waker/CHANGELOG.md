@@ -9,6 +9,17 @@
 
 ---
 
+## v0.7.23（2026-11-01，worker 可主动接管/交回线程：`mesh_thread`）
+
+| 项 | 内容 |
+|---|---|
+| 任务头带 thread | `withTaskHeader()` 输出改为 `[TASK <id> · THREAD <id\|-> · BATCH <id\|-> · FROM <requester>] <时间>`：带 thread 时写线程 id，不传稳定写 `-`（派活/注入两条路径都传 thread） |
+| 新工具 `mesh_thread` | 一个工具三个动作（schema 只用单类型）：`list`（`scope=mine` 默认 / `all`）、`subscribe`（把**调用方会话**绑到线程；已被别的会话占用 → 拒绝并报占用者，不抢）、`release`（只有当前绑定者能解绑；解绑即从 `threads.json` 移除，之后不带 target 的派活报 `unknown thread` = 交回协调）。调用方会话取自宿主 caller（`extra.agent.id`/`sessionId`），拿不到明确报错，不猜默认会话 |
+| 绑定来源 | `threads.json` 每条新增 `subscribedBy`（`dispatch` / `self`，旧文件按 `dispatch` 兼容）；`GET /mesh/threads` 每条返回 `subscribedBy` 与 `taskIds[]` |
+| HTTP 对账 | 新增 loopback `POST /mesh/threads/subscribe`、`POST /mesh/threads/release`（body `{thread, sessionId}`），与工具共用 `subscribeThread`/`releaseThread` |
+| 回执 | 仍按 `requester` 返回，未改动；任务头变化只影响首行，正文逐字不变 |
+| 测试 | +6（共 138/138）：任务头含 `THREAD TH-HDR` 与 `THREAD -`；worker 订阅后 `/mesh/threads` 显示 `self`+targetTitle；被他人占用时拒绝且错误带占用者；非绑定者 release 被拒、绑定者 release 后不再列出；解绑后不带 target 派活报 `unknown thread` 且零投递；HTTP subscribe/release 与工具同规则（冲突 400、二次 release 400）。原 132 例全绿 |
+
 ## v0.7.22（2026-11-01，`baselineTurn=null` 的任务也能标 `started`）
 
 | 项 | 内容 |
