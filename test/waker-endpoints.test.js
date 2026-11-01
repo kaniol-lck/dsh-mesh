@@ -4348,6 +4348,134 @@ async function main() {
   })
 
 
+  // 224-229. Role white list (T-295): only known role names reach `roles`; title fragments
+  // are parked in `rolesUnrecognized`, cleanup is idempotent, and human roles survive it.
+  await runCase('roles: a coordinator title contributes no role', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'roles-coord')
+    const h = await boot({ seedSessions: [{ id: 'session-coord', title: 'mesh · 协调 2', cwd }] })
+    const entry = registryOf(h).workspaces?.['roles-coord']
+    const roles = entry?.roles ?? []
+    const ok =
+      Boolean(entry) &&
+      entry?.coordinator === 'session-coord' &&
+      !roles.includes('协调 2') &&
+      !roles.includes('协调') &&
+      (entry?.rolesUnrecognized ?? []).length === 0
+    report('roles: a coordinator title contributes no role', ok, `coordinator=${entry?.coordinator ?? '-'} roles=${JSON.stringify(roles)} unrecognized=${JSON.stringify(entry?.rolesUnrecognized ?? [])}`)
+  })
+
+  await runCase('roles: a whitelisted suffix becomes a role', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'roles-known')
+    const h = await boot({ seedSessions: [{ id: 'session-waker', title: 'mesh · waker', cwd }] })
+    const entry = registryOf(h).workspaces?.['roles-known']
+    const ok = JSON.stringify(entry?.roles) === JSON.stringify(['waker']) && (entry?.rolesUnrecognized ?? []).length === 0
+    report('roles: a whitelisted suffix becomes a role', ok, `roles=${JSON.stringify(entry?.roles ?? [])} unrecognized=${JSON.stringify(entry?.rolesUnrecognized ?? [])}`)
+  })
+
+  await runCase('roles: an unrecognised suffix is parked, not promoted', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'roles-noise')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-noise-q', title: 'mesh · question/q-ad774b89', cwd },
+        { id: 'session-noise-cn', title: 'mesh · 恢复1/2盘点', cwd },
+      ],
+    })
+    const entry = registryOf(h).workspaces?.['roles-noise']
+    const ok =
+      (entry?.roles ?? []).length === 0 &&
+      JSON.stringify(entry?.rolesUnrecognized) === JSON.stringify(['question/q-ad774b89', '恢复1/2盘点'])
+    report('roles: an unrecognised suffix is parked, not promoted', ok, `roles=${JSON.stringify(entry?.roles ?? [])} unrecognized=${JSON.stringify(entry?.rolesUnrecognized ?? [])}`)
+  })
+
+  await runCase('roles: legacy title fragments are cleaned into unrecognized', async (boot) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-roles-clean-'))
+    const cwd = path.join(tmpRoot, 'work', 'dsh-mesh', 'public')
+    const logFile = path.join(tmpRoot, 'clean.log')
+    try {
+      const h = await boot({
+        tmpRoot,
+        config: { logFile },
+        seedSessions: [
+          { id: 'session-waker', title: 'mesh · waker', cwd },
+          { id: 'session-create3', title: 'mesh · create3', cwd },
+          { id: 'session-restore', title: 'mesh · 恢复1/2盘点', cwd },
+        ],
+        prepareHome: (home) => {
+          const registryDir = path.join(home, '.dsh', 'mesh-waker')
+          fs.mkdirSync(registryDir, { recursive: true })
+          fs.writeFileSync(
+            path.join(registryDir, 'workspaces.json'),
+            `${JSON.stringify({ machine: 'm', workspaces: { 'dsh-mesh': { cwd, roles: ['waker', 'create3', '恢复1/2盘点'] } } }, null, 2)}\n`,
+          )
+        },
+      })
+      const entry = registryOf(h).workspaces?.['dsh-mesh']
+      const log = fs.readFileSync(logFile, 'utf8')
+      const ok =
+        JSON.stringify(entry?.roles) === JSON.stringify(['waker']) &&
+        JSON.stringify(entry?.rolesUnrecognized) === JSON.stringify(['create3', '恢复1/2盘点']) &&
+        /workspaces: roles cleaned 2 → unrecognized/.test(log)
+      report('roles: legacy title fragments are cleaned into unrecognized', ok, `roles=${JSON.stringify(entry?.roles ?? [])} unrecognized=${JSON.stringify(entry?.rolesUnrecognized ?? [])} cleaned=${/roles cleaned 2/.test(log)}`)
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('roles: a human role survives alongside inferred roles', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'roles-human')
+    const h = await boot({
+      seedSessions: [{ id: 'session-waker', title: 'mesh · waker', cwd }],
+      prepareHome: (home) => {
+        const registryDir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(registryDir, { recursive: true })
+        fs.writeFileSync(
+          path.join(registryDir, 'workspaces.json'),
+          `${JSON.stringify({ machine: 'm', workspaces: { 'roles-human': { cwd, roles: ['custom-role'] } } }, null, 2)}\n`,
+        )
+      },
+    })
+    const entry = registryOf(h).workspaces?.['roles-human']
+    const ok = JSON.stringify(entry?.roles) === JSON.stringify(['custom-role', 'waker'])
+    report('roles: a human role survives alongside inferred roles', ok, `roles=${JSON.stringify(entry?.roles ?? [])}`)
+  })
+
+  await runCase('roles: cleanup is idempotent across restarts', async (boot) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-roles-idem-'))
+    const cwd = path.join(tmpRoot, 'work', 'dsh-mesh', 'public')
+    const logOne = path.join(tmpRoot, 'one.log')
+    const logTwo = path.join(tmpRoot, 'two.log')
+    const seeds = [
+      { id: 'session-waker', title: 'mesh · waker', cwd },
+      { id: 'session-create3', title: 'mesh · create3', cwd },
+    ]
+    try {
+      const first = await boot({
+        tmpRoot,
+        config: { logFile: logOne },
+        seedSessions: seeds,
+        prepareHome: (home) => {
+          const registryDir = path.join(home, '.dsh', 'mesh-waker')
+          fs.mkdirSync(registryDir, { recursive: true })
+          fs.writeFileSync(
+            path.join(registryDir, 'workspaces.json'),
+            `${JSON.stringify({ machine: 'm', workspaces: { 'dsh-mesh': { cwd, roles: ['waker', 'create3'] } } }, null, 2)}\n`,
+          )
+        },
+      })
+      const afterFirst = registryOf(first)
+      first.close()
+      const second = await boot({ tmpRoot, config: { logFile: logTwo }, seedSessions: seeds })
+      const afterSecond = registryOf(second)
+      const log = fs.readFileSync(logTwo, 'utf8')
+      const same = JSON.stringify(afterFirst) === JSON.stringify(afterSecond)
+      const ok = same && !/roles cleaned/.test(log) && /workspaces: converged merged=0 ephemeral=0 reslugged=0 \(no changes\)/.test(log)
+      report('roles: cleanup is idempotent across restarts', ok, `same=${same} cleanedLogged=${/roles cleaned/.test(log)}`)
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+
   // 206-211. Numbered coordinators (T-287): one matcher, latest wins, ambiguity still wins
   // over guessing when mtimes cannot separate the candidates.
   await runCase('coordinator: numbered titles are recognised by the shared matcher', async () => {
@@ -4652,14 +4780,16 @@ async function main() {
       'MESH_DISPATCH_TOOL', 'MESH_ASK_TOOL', 'DISPATCH_OUTPUT', 'ASK_OUTPUT', 'MESH_COMPLETE_TOOL', 'COMPLETE_OUTPUT',
       'MESH_THREAD_TOOL', 'THREAD_OUTPUT', 'validateToolSchema', 'previewText', 'truncateUtf8', 'inlineBodyText',
       'cleanTaskSubject', 'resolveTaskSubject', 'normalizeThread', 'withTaskHeader', 'SESSION_PAGE_DEFAULT',
-      'SESSION_PAGE_MAX', 'paginateSessions', 'apply', 'name', 'inject',
+      'SESSION_PAGE_MAX', 'paginateSessions', 'ROLE_NAMES', 'ROLE_UNRECOGNIZED_MAX', 'titleRoleCandidate',
+      'classifyRoleCandidates', 'apply', 'name', 'inject',
     ]
     const missing = expected.filter((key) => api[key] === undefined)
     const wrongType = expected.filter((key) => {
       const value = api[key]
       if (key === 'apply') return typeof value !== 'function'
       if (key === 'name' || key === 'inject') return typeof value === 'undefined'
-      if (key === 'SESSION_PAGE_DEFAULT' || key === 'SESSION_PAGE_MAX') return typeof value !== 'number'
+      if (key === 'SESSION_PAGE_DEFAULT' || key === 'SESSION_PAGE_MAX' || key === 'ROLE_UNRECOGNIZED_MAX') return typeof value !== 'number'
+      if (key === 'ROLE_NAMES') return !Array.isArray(value)
       if (key.endsWith('_TOOL') || key.endsWith('_OUTPUT')) return typeof value !== 'object'
       return typeof value !== 'function'
     })

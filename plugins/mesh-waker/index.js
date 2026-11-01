@@ -29,7 +29,7 @@ import { zstdDecompressSync } from 'node:zlib'
 import { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
 import { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, buildBatchReceipt } from './lib/receipt.mjs'
 import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
-import { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle } from './lib/session.mjs'
+import { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, classifyRoleCandidates, ROLE_UNRECOGNIZED_MAX } from './lib/session.mjs'
 import { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settings.mjs'
 
@@ -38,7 +38,7 @@ import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settin
 export { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
 export { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, buildBatchReceipt } from './lib/receipt.mjs'
 export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
-export { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle } from './lib/session.mjs'
+export { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, ROLE_NAMES, ROLE_UNRECOGNIZED_MAX, titleRoleCandidate, classifyRoleCandidates } from './lib/session.mjs'
 export { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 
 // Self-reported identity: the hub surfaces it so an operator can spot a stale install.
@@ -2970,6 +2970,9 @@ export function apply(ctx, config) {
         ...(value.coordinator ? { coordinator: String(value.coordinator) } : {}),
         ...(value.coordinatorStale === true ? { coordinatorStale: true } : {}),
         ...(Array.isArray(value.roles) ? { roles: value.roles.map(String) } : {}),
+        ...(Array.isArray(value.rolesUnrecognized)
+          ? { rolesUnrecognized: value.rolesUnrecognized.map(String).slice(0, ROLE_UNRECOGNIZED_MAX) }
+          : {}),
         ...(typeof value.slug === 'string' && value.slug ? { slug: String(value.slug) } : {}),
         ...(value.ephemeral === true ? { ephemeral: true } : {}),
       }
@@ -3134,9 +3137,18 @@ export function apply(ctx, config) {
     for (const [, group] of byReal) {
       const survivor = group.find((entry) => typeof entry.value.slug === 'string') ?? group[0]
       const roles = new Set()
+      const unrecognized = new Set()
       for (const entry of group) for (const role of entry.value.roles ?? []) roles.add(role)
+      for (const entry of group) for (const role of entry.value.rolesUnrecognized ?? []) unrecognized.add(role)
       if (group.length > 1) merged += group.length - 1
-      mergedEntries.push({ key: survivor.key, value: { ...survivor.value, ...(roles.size ? { roles: [...roles] } : {}) } })
+      mergedEntries.push({
+        key: survivor.key,
+        value: {
+          ...survivor.value,
+          ...(roles.size ? { roles: [...roles] } : {}),
+          ...(unrecognized.size ? { rolesUnrecognized: [...unrecognized].sort().slice(0, ROLE_UNRECOGNIZED_MAX) } : {}),
+        },
+      })
     }
 
     // Different realpaths that resolve to the same desired slug (public vs dsh-mesh).
@@ -3160,11 +3172,17 @@ export function apply(ctx, config) {
         group[0]
       if (group.length > 1) merged += group.length - 1
       const roles = new Set()
+      const unrecognized = new Set()
       for (const entry of group) for (const role of entry.value.roles ?? []) roles.add(role)
+      for (const entry of group) for (const role of entry.value.rolesUnrecognized ?? []) unrecognized.add(role)
       const cwdList = group.map((entry) => entry.value.cwd)
       const groupSessions = []
       for (const cwd of cwdList) groupSessions.push(...(sessionsByCwd.get(workspaceKeyPath(cwd)) ?? []))
-      const entry = { ...survivor.value, ...(roles.size ? { roles: [...roles] } : {}) }
+      const entry = {
+        ...survivor.value,
+        ...(roles.size ? { roles: [...roles] } : {}),
+        ...(unrecognized.size ? { rolesUnrecognized: [...unrecognized].sort().slice(0, ROLE_UNRECOGNIZED_MAX) } : {}),
+      }
       if (isEphemeralGroup(entry.cwd, groupSessions)) {
         ephemeral += 1
         pruneEmptyWsDir(desired)
@@ -3243,16 +3261,28 @@ export function apply(ctx, config) {
         delete entry.coordinatorStale
         changed = true
       }
-      if (!Array.isArray(entry.roles) || entry.roles.length === 0) {
-        const roles = new Set()
-        for (const session of list) {
-          const match = /·\s*([^\s·]+)\s*$/.exec(String(session.title ?? ''))
-          if (match && !/^(协调|coordinator)$/i.test(match[1])) roles.add(match[1])
-        }
-        if (roles.size) {
-          entry.roles = [...roles]
-          changed = true
-        }
+      // Roles come only from the whitelist (T-295). A `·` suffix that is not a known role is
+      // a title fragment: it is parked in rolesUnrecognized instead of roles. Roles a human
+      // wrote stay: anything not derivable from the current titles is kept as-is, so cleanup
+      // can never delete a hand-written value (T-286's constraint).
+      const { roles: knownRoles, unrecognized } = classifyRoleCandidates(list.map((session) => session.title))
+      const derived = new Set([...knownRoles, ...unrecognized])
+      const existingRoles = Array.isArray(entry.roles) ? entry.roles.map(String) : []
+      const manualRoles = existingRoles.filter((role) => !derived.has(role))
+      const nextRoles = [...manualRoles]
+      for (const role of knownRoles) if (!nextRoles.includes(role)) nextRoles.push(role)
+      const removed = existingRoles.filter((role) => derived.has(role) && !knownRoles.includes(role))
+      if (removed.length) fileLog(`workspaces: roles cleaned ${removed.length} → unrecognized`)
+      if (JSON.stringify(nextRoles) !== JSON.stringify(existingRoles)) {
+        if (nextRoles.length) entry.roles = nextRoles
+        else delete entry.roles
+        changed = true
+      }
+      const previousUnrecognized = Array.isArray(entry.rolesUnrecognized) ? entry.rolesUnrecognized.map(String) : []
+      if (JSON.stringify(unrecognized) !== JSON.stringify(previousUnrecognized)) {
+        if (unrecognized.length) entry.rolesUnrecognized = unrecognized
+        else delete entry.rolesUnrecognized
+        changed = true
       }
     }
     if (changed) saveWorkspaces()

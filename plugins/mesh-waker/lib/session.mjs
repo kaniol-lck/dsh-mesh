@@ -77,3 +77,41 @@ export function withTaskHeader(text, { taskId, batchId, requester, thread, now =
 export function isCoordinatorTitle(title) {
   return /·\s*(协调|coordinator)(?:\s*[-_]?\s*\d+)?\s*$/i.test(String(title ?? ''))
 }
+
+/**
+ * Roles the workspace registry may infer from a session title (T-295). The `·` suffix is a
+ * human convention, not a schema: only these names reach `roles`, so a title like
+ * `mesh · question/q-123` or `mesh · 恢复1/2盘点` can never look like a role again.
+ */
+export const ROLE_NAMES = Object.freeze(['waker', 'hub', 'docs', 'ops', 'approval', 'deploy', 'pipeline', 'verify'])
+
+/** How many unrecognised title fragments a registry entry keeps for later triage. */
+export const ROLE_UNRECOGNIZED_MAX = 20
+
+/**
+ * The role a title claims: the fragment after the last `·`. Coordinator titles carry no
+ * role (isCoordinatorTitle owns them, including `协调 2`), and titles without a suffix
+ * return null. This is the only place that parses a title's role suffix.
+ */
+export function titleRoleCandidate(title) {
+  const text = String(title ?? '')
+  if (isCoordinatorTitle(text)) return null
+  const match = /·\s*([^\s·]+)\s*$/.exec(text)
+  return match ? match[1] : null
+}
+
+/**
+ * Split titles into recognised roles and unrecognised fragments. Both lists are deduped and
+ * sorted, so every boot computes the same result and cleanup stays idempotent (T-295).
+ */
+export function classifyRoleCandidates(titles, roleNames = ROLE_NAMES) {
+  const known = new Set()
+  const unknown = new Set()
+  for (const title of titles ?? []) {
+    const candidate = titleRoleCandidate(title)
+    if (!candidate) continue
+    if (roleNames.includes(candidate)) known.add(candidate)
+    else unknown.add(candidate)
+  }
+  return { roles: [...known].sort(), unrecognized: [...unknown].sort().slice(0, ROLE_UNRECOGNIZED_MAX) }
+}
