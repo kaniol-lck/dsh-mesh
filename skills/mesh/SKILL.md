@@ -337,6 +337,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 - **工具（推荐）**：`mesh_dispatch({ target, text, taskId, batchId, receipt, deadline, createIfMissing })` —— 带 `taskId` 才有回执；没有现成会话时用 `createIfMissing` 起一个；
 - **CLI**：`npx dsh-mesh-dispatch --target "backend" --text "…" --task T-1 --batch B-1 --create`；
 - **HTTP 兜底**：`POST http://127.0.0.1:8795/mesh/inject`，body `{ "title" 或 "session": "…", "text": "…", "mode": "queue" }`。
+- **跨区派活单号必须带工作区前缀**：任务落在 `local/` 时，`taskId` 用 `<项目前缀>-<日期>-<序号>`（如 `T4F-20261101-03`），不要用裸 `T-NNN`——多个协调会话共用 `local/tasks.jsonl`，裸号会相遇。
 
 ### 最小铁律（每条一句话）
 
@@ -349,4 +350,13 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
 ### 回执在哪
 
-`~/.dsh/mesh-waker/receipts.jsonl`，一行一条 JSON：`taskId` / `sessionId` / `turn` / `status` / `durationMs` / `summary`。
+存储按工作区分层（2026-11-01 起；`findRecord` 也是向上查找）：
+
+- **区内任务**（同一工作区）：`~/.dsh/mesh-waker/ws/<slug>/` 下——
+  - `receipts.jsonl`，一行一条 JSON：`taskId` / `sessionId` / `turn` / `status` / `reasonKind` / `reasonDetail` / `injectedAt` / `endedAt` / `durationMs` / `summary` / `source` / `receiptMode` / `baselineTurn` / `settledTurn` / `injectedDuringTurn`；
+  - `tasks.jsonl`（任务登记）、`logs/<YYYY-MM-DD>.log`（当日日志）。
+- **跨区任务**（发起方与目标方不在同一工作区）：`~/.dsh/mesh-waker/local/` 下的同名文件（`receipts.jsonl` / `tasks.jsonl` / `logs/<YYYY-MM-DD>.log`）。
+- **查找顺序：工作区层 → local 层**。
+- **遗留单文件**：`receipts.legacy.jsonl` / `tasks.legacy.jsonl` / `local/logs/legacy-waker.log` 只保留一个兼容周期，不要建议任何人读它——新回执不会写进去。
+
+例：`~/.dsh/mesh-waker/ws/dsh-mesh/receipts.jsonl`。
