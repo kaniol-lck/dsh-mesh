@@ -27,112 +27,41 @@ import { createServer as createHttpServer } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import { randomUUID, randomBytes, createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, createReadStream, statSync, unlinkSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
-
-// Hub version and the oldest plugin build the hub still fully understands. Both are
-// advisory: they drive the drift hints in /api/peers and /api/status, never authorization.
-const HUB_VERSION = '0.7.21'
-const MIN_WAKER = process.env.MESH_MIN_WAKER || '0.4.0'
-// Read-only console. Without a view token (or an admin token to fall back on) the
-// console does not exist at all — a default-open dashboard is how tokens leak.
-const VIEW_TOKEN = process.env.MESH_VIEW_TOKEN || process.env.MESH_ADMIN_TOKEN || null
-// Who may even open the console. Default: loopback only — a management page on plain HTTP
-// must not be reachable from the LAN unless the operator explicitly opts in.
-const CONSOLE_ALLOW = String(process.env.MESH_CONSOLE_ALLOW ?? '').trim()
+import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
+import { config } from './config.mjs'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const PORT = Number(process.env.MESH_PORT ?? 8790)
-const HOST = process.env.MESH_HOST ?? '0.0.0.0'
-const DATA_DIR = process.env.MESH_DATA_DIR ?? join(HERE, 'data')
-const ONLINE_TTL_MS = Number(process.env.MESH_ONLINE_TTL_MS ?? 120_000)
-const MESSAGE_TTL_MS = Number(process.env.MESH_MESSAGE_TTL_MS ?? 7 * 24 * 3600_000)
-// How often read mail is swept and unread mail is marked stale (tests shorten this).
-const PURGE_INTERVAL_MS = Math.max(1000, Number(process.env.MESH_PURGE_INTERVAL_MS ?? 3600_000))
-// Optional unread backlog alarm (0 = off). This never deletes: an unread message is the
-// one piece of state that must survive a long-offline peer.
-const MAX_UNREAD_MESSAGES = Number(process.env.MESH_MAX_UNREAD_MESSAGES ?? 0)
+// Hub version. Advisory: it drives drift hints in /api/peers and /api/status, never
+// authorization. Keep this literal here — scripts/check-version-sync.mjs reads it
+// with a regex against this file.
+const HUB_VERSION = '0.7.21'
 
-// --- resource caps -----------------------------------------------------------
-// The hub is a long-lived process. Everything a caller can create without bound
-// (request bodies, board values, message bodies, MCP sessions, append-only logs)
-// gets a ceiling, otherwise one runaway agent can exhaust memory or the NAS disk.
-const MAX_BODY_BYTES = Number(process.env.MESH_MAX_BODY_BYTES ?? 1_048_576) // 1 MiB per request
-const MAX_MESSAGE_BYTES = Number(process.env.MESH_MAX_MESSAGE_BYTES ?? 65_536) // message body
-const MAX_BOARD_BYTES = Number(process.env.MESH_MAX_BOARD_BYTES ?? 65_536) // board value
-const MAX_KEY_BYTES = 200
-const MAX_SUBJECT_BYTES = 200
-const MAX_RECIPIENT_BYTES = 64
-// --- blob channel ------------------------------------------------------------
-// Files that do not belong in a 64 KiB board value: skill bundles, workspace
-// snapshots, build artefacts. Uploads are bounded per file AND in total, carry a
-// sha256, and expire on their own so a forgotten transfer cannot fill the disk.
+const {
+  MIN_WAKER, VIEW_TOKEN, CONSOLE_ALLOW,
+  PORT, HOST, DATA_DIR, ONLINE_TTL_MS, MESSAGE_TTL_MS, PURGE_INTERVAL_MS, MAX_UNREAD_MESSAGES,
+  MAX_BODY_BYTES, MAX_MESSAGE_BYTES, MAX_BOARD_BYTES,
+  MAX_BLOB_BYTES, MAX_BLOB_CHUNK_BYTES, MAX_BLOB_TOTAL_BYTES, BLOB_TTL_MS,
+  SESSION_IDLE_MS, MCP_SESSION_TTL_MS, MCP_LENIENT_SESSION, MAX_SESSIONS,
+  LOG_KEEP_MS, LOG_KEEP_ROWS,
+  RELAY_TARGET, RELAY_API_KEY, RELAY_MODEL, RELAY_TIMEOUT_MS, RELAY_ENABLED,
+  AUTH_MODE, TRUST_PROXY,
+  WAKE_SECRET, WAKE_TIMEOUT_MS, WAKE_DEBOUNCE_MS,
+  TLS_CERT_FILE, TLS_KEY_FILE, TLS_ENABLED,
+} = config
+let ADMIN_TOKEN = config.ADMIN_TOKEN
+
 const BLOB_DIR = join(DATA_DIR, 'blobs')
-const MAX_BLOB_BYTES = Number(process.env.MESH_MAX_BLOB_BYTES ?? 64 * 1024 * 1024) // 64 MiB per file
-const MAX_BLOB_CHUNK_BYTES = Number(process.env.MESH_MAX_BLOB_CHUNK_BYTES ?? 8 * 1024 * 1024) // 8 MiB per chunk
-const MAX_BLOB_TOTAL_BYTES = Number(process.env.MESH_MAX_BLOB_TOTAL_BYTES ?? 2 * 1024 * 1024 * 1024) // 2 GiB
-const BLOB_TTL_MS = Number(process.env.MESH_BLOB_TTL_MS ?? 24 * 3600_000) // 24 h
-// A conversation id groups messages that belong to one dialogue, so a receiving dsh can
-// keep that dialogue in one session instead of mixing everything into a single inbox.
-const MAX_CONVERSATION_BYTES = 120
-// Sessions live in this process's memory. DSH machines get switched off without a
-// graceful DELETE, so a session must expire on its own or the map leaks forever.
-const SESSION_IDLE_MS = Number(process.env.MESH_SESSION_IDLE_MS ?? 30 * 60_000)
-// MCP sessions are persisted so a hub restart does not force every client to
-// re-initialize (DSH does not reconnect on its own); the row TTL is what finally
-// expires a dead session.
-const MCP_SESSION_TTL_MS = Number(process.env.MESH_MCP_SESSION_TTL_MS ?? 7 * 24 * 3600_000)
-// Lenient mode: rebuild a session for an unknown Mcp-Session-Id instead of answering 404.
-const MCP_LENIENT_SESSION = ['1', 'true', 'yes', 'on'].includes(String(process.env.MESH_MCP_LENIENT_SESSION ?? '').toLowerCase())
-const MAX_SESSIONS = Number(process.env.MESH_MAX_SESSIONS ?? 128)
-// board_log and audit are append-only: keep a useful window, not an infinite table.
-const LOG_KEEP_MS = Number(process.env.MESH_LOG_TTL_MS ?? 30 * 24 * 3600_000)
-const LOG_KEEP_ROWS = Number(process.env.MESH_LOG_MAX_ROWS ?? 20_000)
+// Fixed protocol limits (not operator-tunable).
+const MAX_KEY_BYTES = 200, MAX_SUBJECT_BYTES = 200, MAX_RECIPIENT_BYTES = 64, MAX_CONVERSATION_BYTES = 120
 
-// --- relay wake (host-network deployments only) ------------------------------
-// Some agents expose an OpenAI-compatible API on the host loopback instead of a
-// wake endpoint (a host-network Hub can reach it; bridge containers cannot). The
-// target is a HARD-CODED allow instance: the hub may never be used as a generic
-// HTTP proxy, whatever a caller registers.
-const RELAY_TARGET = process.env.MESH_RELAY_TARGET ?? '127.0.0.1:18642'
-const RELAY_API_KEY = process.env.MESH_RELAY_API_KEY ?? ''
-const RELAY_MODEL = process.env.MESH_RELAY_MODEL ?? 'deepseek/deepseek-v4.1-flash'
-const RELAY_TIMEOUT_MS = Number(process.env.MESH_RELAY_TIMEOUT_MS ?? 180_000)
-const RELAY_ENABLED = Boolean(RELAY_API_KEY)
 const RELAY_PROMPT =
   '自动通知，不是新任务。严格只做两步：① 调用 mesh_inbox(unread_only=true, mark_read=true)；' +
   '② 对每条未读消息调用 mesh_send 回复发送方（沿用该消息的 conversation，并带 no_reply=true）。' +
   '禁止调用 terminal / read_file / search_files 或任何其他工具；最多两次工具调用；做完立即结束，不要继续工作。'
 
-// --- auth configuration -----------------------------------------------------
-// 'token' (default): every request must carry a Bearer token minted by the admin.
-// 'open': no app-level auth; X-Mesh-Agent names the caller. Only for a LAN you
-// fully trust, never for a port reachable from another network.
-const AUTH_MODE = process.env.MESH_AUTH_MODE ?? 'token'
-let ADMIN_TOKEN = process.env.MESH_ADMIN_TOKEN ?? ''
-// Only trust X-Forwarded-For when a reverse proxy you control sets it.
-const TRUST_PROXY = process.env.MESH_TRUST_PROXY === '1'
-
-// --- wake (inbound push) -----------------------------------------------------
-// After a message is queued, the hub may POST a signed "you have mail" ping to the
-// recipient's own LAN endpoint (a dsh host plugin listens there). The ping carries no
-// message content — the receiver still reads /api/inbox — so a leaked wake endpoint
-// can trigger a turn but cannot forge a message. Best effort only: the inbox is truth.
-const WAKE_SECRET = process.env.MESH_WAKE_SECRET ?? ''
-const WAKE_TIMEOUT_MS = Number(process.env.MESH_WAKE_TIMEOUT_MS ?? 3000)
-const WAKE_DEBOUNCE_MS = Number(process.env.MESH_WAKE_DEBOUNCE_MS ?? 2000)
-
-// --- transport encryption ----------------------------------------------------
-// Terminate TLS inside the hub when you expose it through a plain TCP tunnel
-// (frp type="tcp") or on a LAN IP. Leave unset when an frp https2http plugin or
-// a reverse proxy already terminates TLS in front of it.
-const TLS_CERT_FILE = process.env.MESH_TLS_CERT ?? ''
-const TLS_KEY_FILE = process.env.MESH_TLS_KEY ?? ''
-const TLS_ENABLED = Boolean(TLS_CERT_FILE && TLS_KEY_FILE)
 if (Boolean(TLS_CERT_FILE) !== Boolean(TLS_KEY_FILE)) {
   console.error('[mesh] set both MESH_TLS_CERT and MESH_TLS_KEY, or neither')
   process.exit(1)
