@@ -41,3 +41,9 @@ jobs:
 
       - name: No duplicate tool implementations
         run: node scripts/check-duplicates.mjs
+
+      - name: Changelog format
+        run: node scripts/check-changelog.mjs
+
+      - name: Version sync
+        run: node scripts/check-version-sync.mjs
