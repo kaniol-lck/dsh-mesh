@@ -4617,7 +4617,13 @@ async function main() {
   const withFakePlugin = async (fn) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-self-'))
     fs.copyFileSync(path.join(__dirname, '..', 'plugins', 'mesh-waker', 'index.js'), path.join(dir, 'index.js'))
-    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'dsh-mesh-waker', version: '0.7.31' }))
+    // Track the real package version instead of hardcoding it: a version bump must not turn
+    // these staleness cases red (T-309). The version-change case below deliberately writes a
+    // different version on top of this.
+    const realVersion = JSON.parse(
+      fs.readFileSync(path.join(__dirname, '..', 'plugins', 'mesh-waker', 'package.json'), 'utf8'),
+    ).version
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'dsh-mesh-waker', version: realVersion }))
     const previous = process.env.MESH_WAKER_SELF_FILE
     process.env.MESH_WAKER_SELF_FILE = path.join(dir, 'index.js')
     try {
@@ -4678,6 +4684,23 @@ async function main() {
         versions.codeHash === versions.diskCodeHash &&
         typeof versions.bootedAt === 'string'
       report('stale: unchanged code and version stay quiet', ok, `codeStale=${versions.codeStale} stale=${versions.stale} hashes=${versions.codeHash}/${versions.diskCodeHash}`)
+    })
+  })
+
+  await runCase('stale: the fake plugin tracks the real package version', async (boot) => {
+    await withFakePlugin(async (dir) => {
+      const fixture = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
+      const real = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'plugins', 'mesh-waker', 'package.json'), 'utf8'))
+      const h = await boot({})
+      const versions = await versionsOf(h)
+      // Guards the fixture itself: if it drifts from the real version (e.g. a bump leaves a
+      // hardcoded value behind), versionStale turns true and this case fails loudly (T-309).
+      const ok =
+        fixture.version === real.version &&
+        versions.versionStale === false &&
+        versions.codeStale === false &&
+        versions.stale === false
+      report('stale: the fake plugin tracks the real package version', ok, `fixture=${fixture.version} real=${real.version} versionStale=${versions.versionStale} stale=${versions.stale}`)
     })
   })
 
