@@ -2,9 +2,13 @@
 
 本项目从 0.1.0 开始记录。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 SemVer。
 
-> 最新发布：`0.7.5`（npm `latest` / `next`）。`0.7.6` 之后的改动见「未发布」。
+> 最新发布：`0.8.0`（npm `latest`）。
 
 ## [未发布]
+
+暂无变更。
+
+## [0.8.0] - 2026-11-02
 
 ### Added
 
