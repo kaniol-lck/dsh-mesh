@@ -104,8 +104,19 @@ function loadActual(options) {
     [path.join(ROOT, 'skills/worklog/scripts/roadmap.mjs'), '--json', '--no-checks', '--worklog-dir', path.join(ROOT, '.worklog'), '--gates', path.join(ROOT, '.worklog/gates.json')],
     { cwd: ROOT, encoding: 'utf8' },
   )
-  if (child.status !== 0) throw new Error('roadmap --json failed: ' + String(child.stderr ?? '').slice(0, 400))
-  const model = JSON.parse(child.stdout)
+  // roadmap --json still prints the full model when it exits non-zero (unsatisfied
+  // gates make it exit 1), so the exit code must not abort the comparison.
+  if (child.status !== 0) {
+    console.error(`note: roadmap exited ${child.status}（可能因其它检查失败/关口未达成），已按 stdout 比对`)
+  }
+  let model
+  try {
+    model = JSON.parse(child.stdout)
+  } catch (error) {
+    const stderr = String(child.stderr ?? '').trim().slice(0, 400) || '(empty)'
+    const stdoutHead = String(child.stdout ?? '').split(/\r?\n/).slice(0, 5).join('\n') || '(empty)'
+    throw new Error(`roadmap --json 输出无法解析：${error.message}\n  stderr: ${stderr}\n  stdout 前几行:\n${stdoutHead}`)
+  }
   return model.gates.filter((gate) => gate.satisfied === true).map((gate) => gate.id)
 }
 
@@ -147,4 +158,11 @@ function main() {
   process.exit(result.ok ? 0 : 1)
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    main()
+  } catch (error) {
+    console.error(`ERROR ${error?.message ?? error}`)
+    process.exit(1)
+  }
+}
