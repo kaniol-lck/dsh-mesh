@@ -5335,7 +5335,7 @@ async function main() {
       'MESH_THREAD_TOOL', 'THREAD_OUTPUT', 'validateToolSchema', 'previewText', 'truncateUtf8', 'inlineBodyText',
       'cleanTaskSubject', 'resolveTaskSubject', 'normalizeThread', 'withTaskHeader', 'SESSION_PAGE_DEFAULT',
       'SESSION_PAGE_MAX', 'paginateSessions', 'ROLE_NAMES', 'ROLE_UNRECOGNIZED_MAX', 'titleRoleCandidate',
-      'classifyRoleCandidates', 'createReceiptFlow', 'apply', 'name', 'inject',
+      'classifyRoleCandidates', 'createReceiptFlow', 'createThreads', 'apply', 'name', 'inject',
     ]
     const missing = expected.filter((key) => api[key] === undefined)
     const wrongType = expected.filter((key) => {
@@ -5352,7 +5352,7 @@ async function main() {
   })
 
   await runCase('lib: every module imports standalone and the graph has no cycles', async () => {
-    const files = ['text', 'receipt', 'tools', 'session', 'tasks', 'settings', 'receipt-flow']
+    const files = ['text', 'receipt', 'tools', 'session', 'tasks', 'settings', 'receipt-flow', 'threads']
     const modules = {}
     for (const name of files) modules[name] = await import(libUrl(`${name}.mjs`))
     const edges = {}
@@ -5379,6 +5379,7 @@ async function main() {
       typeof modules.session.withTaskHeader === 'function' &&
       typeof modules.tasks.resolveTaskText === 'function' &&
       typeof modules['receipt-flow'].createReceiptFlow === 'function' &&
+      typeof modules.threads.createThreads === 'function' &&
       typeof modules.settings.clampInterval === 'function'
     const ok = exportsOk && cyclic.length === 0
     report('lib: every module imports standalone and the graph has no cycles', ok, `cyclic=${cyclic.join(',') || '-'} edges=${JSON.stringify(edges)}`)
@@ -5461,6 +5462,7 @@ async function main() {
     return { deps, logs, calls, flow: createReceiptFlow(deps) }
   }
   const { createReceiptFlow } = await import(pathToFileURL(ENTRY).href)
+  const { createThreads } = await import(pathToFileURL(ENTRY).href)
 
   await runCase('receipt flow: resolves a named requester without apply()', async () => {
     const { flow } = makeReceiptFlow({ resolveLocalSession: (draft) => ({ id: `session-for-${draft.title}` }) })
@@ -5511,25 +5513,75 @@ async function main() {
     report('receipt flow: wake without wakeSecret warns and delivers as queue', ok, `mode=${calls[0]?.[2] ?? '-'} warned=${logs.some((line) => /needs wakeSecret/.test(line))}`)
   })
 
+  // Static guard shared by every subsystem factory (T-318). A factory may only reach plugin
+  // state through `deps.`, so any bare closure name in its source is a leak. The lookbehind
+  // excludes `deps.NAME` and member access (`.NAME`), but still flags the spread form
+  // (`...NAME`) that a plain `(?<![\w.])` check misses — the threads move hit exactly that.
+  const factoryFreeRefs = (factory, forbidden) => {
+    const code = String(factory).replace(/\/\/[^\n]*/g, '')
+    return forbidden.filter((name) => new RegExp(`(?<!deps\\.)(?:(?<=\\.\\.\\.)|(?<![\\w$.]))${name}\\b`).test(code))
+  }
+  const RECEIPT_FLOW_DEPS = [
+    'state',
+    'taskRows',
+    'lastReceipt',
+    'fileLog',
+    'listLocalSessions',
+    'resolveLocalSession',
+    'promptWithResume',
+    'writeReceiptFile',
+    'dirForRow',
+    'updateTaskRow',
+    'receiptBody',
+    'c',
+  ]
+
   await runCase('receipt flow: the factory body has no free apply() references', async () => {
-    const code = String(createReceiptFlow).replace(/\/\/[^\n]*/g, '')
-    const forbidden = [
-      'state',
-      'taskRows',
-      'lastReceipt',
-      'fileLog',
-      'listLocalSessions',
-      'resolveLocalSession',
-      'promptWithResume',
-      'writeReceiptFile',
-      'dirForRow',
-      'updateTaskRow',
-      'receiptBody',
-    ]
-    const free = forbidden.filter((name) => new RegExp(`(?<![\\w.])${name}\\b`).test(code))
-    const configRef = /(?<![\w.])c\./.test(code)
-    const ok = free.length === 0 && !configRef
-    report('receipt flow: the factory body has no free apply() references', ok, `free=${free.join(',') || '-'} configRef=${configRef}`)
+    const free = factoryFreeRefs(createReceiptFlow, RECEIPT_FLOW_DEPS)
+    const ok = free.length === 0
+    report('receipt flow: the factory body has no free apply() references', ok, `free=${free.join(',') || '-'} (${RECEIPT_FLOW_DEPS.length} checked)`)
+  })
+
+  await runCase('threads factory: binds, lists and releases without apply()', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-threads-factory-'))
+    try {
+      const threadRows = new Map()
+      const taskRows = new Map([['T-TF-1', { taskId: 'T-TF-1', thread: 'TH-1', createdAt: 1000 }]])
+      const flow = createThreads({
+        threadsFile: path.join(tmpRoot, 'threads.json'),
+        threadRows,
+        taskRows,
+        fileLog: () => {},
+        resolveLocalSession: (draft) => ({ id: `session-for-${draft.session ?? draft.title}` }),
+      })
+      flow.bindThread('TH-1', { id: 'session-a', title: 'worker a' }, 'T-TF-1')
+      const listed = flow.listThreads({ scope: 'all' })
+      const persisted = JSON.parse(fs.readFileSync(path.join(tmpRoot, 'threads.json'), 'utf8'))
+      let refused = false
+      try {
+        flow.subscribeThread('TH-1', { id: 'session-b' })
+      } catch {
+        refused = true
+      }
+      flow.releaseThread('TH-1', 'session-a')
+      const afterRelease = flow.listThreads({ scope: 'all' })
+      const ok =
+        listed.length === 1 &&
+        listed[0].targetSessionId === 'session-a' &&
+        JSON.stringify(listed[0].taskIds) === JSON.stringify(['T-TF-1']) &&
+        Boolean(persisted['TH-1']) &&
+        refused &&
+        afterRelease.length === 0
+      report('threads factory: binds, lists and releases without apply()', ok, `listed=${listed.length} persisted=${Boolean(persisted['TH-1'])} refused=${refused} afterRelease=${afterRelease.length}`)
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('threads: the factory body has no free apply() references', async () => {
+    const free = factoryFreeRefs(createThreads, ['threadRows', 'threadsFile', 'pendingTasks', 'taskRows', 'fileLog', 'resolveLocalSession', 'state', 'c'])
+    const ok = free.length === 0
+    report('threads: the factory body has no free apply() references', ok, `free=${free.join(',') || '-'}`)
   })
 
   await runCase('receipt flow: lib/receipt-flow.mjs imports without index.js', async () => {

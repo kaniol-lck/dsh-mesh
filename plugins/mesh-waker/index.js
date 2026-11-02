@@ -33,6 +33,7 @@ import { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessi
 import { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settings.mjs'
 import { createReceiptFlow } from './lib/receipt-flow.mjs'
+import { createThreads } from './lib/threads.mjs'
 
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
@@ -41,6 +42,7 @@ export { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, 
 export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
 export { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, ROLE_NAMES, ROLE_UNRECOGNIZED_MAX, titleRoleCandidate, classifyRoleCandidates } from './lib/session.mjs'
 export { createReceiptFlow } from './lib/receipt-flow.mjs'
+export { createThreads } from './lib/threads.mjs'
 export { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 
 // Self-reported identity: the hub surfaces it so an operator can spot a stale install.
@@ -3880,135 +3882,21 @@ export function apply(ctx, config) {
 
   // ══ 子系统：线程 ══════════════════════════════════════════════════
   // 职责：threads.json 读写、mesh_thread 动作、绑定与线程列表
-  // 共享闭包：threadRows, threadsFile, pendingTasks, taskRows
-  // 对外入口：bindThread / listThreads / subscribeThread / releaseThread
+  // 实现：createThreads(deps)（模块级，T-318）；本区只做依赖装配
+  // 对外入口：threadFlow.loadThreads / bindThread / listThreads / subscribeThread / releaseThread / sessionForId
   // 注意：只有成功投递才绑定；release 后无 target 派活必须报 unknown thread
-
-  function loadThreads() {
-    try {
-      const raw = JSON.parse(readFileSync(threadsFile, 'utf8'))
-      const entries = raw && typeof raw === 'object' && raw.threads && typeof raw.threads === 'object' ? raw.threads : raw
-      for (const [thread, value] of Object.entries(entries ?? {})) {
-        if (!value || typeof value !== 'object') continue
-        threadRows.set(String(thread), {
-          targetSessionId: value.targetSessionId == null ? null : String(value.targetSessionId),
-          targetTitle: value.targetTitle == null ? null : String(value.targetTitle),
-          lastTaskId: value.lastTaskId == null ? null : String(value.lastTaskId),
-          count: Number.isFinite(Number(value.count)) ? Number(value.count) : 0,
-          updatedAt: Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : 0,
-          // Older files predate subscribe: they were written by dispatches.
-          subscribedBy: value.subscribedBy == null ? 'dispatch' : String(value.subscribedBy),
-        })
-      }
-    } catch {
-      /* first run: no threads yet */
-    }
-    fileLog(`thread registry loaded threads=${threadRows.size}`)
-  }
-
-  function saveThreads() {
-    try {
-      mkdirSync(dirname(threadsFile), { recursive: true })
-      const temp = `${threadsFile}.tmp`
-      const payload = Object.fromEntries([...threadRows.entries()].sort(([left], [right]) => left.localeCompare(right)))
-      writeFileSync(temp, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
-      renameSync(temp, threadsFile)
-      return true
-    } catch (error) {
-      fileLog(`thread registry write failed: ${error.message}`)
-      return false
-    }
-  }
-
-  /** Bind (or re-bind) a thread after a successful delivery and persist it. */
-  function bindThread(thread, target, taskId, source = 'dispatch') {
-    const previous = threadRows.get(thread)
-    const rebound = Boolean(previous && previous.targetSessionId && previous.targetSessionId !== target.id)
-    threadRows.set(thread, {
-      targetSessionId: target.id,
-      targetTitle: target.title ?? null,
-      lastTaskId: taskId ?? previous?.lastTaskId ?? null,
-      count: (previous?.count ?? 0) + 1,
-      updatedAt: Date.now(),
-      subscribedBy: previous?.subscribedBy && source === 'dispatch' ? previous.subscribedBy : source,
-    })
-    saveThreads()
-    if (rebound) {
-      fileLog(`thread ${thread} rebound: ${previous.targetSessionId} -> ${target.id} (${target.title ?? 'no title'}) task=${taskId ?? '-'} by=${source}`)
-    } else {
-      fileLog(`thread ${thread} bound to ${target.id} (${target.title ?? 'no title'}) count=${threadRows.get(thread).count} task=${taskId ?? '-'} by=${source}`)
-    }
-  }
-
-  /** Resolve a title for an arbitrary session id; null when it is unknown to this host. */
-  function sessionForId(sessionId) {
-    const id = String(sessionId ?? '').trim()
-    if (!id) throw new Error('sessionId is required')
-    try {
-      const session = resolveLocalSession({ session: id })
-      return { id: session.id, title: session.title ?? null }
-    } catch {
-      return { id, title: null }
-    }
-  }
-
-  /** The public shape of one thread, including the tasks that carried it. */
-  function describeThread(thread) {
-    const value = threadRows.get(thread)
-    if (!value) return null
-    return {
-      thread,
-      targetSessionId: value.targetSessionId ?? null,
-      targetTitle: value.targetTitle ?? null,
-      count: value.count ?? 0,
-      lastTaskId: value.lastTaskId ?? null,
-      updatedAt: value.updatedAt ?? null,
-      subscribedBy: value.subscribedBy ?? 'dispatch',
-      taskIds: [...taskRows.values()]
-        .filter((row) => row.thread === thread)
-        .sort((left, right) => Number(left.createdAt) - Number(right.createdAt))
-        .map((row) => row.taskId),
-    }
-  }
-
-  function listThreads({ scope = 'all', sessionId = null } = {}) {
-    const wanted = scope === 'mine' ? sessionId : null
-    if (scope === 'mine' && !wanted) throw new Error('scope=mine needs a session (the host did not pass one)')
-    return [...threadRows.keys()]
-      .map((thread) => describeThread(thread))
-      .filter((row) => row && (!wanted || row.targetSessionId === wanted))
-      .sort((left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0))
-  }
-
-  /** Bind a thread to a session. Refuses to steal an existing binding from another session. */
-  function subscribeThread(threadValue, session) {
-    const thread = normalizeThread(threadValue)
-    if (!thread) throw new Error('thread is required')
-    const owner = threadRows.get(thread)
-    if (owner && owner.targetSessionId && owner.targetSessionId !== session.id) {
-      const who = owner.targetTitle ? `${owner.targetSessionId} (${owner.targetTitle})` : owner.targetSessionId
-      throw new Error(`thread "${thread}" is already bound to ${who}; only that session can release it`)
-    }
-    bindThread(thread, session, owner?.lastTaskId ?? null, 'self')
-    return describeThread(thread)
-  }
-
-  /** Unbind a thread; only the current owner may release it. */
-  function releaseThread(threadValue, sessionId) {
-    const thread = normalizeThread(threadValue)
-    if (!thread) throw new Error('thread is required')
-    const owner = threadRows.get(thread)
-    if (!owner) throw new Error(`unknown thread "${thread}"`)
-    if (owner.targetSessionId !== sessionId) {
-      throw new Error(
-        `thread "${thread}" is bound to ${owner.targetSessionId ?? '(unknown)'}${owner.targetTitle ? ` (${owner.targetTitle})` : ''}, not ${sessionId}; only the current owner can release it`,
-      )
-    }
-    threadRows.delete(thread)
-    saveThreads()
-    fileLog(`thread ${thread} released by ${sessionId}`)
-    return { thread, released: true }
-  }
+  const threadFlow = createThreads({
+    // threads.json 路径（本机线程注册表持久化）
+    threadsFile,
+    // thread → { targetSessionId, targetTitle, lastTaskId, count, updatedAt, subscribedBy }
+    threadRows,
+    // 任务库内存索引：describeThread 用它列出线程承载过的 taskIds
+    taskRows,
+    // 写 waker 日志
+    fileLog,
+    // 按 id 解析本机会话（sessionForId；拿不到标题时返回 id）
+    resolveLocalSession,
+  })
 
   // ══ 子系统：任务账本 ══════════════════════════════════════════════════
   // 职责：任务行追加/更新、启动加载与保留策略、任务 API 投影
@@ -5147,7 +5035,7 @@ export function apply(ctx, config) {
       if (taskId) cancelPendingTask(taskId)
       throw error
     }
-    if (thread) bindThread(thread, session, taskId)
+    if (thread) threadFlow.bindThread(thread, session, taskId)
     fileLog(
       `mesh_dispatch: ${text.length} chars (delivered ${deliveredText.length}) -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''}${thread ? ` thread=${thread}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession} header=${c.injectHeader}${explicitTarget ? ' explicit-target' : thread ? ' via-thread' : ''}`,
     )
@@ -5172,15 +5060,15 @@ export function apply(ctx, config) {
     if (!caller) {
       throw new Error('mesh_thread needs the calling session; the host did not pass one (no default session is guessed)')
     }
-    const session = sessionForId(caller)
+    const session = threadFlow.sessionForId(caller)
     if (action === 'list') {
       const scope = args.scope === 'mine' ? 'mine' : 'all'
-      const threads = listThreads({ scope, sessionId: session.id })
+      const threads = threadFlow.listThreads({ scope, sessionId: session.id })
       fileLog(`mesh_thread list scope=${scope} by=${caller} threads=${threads.length}`)
       return { ok: true, action, scope, threads }
     }
     if (action === 'subscribe') {
-      const row = subscribeThread(args.thread, session)
+      const row = threadFlow.subscribeThread(args.thread, session)
       fileLog(`mesh_thread subscribe thread=${row.thread} by=${caller}`)
       return {
         ok: true,
@@ -5192,7 +5080,7 @@ export function apply(ctx, config) {
       }
     }
     if (action === 'release') {
-      const result = releaseThread(args.thread, session.id)
+      const result = threadFlow.releaseThread(args.thread, session.id)
       fileLog(`mesh_thread release thread=${result.thread} by=${caller}`)
       return { ok: true, action, thread: result.thread, released: true }
     }
@@ -5416,7 +5304,7 @@ export function apply(ctx, config) {
   loadTaskRegistry()
   // A receipt must live with its task row (T-300): fix historical mismatches once, idempotently.
   realignReceiptTiersAtBoot()
-  loadThreads()
+  threadFlow.loadThreads()
   // Migrate inline bodies before anything reads or rewrites rows (idempotent, T-277).
   compactTaskTexts()
   // Once per process: pending/started rows from a previous host process can never settle.
@@ -5589,7 +5477,7 @@ export function apply(ctx, config) {
         res.end('{"error":"loopback only"}')
         return
       }
-      const threads = listThreads({ scope: 'all' })
+      const threads = threadFlow.listThreads({ scope: 'all' })
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
       res.end(JSON.stringify({ ok: true, total: threads.length, threads }))
       return
@@ -5616,11 +5504,11 @@ export function apply(ctx, config) {
         const sessionId = String(draft.sessionId ?? '').trim()
         if (!sessionId) throw new Error('sessionId is required')
         if (path.endsWith('/subscribe')) {
-          const row = subscribeThread(draft.thread, sessionForId(sessionId))
+          const row = threadFlow.subscribeThread(draft.thread, threadFlow.sessionForId(sessionId))
           res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
           res.end(JSON.stringify({ ok: true, thread: row.thread, targetSessionId: row.targetSessionId, targetTitle: row.targetTitle, subscribedBy: row.subscribedBy }))
         } else {
-          const released = releaseThread(draft.thread, sessionId)
+          const released = threadFlow.releaseThread(draft.thread, sessionId)
           res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
           res.end(JSON.stringify({ ok: true, thread: released.thread, released: true }))
         }
@@ -5986,7 +5874,7 @@ export function apply(ctx, config) {
           if (taskId) cancelPendingTask(taskId)
           throw error
         }
-        if (thread) bindThread(thread, target, taskId)
+        if (thread) threadFlow.bindThread(thread, target, taskId)
         fileLog(`injected ${text.length} chars (delivered ${deliveredText.length}) into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}${thread ? ` thread=${thread}` : ''}${explicitTarget ? '' : ' via-thread'} header=${c.injectHeader}`)
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(
