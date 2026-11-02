@@ -5335,7 +5335,7 @@ async function main() {
       'MESH_THREAD_TOOL', 'THREAD_OUTPUT', 'validateToolSchema', 'previewText', 'truncateUtf8', 'inlineBodyText',
       'cleanTaskSubject', 'resolveTaskSubject', 'normalizeThread', 'withTaskHeader', 'SESSION_PAGE_DEFAULT',
       'SESSION_PAGE_MAX', 'paginateSessions', 'ROLE_NAMES', 'ROLE_UNRECOGNIZED_MAX', 'titleRoleCandidate',
-      'classifyRoleCandidates', 'createReceiptFlow', 'createThreads', 'createTaskRegistry', 'apply', 'name', 'inject',
+      'classifyRoleCandidates', 'createReceiptFlow', 'createThreads', 'createTaskRegistry', 'createTaskLifecycle', 'apply', 'name', 'inject',
     ]
     const missing = expected.filter((key) => api[key] === undefined)
     const wrongType = expected.filter((key) => {
@@ -5352,7 +5352,7 @@ async function main() {
   })
 
   await runCase('lib: every module imports standalone and the graph has no cycles', async () => {
-    const files = ['text', 'receipt', 'tools', 'session', 'tasks', 'settings', 'receipt-flow', 'threads', 'task-registry']
+    const files = ['text', 'receipt', 'tools', 'session', 'tasks', 'settings', 'receipt-flow', 'threads', 'task-registry', 'task-lifecycle']
     const modules = {}
     for (const name of files) modules[name] = await import(libUrl(`${name}.mjs`))
     const edges = {}
@@ -5381,6 +5381,7 @@ async function main() {
       typeof modules['receipt-flow'].createReceiptFlow === 'function' &&
       typeof modules.threads.createThreads === 'function' &&
       typeof modules['task-registry'].createTaskRegistry === 'function' &&
+      typeof modules['task-lifecycle'].createTaskLifecycle === 'function' &&
       typeof modules.settings.clampInterval === 'function'
     const ok = exportsOk && cyclic.length === 0
     report('lib: every module imports standalone and the graph has no cycles', ok, `cyclic=${cyclic.join(',') || '-'} edges=${JSON.stringify(edges)}`)
@@ -5465,6 +5466,7 @@ async function main() {
   const { createReceiptFlow } = await import(pathToFileURL(ENTRY).href)
   const { createThreads } = await import(pathToFileURL(ENTRY).href)
   const { createTaskRegistry } = await import(pathToFileURL(ENTRY).href)
+  const { createTaskLifecycle } = await import(pathToFileURL(ENTRY).href)
 
   await runCase('receipt flow: resolves a named requester without apply()', async () => {
     const { flow } = makeReceiptFlow({ resolveLocalSession: (draft) => ({ id: `session-for-${draft.title}` }) })
@@ -5645,6 +5647,128 @@ async function main() {
     ])
     const ok = free.length === 0
     report('task registry: the factory body has no free apply() references', ok, `free=${free.join(',') || '-'}`)
+  })
+
+  // Behavior guards for the lifecycle factory (T-320). T-279's two rules — a queued task
+  // behind a running turn is re-armed rather than reported not-started, and a dormant task
+  // resumes on a late turn — are exactly what a bad extraction would break silently.
+  const makeLifecycle = (overrides = {}) => {
+    const logs = []
+    const receipts = []
+    const pendingTasks = new Map()
+    const deps = {
+      pendingTasks,
+      receiptTimers: new Set(),
+      liveness: new Map(),
+      assistantText: new Map(),
+      turnStartedAt: new Map(),
+      state: { pendingTasks: 0, lastReceipt: null },
+      config: {
+        receiptStallMs: 80,
+        receiptSummaryChars: 300,
+        receiptFile: 'receipts.jsonl',
+        receiptMode: 'queue',
+        requireNamespacedIds: false,
+        startedClaimWindowMs: 60000,
+      },
+      fileLog: (message) => logs.push(String(message)),
+      taskRegistry: { recordTaskPending: () => {}, updateTaskRow: () => null },
+      receiptFlow: {
+        resolveRequester: () => ({ requester: null, sessionId: null, inferred: false }),
+        deliverReceipt: async (receipt) => {
+          receipts.push(receipt)
+        },
+      },
+      setLastReceipt: (value) => {
+        deps.state.lastReceipt = value
+      },
+      writeReceiptFile: () => true,
+      receiptDirForTask: () => 'dir',
+      receiptDirFor: () => 'dir',
+      livenessFor: () => ({ openTurn: null, openCalls: new Set(), openJobs: new Set(), openApprovals: new Set() }),
+      maxTurnFor: () => 1,
+      sessionCwdOf: () => 'proj',
+      routeForCwds: () => ({ dir: 'dir', scope: 'ws', workspace: 'w' }),
+      scopeFields: () => ({}),
+      findTaskRowInFile: () => null,
+      layerLabel: () => 'ws',
+      taskRecordFiles: () => [],
+      registerBatchTask: () => {},
+      updateBatchTask: () => {},
+      ...overrides,
+    }
+    return { deps, logs, receipts, pendingTasks, flow: createTaskLifecycle(deps) }
+  }
+  const waitForLifecycle = async (predicate, timeoutMs = 3000) => {
+    const deadline = Date.now() + timeoutMs
+    while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5))
+    return predicate()
+  }
+
+  await runCase('lifecycle: a queued task behind a running turn is re-armed, not not-started (T-279)', async () => {
+    const { flow, pendingTasks, receipts, logs } = makeLifecycle()
+    const now = Date.now()
+    pendingTasks.set('T-RUNNING', {
+      sessionId: 'sess-q',
+      mode: 'queue',
+      baselineTurn: 1,
+      injectedAt: now,
+      startedAt: now - 10,
+      settled: false,
+      receiptMode: 'queue',
+      stallTimer: null,
+    })
+    flow.registerPendingTask({ id: 'sess-q', cwd: 'proj' }, { taskId: 'T-QUEUED' }, 'queue', 'body')
+    const rearmed = await waitForLifecycle(() => logs.some((line) => /stall re-armed/.test(line)))
+    const queued = pendingTasks.get('T-QUEUED')
+    const ok = rearmed && Boolean(queued) && queued.settled !== true && receipts.length === 0
+    report('lifecycle: a queued task behind a running turn is re-armed, not not-started', ok, `rearmed=${rearmed} pending=${Boolean(queued)} settled=${queued?.settled} receipts=${receipts.length}`)
+    flow.clearPending(queued)
+  })
+
+  await runCase('lifecycle: a dormant task resumes and its receipt carries source=resumed (T-279)', async () => {
+    const { flow, pendingTasks, receipts } = makeLifecycle()
+    flow.registerPendingTask({ id: 'sess-d', cwd: 'proj' }, { taskId: 'T-DORMANT' }, 'queue', 'body')
+    const dormant = await waitForLifecycle(() => Boolean(pendingTasks.get('T-DORMANT')?.dormant))
+    const notStarted = receipts.some((receipt) => receipt.status === 'not-started')
+    flow.handleSessionEvent({ id: 'sess-d' }, { type: 'turn/start', data: { turn: 5 } })
+    const task = pendingTasks.get('T-DORMANT')
+    const resumed = task?.source === 'resumed' && task?.dormant === false
+    flow.handleSessionEvent({ id: 'sess-d' }, { type: 'turn/end', data: { turn: 5, reason: 'completed' } })
+    const finalReceipt = receipts.find((receipt) => receipt.status !== 'not-started')
+    const ok = dormant && notStarted && resumed && finalReceipt?.source === 'resumed'
+    report('lifecycle: a dormant task resumes and its receipt carries source=resumed', ok, `dormant=${dormant} notStarted=${notStarted} resumed=${resumed} source=${finalReceipt?.source ?? '-'}`)
+  })
+
+  await runCase('lifecycle: the factory body has no free apply() references', async () => {
+    const free = factoryFreeRefs(createTaskLifecycle, [
+      'pendingTasks',
+      'receiptTimers',
+      'liveness',
+      'assistantText',
+      'turnStartedAt',
+      'state',
+      'fileLog',
+      'taskRegistry',
+      'receiptFlow',
+      'setLastReceipt',
+      'writeReceiptFile',
+      'receiptDirForTask',
+      'receiptDirFor',
+      'livenessFor',
+      'maxTurnFor',
+      'sessionCwdOf',
+      'routeForCwds',
+      'scopeFields',
+      'findTaskRowInFile',
+      'layerLabel',
+      'taskRecordFiles',
+      'registerBatchTask',
+      'updateBatchTask',
+      'c',
+    ])
+    const ok = free.length === 0
+    report('lifecycle: the factory body has no free apply() references', ok, `free=${free.join(',') || '-'}`)
   })
 
   await runCase('receipt flow: lib/receipt-flow.mjs imports without index.js', async () => {

@@ -35,7 +35,7 @@ import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settin
 import { createReceiptFlow } from './lib/receipt-flow.mjs'
 import { createThreads } from './lib/threads.mjs'
 import { createTaskRegistry } from './lib/task-registry.mjs'
-
+import { createTaskLifecycle } from './lib/task-lifecycle.mjs'
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
 export { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
@@ -45,6 +45,7 @@ export { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessi
 export { createReceiptFlow } from './lib/receipt-flow.mjs'
 export { createThreads } from './lib/threads.mjs'
 export { createTaskRegistry } from './lib/task-registry.mjs'
+export { createTaskLifecycle } from './lib/task-lifecycle.mjs'
 export { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 
 // Self-reported identity: the hub surfaces it so an operator can spot a stale install.
@@ -237,14 +238,7 @@ export function realignReceiptTiers({ meshHome, storageTiers = true, log = () =>
 // Receipt delivery lives in lib/receipt-flow.mjs (T-317); re-exported below.
 
 /** A task id already used by a different target in the same tier file (T-301). */
-export class TaskIdCollisionError extends Error {
-  constructor(message, details = {}) {
-    super(message)
-    this.name = 'TaskIdCollisionError'
-    this.status = 409
-    this.details = details
-  }
-}
+export { TaskIdCollisionError } from './lib/task-lifecycle.mjs'
 
 export const name = 'mesh-waker'
 export const inject = ['sessionController', 'agents', 'workspaceRegistry', 'configEditor', 'commands', 'attachments']
@@ -3978,409 +3972,68 @@ export function apply(ctx, config) {
 
   // ══ 子系统：任务生命周期与结算 ══════════════════════════════════════════════════
   // 职责：pending 登记、started 认领、not-started 看门狗与 dormant 恢复、settle、turn 事件入口
-  // 共享闭包：pendingTasks, taskRows, liveness, assistantText, receiptTimers, c.receiptStallMs
-  // 对外入口：registerPendingTask / settleTask / handleSessionEvent
+  // 实现：createTaskLifecycle(deps)（模块级，T-320）；本区只做依赖装配
+  // 对外入口：lifecycle.registerPendingTask / settleTask / handleSessionEvent / cancelPendingTask / clearPending
   // 注意：排队 re-arm 与 dormant 恢复不能删（T-279）；结算后回执交给「回执投递」
-
-  function clearPending(task) {
-    if (!task) return
-    if (task.stallTimer) {
-      clearTimeout(task.stallTimer)
-      receiptTimers.delete(task.stallTimer)
-      task.stallTimer = null
-    }
-    if (task.dormantTimer) {
-      clearTimeout(task.dormantTimer)
-      receiptTimers.delete(task.dormantTimer)
-      task.dormantTimer = null
-    }
-  }
-
-  function discardDormant(taskId) {
-    const task = pendingTasks.get(taskId)
-    if (!task || !task.dormant) return
-    clearPending(task)
-    pendingTasks.delete(taskId)
-    state.pendingTasks = pendingTasks.size
-    fileLog(`task ${taskId} dropped: dormant and the session stayed idle`)
-  }
-
-  /**
-   * Stall watchdog: a queued task behind another running task is not "not-started", it is
-   * simply waiting — re-arm instead of settling it (T-279). A real miss still reports
-   * not-started once, but the task stays dormant so a late turn/start can resume tracking.
-   */
-  function armStallTimer(taskId, task) {
-    const timer = setTimeout(() => {
-      receiptTimers.delete(timer)
-      if (task.settled || task.dormant) return
-      const busy = [...pendingTasks.values()].some(
-        (other) => other !== task && other.sessionId === task.sessionId && !other.settled && Number.isFinite(other.startedAt),
-      )
-      if (busy) {
-        fileLog(`task ${taskId} stall re-armed: another task is still running on ${task.sessionId}`)
-        task.stallTimer = armStallTimer(taskId, task)
-        return
-      }
-      fileLog(`task ${taskId} not-started after ${c.receiptStallMs}ms; kept dormant for resume`)
-      settleTask(taskId, task, {
-        turn: null,
-        status: 'not-started',
-        reasonKind: 'not-started',
-        reasonDetail: `no turn/start within ${c.receiptStallMs}ms`,
-        keepTracking: true,
-      })
-      if (task.settled) return
-      task.dormant = true
-      task.dormantSince = Date.now()
-      const drop = setTimeout(() => discardDormant(taskId), c.receiptStallMs)
-      drop.unref?.()
-      receiptTimers.add(drop)
-      task.dormantTimer = drop
-    }, c.receiptStallMs)
-    timer.unref?.()
-    task.stallTimer = timer
-    receiptTimers.add(timer)
-    return timer
-  }
-
-  function settleTask(taskId, task, details) {
-    if (!task || task.settled) return null
-    // A not-started receipt is advisory: the task may still run later, so keep it in
-    // pendingTasks (dormant) instead of deleting the only tracking record (T-279).
-    const keepTracking = details.keepTracking === true
-    if (!keepTracking) {
-      task.settled = true
-      pendingTasks.delete(taskId)
-    }
-    clearPending(task)
-    const shot = assistantText.get(task.sessionId)
-    // Turn numbers advance out of step between assistant/message and turn/end, so equality
-    // alone can attach a previous turn's prose to this task (T-267). The snapshot must also
-    // be newer than the injection; otherwise the summary stays empty (never wrong prose).
-    const turnMatches =
-      Boolean(shot) && (details.turn === null || details.turn === undefined || shot.turn === null || shot.turn === details.turn)
-    const textIsFresh = Boolean(shot) && Number.isFinite(shot.at) && Number.isFinite(task.injectedAt) && shot.at >= task.injectedAt
-    // A declared completion writes its own summary; observed settlement still uses the
-    // guarded snapshot (never invent prose the worker did not send).
-    const captured = turnMatches && textIsFresh ? shot.text : ''
-    const summary = details.summary !== undefined ? String(details.summary) : captured
-    const receipt = buildReceipt({
-      taskId,
-      sessionId: task.sessionId,
-      turn: details.turn ?? null,
-      status: details.status,
-      reasonKind: details.reasonKind ?? details.status,
-      reasonDetail: details.reasonDetail ?? null,
-      injectedAt: task.injectedAt,
-      endedAt: details.endedAt ?? Date.now(),
-      summary,
-      receiptMode: task.receiptMode,
-      summaryChars: c.receiptSummaryChars,
-      baselineTurn: task.baselineTurn ?? null,
-      settledTurn: details.turn ?? null,
-      injectedDuringTurn: task.injectedDuringTurn === true,
-      source: details.source ?? task.source ?? 'observed',
-    })
-    writeReceiptFile(receipt, task.recordDir ?? receiptDirForTask(taskId) ?? receiptDirFor(receipt))
-    // Registry status mirrors the receipt: not-started is the stall path, everything else
-    // settled. Registry durationMs is measured from startedAt when the task was seen
-    // starting (falling back to injection time); the receipt keeps its own duration.
-    const registryStartedAt = Number.isFinite(task.startedAt) ? task.startedAt : task.injectedAt
-    taskRegistry.updateTaskRow(taskId, {
-      status: receipt.status === 'not-started' ? 'stalled' : 'settled',
-      settledAt: receipt.endedAt,
-      durationMs: Math.max(0, receipt.endedAt - registryStartedAt),
-      receiptRef: c.receiptFile,
-      receiptSummary: Array.from(receipt.summary ?? '').slice(0, 500).join(''),
-    })
-    lastReceipt = { taskId: receipt.taskId, status: receipt.status, at: receipt.endedAt, deliveredTo: null }
-    state.lastReceipt = lastReceipt
-    state.pendingTasks = pendingTasks.size
-    fileLog(`receipt ${taskId} ${receipt.status} turn=${receipt.turn ?? '-'} duration=${receipt.durationMs}ms`)
-    void receiptFlow.deliverReceipt(receipt, task).catch((error) => {
-      fileLog(`receipt ${taskId} delivery crashed: ${error && error.message ? error.message : error}`)
-    })
-    if (!keepTracking) updateBatchTask(taskId, receipt)
-    return receipt
-  }
-
-  function registerPendingTask(target, meta, mode = 'queue', text = '') {
-    const taskId = String(meta?.taskId ?? '').trim()
-    // A namespaced cross-workspace id may carry one `<slug>/` prefix (T-301). `.`/`..`
-    // segments are rejected so an id can never double as a path.
-    const namespacedId = /^[A-Za-z0-9._-]{1,40}\/[A-Za-z0-9._:-]{1,80}$/
-    if (!/^[A-Za-z0-9._:-]{1,80}$/.test(taskId) && !namespacedId.test(taskId)) {
-      throw new Error('meta.taskId must match [A-Za-z0-9._:-]{1,80} or <slug>/<id>')
-    }
-    if (/(^|\/)\.\.?(\/|$)/.test(taskId)) throw new Error('meta.taskId must not contain . or .. segments')
-    const requested = String(meta?.receipt ?? '')
-    const batchId = meta?.batchId ? String(meta.batchId).trim() : null
-    // Batch members never disturb the coordinator one by one: only the aggregate goes out.
-    const receiptMode = batchId ? 'file' : ['file', 'queue', 'wake'].includes(requested) ? requested : c.receiptMode
-    const previous = pendingTasks.get(taskId)
-    if (previous) clearPending(previous)
-    // If the session is mid-turn, that turn was already running before this task existed:
-    // a queue delivery must wait for a strictly later turn, otherwise its turn/end would be
-    // mistaken for the task finishing (the T-130 false receipt).
-    const openTurn = liveness.get(target.id)?.openTurn ?? null
-    const injectedDuringTurn = openTurn !== null
-    const taskMode = mode === 'steer' ? 'steer' : 'queue'
-    // A queue prompt delivered while turn T runs becomes its own later turn, so two tasks
-    // injected inside the same turn must NOT share a baseline: otherwise the first task's
-    // turn/end settles the second one too (T-220: a task that never ran got "completed").
-    // Each same-turn queue task therefore waits one extra turn per earlier queued task;
-    // when the position is unclear this errs toward pending (a stall timer), never a fake
-    // receipt.
-    let baselineTurn = injectedDuringTurn ? openTurn : maxTurnFor(target.id)
-    let sameTurnInjected = false
-    if (injectedDuringTurn && taskMode === 'queue') {
-      const queuedAhead = [...pendingTasks.values()].filter(
-        (pending) =>
-          pending.sessionId === target.id &&
-          !pending.settled &&
-          pending.mode === 'queue' &&
-          pending.injectedDuringTurn === true &&
-          pending.injectedAtTurn === openTurn,
-      ).length
-      baselineTurn = openTurn + queuedAhead
-      sameTurnInjected = queuedAhead > 0
-    }
-    // Receipts go back to whoever dispatched the task; receiptTo is only the fallback.
-    const requester = receiptFlow.resolveRequester(meta?.requester, target)
-    // LCA routing (T-282): same workspace -> ws/<slug>/, cross-workspace -> local/.
-    const route = routeForCwds(target.cwd ?? sessionCwdOf(target.id), requester.sessionId ? sessionCwdOf(requester.sessionId) : null)
-    // Same-layer uniqueness (T-301): findRecord only sees this workspace + local, so a
-    // duplicate id in the same file is ambiguous and silently resolves to the last row.
-    // A retry/re-dispatch to the SAME target keeps working; a different target is rejected.
-    const recordFile = join(route.dir, 'tasks.jsonl')
-    const existingRow = findTaskRowInFile(recordFile, taskId)
-    if (existingRow && String(existingRow.targetSessionId ?? '') !== String(target.id ?? '')) {
-      fileLog(`task id collision rejected: ${taskId}`)
-      throw new TaskIdCollisionError(
-        `task id ${taskId} already exists in ${layerLabel(route.dir)} for target ${existingRow.targetSessionId ?? '-'}; refusing to overwrite it with target ${target.id}`,
-        {
-          taskId,
-          existingTarget: existingRow.targetSessionId ?? null,
-          requestedTarget: target.id,
-          layer: route.scope === 'machine' ? 'local' : `ws:${route.workspace}`,
-        },
-      )
-    }
-    // The same id in another layer is a different file (not a collision), but an upward
-    // lookup can shadow it, so it must be visible.
-    if (!existingRow) {
-      for (const file of taskRecordFiles()) {
-        if (dirname(file) === route.dir) continue
-        if (findTaskRowInFile(file, taskId)) {
-          fileLog(`WARN task id ${taskId} also exists in ${layerLabel(dirname(file))} (cross-layer duplicate; lookups may shadow)`)
-          break
-        }
-      }
-    }
-    // Cross-workspace ids share local/tasks.jsonl between coordinators. `T4F-…` and
-    // `<slug>/T-…` count as namespaced; a bare `T-…` warns, and is rejected when
-    // requireNamespacedIds is on (opt-in so historical ids stay addressable).
-    let idWarning = null
-    if (route.scope === 'machine' && /^T-/i.test(taskId)) {
-      if (c.requireNamespacedIds === true) {
-        fileLog(`task id rejected (not namespaced): ${taskId}`)
-        throw new Error(
-          `cross-workspace task id ${taskId} must be namespaced (e.g. dsh-mesh/${taskId}); set requireNamespacedIds:false to allow bare ids`,
-        )
-      }
-      idWarning = 'cross-workspace task ids should be namespaced (e.g. dsh-mesh/T-123)'
-      fileLog(`WARN cross-workspace task id ${taskId} is not namespaced`)
-    }
-    const task = {
-      sessionId: target.id,
-      requester: requester.requester,
-      requesterSessionId: requester.sessionId,
-      requesterInferred: requester.inferred === true,
-      recordDir: route.dir,
-      ...scopeFields(route),
-      injectedAt: Date.now(),
-      baselineTurn,
-      injectedDuringTurn,
-      injectedAtTurn: openTurn,
-      sameTurnInjected,
-      mode: taskMode,
-      receiptMode,
-      batchId,
-      settled: false,
-      stallTimer: null,
-      ...(idWarning ? { idWarning } : {}),
-    }
-    pendingTasks.set(taskId, task)
-    state.pendingTasks = pendingTasks.size
-    if (batchId) registerBatchTask(taskId, task, meta)
-    taskRegistry.recordTaskPending(taskId, target, meta, text, {
-      batchId,
-      thread: normalizeThread(meta?.thread),
-      requester: requester.requester,
-      requesterSessionId: requester.sessionId,
-      deadlineMs: Number(meta?.deadlineMs) || null,
-      route,
-      // Persist the actual mode so a restart can still notify the dispatcher (T-273).
-      receiptMode,
-    })
-    const timer = armStallTimer(taskId, task)
-    task.stallTimer = timer
-    fileLog(
-      `task ${taskId} pending on ${target.id} baselineTurn=${task.baselineTurn ?? 'unknown'} duringTurn=${injectedDuringTurn} mode=${task.mode} receipt=${receiptMode} requester=${task.requester ?? '-'}${batchId ? ` batch=${batchId}` : ''}`,
-    )
-    return taskId
-  }
-
-  function cancelPendingTask(taskId) {
-    const task = pendingTasks.get(taskId)
-    if (!task) return
-    clearPending(task)
-    pendingTasks.delete(taskId)
-    state.pendingTasks = pendingTasks.size
-    taskRegistry.updateTaskRow(taskId, { status: 'cancelled', settledAt: Date.now() })
-  }
-
-  /** Feed the liveness ledger, then settle tasks on turn/end. */
-  function handleSessionEvent(session, event) {
-    try {
-      const sessionId = typeof session === 'string' ? session : session?.id ?? session?.sessionId
-      if (!sessionId || !event || typeof event !== 'object') return
-      // DSH hands over an envelope `{ type, seq, time, data }`: turn/reason/message/tool
-      // fields live under `data`. Synthetic producers may still pass a flat payload, so
-      // prefer the real shape and fall back to the event itself.
-      const d = event.data && typeof event.data === 'object' ? event.data : event
-      const type = String(event.type ?? d.type ?? '')
-      const turn = Number.isFinite(Number(d.turn)) ? Number(d.turn) : null
-      const ledger = livenessFor(sessionId)
-      const now = Date.now()
-      ledger.lastEventAt = now
-      switch (type) {
-        case 'turn/start':
-          ledger.openTurn = turn
-          ledger.lastTurnStartAt = now
-          ledger.openCalls.clear()
-          ledger.openJobs.clear()
-          ledger.openApprovals.clear()
-          break
-        case 'turn/end':
-          ledger.openTurn = null
-          ledger.lastReason = d.reason ?? null
-          ledger.openCalls.clear()
-          ledger.openJobs.clear()
-          ledger.openApprovals.clear()
-          break
-        case 'tool/call':
-          ledger.openCalls.set(String(d.callId ?? randomUUID()), {
-            name: String(d.name ?? 'tool'),
-            startedAt: now,
-          })
-          break
-        case 'tool/result': {
-          const callId = d.callId ?? d.message?.callId
-          if (callId !== undefined) ledger.openCalls.delete(String(callId))
-          else {
-            const first = ledger.openCalls.keys().next()
-            if (!first.done) ledger.openCalls.delete(first.value)
-          }
-          break
-        }
-        case 'job/registered': {
-          const jobId = d.jobId ?? d.id ?? d.job?.id ?? randomUUID()
-          ledger.openJobs.set(String(jobId), { startedAt: now })
-          break
-        }
-        case 'job/settled': {
-          const jobId = d.jobId ?? d.id ?? d.job?.id
-          if (jobId !== undefined) ledger.openJobs.delete(String(jobId))
-          break
-        }
-        case 'approval/asked':
-          ledger.openApprovals.set(String(d.id ?? randomUUID()), {
-            toolName: String(d.toolName ?? d.name ?? 'tool'),
-            askedAt: now,
-          })
-          break
-        case 'approval/decided':
-          if (d.id !== undefined) ledger.openApprovals.delete(String(d.id))
-          break
-        case 'llm/retry':
-        case 'llm/retry-started':
-          ledger.lastLlmAt = now
-          break
-        default:
-          break
-      }
-      if (type === 'turn/start') {
-        if (turn !== null) turnStartedAt.set(sessionId, Math.max(turn, turnStartedAt.get(sessionId) ?? 0))
-        for (const [taskId, task] of pendingTasks) {
-          if (task.sessionId !== sessionId || task.settled || task.startedAt) continue
-          // Same ownership rule as settlement: a queue task owns a strictly later turn, a
-          // steer task may own the running one. A null baseline means we had no turn
-          // knowledge at injection (T-253): claim only if this turn starts within the
-          // configured window after injection, then record the baseline so settlement and
-          // later turns behave like the normal path. Outside the window: never invent
-          // progress (the task stays pending/stalled).
-          const resumed = task.dormant === true
-          const withinWindow =
-            Number.isFinite(task.injectedAt) && now - task.injectedAt <= c.startedClaimWindowMs
-          const ownsTurn = resumed
-            ? turn !== null &&
-              (task.baselineTurn === null ||
-                (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn))
-            : task.baselineTurn !== null
-              ? turn !== null && (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn)
-              : turn !== null && withinWindow
-          if (!ownsTurn) continue
-          if (resumed) {
-            task.dormant = false
-            task.source = 'resumed'
-            if (task.dormantTimer) {
-              clearTimeout(task.dormantTimer)
-              receiptTimers.delete(task.dormantTimer)
-              task.dormantTimer = null
-            }
-            fileLog(`task ${taskId} resumed at turn=${turn} (not-started was advisory)`)
-          }
-          if (task.baselineTurn === null) {
-            // A queued task owns strictly later turns; the claim turn itself is the start.
-            task.baselineTurn = turn - 1
-            fileLog(
-              `task ${taskId} claimed null baseline within ${c.startedClaimWindowMs}ms: turn=${turn} baselineTurn=${task.baselineTurn} injectedAgo=${now - task.injectedAt}ms`,
-            )
-          }
-          task.startedAt = now
-          taskRegistry.updateTaskRow(taskId, { status: 'started', startedAt: now })
-          fileLog(`task ${taskId} started turn=${turn} baselineTurn=${task.baselineTurn}`)
-        }
-        for (const task of pendingTasks.values()) {
-          if (task.sessionId !== sessionId || task.settled) continue
-          if (task.baselineTurn === null || (turn !== null && turn > task.baselineTurn)) clearPending(task)
-        }
-        return
-      }
-      if (type === 'assistant/message') {
-        const text = messageText(d.message)
-        if (text) assistantText.set(sessionId, { turn, text, at: Date.now() })
-        return
-      }
-      if (type === 'turn/end') {
-        const classified = classifyTurnEnd(d.reason)
-        for (const [taskId, task] of [...pendingTasks]) {
-          if (task.sessionId !== sessionId || task.settled) continue
-          if (task.baselineTurn !== null && turn !== null) {
-            // queue: the task only started in a strictly later turn; steer was inserted into
-            // the running turn, so that turn's end already covers it.
-            const settled = task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn
-            if (!settled) continue
-          }
-          settleTask(taskId, task, { turn, ...classified })
-        }
-      }
-    } catch (error) {
-      fileLog(`session/event handling failed: ${error.message}`)
-    }
-  }
+  const lifecycle = createTaskLifecycle({
+    // 在飞任务（taskId → task）
+    pendingTasks,
+    // 看门狗 / dormant 定时器
+    receiptTimers,
+    // 会话活跃账本（openTurn）
+    liveness,
+    // 最近一条 assistant 正文（结算摘要）
+    assistantText,
+    // 会话最近 turn/start 的回合号
+    turnStartedAt,
+    // apply() 的状态账本
+    state,
+    // 生命周期用到的配置切片
+    config: {
+      receiptStallMs: c.receiptStallMs,
+      receiptSummaryChars: c.receiptSummaryChars,
+      receiptFile: c.receiptFile,
+      receiptMode: c.receiptMode,
+      requireNamespacedIds: c.requireNamespacedIds,
+      startedClaimWindowMs: c.startedClaimWindowMs,
+    },
+    // 写 waker 日志
+    fileLog,
+    // 任务行读写（账本实例）
+    taskRegistry,
+    // 结算后交回执（投递实例）
+    receiptFlow,
+    // 写 apply() 的 lastReceipt 镜像
+    setLastReceipt: (value) => {
+      lastReceipt = value
+    },
+    // 回执落盘
+    writeReceiptFile,
+    // 任务 id → 回执目录
+    receiptDirForTask,
+    // 回执 / 任务行 → 回执目录
+    receiptDirFor,
+    // 会话 id → 活跃账本条目
+    livenessFor,
+    // 会话 id → 已知最大回合号
+    maxTurnFor,
+    // 会话 id → cwd（路由用）
+    sessionCwdOf,
+    // LCA 路由
+    routeForCwds,
+    // 路由 → scope 字段
+    scopeFields,
+    // 同一层文件里查 taskId
+    findTaskRowInFile,
+    // 所有层级的 tasks.jsonl（跨层重复检查）
+    taskRecordFiles,
+    // 目录 → 人类可读层名
+    layerLabel,
+    // 登记批次成员
+    registerBatchTask,
+    // 批次聚合的回执更新
+    updateBatchTask,
+  })
 
   // ══ 子系统：批次 ══════════════════════════════════════════════════
   // 职责：batches.json、屏障聚合、deadline/告警、取消与恢复
@@ -4516,7 +4169,7 @@ export function apply(ctx, config) {
       }
     })()
     // A closed batch stops waiting: unsettled members must not emit their own receipts later.
-    for (const taskId of batch.tasks.keys()) if (pendingTasks.has(taskId)) cancelPendingTask(taskId)
+    for (const taskId of batch.tasks.keys()) if (pendingTasks.has(taskId)) lifecycle.cancelPendingTask(taskId)
     batches.delete(batchId)
     state.pendingBatches = batches.size
     saveBatches()
@@ -4529,7 +4182,7 @@ export function apply(ctx, config) {
     batch.finalized = true
     if (batch.deadlineTimer) clearTimeout(batch.deadlineTimer)
     if (batch.completeTimer) clearTimeout(batch.completeTimer)
-    for (const taskId of batch.tasks.keys()) if (pendingTasks.has(taskId)) cancelPendingTask(taskId)
+    for (const taskId of batch.tasks.keys()) if (pendingTasks.has(taskId)) lifecycle.cancelPendingTask(taskId)
     batches.delete(batchId)
     state.pendingBatches = batches.size
     saveBatches()
@@ -4697,7 +4350,7 @@ export function apply(ctx, config) {
         pendingTasks.set(taskId, task)
         const timer = setTimeout(() => {
           receiptTimers.delete(timer)
-          settleTask(taskId, task, {
+          lifecycle.settleTask(taskId, task, {
             turn: null,
             status: 'lost',
             reasonKind: 'lost',
@@ -4713,7 +4366,7 @@ export function apply(ctx, config) {
   }
 
   function disposeReceipts() {
-    for (const task of pendingTasks.values()) clearPending(task)
+    for (const task of pendingTasks.values()) lifecycle.clearPending(task)
     pendingTasks.clear()
     receiptTimers.clear()
     for (const batch of batches.values()) {
@@ -4730,7 +4383,7 @@ export function apply(ctx, config) {
 
   if (typeof ctx.on === 'function') {
     ctx.effect(() => {
-      const off = ctx.on('session/event', handleSessionEvent)
+      const off = ctx.on('session/event', lifecycle.handleSessionEvent)
       return typeof off === 'function' ? off : undefined
     })
     // Remote approvals: disabled installs delegate straight to the next answerer.
@@ -4882,10 +4535,10 @@ export function apply(ctx, config) {
       : text
     let taskId = null
     try {
-      taskId = registerPendingTask(session, meta, args.mode === 'steer' ? 'steer' : 'queue', text)
+      taskId = lifecycle.registerPendingTask(session, meta, args.mode === 'steer' ? 'steer' : 'queue', text)
       await promptWithResume(session.id, deliveredText, args.mode === 'steer' ? 'steer' : 'queue')
     } catch (error) {
-      if (taskId) cancelPendingTask(taskId)
+      if (taskId) lifecycle.cancelPendingTask(taskId)
       throw error
     }
     if (thread) threadFlow.bindThread(thread, session, taskId)
@@ -4967,7 +4620,7 @@ export function apply(ctx, config) {
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 300)
-    const receipt = settleTask(taskId, task, {
+    const receipt = lifecycle.settleTask(taskId, task, {
       turn: liveness.get(task.sessionId)?.openTurn ?? null,
       status: COMPLETE_STATUS[requested],
       reasonKind: requested,
@@ -5445,7 +5098,7 @@ export function apply(ctx, config) {
         res.end(JSON.stringify({ ok: false, error: 'only pending tasks can be cancelled', status: row.status }))
         return
       }
-      cancelPendingTask(taskId)
+      lifecycle.cancelPendingTask(taskId)
       fileLog(`task ${taskId} cancelled via DELETE`)
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
       res.end(JSON.stringify({ ok: true, taskId, status: 'cancelled' }))
@@ -5721,10 +5374,10 @@ export function apply(ctx, config) {
         // Register before prompting: a very fast turn can end before this request returns.
         let taskId = null
         try {
-          if (meta.taskId) taskId = registerPendingTask(target, meta, mode, text)
+          if (meta.taskId) taskId = lifecycle.registerPendingTask(target, meta, mode, text)
           await promptWithResume(target.id, deliveredText, mode)
         } catch (error) {
-          if (taskId) cancelPendingTask(taskId)
+          if (taskId) lifecycle.cancelPendingTask(taskId)
           throw error
         }
         if (thread) threadFlow.bindThread(thread, target, taskId)
