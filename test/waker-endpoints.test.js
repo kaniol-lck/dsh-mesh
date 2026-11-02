@@ -5335,7 +5335,7 @@ async function main() {
       'MESH_THREAD_TOOL', 'THREAD_OUTPUT', 'validateToolSchema', 'previewText', 'truncateUtf8', 'inlineBodyText',
       'cleanTaskSubject', 'resolveTaskSubject', 'normalizeThread', 'withTaskHeader', 'SESSION_PAGE_DEFAULT',
       'SESSION_PAGE_MAX', 'paginateSessions', 'ROLE_NAMES', 'ROLE_UNRECOGNIZED_MAX', 'titleRoleCandidate',
-      'classifyRoleCandidates', 'createReceiptFlow', 'createThreads', 'apply', 'name', 'inject',
+      'classifyRoleCandidates', 'createReceiptFlow', 'createThreads', 'createTaskRegistry', 'apply', 'name', 'inject',
     ]
     const missing = expected.filter((key) => api[key] === undefined)
     const wrongType = expected.filter((key) => {
@@ -5352,7 +5352,7 @@ async function main() {
   })
 
   await runCase('lib: every module imports standalone and the graph has no cycles', async () => {
-    const files = ['text', 'receipt', 'tools', 'session', 'tasks', 'settings', 'receipt-flow', 'threads']
+    const files = ['text', 'receipt', 'tools', 'session', 'tasks', 'settings', 'receipt-flow', 'threads', 'task-registry']
     const modules = {}
     for (const name of files) modules[name] = await import(libUrl(`${name}.mjs`))
     const edges = {}
@@ -5380,6 +5380,7 @@ async function main() {
       typeof modules.tasks.resolveTaskText === 'function' &&
       typeof modules['receipt-flow'].createReceiptFlow === 'function' &&
       typeof modules.threads.createThreads === 'function' &&
+      typeof modules['task-registry'].createTaskRegistry === 'function' &&
       typeof modules.settings.clampInterval === 'function'
     const ok = exportsOk && cyclic.length === 0
     report('lib: every module imports standalone and the graph has no cycles', ok, `cyclic=${cyclic.join(',') || '-'} edges=${JSON.stringify(edges)}`)
@@ -5463,6 +5464,7 @@ async function main() {
   }
   const { createReceiptFlow } = await import(pathToFileURL(ENTRY).href)
   const { createThreads } = await import(pathToFileURL(ENTRY).href)
+  const { createTaskRegistry } = await import(pathToFileURL(ENTRY).href)
 
   await runCase('receipt flow: resolves a named requester without apply()', async () => {
     const { flow } = makeReceiptFlow({ resolveLocalSession: (draft) => ({ id: `session-for-${draft.title}` }) })
@@ -5582,6 +5584,67 @@ async function main() {
     const free = factoryFreeRefs(createThreads, ['threadRows', 'threadsFile', 'pendingTasks', 'taskRows', 'fileLog', 'resolveLocalSession', 'state', 'c'])
     const ok = free.length === 0
     report('threads: the factory body has no free apply() references', ok, `free=${free.join(',') || '-'}`)
+  })
+
+  await runCase('task registry factory: loads latest rows and applies retention without apply()', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-task-registry-'))
+    try {
+      const tasksDir = path.join(tmpRoot, 'ws')
+      const registryFile = path.join(tasksDir, 'tasks.jsonl')
+      fs.mkdirSync(tasksDir, { recursive: true })
+      const now = Date.now()
+      const seed = [
+        { taskId: 'T-LAST-1', createdAt: now - 5000, status: 'pending' },
+        { taskId: 'T-LAST-1', createdAt: now - 4000, status: 'settled' },
+        { taskId: 'T-OLD-1', createdAt: now - 3 * 24 * 60 * 60 * 1000, status: 'settled' },
+        { taskId: 'T-LAST-2', createdAt: now - 3000, status: 'pending' },
+        { taskId: 'T-LAST-3', createdAt: now - 2000, status: 'pending' },
+      ]
+      fs.writeFileSync(registryFile, `${seed.map((row) => JSON.stringify(row)).join('\n')}\n`)
+      const baseDeps = {
+        taskFiles: new Map(),
+        fileLog: () => {},
+        tasksFileIn: (dir) => path.join(dir, 'tasks.jsonl'),
+        dirForRow: () => tasksDir,
+        taskRecordFiles: () => [registryFile],
+        taskTextDir: path.join(tmpRoot, 'tasks'),
+        taskTextsDir: path.join(tmpRoot, 'texts'),
+        writeTaskText: () => 'texts/ref.md',
+        routeForSessions: () => ({ dir: tasksDir, scope: 'ws', workspace: 'w' }),
+        scopeFields: (route) => ({ scope: route.scope, workspace: route.workspace }),
+      }
+      const keptRows = new Map()
+      createTaskRegistry({ ...baseDeps, taskRows: keptRows, config: { tasksRetentionDays: 1, tasksMaxRows: 10 } }).loadTaskRegistry()
+      const lastWins = keptRows.get('T-LAST-1')?.status === 'settled'
+      const retentionPruned = !keptRows.has('T-OLD-1')
+      const cappedRows = new Map()
+      createTaskRegistry({ ...baseDeps, taskRows: cappedRows, config: { tasksRetentionDays: 1, tasksMaxRows: 2 } }).loadTaskRegistry()
+      const capped = cappedRows.size === 2
+      const ok = lastWins && retentionPruned && capped
+      report('task registry factory: loads latest rows and applies retention without apply()', ok, `lastWins=${lastWins} retentionPruned=${retentionPruned} capped=${cappedRows.size}/2`)
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('task registry: the factory body has no free apply() references', async () => {
+    const free = factoryFreeRefs(createTaskRegistry, [
+      'taskRows',
+      'taskFiles',
+      'fileLog',
+      'state',
+      'c',
+      'tasksFileIn',
+      'dirForRow',
+      'taskRecordFiles',
+      'taskTextDir',
+      'taskTextsDir',
+      'writeTaskText',
+      'routeForSessions',
+      'scopeFields',
+    ])
+    const ok = free.length === 0
+    report('task registry: the factory body has no free apply() references', ok, `free=${free.join(',') || '-'}`)
   })
 
   await runCase('receipt flow: lib/receipt-flow.mjs imports without index.js', async () => {

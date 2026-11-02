@@ -34,6 +34,7 @@ import { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs
 import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settings.mjs'
 import { createReceiptFlow } from './lib/receipt-flow.mjs'
 import { createThreads } from './lib/threads.mjs'
+import { createTaskRegistry } from './lib/task-registry.mjs'
 
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
@@ -43,6 +44,7 @@ export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_CO
 export { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, ROLE_NAMES, ROLE_UNRECOGNIZED_MAX, titleRoleCandidate, classifyRoleCandidates } from './lib/session.mjs'
 export { createReceiptFlow } from './lib/receipt-flow.mjs'
 export { createThreads } from './lib/threads.mjs'
+export { createTaskRegistry } from './lib/task-registry.mjs'
 export { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 
 // Self-reported identity: the hub surfaces it so an operator can spot a stale install.
@@ -3900,187 +3902,38 @@ export function apply(ctx, config) {
 
   // ══ 子系统：任务账本 ══════════════════════════════════════════════════
   // 职责：任务行追加/更新、启动加载与保留策略、任务 API 投影
-  // 共享闭包：taskRows, taskFiles, taskFilesWithRows, c.tasksRetentionDays / tasksMaxRows
-  // 对外入口：recordTaskPending / updateTaskRow / loadTaskRegistry / taskRowForApi
+  // 实现：createTaskRegistry(deps)（模块级，T-319）；本区只做依赖装配
+  // 对外入口：taskRegistry.recordTaskPending / updateTaskRow / loadTaskRegistry / taskRowForApi
   // 注意：jsonl 是追加式事件日志，同 taskId 取最后一条为准
-
-  function appendTaskRow(row) {
-    const file = taskFiles.get(row.taskId) ?? tasksFileIn(dirForRow(row))
-    try {
-      mkdirSync(dirname(file), { recursive: true })
-      appendFileSync(file, `${JSON.stringify(row)}\n`, { mode: 0o600 })
-      taskFiles.set(row.taskId, file)
-      return true
-    } catch (error) {
-      fileLog(`task registry write failed for ${row.taskId}: ${error.message}`)
-      return false
-    }
-  }
-
-  function updateTaskRow(taskId, patch) {
-    const current = taskRows.get(taskId)
-    if (!current) return null
-    const next = { ...current, ...patch }
-    taskRows.set(taskId, next)
-    appendTaskRow(next)
-    return next
-  }
-
-  /** Load every tier file into one in-memory view, then apply retention across the union. */
-  function loadTaskRegistry() {
-    const files = taskRecordFiles()
-    const parsed = []
-    for (const file of files) {
-      try {
-        for (const line of readFileSync(file, 'utf8').split('\n')) {
-          if (!line.trim()) continue
-          try {
-            const row = JSON.parse(line)
-            if (row && typeof row === 'object' && row.taskId) parsed.push({ row, file })
-          } catch {
-            /* skip a torn line */
-          }
-        }
-      } catch {
-        /* unreadable file: skip */
-      }
-    }
-    const latest = new Map()
-    for (const entry of parsed) latest.set(String(entry.row.taskId), entry)
-    const cutoff = Date.now() - c.tasksRetentionDays * 24 * 60 * 60 * 1000
-    const kept = [...latest.values()]
-      .filter((entry) => Number(entry.row.createdAt) >= cutoff)
-      .sort((left, right) => Number(right.row.createdAt) - Number(left.row.createdAt))
-      .slice(0, c.tasksMaxRows)
-    taskRows.clear()
-    taskFiles.clear()
-    const keepIds = new Set()
-    for (const entry of kept) {
-      const taskId = String(entry.row.taskId)
-      taskRows.set(taskId, entry.row)
-      taskFiles.set(taskId, entry.file)
-      keepIds.add(taskId)
-    }
-    try {
-      // Rewrite only when something was pruned: unchanged files stay byte-identical.
-      if (kept.length !== parsed.length) {
-        const byFile = new Map(files.map((file) => [file, []]))
-        for (const entry of kept) {
-          if (!byFile.has(entry.file)) byFile.set(entry.file, [])
-          byFile.get(entry.file).push(entry.row)
-        }
-        for (const [file, rows] of byFile) {
-          mkdirSync(dirname(file), { recursive: true })
-          const temp = `${file}.rewrite.tmp`
-          writeFileSync(temp, rows.map((row) => JSON.stringify(row)).join('\n') + (rows.length ? '\n' : ''), { mode: 0o600 })
-          renameSync(temp, file)
-        }
-      }
-    } catch (error) {
-      fileLog(`task registry compaction failed: ${error.message}`)
-    }
-    try {
-      for (const name of readdirSync(taskTextDir)) {
-        if (!name.endsWith('.md')) continue
-        const id = name.slice(0, -3)
-        if (!keepIds.has(id)) rmSync(join(taskTextDir, name), { force: true })
-      }
-    } catch {
-      /* no text dir yet */
-    }
-    fileLog(`task registry loaded rows=${taskRows.size} files=${files.length}`)
-  }
-
-  /** Persist a dispatched task; bodies over 8 KiB go to tasks/<id>.md (privacy: never logged). */
-  function recordTaskPending(taskId, target, meta, text, extra = {}) {
-    const body = String(text ?? '')
-    const textBytes = Buffer.byteLength(body)
-    // Reusing an id is allowed (a deliberate re-dispatch), but never silent: two rows with
-    // contradictory outcomes under one id make reconciliation lie (T-255).
-    const previousRow = taskRows.get(taskId)
-    let reusedId = false
-    if (previousRow && Number.isFinite(Number(previousRow.createdAt))) {
-      const age = Date.now() - Number(previousRow.createdAt)
-      if (age <= 24 * 60 * 60 * 1000) {
-        reusedId = true
-        const settledAt = Number(previousRow.settledAt ?? previousRow.createdAt)
-        fileLog(`WARN taskId ${taskId} reused (previous settled at ${new Date(settledAt).toISOString()})`)
-      }
-    }
-    const route = extra.route ?? routeForSessions(target.id, extra.requesterSessionId ?? null)
-    const row = {
-      taskId,
-      batchId: extra.batchId ?? null,
-      thread: extra.thread ?? null,
-      requester: extra.requester ?? null,
-      targetSessionId: target.id,
-      targetTitle: target.title ?? null,
-      subject: resolveTaskSubject(meta?.subject, body),
-      textBytes,
-      createdAt: Date.now(),
-      deadlineMs: extra.deadlineMs ?? null,
-      status: 'pending',
-      startedAt: null,
-      settledAt: null,
-      durationMs: null,
-      receiptMode: extra.receiptMode ?? null,
-      receiptRef: null,
-      ...scopeFields(route),
-      ...(reusedId ? { reusedId: true } : {}),
-      refs: Array.isArray(meta?.refs)
-        ? meta.refs
-            .filter((ref) => typeof ref === 'string' && ref.trim())
-            .slice(0, 10)
-            .map((ref) => ref.slice(0, 200))
-        : [],
-    }
-    const textRef = body ? writeTaskText(body) : null
-    if (textRef) {
-      row.textRef = textRef
-    } else if (body) {
-      // Storage failure must not lose the task body; keep it inline as a fallback.
-      row.text = body
-      fileLog(`task text store unavailable for ${taskId}; kept inline (${textBytes} bytes)`)
-    }
-    taskRows.set(taskId, row)
-    taskFiles.set(taskId, join(route.dir, 'tasks.jsonl'))
-    appendTaskRow(row)
-    fileLog(
-      `task registry pending ${taskId} bytes=${textBytes} scope=${route.scope}${route.workspace ? ` ws=${route.workspace}` : ''}${route.scopeUncertain ? ' scopeUncertain' : ''} subject=${JSON.stringify(row.subject)}`,
-    )
-  }
-
-  function taskRowForApi(row, { withText = false } = {}) {
-    const base = {
-      taskId: row.taskId,
-      batchId: row.batchId ?? null,
-      thread: row.thread ?? null,
-      scope: row.scope ?? null,
-      origin: row.origin ?? null,
-      ...(Array.isArray(row.peers) && row.peers.length ? { peers: row.peers } : {}),
-      ...(row.scopeUncertain === true ? { scopeUncertain: true } : {}),
-      ...(row.workspace ? { workspace: row.workspace } : {}),
-      requester: row.requester ?? null,
-      targetSessionId: row.targetSessionId ?? null,
-      targetTitle: row.targetTitle ?? null,
-      subject: row.subject ?? '',
-      textBytes: row.textBytes ?? 0,
-      createdAt: row.createdAt ?? null,
-      deadlineMs: row.deadlineMs ?? null,
-      status: row.status ?? 'pending',
-      startedAt: row.startedAt ?? null,
-      settledAt: row.settledAt ?? null,
-      durationMs: row.durationMs ?? null,
-      receiptRef: row.receiptRef ?? null,
-      receiptSummary: row.receiptSummary ?? null,
-      refs: Array.isArray(row.refs) ? row.refs : [],
-      reusedId: row.reusedId === true,
-      textRef: row.textRef ?? null,
-      hasTextFile: Boolean(row.textRef || row.textPath),
-    }
-    if (!withText) return base
-    return { ...base, text: resolveTaskText(row, taskTextsDir) }
-  }
+  const taskRegistry = createTaskRegistry({
+    // 任务库内存索引（taskId → 行）
+    taskRows,
+    // taskId → 所在 tasks.jsonl（追加时复用同一文件）
+    taskFiles,
+    // 保留策略的两个上限
+    config: {
+      tasksRetentionDays: c.tasksRetentionDays,
+      tasksMaxRows: c.tasksMaxRows,
+    },
+    // 写 waker 日志
+    fileLog,
+    // 目录 → tasks.jsonl 路径（存储分层）
+    tasksFileIn,
+    // 任务行 → 分层目录（存储分层）
+    dirForRow,
+    // 所有层级的 tasks.jsonl 列表（启动加载）
+    taskRecordFiles,
+    // 大正文目录（清理孤儿 .md）
+    taskTextDir,
+    // 正文解析目录（taskRowForApi withText）
+    taskTextsDir,
+    // 写正文文件并返回 textRef
+    writeTaskText,
+    // LCA 路由：目标 / requester 的 cwd → scope
+    routeForSessions,
+    // 路由 → scope 字段
+    scopeFields,
+  })
 
   // ══ 子系统：回执投递 ══════════════════════════════════════════════════
   // 职责：requester 解析与同 cwd 推断、queue/file/wake 投递、重启 lost 补发
@@ -4113,7 +3966,7 @@ export function apply(ctx, config) {
     // 任务行 → 分层目录
     dirForRow,
     // 任务库追加 / 更新行
-    updateTaskRow,
+    updateTaskRow: taskRegistry.updateTaskRow,
     // 任务库内存索引（重启补发扫描）
     taskRows,
     // 读 / 写 apply() 的 lastReceipt 镜像
@@ -4234,7 +4087,7 @@ export function apply(ctx, config) {
     // settled. Registry durationMs is measured from startedAt when the task was seen
     // starting (falling back to injection time); the receipt keeps its own duration.
     const registryStartedAt = Number.isFinite(task.startedAt) ? task.startedAt : task.injectedAt
-    updateTaskRow(taskId, {
+    taskRegistry.updateTaskRow(taskId, {
       status: receipt.status === 'not-started' ? 'stalled' : 'settled',
       settledAt: receipt.endedAt,
       durationMs: Math.max(0, receipt.endedAt - registryStartedAt),
@@ -4361,7 +4214,7 @@ export function apply(ctx, config) {
     pendingTasks.set(taskId, task)
     state.pendingTasks = pendingTasks.size
     if (batchId) registerBatchTask(taskId, task, meta)
-    recordTaskPending(taskId, target, meta, text, {
+    taskRegistry.recordTaskPending(taskId, target, meta, text, {
       batchId,
       thread: normalizeThread(meta?.thread),
       requester: requester.requester,
@@ -4385,7 +4238,7 @@ export function apply(ctx, config) {
     clearPending(task)
     pendingTasks.delete(taskId)
     state.pendingTasks = pendingTasks.size
-    updateTaskRow(taskId, { status: 'cancelled', settledAt: Date.now() })
+    taskRegistry.updateTaskRow(taskId, { status: 'cancelled', settledAt: Date.now() })
   }
 
   /** Feed the liveness ledger, then settle tasks on turn/end. */
@@ -4497,7 +4350,7 @@ export function apply(ctx, config) {
             )
           }
           task.startedAt = now
-          updateTaskRow(taskId, { status: 'started', startedAt: now })
+          taskRegistry.updateTaskRow(taskId, { status: 'started', startedAt: now })
           fileLog(`task ${taskId} started turn=${turn} baselineTurn=${task.baselineTurn}`)
         }
         for (const task of pendingTasks.values()) {
@@ -5301,7 +5154,7 @@ export function apply(ctx, config) {
   registerWorkspacesFromSessions()
   // Split legacy single files into tier files before anything loads or rewrites rows.
   migrateLegacyStorage()
-  loadTaskRegistry()
+  taskRegistry.loadTaskRegistry()
   // A receipt must live with its task row (T-300): fix historical mismatches once, idempotently.
   realignReceiptTiersAtBoot()
   threadFlow.loadThreads()
@@ -5550,7 +5403,7 @@ export function apply(ctx, config) {
           offset,
           tasks: rows
             .slice(offset, offset + limit)
-            .map((row) => taskRowForApi(row, { withText: params.get('include') === 'text' })),
+            .map((row) => taskRegistry.taskRowForApi(row, { withText: params.get('include') === 'text' })),
         }),
       )
       return
@@ -5583,7 +5436,7 @@ export function apply(ctx, config) {
             }
           : null
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-        res.end(JSON.stringify({ ok: true, task: taskRowForApi(row, { withText: true }), target }))
+        res.end(JSON.stringify({ ok: true, task: taskRegistry.taskRowForApi(row, { withText: true }), target }))
         return
       }
       // DELETE only cancels a task that has not settled yet (settled history is immutable).
