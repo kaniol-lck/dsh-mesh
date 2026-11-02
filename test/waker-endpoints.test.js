@@ -5430,6 +5430,107 @@ async function main() {
     report('lib: package.json files includes lib/ for publishing', ok, `files=${files.join(',')} entry=${exportsMap['.'] ?? '-'}`)
   })
 
+  // 252-256. Receipt flow factory (T-314): the subsystem must run without apply(). These
+  // cases call createReceiptFlow(fakeDeps) directly, so a hidden closure reference throws
+  // instead of silently working, and a static check guards the factory body.
+  const makeReceiptFlow = (overrides = {}) => {
+    const logs = []
+    const calls = []
+    const deps = {
+      state: { lastError: null, lastReceipt: null },
+      config: { receiptTo: '', wakeSecret: '', receiptSummaryChars: 300 },
+      log: { warn: (message) => logs.push(`warn: ${message}`) },
+      fileLog: (message) => logs.push(String(message)),
+      listLocalSessions: () => [],
+      resolveLocalSession: () => ({ id: 'session-default' }),
+      promptWithResume: async (...args) => {
+        calls.push(args)
+      },
+      receiptBody: () => 'receipt body',
+      writeReceiptFile: () => true,
+      dirForRow: () => '/tmp/records',
+      updateTaskRow: () => {},
+      taskRows: new Map(),
+      getLastReceipt: () => deps.state.lastReceipt,
+      setLastReceipt: (value) => {
+        deps.state.lastReceipt = value
+      },
+      ...overrides,
+    }
+    return { deps, logs, calls, flow: createReceiptFlow(deps) }
+  }
+  const { createReceiptFlow } = await import(pathToFileURL(ENTRY).href)
+
+  await runCase('receipt flow: resolves a named requester without apply()', async () => {
+    const { flow } = makeReceiptFlow({ resolveLocalSession: (draft) => ({ id: `session-for-${draft.title}` }) })
+    const resolved = flow.resolveRequester('mesh · 协调 2')
+    const ok =
+      resolved.requester === 'mesh · 协调 2' &&
+      resolved.sessionId === 'session-for-mesh · 协调 2' &&
+      resolved.inferred === false
+    report('receipt flow: resolves a named requester without apply()', ok, `sessionId=${resolved.sessionId ?? '-'} inferred=${resolved.inferred}`)
+  })
+
+  await runCase('receipt flow: infers the newest numbered coordinator in the target cwd', async () => {
+    const cwd = path.join('virtual', 'proj')
+    const { flow } = makeReceiptFlow({
+      listLocalSessions: () => [
+        { id: 'session-old', title: 'mesh · 协调', cwd, archived: false, last_active: 1000 },
+        { id: 'session-new', title: 'mesh · 协调 2', cwd, archived: false, last_active: 2000 },
+        { id: 'session-worker', title: 'worker', cwd, archived: false, last_active: 3000 },
+      ],
+    })
+    const resolved = flow.resolveRequester(null, { id: 'session-target', cwd })
+    const ok = resolved.inferred === true && resolved.sessionId === 'session-new' && resolved.requester === 'mesh · 协调 2'
+    report('receipt flow: infers the newest numbered coordinator in the target cwd', ok, `sessionId=${resolved.sessionId ?? '-'} inferred=${resolved.inferred}`)
+  })
+
+  await runCase('receipt flow: file mode logs without injecting, queue mode delivers', async () => {
+    const { calls, logs, flow } = makeReceiptFlow()
+    await flow.deliverReceipt(
+      { taskId: 'T-RF-FILE', status: 'completed', receiptMode: 'file' },
+      { requester: 'x', requesterSessionId: 'session-req' },
+    )
+    const fileMode = calls.length === 0 && logs.some((line) => /T-RF-FILE completed → file only/.test(line))
+    await flow.deliverReceipt(
+      { taskId: 'T-RF-QUEUE', status: 'completed', receiptMode: 'queue' },
+      { requester: 'x', requesterSessionId: 'session-req' },
+    )
+    const queueMode = calls.length === 1 && calls[0][0] === 'session-req' && calls[0][1] === 'receipt body' && calls[0][2] === 'queue'
+    report('receipt flow: file mode logs without injecting, queue mode delivers', fileMode && queueMode, `fileMode=${fileMode} queueMode=${queueMode}`)
+  })
+
+  await runCase('receipt flow: wake without wakeSecret warns and delivers as queue', async () => {
+    const { calls, logs, flow } = makeReceiptFlow()
+    await flow.deliverReceipt(
+      { taskId: 'T-RF-WAKE', status: 'completed', receiptMode: 'wake' },
+      { requesterSessionId: 'session-req' },
+    )
+    const ok = calls.length === 1 && calls[0][2] === 'queue' && logs.some((line) => /needs wakeSecret/.test(line))
+    report('receipt flow: wake without wakeSecret warns and delivers as queue', ok, `mode=${calls[0]?.[2] ?? '-'} warned=${logs.some((line) => /needs wakeSecret/.test(line))}`)
+  })
+
+  await runCase('receipt flow: the factory body has no free apply() references', async () => {
+    const code = String(createReceiptFlow).replace(/\/\/[^\n]*/g, '')
+    const forbidden = [
+      'state',
+      'taskRows',
+      'lastReceipt',
+      'fileLog',
+      'listLocalSessions',
+      'resolveLocalSession',
+      'promptWithResume',
+      'writeReceiptFile',
+      'dirForRow',
+      'updateTaskRow',
+      'receiptBody',
+    ]
+    const free = forbidden.filter((name) => new RegExp(`(?<![\\w.])${name}\\b`).test(code))
+    const configRef = /(?<![\w.])c\./.test(code)
+    const ok = free.length === 0 && !configRef
+    report('receipt flow: the factory body has no free apply() references', ok, `free=${free.join(',') || '-'} configRef=${configRef}`)
+  })
+
   // 241. Boot diagnostics (T-299): a listener that cannot bind must fail fast and name the
   // real error instead of burning the 5s probe budget and reporting "never answered".
   {

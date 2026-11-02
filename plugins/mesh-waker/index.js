@@ -228,6 +228,220 @@ export function realignReceiptTiers({ meshHome, storageTiers = true, log = () =>
   return { moved: moves.length, skipped }
 }
 
+/**
+ * Receipt delivery subsystem (T-314, step 3 of the source-structure plan).
+ *
+ * Nothing in here may capture the apply() closure: every plugin/host dependency arrives
+ * through `deps`, so the flow can be constructed and exercised without booting the plugin
+ * (see the "receipt flow runs without apply()" cases). Callers inside apply() go through
+ * receiptFlow.resolveRequester / deliverReceipt / deliverNotice / reconcileOrphanTasks.
+ *
+ * deps:
+ *   state                 apply() 的状态账本（写 lastError / lastReceipt）
+ *   config                normalize() 后的配置快照（receiptTo / wakeSecret / receiptSummaryChars）
+ *   log                   宿主 logger（wake 缺 wakeSecret 时 warn）
+ *   fileLog               写 waker 日志
+ *   listLocalSessions     列举本机会话（requester 推断）
+ *   resolveLocalSession   按 id / 标题解析本机会话
+ *   promptWithResume      真正投递（queue / steer）
+ *   receiptBody           把回执渲染成通知文本
+ *   writeReceiptFile      回执落盘
+ *   dirForRow             任务行 → 分层目录
+ *   updateTaskRow         任务库追加 / 更新行
+ *   taskRows              任务库内存索引（重启补发扫描）
+ *   getLastReceipt        读 apply() 的 lastReceipt 镜像
+ *   setLastReceipt        写回 apply() 的 lastReceipt 镜像
+ */
+export function createReceiptFlow(deps) {
+  /**
+   * Resolve a requester id/title once. When the dispatcher named nobody, infer a coordinator
+   * from the *target's* cwd (exactly one `· 协调` / `· coordinator` session there). The global
+   * receiptTo is deliberately not consulted: one waker can serve several workspaces, and a
+   * receipt must never cross into another project's coordinator (T-255).
+   */
+  function inferRequesterFromWorkspace(target) {
+    const cwd = String(target?.cwd ?? '').trim()
+    if (!cwd) return { kind: 'no-cwd' }
+    let sessions = []
+    try {
+      sessions = deps.listLocalSessions()
+    } catch {
+      return { kind: 'none' }
+    }
+    const matches = sessions.filter(
+      (session) =>
+        session.id !== target.id &&
+        !session.archived &&
+        String(session.cwd ?? '').trim() === cwd &&
+        isCoordinatorTitle(session.title),
+    )
+    if (matches.length === 1) return { kind: 'one', session: matches[0] }
+    if (matches.length > 1) {
+      // Numbered coordinators are normal (mesh · 协调 2). A clearly newer one wins; only
+      // equal/unknown activity keeps the "ambiguous, do not guess" behaviour (T-287).
+      matches.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
+      const newest = Number(matches[0].last_active ?? 0)
+      const runnerUp = Number(matches[1].last_active ?? 0)
+      if (Number.isFinite(newest) && Number.isFinite(runnerUp) && newest > runnerUp) {
+        return { kind: 'one', session: matches[0], pickedLatest: true }
+      }
+    }
+    return { kind: matches.length === 0 ? 'none' : 'ambiguous', candidates: matches, cwd }
+  }
+
+  function resolveRequester(raw, target = null) {
+    const requester = String(raw ?? '').trim()
+    if (!requester) {
+      const inferred = inferRequesterFromWorkspace(target)
+      if (inferred.kind === 'one') {
+        deps.fileLog(
+          `requester inferred from workspace: ${inferred.session.title} (${inferred.session.id})${inferred.pickedLatest ? ' [newest of several coordinators]' : ''}`,
+        )
+        return { requester: inferred.session.title || inferred.session.id, sessionId: inferred.session.id, inferred: true }
+      }
+      if (inferred.kind === 'ambiguous') {
+        deps.fileLog(
+          `requester inference ambiguous: ${inferred.candidates.length} coordinator sessions share cwd ${inferred.cwd}; receipt stays file-only`,
+        )
+      }
+      return { requester: null, sessionId: null, inferred: false }
+    }
+    try {
+      const target = deps.resolveLocalSession({ session: requester, title: requester })
+      return { requester, sessionId: target.id, inferred: false }
+    } catch (error) {
+      deps.state.lastError = `requester not resolved (${requester}): ${error.message}; falling back to receiptTo`
+      deps.fileLog(`requester ${requester} not resolved (${error.message}); receipts fall back to receiptTo`)
+      return { requester, sessionId: null, inferred: false }
+    }
+  }
+
+  /**
+   * Deliver one notice (receipt or batch text). `targetSessionId` wins when given (the
+   * dispatcher's own session); otherwise fall back to the configured receiptTo; file mode
+   * never injects. Returns the session id that actually received it, or null.
+   */
+  async function deliverNotice(mode, text, label, targetSessionId) {
+    if (mode === 'file') return null
+    let targetId = targetSessionId ? String(targetSessionId) : ''
+    if (!targetId) {
+      if (!deps.config.receiptTo) {
+        deps.state.lastError = 'no requester and receiptTo is empty; notice written to file only'
+        deps.fileLog(`${label} delivery skipped: no requester, receiptTo is empty`)
+        return null
+      }
+      try {
+        targetId = deps.resolveLocalSession({ session: deps.config.receiptTo, title: deps.config.receiptTo }).id
+      } catch (error) {
+        deps.state.lastError = `receiptTo not resolved: ${error.message}`
+        deps.fileLog(`${label} delivery skipped: ${error.message}`)
+        return null
+      }
+    }
+    let turnMode = 'queue'
+    if (mode === 'wake') {
+      if (deps.config.wakeSecret) turnMode = 'steer'
+      else deps.log.warn('[mesh-waker] wake delivery needs wakeSecret; delivering as queue')
+    }
+    try {
+      await deps.promptWithResume(targetId, text, turnMode)
+      deps.fileLog(`${label} delivered to ${targetId} (${mode}, mode=${turnMode})`)
+      return targetId
+    } catch (error) {
+      deps.state.lastError = `${label} delivery failed: ${error.message}`
+      deps.fileLog(`${label} delivery failed: ${error.message}`)
+      return null
+    }
+  }
+
+  async function deliverReceipt(receipt, task) {
+    const hasRequester = Boolean(task?.requesterSessionId || task?.requester)
+    if (receipt.receiptMode === 'file') {
+      // File mode never injects, but it must never be silent either (T-255: a 16.8s turn
+      // ended in error and nobody was told because this branch returned without a log line).
+      const requesterLabel = hasRequester ? (task?.requesterInferred ? '有 (inferred)' : '有') : '无'
+      deps.fileLog(
+        `receipt ${receipt.taskId} ${receipt.status} → file only (requester=${requesterLabel}, receiptTo=${deps.config.receiptTo ? '有' : '无'})`,
+      )
+      if (!hasRequester && !deps.config.receiptTo) {
+        deps.fileLog(`WARN receipt ${receipt.taskId} has no delivery target; nobody was notified`)
+        deps.state.lastError = `receipt ${receipt.taskId} has no delivery target; nobody was notified`
+      }
+      return
+    }
+    const deliveredTo = await deliverNotice(
+      receipt.receiptMode,
+      deps.receiptBody(receipt),
+      `receipt ${receipt.taskId}`,
+      task?.requesterSessionId ?? '',
+    )
+    const current = deps.getLastReceipt()
+    if (deliveredTo && current && current.taskId === receipt.taskId) {
+      current.deliveredTo = deliveredTo
+      deps.setLastReceipt(current)
+      deps.state.lastReceipt = current
+    }
+  }
+
+  /**
+   * A host restart clears pendingTasks but leaves pending/started rows in tasks.jsonl.
+   * Those rows belong to the previous process (this one never registered them in memory),
+   * so they can never settle: mark each lost and send the receipt its dispatcher is still
+   * waiting for. Runs once at startup; finished rows are never touched (T-265).
+   */
+  async function reconcileOrphanTasks() {
+    const orphans = [...deps.taskRows.values()].filter(
+      (row) => (row.status === 'pending' || row.status === 'started') && (row.settledAt === null || row.settledAt === undefined),
+    )
+    if (orphans.length === 0) return
+    deps.fileLog(`restart reconciliation: ${orphans.length} orphan task(s) from the previous process`)
+    for (const row of orphans) {
+      const settledAt = Date.now()
+      const summary = 'session restarted before this task finished; resend if still needed'
+      deps.updateTaskRow(row.taskId, {
+        status: 'lost',
+        settledAt,
+        reasonKind: 'lost',
+        reasonDetail: 'host restart',
+        receiptSummary: summary,
+      })
+      let requester = row.requester ?? null
+      let requesterSessionId = null
+      let inferred = false
+      if (row.requester) {
+        const resolved = resolveRequester(row.requester, null)
+        requesterSessionId = resolved.sessionId
+      } else {
+        const target =
+          deps.listLocalSessions().find((session) => session.id === row.targetSessionId) ?? { id: row.targetSessionId, cwd: null }
+        const resolved = resolveRequester(null, target)
+        requester = resolved.requester
+        requesterSessionId = resolved.sessionId
+        inferred = resolved.inferred === true
+      }
+      const receipt = buildReceipt({
+        taskId: row.taskId,
+        sessionId: row.targetSessionId ?? null,
+        status: 'lost',
+        reasonKind: 'lost',
+        reasonDetail: 'host restart',
+        injectedAt: row.createdAt ?? null,
+        endedAt: settledAt,
+        summary,
+        // Rows written before 0.7.30 have no receiptMode. A named requester asked to be told,
+        // so default those to queue; without a requester a file-only notice has no value (T-273).
+        receiptMode: ['file', 'queue', 'wake'].includes(row.receiptMode) ? row.receiptMode : requester ? 'queue' : 'file',
+        summaryChars: deps.config.receiptSummaryChars,
+      })
+      deps.writeReceiptFile(receipt, deps.dirForRow(row))
+      deps.fileLog(`task ${row.taskId} marked lost after restart (requester=${requester ? '有' : '无'})`)
+      await deliverReceipt(receipt, { requester, requesterSessionId, requesterInferred: inferred })
+    }
+  }
+
+  return { inferRequesterFromWorkspace, resolveRequester, deliverNotice, deliverReceipt, reconcileOrphanTasks }
+}
+
 /** A task id already used by a different target in the same tier file (T-301). */
 export class TaskIdCollisionError extends Error {
   constructor(message, details = {}) {
@@ -4192,192 +4406,40 @@ export function apply(ctx, config) {
 
   // ══ 子系统：回执投递 ══════════════════════════════════════════════════
   // 职责：requester 解析与同 cwd 推断、queue/file/wake 投递、重启 lost 补发
-  // 共享闭包：pendingTasks, taskRows, assistantText, state.lastReceipt, c.receiptTo
-  // 对外入口：settleTask（调用）/ reconcileOrphanTasks（启动）
+  // 实现：createReceiptFlow(deps)（模块级，T-314）；本区只做依赖装配，不再持有逻辑
+  // 对外入口：receiptFlow.resolveRequester / deliverReceipt / deliverNotice / reconcileOrphanTasks
   // 注意：推断取同 cwd 最新协调会话，mtime 无法区分才按歧义处理（T-287）
-
-  /**
-   * Resolve a requester id/title once. When the dispatcher named nobody, infer a coordinator
-   * from the *target's* cwd (exactly one `· 协调` / `· coordinator` session there). The global
-   * receiptTo is deliberately not consulted: one waker can serve several workspaces, and a
-   * receipt must never cross into another project's coordinator (T-255).
-   */
-  function inferRequesterFromWorkspace(target) {
-    const cwd = String(target?.cwd ?? '').trim()
-    if (!cwd) return { kind: 'no-cwd' }
-    let sessions = []
-    try {
-      sessions = listLocalSessions()
-    } catch {
-      return { kind: 'none' }
-    }
-    const matches = sessions.filter(
-      (session) =>
-        session.id !== target.id &&
-        !session.archived &&
-        String(session.cwd ?? '').trim() === cwd &&
-        isCoordinatorTitle(session.title),
-    )
-    if (matches.length === 1) return { kind: 'one', session: matches[0] }
-    if (matches.length > 1) {
-      // Numbered coordinators are normal (mesh · 协调 2). A clearly newer one wins; only
-      // equal/unknown activity keeps the "ambiguous, do not guess" behaviour (T-287).
-      matches.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
-      const newest = Number(matches[0].last_active ?? 0)
-      const runnerUp = Number(matches[1].last_active ?? 0)
-      if (Number.isFinite(newest) && Number.isFinite(runnerUp) && newest > runnerUp) {
-        return { kind: 'one', session: matches[0], pickedLatest: true }
-      }
-    }
-    return { kind: matches.length === 0 ? 'none' : 'ambiguous', candidates: matches, cwd }
-  }
-
-  function resolveRequester(raw, target = null) {
-    const requester = String(raw ?? '').trim()
-    if (!requester) {
-      const inferred = inferRequesterFromWorkspace(target)
-      if (inferred.kind === 'one') {
-        fileLog(
-          `requester inferred from workspace: ${inferred.session.title} (${inferred.session.id})${inferred.pickedLatest ? ' [newest of several coordinators]' : ''}`,
-        )
-        return { requester: inferred.session.title || inferred.session.id, sessionId: inferred.session.id, inferred: true }
-      }
-      if (inferred.kind === 'ambiguous') {
-        fileLog(
-          `requester inference ambiguous: ${inferred.candidates.length} coordinator sessions share cwd ${inferred.cwd}; receipt stays file-only`,
-        )
-      }
-      return { requester: null, sessionId: null, inferred: false }
-    }
-    try {
-      const target = resolveLocalSession({ session: requester, title: requester })
-      return { requester, sessionId: target.id, inferred: false }
-    } catch (error) {
-      state.lastError = `requester not resolved (${requester}): ${error.message}; falling back to receiptTo`
-      fileLog(`requester ${requester} not resolved (${error.message}); receipts fall back to receiptTo`)
-      return { requester, sessionId: null, inferred: false }
-    }
-  }
-
-  /**
-   * Deliver one notice (receipt or batch text). `targetSessionId` wins when given (the
-   * dispatcher's own session); otherwise fall back to the configured receiptTo; file mode
-   * never injects. Returns the session id that actually received it, or null.
-   */
-  async function deliverNotice(mode, text, label, targetSessionId) {
-    if (mode === 'file') return null
-    let targetId = targetSessionId ? String(targetSessionId) : ''
-    if (!targetId) {
-      if (!c.receiptTo) {
-        state.lastError = 'no requester and receiptTo is empty; notice written to file only'
-        fileLog(`${label} delivery skipped: no requester, receiptTo is empty`)
-        return null
-      }
-      try {
-        targetId = resolveLocalSession({ session: c.receiptTo, title: c.receiptTo }).id
-      } catch (error) {
-        state.lastError = `receiptTo not resolved: ${error.message}`
-        fileLog(`${label} delivery skipped: ${error.message}`)
-        return null
-      }
-    }
-    let turnMode = 'queue'
-    if (mode === 'wake') {
-      if (c.wakeSecret) turnMode = 'steer'
-      else log.warn('[mesh-waker] wake delivery needs wakeSecret; delivering as queue')
-    }
-    try {
-      await promptWithResume(targetId, text, turnMode)
-      fileLog(`${label} delivered to ${targetId} (${mode}, mode=${turnMode})`)
-      return targetId
-    } catch (error) {
-      state.lastError = `${label} delivery failed: ${error.message}`
-      fileLog(`${label} delivery failed: ${error.message}`)
-      return null
-    }
-  }
-
-  async function deliverReceipt(receipt, task) {
-    const hasRequester = Boolean(task?.requesterSessionId || task?.requester)
-    if (receipt.receiptMode === 'file') {
-      // File mode never injects, but it must never be silent either (T-255: a 16.8s turn
-      // ended in error and nobody was told because this branch returned without a log line).
-      const requesterLabel = hasRequester ? (task?.requesterInferred ? '有 (inferred)' : '有') : '无'
-      fileLog(`receipt ${receipt.taskId} ${receipt.status} → file only (requester=${requesterLabel}, receiptTo=${c.receiptTo ? '有' : '无'})`)
-      if (!hasRequester && !c.receiptTo) {
-        fileLog(`WARN receipt ${receipt.taskId} has no delivery target; nobody was notified`)
-        state.lastError = `receipt ${receipt.taskId} has no delivery target; nobody was notified`
-      }
-      return
-    }
-    const deliveredTo = await deliverNotice(
-      receipt.receiptMode,
-      receiptBody(receipt),
-      `receipt ${receipt.taskId}`,
-      task?.requesterSessionId ?? '',
-    )
-    if (deliveredTo && lastReceipt && lastReceipt.taskId === receipt.taskId) {
-      lastReceipt.deliveredTo = deliveredTo
-      state.lastReceipt = lastReceipt
-    }
-  }
-
-
-  /**
-   * A host restart clears pendingTasks but leaves pending/started rows in tasks.jsonl.
-   * Those rows belong to the previous process (this one never registered them in memory),
-   * so they can never settle: mark each lost and send the receipt its dispatcher is still
-   * waiting for. Runs once at startup; finished rows are never touched (T-265).
-   */
-  async function reconcileOrphanTasks() {
-    const orphans = [...taskRows.values()].filter(
-      (row) => (row.status === 'pending' || row.status === 'started') && (row.settledAt === null || row.settledAt === undefined),
-    )
-    if (orphans.length === 0) return
-    fileLog(`restart reconciliation: ${orphans.length} orphan task(s) from the previous process`)
-    for (const row of orphans) {
-      const settledAt = Date.now()
-      const summary = 'session restarted before this task finished; resend if still needed'
-      updateTaskRow(row.taskId, {
-        status: 'lost',
-        settledAt,
-        reasonKind: 'lost',
-        reasonDetail: 'host restart',
-        receiptSummary: summary,
-      })
-      let requester = row.requester ?? null
-      let requesterSessionId = null
-      let inferred = false
-      if (row.requester) {
-        const resolved = resolveRequester(row.requester, null)
-        requesterSessionId = resolved.sessionId
-      } else {
-        const target =
-          listLocalSessions().find((session) => session.id === row.targetSessionId) ?? { id: row.targetSessionId, cwd: null }
-        const resolved = resolveRequester(null, target)
-        requester = resolved.requester
-        requesterSessionId = resolved.sessionId
-        inferred = resolved.inferred === true
-      }
-      const receipt = buildReceipt({
-        taskId: row.taskId,
-        sessionId: row.targetSessionId ?? null,
-        status: 'lost',
-        reasonKind: 'lost',
-        reasonDetail: 'host restart',
-        injectedAt: row.createdAt ?? null,
-        endedAt: settledAt,
-        summary,
-        // Rows written before 0.7.30 have no receiptMode. A named requester asked to be told,
-        // so default those to queue; without a requester a file-only notice has no value (T-273).
-        receiptMode: ['file', 'queue', 'wake'].includes(row.receiptMode) ? row.receiptMode : requester ? 'queue' : 'file',
-        summaryChars: c.receiptSummaryChars,
-      })
-      writeReceiptFile(receipt, dirForRow(row))
-      fileLog(`task ${row.taskId} marked lost after restart (requester=${requester ? '有' : '无'})`)
-      await deliverReceipt(receipt, { requester, requesterSessionId, requesterInferred: inferred })
-    }
-  }
+  const receiptFlow = createReceiptFlow({
+    // apply() 的状态账本：写 lastError / lastReceipt
+    state,
+    // normalize() 后的配置快照：receiptTo / wakeSecret / receiptSummaryChars
+    config: c,
+    // 宿主 logger（wake 缺 wakeSecret 时 warn）
+    log,
+    // 写 waker 日志
+    fileLog,
+    // 列举本机会话（requester 推断）
+    listLocalSessions,
+    // 按 id / 标题解析本机会话
+    resolveLocalSession,
+    // 真正投递（queue / steer）
+    promptWithResume,
+    // 回执渲染成通知文本
+    receiptBody,
+    // 回执落盘
+    writeReceiptFile,
+    // 任务行 → 分层目录
+    dirForRow,
+    // 任务库追加 / 更新行
+    updateTaskRow,
+    // 任务库内存索引（重启补发扫描）
+    taskRows,
+    // 读 / 写 apply() 的 lastReceipt 镜像
+    getLastReceipt: () => lastReceipt,
+    setLastReceipt: (value) => {
+      lastReceipt = value
+    },
+  })
 
   // ══ 子系统：任务生命周期与结算 ══════════════════════════════════════════════════
   // 职责：pending 登记、started 认领、not-started 看门狗与 dormant 恢复、settle、turn 事件入口
@@ -4501,7 +4563,7 @@ export function apply(ctx, config) {
     state.lastReceipt = lastReceipt
     state.pendingTasks = pendingTasks.size
     fileLog(`receipt ${taskId} ${receipt.status} turn=${receipt.turn ?? '-'} duration=${receipt.durationMs}ms`)
-    void deliverReceipt(receipt, task).catch((error) => {
+    void receiptFlow.deliverReceipt(receipt, task).catch((error) => {
       fileLog(`receipt ${taskId} delivery crashed: ${error && error.message ? error.message : error}`)
     })
     if (!keepTracking) updateBatchTask(taskId, receipt)
@@ -4550,7 +4612,7 @@ export function apply(ctx, config) {
       sameTurnInjected = queuedAhead > 0
     }
     // Receipts go back to whoever dispatched the task; receiptTo is only the fallback.
-    const requester = resolveRequester(meta?.requester, target)
+    const requester = receiptFlow.resolveRequester(meta?.requester, target)
     // LCA routing (T-282): same workspace -> ws/<slug>/, cross-workspace -> local/.
     const route = routeForCwds(target.cwd ?? sessionCwdOf(target.id), requester.sessionId ? sessionCwdOf(requester.sessionId) : null)
     // Same-layer uniqueness (T-301): findRecord only sees this workspace + local, so a
@@ -4912,7 +4974,7 @@ export function apply(ctx, config) {
     fileLog(`batch ${batchId} finalized partial=${partial} ${record.done}/${record.total}`)
     const batchTarget = batch.requesterSessionId ?? ''
     void (async () => {
-      const deliveredTo = await deliverNotice(batch.barrierMode, body, `batch ${batchId}`, batchTarget)
+      const deliveredTo = await receiptFlow.deliverNotice(batch.barrierMode, body, `batch ${batchId}`, batchTarget)
       if (deliveredTo && lastReceipt && lastReceipt.taskId === batchId) {
         lastReceipt.deliveredTo = deliveredTo
         state.lastReceipt = lastReceipt
@@ -5042,7 +5104,7 @@ export function apply(ctx, config) {
           receiptDirForTask(taskId) ?? receiptDirFor({ sessionId: row.sessionId }),
         )
         saveBatches()
-        void deliverNotice(
+        void receiptFlow.deliverNotice(
           batch.alertMode,
           `[BATCH-ALERT] ${batchId} ${taskId} ${derived.state} ${derived.detail}`,
           `batch alert ${batchId}/${taskId}`,
@@ -5564,7 +5626,7 @@ export function apply(ctx, config) {
   // Migrate inline bodies before anything reads or rewrites rows (idempotent, T-277).
   compactTaskTexts()
   // Once per process: pending/started rows from a previous host process can never settle.
-  void reconcileOrphanTasks().catch((error) => {
+  void receiptFlow.reconcileOrphanTasks().catch((error) => {
     fileLog(`restart reconciliation failed: ${error && error.message ? error.message : error}`)
   })
   restoreBatches()
