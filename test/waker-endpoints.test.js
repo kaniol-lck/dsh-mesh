@@ -5335,7 +5335,7 @@ async function main() {
       'MESH_THREAD_TOOL', 'THREAD_OUTPUT', 'validateToolSchema', 'previewText', 'truncateUtf8', 'inlineBodyText',
       'cleanTaskSubject', 'resolveTaskSubject', 'normalizeThread', 'withTaskHeader', 'SESSION_PAGE_DEFAULT',
       'SESSION_PAGE_MAX', 'paginateSessions', 'ROLE_NAMES', 'ROLE_UNRECOGNIZED_MAX', 'titleRoleCandidate',
-      'classifyRoleCandidates', 'apply', 'name', 'inject',
+      'classifyRoleCandidates', 'createReceiptFlow', 'apply', 'name', 'inject',
     ]
     const missing = expected.filter((key) => api[key] === undefined)
     const wrongType = expected.filter((key) => {
@@ -5352,7 +5352,7 @@ async function main() {
   })
 
   await runCase('lib: every module imports standalone and the graph has no cycles', async () => {
-    const files = ['text', 'receipt', 'tools', 'session', 'tasks', 'settings']
+    const files = ['text', 'receipt', 'tools', 'session', 'tasks', 'settings', 'receipt-flow']
     const modules = {}
     for (const name of files) modules[name] = await import(libUrl(`${name}.mjs`))
     const edges = {}
@@ -5378,6 +5378,7 @@ async function main() {
       typeof modules.tools.validateToolSchema === 'function' &&
       typeof modules.session.withTaskHeader === 'function' &&
       typeof modules.tasks.resolveTaskText === 'function' &&
+      typeof modules['receipt-flow'].createReceiptFlow === 'function' &&
       typeof modules.settings.clampInterval === 'function'
     const ok = exportsOk && cyclic.length === 0
     report('lib: every module imports standalone and the graph has no cycles', ok, `cyclic=${cyclic.join(',') || '-'} edges=${JSON.stringify(edges)}`)
@@ -5529,6 +5530,33 @@ async function main() {
     const configRef = /(?<![\w.])c\./.test(code)
     const ok = free.length === 0 && !configRef
     report('receipt flow: the factory body has no free apply() references', ok, `free=${free.join(',') || '-'} configRef=${configRef}`)
+  })
+
+  await runCase('receipt flow: lib/receipt-flow.mjs imports without index.js', async () => {
+    const modulePath = path.join(REPO, 'plugins', 'mesh-waker', 'lib', 'receipt-flow.mjs')
+    const module = await import(pathToFileURL(modulePath).href)
+    const flow = module.createReceiptFlow({
+      state: { lastError: null, lastReceipt: null },
+      config: { receiptTo: '', wakeSecret: '', receiptSummaryChars: 300 },
+      log: { warn: () => {} },
+      fileLog: () => {},
+      listLocalSessions: () => [],
+      resolveLocalSession: () => ({ id: 'session-direct' }),
+      promptWithResume: async () => {},
+      receiptBody: () => 'body',
+      writeReceiptFile: () => true,
+      dirForRow: () => 'records',
+      updateTaskRow: () => {},
+      taskRows: new Map(),
+      getLastReceipt: () => null,
+      setLastReceipt: () => {},
+    })
+    const resolved = flow.resolveRequester('direct requester')
+    const ok =
+      typeof module.createReceiptFlow === 'function' &&
+      resolved.sessionId === 'session-direct' &&
+      typeof flow.deliverReceipt === 'function'
+    report('receipt flow: lib/receipt-flow.mjs imports without index.js', ok, `sessionId=${resolved.sessionId ?? '-'} exports=${Object.keys(module).join(',')}`)
   })
 
   // 241. Boot diagnostics (T-299): a listener that cannot bind must fail fast and name the
