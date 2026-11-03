@@ -67,21 +67,6 @@ function staleVersionNotice(status) {
   return `检测到磁盘版本 ${disk}，进程版本 ${process} —— 重启 DSH 后生效`
 }
 
-// Session list rows: archived sessions are visibly inert (grayed, labelled) and get no
-// archive action; deletion deliberately stays CLI-only so a stray click cannot destroy a
-// session directory.
-function formatSessionRow(session) {
-  const archived = session?.archived === true
-  return {
-    id: String(session?.id ?? ''),
-    title: String(session?.title ?? '（无标题）'),
-    archived,
-    label: archived ? '已归档' : '',
-    disabled: archived,
-    opacity: archived ? 0.55 : 1,
-  }
-}
-
 /** Human label for a task-registry status (pending -> started -> settled, plus terminal). */
 function formatTaskStatus(status) {
   const labels = {
@@ -136,18 +121,6 @@ function groupTasksByBatch(tasks) {
   })
   result.sort((left, right) => (left.batchId ? 0 : 1) - (right.batchId ? 0 : 1) || right.latest - left.latest)
   return result
-}
-
-/** POST /mesh/sessions/archive once; injectable fetch keeps this testable without a host. */
-async function archiveSessionRequest(sessionId, fetchImpl, base = 'http://127.0.0.1:8795') {
-  const doFetch = fetchImpl ?? fetch
-  const response = await doFetch(base + '/mesh/sessions/archive', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ session: sessionId }),
-  })
-  if (!response.ok) throw new Error('archive failed: HTTP ' + response.status)
-  return true
 }
 
 // Two copies of this plugin can coexist (a linked copy plus the npm package). The loader
@@ -1510,7 +1483,6 @@ try {
       const [leftWidth, setLeftWidth] = React.useState(250)
       const [peerFilter, setPeerFilter] = React.useState('')
       const [maintenanceNote, setMaintenanceNote] = React.useState(null)
-      const [sessions, setSessions] = React.useState(null)
       const [draftMaxWakes, setDraftMaxWakes] = React.useState('')
       const [draftResetAfterHours, setDraftResetAfterHours] = React.useState('')
       const [draftSessionTitle, setDraftSessionTitle] = React.useState('')
@@ -1581,25 +1553,7 @@ try {
         } catch {
           /* history is optional until synced */
         }
-        try {
-          const listed = await json(BASE + '/mesh/sessions')
-          setSessions(listed.sessions ?? [])
-        } catch {
-          /* session list is optional (older host) */
-        }
       }, [])
-
-      const archiveSession = async (session) => {
-        setNote(null)
-        try {
-          await archiveSessionRequest(session.id)
-          const listed = await json(BASE + '/mesh/sessions')
-          setSessions(listed.sessions ?? [])
-          setNote('已归档：' + (session.title ?? session.id))
-        } catch (error) {
-          setNote('归档失败：' + error.message)
-        }
-      }
 
       // Task registry (0.7.11): list is filterable; detail carries the body + receipt summary.
       const loadHistory = async () => {
@@ -2000,57 +1954,6 @@ try {
             ),
             h(Btn, { onClick: pickDir }, '选择目录…'),
           ),
-          h(
-            Row,
-            { title: '本机会话', description: '归档后置灰并标记；删除只走 CLI（面板不提供，避免误删会话目录）' },
-            h(
-              'div',
-              { style: { display: 'grid', gap: 4, minWidth: 260, maxHeight: 220, overflowY: 'auto' } },
-              (sessions ?? []).map((session) => {
-                const row = formatSessionRow(session)
-                return h(
-                  'div',
-                  {
-                    key: row.id,
-                    title: row.title,
-                    style: { display: 'flex', alignItems: 'center', gap: 8, height: 28, minWidth: 0, opacity: row.opacity },
-                  },
-                  h(
-                    'span',
-                    { style: { flex: 1, minWidth: 0, fontSize: TOKENS.font.md, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-                    row.title,
-                  ),
-                  row.label
-                    ? h(
-                        'span',
-                        {
-                          style: {
-                            flexShrink: 0,
-                            fontSize: TOKENS.font.sm,
-                            padding: '1px 6px',
-                            borderRadius: 4,
-                            background: 'rgba(120, 120, 120, 0.2)',
-                            color: 'var(--dsw-alias-label-secondary, inherit)',
-                          },
-                        },
-                        row.label,
-                      )
-                    : null,
-                  row.disabled
-                    ? null
-                    : ui.button(
-                        {
-                          type: 'button',
-                          size: 'sm', style: { flexShrink: 0, width: 56, height: 24 },
-                          onClick: () => archiveSession(session),
-                        },
-                        '归档',
-                      ),
-                )
-              }),
-              (sessions ?? []).length ? null : h('span', { style: { fontSize: TOKENS.font.md, opacity: 0.6 } }, '（无会话）'),
-            ),
-          ),
         ),
         h(
           SettingsSection,
@@ -2079,26 +1982,6 @@ try {
                 ' 天 / ' +
                 (config && config.tasksMaxRows ? config.tasksMaxRows : '?') +
                 ' 条',
-            ),
-          ),
-          h(
-            Row,
-            { title: '派活任务', description: '任务面板在「' + entryLabel + '」页面顶部标签「派活任务」，设置页不放表格' },
-            ui.button(
-              {
-                type: 'button',
-                variant: 'primary',
-                onClick: () => {
-                  // ctx.layout.selectPanel('mesh-inbox') switches the window to our main panel;
-                  // the shared tab store makes the page open on 「派活任务」. Every outcome
-                  // leaves a visible note right under this row.
-                  const result = requestTasksPanel()
-                  if (result === 'ok') setNote('已打开「' + entryLabel + '」→「派活任务」')
-                  else if (result === 'failed') setNote('切换失败：宿主拒绝了 selectPanel；请从左侧边栏打开「' + entryLabel + '」→「派活任务」')
-                  else setNote('宿主导航不可用；请从左侧边栏打开「' + entryLabel + '」→「派活任务」')
-                },
-              },
-              '去任务面板',
             ),
           ),
         ),
@@ -3303,5 +3186,5 @@ try {
 // VM test hook: harnesses that evaluate this file without React (see the dynamic-id test)
 // opt in by defining the global, so runtime behaviour and globals stay unchanged.
 if (typeof globalThis !== 'undefined' && typeof globalThis.__meshWakerTestHook === 'function') {
-  globalThis.__meshWakerTestHook({ staleVersionNotice, formatSessionRow, formatTaskStatus, formatDuration, formatStamp, groupTasksByBatch, archiveSessionRequest })
+  globalThis.__meshWakerTestHook({ staleVersionNotice, formatTaskStatus, formatDuration, formatStamp, groupTasksByBatch })
 }

@@ -2209,38 +2209,8 @@ async function main() {
     report('logging: status exposes logFile and logBytes fields', ok, `logFile=${status.json?.logFile} logBytes=${status.json?.logBytes}`)
   })
 
-  // 83-85. Archived sessions have a UI exit; deleted ids stop polluting the archive set.
-  await runCase('client: archived session rows are greyed, labelled and not actionable', async () => {
-    const helpers = loadClientHelpers()
-    const live = helpers.formatSessionRow({ id: 'session-a', title: '活跃', archived: false })
-    const archived = helpers.formatSessionRow({ id: 'session-b', title: '归档', archived: true })
-    const ok =
-      live.label === '' &&
-      live.disabled === false &&
-      live.opacity === 1 &&
-      archived.label === '已归档' &&
-      archived.disabled === true &&
-      archived.opacity === 0.55
-    report('client: archived session rows are greyed, labelled and not actionable', ok, `live=${JSON.stringify(live)} archived=${JSON.stringify(archived)}`)
-  })
-
-  await runCase('client: the archive action posts one request to /mesh/sessions/archive', async () => {
-    const helpers = loadClientHelpers()
-    const calls = []
-    const stub = async (url, init) => {
-      calls.push({ url, init })
-      return { ok: true, status: 200 }
-    }
-    const result = await helpers.archiveSessionRequest('session-b', stub, 'http://127.0.0.1:8795')
-    const call = calls[0] ?? {}
-    const ok =
-      result === true &&
-      calls.length === 1 &&
-      call.url === 'http://127.0.0.1:8795/mesh/sessions/archive' &&
-      call.init?.method === 'POST' &&
-      JSON.parse(call.init?.body ?? '{}').session === 'session-b'
-    report('client: the archive action posts one request to /mesh/sessions/archive', ok, `calls=${calls.length} url=${call.url ?? '-'} method=${call.init?.method ?? '-'}`)
-  })
+  // 83-85. Archived sessions had a UI exit until T-332 removed the local-session list; the
+  // archive action and its row formatter were deleted with it, so their cases went too.
 
   await runCase('sessions: deleting an archived session clears its id from the archive view', async (boot) => {
     const h = await boot({
@@ -2895,7 +2865,7 @@ async function main() {
     report('client: package.json injects the ui-workspace client package', ok, `inject=${inject.join(',')}`)
   })
 
-  await runCase('client: both task-panel buttons navigate through layout.selectPanel', async () => {
+  await runCase('client: the task-panel entry navigates through layout.selectPanel', async () => {
     const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
     const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'package.json'), 'utf8'))
     const inject = pkg?.dsh?.client?.inject ?? []
@@ -2904,9 +2874,9 @@ async function main() {
       /selectPanel\('mesh-inbox'\)/.test(source) &&
       /inject:\s*\[[^\]]*'layout'/.test(source) &&
       inject.includes('@deepseek-ai/dsh-client-ui-layout') &&
-      entryPoints >= 3 &&
+      entryPoints >= 2 &&
       source.includes('宿主导航不可用')
-    report('client: both task-panel buttons navigate through layout.selectPanel', ok, `selectPanel=${/selectPanel\('mesh-inbox'\)/.test(source)} layoutInject=${inject.includes('@deepseek-ai/dsh-client-ui-layout')} entryPoints=${entryPoints}`)
+    report('client: the task-panel entry navigates through layout.selectPanel', ok, `selectPanel=${/selectPanel\('mesh-inbox'\)/.test(source)} layoutInject=${inject.includes('@deepseek-ai/dsh-client-ui-layout')} entryPoints=${entryPoints}`)
   })
 
   // 124-125. Host schema subset guard (T-236): type arrays silently block registration.
