@@ -15,24 +15,27 @@
 // BEGIN UI TOKENS
 const TOKENS = {
   color: {
-    surface: 'var(--dsw-alias-bg-layer-2, #fff)', // 卡片 / 面板底
-    surfaceRaised: 'var(--dsw-alias-bg-layer-1, #fff)', // 浮层 / 高亮块
-    success: 'var(--dsw-alias-state-success-primary, #2f9e6e)', // 在线 / 成功
-    business: 'var(--dsw-alias-state-business-primary, #5b7cfa)', // 业务进行中
-    danger: '#d9534f', // 错误 / 危险
-    dangerBorder: 'rgba(217,83,79,0.9)', // 危险按钮描边
-    warning: '#b45309', // 告警
-    primary: 'rgba(99,102,241,0.85)', // 主色底（主按钮 / 胶囊）
+    // Fallbacks below are the official LIGHT-theme values (T-336), extracted from the host's
+    // design_platform_css_default with var() chains resolved to literals. The comment names
+    // the official source token so a future theme change can be re-checked against it.
+    surface: 'var(--dsw-alias-bg-layer-2, #fff)', // 卡片 / 面板底（官方 bg-layer-2 = #fff）
+    surfaceRaised: 'var(--dsw-alias-bg-layer-1, #fff)', // 浮层 / 高亮块（官方 bg-layer-1 = #fff）
+    success: 'var(--dsw-alias-state-success-primary, #22c55e)', // 在线 / 成功（官方 = green-500）
+    business: 'var(--dsw-alias-state-business-primary, #4176e6)', // 业务进行中（官方 = deepseek-500）
+    danger: 'var(--dsw-alias-state-error-primary, #ec1313)', // 错误 / 危险（官方 = red-600）
+    dangerBorder: 'rgba(236,19,19,0.9)', // 危险按钮描边（官方 error 色的 90%）
+    warning: '#b45309', // 告警（官方没有 warning-primary 别名，保留本地值）
+    primary: 'rgba(99,102,241,0.85)', // 主色底（官方品牌色是单色，没有半透明底别名，保留本地值）
     primaryBorder: 'rgba(99,102,241,0.9)', // 主色描边
     onPrimary: '#fff', // 主色上的前景
     maskOpaque: '#000', // 遮罩渐变的不透明端（mask 只取 alpha）
     transparent: '#0000', // 完全透明
     // 官方设置页卡片（T-333）：外层卡片 + 稍深的内嵌区；折叠头 hover 用同一档灰。
-    card: 'var(--dsw-alias-bg-layer-2)', // 卡片底
-    cardBorder: 'var(--dsw-alias-border-l1)', // 卡片 1px 边框 / 标题与内容间的分隔线
-    interactive: 'var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,0.12))', // 内嵌区底 / 折叠头 hover
-    labelPrimary: 'var(--dsw-alias-label-primary)', // 卡片标题
-    labelSecondary: 'var(--dsw-alias-label-secondary)', // 卡片说明文字、箭头
+    card: 'var(--dsw-alias-bg-layer-2, #fff)', // 卡片底（官方 bg-layer-2 = #fff）
+    cardBorder: 'var(--dsw-alias-border-l1, #0000000a)', // 卡片 1px 边框 / 标题与内容间的分隔线（官方 border-l1 = #0000000a）
+    interactive: 'var(--dsw-alias-interactive-bg-hover, #2631480f)', // 内嵌区底 / 折叠头 hover（官方 interactive-bg-hover = #2631480f）
+    labelPrimary: 'var(--dsw-alias-label-primary, #0f1115)', // 卡片标题（官方 = neutral-bluish-1000）
+    labelSecondary: 'var(--dsw-alias-label-secondary, #61666b)', // 卡片说明文字、箭头（官方 = neutral-bluish-700）
   },
   font: { xs: 10, sm: 11, md: 12, lg: 13 }, // 徽标 / 标签 / 正文 / 标题
 }
@@ -554,7 +557,7 @@ try {
       WebkitAppearance: 'none',
       height: 32,
       padding: '0 28px 0 12px',
-      borderRadius: 'var(--dsw-radius-lg, 10px)',
+      borderRadius: 'var(--dsw-radius-lg, 16px)',
       border: 'none',
       // layer-3 is near-white (the host uses it as text on coloured badges); the filled
       // pill in the host's own selects is the interactive hover grey.
@@ -659,7 +662,7 @@ try {
                   overflowY: 'auto',
                   background: TOKENS.color.surface,
                   border: '0.5px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.2))',
-                  borderRadius: 'var(--dsw-radius-lg, 10px)',
+                  borderRadius: 'var(--dsw-radius-lg, 16px)',
                   boxShadow: '0 10px 30px rgba(0,0,0,0.16)',
                 },
               },
@@ -702,7 +705,7 @@ try {
 
     const controlStyle = {
       padding: '6px 12px',
-      borderRadius: 'var(--dsw-radius-lg, 10px)',
+      borderRadius: 'var(--dsw-radius-lg, 16px)',
       border: '0.5px solid var(--dsw-alias-border-l4)',
       background: 'var(--dsw-alias-bg-layer-2)',
       color: 'var(--dsw-alias-label-primary)',
@@ -947,7 +950,7 @@ try {
           style: {
             background: TOKENS.color.card,
             border: '1px solid ' + TOKENS.color.cardBorder,
-            borderRadius: 'var(--dsw-radius-lg, 10px)',
+            borderRadius: 'var(--dsw-radius-lg, 16px)',
             padding: 16,
             marginBottom: 12,
           },
@@ -960,7 +963,7 @@ try {
             style: {
               padding: '6px 8px',
               margin: '-6px -8px',
-              borderRadius: 'var(--dsw-radius-lg, 10px)',
+              borderRadius: 'var(--dsw-radius-lg, 16px)',
               background: hover ? TOKENS.color.interactive : 'transparent',
               transition: 'background .12s',
             },
@@ -1010,7 +1013,7 @@ try {
                   marginTop: 10,
                   padding: 12,
                   background: TOKENS.color.interactive,
-                  borderRadius: 'var(--dsw-radius-lg, 10px)',
+                  borderRadius: 'var(--dsw-radius-lg, 16px)',
                   borderTop: '1px solid ' + TOKENS.color.cardBorder,
                   display: 'grid',
                   gap: 0,
@@ -1139,7 +1142,7 @@ try {
                   maxHeight: 100,
                   overflow: 'hidden',
                   padding: '10px 12px',
-                  borderRadius: 'var(--dsw-radius-lg, 10px)',
+                  borderRadius: 'var(--dsw-radius-lg, 16px)',
                   background: TOKENS.color.surfaceRaised,
                   border: '0.5px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.18))',
                   borderLeft: '3px solid ' + toneColor(toneOf ? toneOf(items[preview.index]) : 'in'),
@@ -1527,7 +1530,7 @@ try {
                       onMouseLeave: () => setHoverGroup(null),
                       style: {
                         padding: '4px 10px',
-                        borderRadius: 'var(--dsw-radius-lg, 10px)',
+                        borderRadius: 'var(--dsw-radius-lg, 16px)',
                         background: hoverGroup === group.key ? TOKENS.color.interactive : 'transparent',
                         borderBottom: '1px solid ' + TOKENS.color.cardBorder,
                         transition: 'background .12s',
@@ -3186,7 +3189,7 @@ try {
                       padding: 4,
                       background: TOKENS.color.surface,
                       border: '0.5px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.2))',
-                      borderRadius: 'var(--dsw-radius-lg, 10px)',
+                      borderRadius: 'var(--dsw-radius-lg, 16px)',
                       boxShadow: '0 10px 30px rgba(0,0,0,0.16)',
                     },
                   },
