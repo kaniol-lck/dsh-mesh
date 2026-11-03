@@ -32,6 +32,10 @@
         catchUpMaxConversations: 3
         cooldownMs: 1500
         registerIntervalMs: 300000
+        # Sidebar entries: false hides the left "Mesh 信箱" panellist entry (and its page) or
+        # the right-hand pane tab. The settings page toggles the same keys; both default true.
+        sidebarLeft: true
+        sidebarRight: true
         # Receipt notices inject the status line only (the summary stays in receipts.jsonl and
         # the task API). Set true to restore the legacy "status line + summary" text.
         receiptNoticeSummary: false

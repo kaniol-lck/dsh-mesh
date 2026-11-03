@@ -458,6 +458,41 @@ try {
     let hostCtx = null
     // Right-sidebar registration outcome, surfaced in Settings -> Mesh.
     let rightTabState = 'pending'
+    // Sidebar entry switches (T-334): both sides register through disposers, so the settings
+    // page can hide/show them at runtime. The boot status fetch only corrects the initial
+    // state (one frame may still show the default before it lands).
+    const sidebarSwitches = {
+      left: true,
+      right: true,
+      leftRegistered: false,
+      rightRegistered: false,
+      leftDisposers: [],
+      rightDisposers: [],
+      registerLeft: null,
+      registerRight: null,
+      rightTabs: null,
+    }
+    function applySidebarSwitches(flags) {
+      if (flags && typeof flags.left === 'boolean') sidebarSwitches.left = flags.left
+      if (flags && typeof flags.right === 'boolean') sidebarSwitches.right = flags.right
+      for (const side of ['left', 'right']) {
+        const disposers = sidebarSwitches[side + 'Disposers']
+        const registered = sidebarSwitches[side + 'Registered']
+        if (sidebarSwitches[side] && !registered) {
+          const register = sidebarSwitches[side === 'left' ? 'registerLeft' : 'registerRight']
+          if (typeof register === 'function') register()
+        } else if (!sidebarSwitches[side] && registered) {
+          for (const dispose of disposers.splice(0)) {
+            try {
+              dispose()
+            } catch {
+              /* already gone */
+            }
+          }
+          sidebarSwitches[side + 'Registered'] = false
+        }
+      }
+    }
 
     /** Conversations read like mail: the newest subject is the title, the id is the subtitle. */
     const convTitle = (entry) =>
@@ -734,6 +769,62 @@ try {
       },
       cell(children) {
         return h('td', { style: CELL_STYLE }, children)
+      },
+      toggle({ checked = false, onChange, disabled = false, title }, ...children) {
+        return h(
+          'button',
+          {
+            type: 'button',
+            role: 'switch',
+            'aria-checked': checked ? 'true' : 'false',
+            disabled,
+            title,
+            onClick: () => {
+              if (!disabled && typeof onChange === 'function') onChange(!checked)
+            },
+            style: {
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 8,
+              padding: 0,
+              border: 'none',
+              background: 'transparent',
+              color: 'inherit',
+              cursor: disabled ? 'default' : 'pointer',
+              fontSize: TOKENS.font.sm,
+              opacity: disabled ? 0.6 : 1,
+            },
+          },
+          h(
+            'span',
+            {
+              style: {
+                position: 'relative',
+                display: 'inline-flex',
+                alignItems: 'center',
+                width: 32,
+                height: 18,
+                borderRadius: 999,
+                background: checked ? TOKENS.color.primary : TOKENS.color.interactive,
+                border: '1px solid ' + TOKENS.color.cardBorder,
+                flexShrink: 0,
+              },
+            },
+            h('span', {
+              style: {
+                position: 'absolute',
+                top: 1,
+                left: checked ? 15 : 1,
+                width: 14,
+                height: 14,
+                borderRadius: 999,
+                background: checked ? TOKENS.color.onPrimary : TOKENS.color.labelSecondary,
+                transition: 'left .12s',
+              },
+            }),
+          ),
+          ...children,
+        )
       },
     }
     // END UI CONTROLS
@@ -1687,6 +1778,11 @@ try {
           // Never trust the local echo: re-read /mesh/status so the controls show what the
           // server really has (the write may have fallen back to the patch file or config.json).
           await reload()
+          // Sidebar switches (T-334): apply the new value to the live slot registrations.
+          applySidebarSwitches({
+            left: patch.sidebarLeft === undefined ? undefined : patch.sidebarLeft !== false,
+            right: patch.sidebarRight === undefined ? undefined : patch.sidebarRight !== false,
+          })
           setNote('已保存' + (result.persisted === false ? '（仅本次运行：' + (result.reason ?? '未落盘') + '）' : ''))
         } catch (error) {
           setNote('保存失败：' + error.message)
@@ -2032,6 +2128,32 @@ try {
                 ' 天 / ' +
                 (config && config.tasksMaxRows ? config.tasksMaxRows : '?') +
                 ' 条',
+            ),
+          ),
+        ),
+        h(
+          SettingsSection,
+          { title: '侧边栏入口', description: '关闭后对应一侧不再出现 Mesh 入口；立即生效，设置页本身始终保留。' },
+          h(
+            Row,
+            { title: '左侧「Mesh 信箱」', description: '左侧边栏的 panellist 条目与它的主页面' },
+            ui.toggle(
+              {
+                checked: !(status && status.config && status.config.sidebarLeft === false),
+                onChange: (value) => void save({ sidebarLeft: value }),
+              },
+              status && status.config && status.config.sidebarLeft === false ? '隐藏' : '显示',
+            ),
+          ),
+          h(
+            Row,
+            { title: '右侧「Mesh 信箱」页签', description: '右侧 pane 的 tab 与它的内容' },
+            ui.toggle(
+              {
+                checked: !(status && status.config && status.config.sidebarRight === false),
+                onChange: (value) => void save({ sidebarRight: value }),
+              },
+              status && status.config && status.config.sidebarRight === false ? '隐藏' : '显示',
             ),
           ),
         ),
@@ -3155,16 +3277,76 @@ try {
             ctx.slots.register({ name: 'settings.section', id: 'mesh', order: 30, label: 'Mesh' }, MeshSection),
           ),
         )
-        disposers.push(
-          ctx.slots.inject('sidebar.panellist', () =>
-            ctx.slots.register({ name: 'sidebar.panellist', id: 'mesh-inbox', order: 40, label: 'Mesh 信箱' }, MeshInboxGlyph),
-          ),
-        )
-        disposers.push(ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'mesh-inbox' }, MeshInboxPage)))
+        // Left sidebar entry + its page (T-334): registered through a switchable disposer list.
+        const registerLeft = () => {
+          if (sidebarSwitches.leftRegistered) return
+          sidebarSwitches.leftDisposers.push(
+            ctx.slots.inject('sidebar.panellist', () =>
+              ctx.slots.register({ name: 'sidebar.panellist', id: 'mesh-inbox', order: 40, label: 'Mesh 信箱' }, MeshInboxGlyph),
+            ),
+          )
+          sidebarSwitches.leftDisposers.push(
+            ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'mesh-inbox' }, MeshInboxPage)),
+          )
+          sidebarSwitches.leftRegistered = true
+        }
+        sidebarSwitches.registerLeft = registerLeft
+        registerLeft()
         // The right sidebar service may be registered after this plugin's apply runs
         // (it did race on restart), so wait for it with the Cordis injector instead of
         // reading it once: ctx.get() at apply time silently skipped the registration.
         rightTabState = 'pending'
+        const registerRight = () => {
+          const rightTabs = sidebarSwitches.rightTabs
+          if (!rightTabs || sidebarSwitches.rightRegistered) return
+          // Type and body are registered separately on purpose: on a plugin reload the
+          // previous type registration may still be alive ("already registered"), and a
+          // single try block would then skip the body — the shell would show the tab but
+          // report "no viewer for this content".
+          try {
+            const unregister = rightTabs.register({
+              id: 'mesh-inbox',
+              kind: 'mesh-inbox',
+              multiple: false,
+              keepMounted: true,
+              priority: 'extension',
+              title: () => meshEntryLabel,
+              guide: [
+                {
+                  id: 'open',
+                  order: 30,
+                  title: () => meshEntryLabel,
+                  description: () => '查看与其它 agent 的往来信件（跟随当前会话筛选）',
+                  icon: MeshInboxGlyph,
+                },
+              ],
+            })
+            if (typeof unregister === 'function') sidebarSwitches.rightDisposers.push(unregister)
+            rightTabState = 'ok'
+          } catch (error) {
+            const message = String(error && error.message ? error.message : error)
+            rightTabState = /already registered/i.test(message) ? 'ok (已注册)' : 'error: ' + message
+            if (typeof console !== 'undefined') console.warn('[mesh-waker] right tab type:', message)
+          }
+          try {
+            sidebarSwitches.rightDisposers.push(
+              ctx.slots.inject('sidebar.right.pane.tab', () =>
+                ctx.slots.register(
+                  {
+                    name: 'sidebar.right.pane.tab',
+                    key: 'mesh-inbox',
+                    inject: (sessionId) => ({ sessionId }),
+                  },
+                  MeshInboxTab,
+                ),
+              ),
+            )
+          } catch (error) {
+            rightTabState += ' | body: ' + (error && error.message ? error.message : String(error))
+          }
+          sidebarSwitches.rightRegistered = true
+        }
+        sidebarSwitches.registerRight = registerRight
         if (typeof ctx.inject === 'function') {
           disposers.push(
             ctx.inject(['sidebarRightTabs'], (scoped) => {
@@ -3173,57 +3355,40 @@ try {
                 rightTabState = 'missing'
                 return
               }
-              // Type and body are registered separately on purpose: on a plugin reload the
-              // previous type registration may still be alive ("already registered"), and a
-              // single try block would then skip the body — the shell would show the tab but
-              // report "no viewer for this content".
-              try {
-                rightTabs.register({
-                  id: 'mesh-inbox',
-                  kind: 'mesh-inbox',
-                  multiple: false,
-                  keepMounted: true,
-                  priority: 'extension',
-                  title: () => meshEntryLabel,
-                  guide: [
-                    {
-                      id: 'open',
-                      order: 30,
-                      title: () => meshEntryLabel,
-                      description: () => '查看与其它 agent 的往来信件（跟随当前会话筛选）',
-                      icon: MeshInboxGlyph,
-                    },
-                  ],
-                })
-                rightTabState = 'ok'
-              } catch (error) {
-                const message = String(error && error.message ? error.message : error)
-                rightTabState = /already registered/i.test(message) ? 'ok (已注册)' : 'error: ' + message
-                if (typeof console !== 'undefined') console.warn('[mesh-waker] right tab type:', message)
-              }
-              try {
-                disposers.push(
-                  ctx.slots.inject('sidebar.right.pane.tab', () =>
-                    ctx.slots.register(
-                      {
-                        name: 'sidebar.right.pane.tab',
-                        key: 'mesh-inbox',
-                        inject: (sessionId) => ({ sessionId }),
-                      },
-                      MeshInboxTab,
-                    ),
-                  ),
-                )
-              } catch (error) {
-                rightTabState += ' | body: ' + (error && error.message ? error.message : String(error))
-              }
+              sidebarSwitches.rightTabs = rightTabs
+              // Respect a toggle that already happened (the service may arrive late).
+              applySidebarSwitches()
             }),
           )
         } else {
           rightTabState = 'unsupported'
         }
+        // Persisted switches arrive with the status payload; correct the default here.
+        json(BASE + '/mesh/status')
+          .then((value) => {
+            const config = value && value.config ? value.config : null
+            if (!config) return
+            applySidebarSwitches({ left: config.sidebarLeft !== false, right: config.sidebarRight !== false })
+          })
+          .catch(() => {})
         return () => {
           for (const dispose of disposers.splice(0)) dispose()
+          for (const dispose of sidebarSwitches.leftDisposers.splice(0)) {
+            try {
+              dispose()
+            } catch {
+              /* already gone */
+            }
+          }
+          for (const dispose of sidebarSwitches.rightDisposers.splice(0)) {
+            try {
+              dispose()
+            } catch {
+              /* already gone */
+            }
+          }
+          sidebarSwitches.leftRegistered = false
+          sidebarSwitches.rightRegistered = false
         }
       },
     }

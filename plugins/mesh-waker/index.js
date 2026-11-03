@@ -485,6 +485,10 @@ function normalizeBase(config) {
     throttleMaxWakesPerWindow: Number(c.throttleMaxWakesPerWindow ?? 30),
     throttleWindowMs: Number(c.throttleWindowMs ?? 3_600_000),
     registerIntervalMs: Number(c.registerIntervalMs ?? 300000),
+    // Sidebar entry switches (T-334): host the left panellist/page entry and the right pane
+    // tab? Both default to true so an upgrade looks unchanged; the settings UI toggles them.
+    sidebarLeft: c.sidebarLeft !== false,
+    sidebarRight: c.sidebarRight !== false,
     // Trust is deliberately a LOCAL setting: neither the hub nor a peer can raise it, so a
     // remote message can never turn this machine into an unapproved execution surface.
     trust: ['strict', 'normal', 'full'].includes(String(c.trust)) ? String(c.trust) : 'normal',
@@ -2601,6 +2605,9 @@ export function apply(ctx, config) {
     catchUpDelayMs: c.catchUpDelayMs,
     // The client reads this to label the inbox entry/title (config.entryLabel).
     entryLabel: c.entryLabel,
+    // Sidebar entry switches (T-334): the settings page toggles these and hides the slots.
+    sidebarLeft: c.sidebarLeft,
+    sidebarRight: c.sidebarRight,
     // Read-only projection: retention is config-file only, the settings page just shows it.
     tasksRetentionDays: c.tasksRetentionDays,
     tasksMaxRows: c.tasksMaxRows,
@@ -2700,6 +2707,8 @@ export function apply(ctx, config) {
       if (!Number.isFinite(delay) || delay < 0) throw new Error('catchUpDelayMs must be >= 0')
       next.catchUpDelayMs = delay
     }
+    if (patch.sidebarLeft !== undefined) next.sidebarLeft = patch.sidebarLeft !== false
+    if (patch.sidebarRight !== undefined) next.sidebarRight = patch.sidebarRight !== false
     if (!Object.keys(next).length) throw new Error('nothing to save')
 
     Object.assign(c, next)

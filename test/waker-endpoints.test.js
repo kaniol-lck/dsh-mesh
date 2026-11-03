@@ -5845,6 +5845,20 @@ async function main() {
     report('ui controls: danger and primary buttons stay different', ok, `danger=${danger.color} primary=${primary.color}`)
   })
 
+  await runCase('config: sidebar switches default on and persist through the config API', async (boot) => {
+    const h = await boot({})
+    const before = await request(h.base, '/mesh/status')
+    const defaultsOn = before.json?.config?.sidebarLeft !== false && before.json?.config?.sidebarRight !== false
+    const savedLeft = await request(h.base, '/mesh/config', { method: 'POST', body: { sidebarLeft: false } })
+    const savedRight = await request(h.base, '/mesh/config', { method: 'POST', body: { sidebarRight: false } })
+    const after = await request(h.base, '/mesh/status')
+    const leftOff = after.json?.config?.sidebarLeft === false
+    const rightOff = after.json?.config?.sidebarRight === false
+    await request(h.base, '/mesh/config', { method: 'POST', body: { sidebarLeft: true, sidebarRight: true } })
+    const ok = defaultsOn && savedLeft.json?.ok !== false && savedRight.json?.ok !== false && leftOff && rightOff
+    report('config: sidebar switches default on and persist through the config API', ok, `defaults=${defaultsOn} left=${leftOff} right=${rightOff}`)
+  })
+
   // 241. Boot diagnostics (T-299): a listener that cannot bind must fail fast and name the
   // real error instead of burning the 5s probe budget and reporting "never answered".
   {

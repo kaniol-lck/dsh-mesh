@@ -102,6 +102,8 @@ dsh plugin --profile web add dsh-mesh-waker
 | `sessionCwd` | — | 收件箱会话的工作目录 |
 | `workspacePath` | — | 收件箱会话绑定到的工作区路径 |
 | `workspaceTitle` | `Mesh 收件箱` | 侧栏里该工作区的显示名 |
+| `sidebarLeft` | `true` | 是否注册左侧「Mesh 信箱」panellist 条目与它的页面；设置页开关即时生效 |
+| `sidebarRight` | `true` | 是否注册右侧 pane 的「Mesh 信箱」页签；设置页开关即时生效 |
 | `branchReuseHours` | `12` | branch 侧会话复用窗口（小时） |
 | `branchTitlePrefix` | `mesh · ` | branch 侧会话标题前缀 |
 | `resetAfterHours` | `12` | 收件箱会话闲置多久后重置 |
