@@ -907,7 +907,7 @@ try {
     }
 
     /** Collapsible settings chapter: official card — white layer-1 surface, 1px border-l2. */
-    function SettingsSection({ title, description, defaultOpen = true, children }) {
+    function SettingsSection({ title, description, defaultOpen = false, children }) {
       const [open, setOpen] = React.useState(defaultOpen)
       const [hover, setHover] = React.useState(false)
       return h(
@@ -1157,9 +1157,8 @@ try {
     // jump line all read it from /mesh/status (config.entryLabel).
     let meshEntryLabel = 'Mesh 信箱'
 
-    // Main-page tab selection shared by the page itself and the two "open task panel" entry
-    // points. ctx.layout.selectPanel('mesh-inbox') switches the window to our main panel, and
-    // this store tells the already-mounted page which tab to show.
+    // Main-page tab selection shared by the page itself and the sidebar entries; T-340 removed
+    // the jump helpers, so this store now only tells the already-mounted page which tab to show.
     let inboxTab = 'inbox'
     const inboxTabListeners = new Set()
 
@@ -1177,20 +1176,6 @@ try {
     function subscribeInboxTab(listener) {
       inboxTabListeners.add(listener)
       return () => inboxTabListeners.delete(listener)
-    }
-
-    /** Try to open the inbox page on its task tab. Returns 'ok' | 'no-layout' | 'failed'. */
-    function requestTasksPanel() {
-      setInboxTab('tasks')
-      const layout = hostCtx?.layout ?? (typeof hostCtx?.get === 'function' ? hostCtx.get('layout') : undefined)
-      if (!layout || typeof layout.selectPanel !== 'function') return 'no-layout'
-      try {
-        layout.selectPanel('mesh-inbox')
-        return 'ok'
-      } catch (error) {
-        console.info('[mesh-waker] selectPanel(mesh-inbox) failed', String(error && error.message ? error.message : error))
-        return 'failed'
-      }
     }
 
     function useEntryLabel() {
@@ -1616,67 +1601,6 @@ try {
         rightPane,
       )
     }
-
-    /** Compact task summary for the right sidebar tab (entry point next to the mailbox). */
-    function TaskTabSummary() {
-      const [counts, setCounts] = React.useState(null)
-      const [feedback, setFeedback] = React.useState(null)
-      const entryLabel = useEntryLabel()
-      React.useEffect(() => {
-        let alive = true
-        json(BASE + '/mesh/tasks?limit=100')
-          .then((value) => {
-            const rows = (value && value.tasks) || []
-            if (alive) setCounts(rows.filter((task) => task.status === 'pending' || task.status === 'started').length)
-          })
-          .catch(() => {})
-        return () => {
-          alive = false
-        }
-      }, [])
-
-      const openTasks = () => {
-        const result = requestTasksPanel()
-        if (result === 'ok') setFeedback('已切换到「' + entryLabel + '」→「派活任务」')
-        else if (result === 'failed') setFeedback('切换失败：宿主拒绝了 selectPanel；请从左侧边栏打开「' + entryLabel + '」→「派活任务」')
-        else setFeedback('宿主导航不可用；请从左侧边栏打开「' + entryLabel + '」→「派活任务」')
-      }
-
-      const copyEntry = async () => {
-        const text = entryLabel + ' → 派活任务'
-        try {
-          await navigator.clipboard.writeText(text)
-          setFeedback('已复制入口：' + text)
-        } catch {
-          setFeedback('复制失败，入口路径：' + text)
-        }
-      }
-
-      return h(
-        'div',
-        { style: { display: 'flex', flexDirection: 'column', gap: 2, padding: '4px 8px', borderBottom: '0.5px solid var(--dsw-alias-border-l3)', fontSize: TOKENS.font.sm } },
-        h(
-          'div',
-          { style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 } },
-          h('span', { style: { opacity: 0.8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, '派活任务：' + (counts === null ? '…' : counts) + ' 条待办/进行中'),
-          ui.button(
-            {
-              type: 'button',
-              variant: 'primary', size: 'sm', style: { marginLeft: 'auto' },
-              title: '打开 ' + entryLabel + ' 页面的「派活任务」标签',
-              onClick: openTasks,
-            },
-            '打开任务面板',
-          ),
-          ui.button(
-            { type: 'button', size: 'sm', title: '复制入口路径', onClick: () => void copyEntry() },
-            '复制入口',
-          ),
-        ),
-        feedback ? h('div', { style: { opacity: 0.75, lineHeight: '16px' } }, feedback) : null,
-      )
-    }
-
 
     function MeshSection() {
       const [config, setConfig] = React.useState(null)
@@ -2271,201 +2195,6 @@ try {
             h('span', { style: { fontSize: TOKENS.font.md, opacity: 0.8 } }, String(rightTabState ?? 'unknown')),
           ),
           maintenanceNote ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.75, padding: '2px 0 8px' } }, maintenanceNote) : null,
-        ),
-        h(
-          'div',
-          {
-            style: {
-              display: 'flex',
-              height: 440,
-              marginTop: 4,
-              border: '1px solid var(--dsw-alias-border-l1)',
-              borderRadius: 8,
-              overflow: 'hidden',
-            },
-          },
-          h(
-            'div',
-            {
-              style: {
-                flex: '0 0 ' + leftWidth + 'px',
-                borderRight: '1px solid var(--dsw-alias-border-l1)',
-                overflowY: 'auto',
-                background: 'var(--dsw-alias-bg-layer-1)',
-              },
-            },
-            h(
-              'div',
-              {
-                style: {
-                  padding: '6px 8px',
-                  borderBottom: '1px solid var(--dsw-alias-border-l1)',
-                  background: 'rgba(127,127,127,0.06)',
-                },
-              },
-              h(
-                MiniSelect,
-                {
-                  style: { ...selectStyle, width: '100%', height: 28, fontSize: TOKENS.font.md, padding: '0 24px 0 8px' },
-                  value: peerFilter,
-                  onChange: (event) => setPeerFilter(event.target.value),
-                },
-                h('option', { value: '' }, '全部对话目标'),
-                [...new Set((historyList ?? []).flatMap((entry) => entry.peers ?? []))].map((name) =>
-                  h('option', { key: name, value: name }, name),
-                ),
-              ),
-            ),
-            (historyList ?? []).filter((entry) => !peerFilter || (entry.peers ?? []).includes(peerFilter)).length === 0
-              ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.6, padding: 12 } }, '暂无历史，点「从中枢同步」')
-              : (historyList ?? [])
-                  .filter((entry) => !peerFilter || (entry.peers ?? []).includes(peerFilter))
-                  .map((entry) =>
-                  ui.button(
-                    {
-                      key: entry.conversation,
-                      type: 'button',
-                      onClick: () => void openThread(entry.conversation),
-                      style: {
-                        display: 'block',
-                        width: '100%',
-                        textAlign: 'left',
-                        border: 'none',
-                        borderBottom: '1px solid rgba(127,127,127,0.14)',
-                        padding: '8px 10px',
-                        cursor: 'pointer',
-                        fontSize: TOKENS.font.md,
-                        background: activeConv === entry.conversation ? 'rgba(99,102,241,0.14)' : 'transparent',
-                      },
-                    },
-                    h(
-                      'div',
-                      { style: { display: 'flex', justifyContent: 'space-between', gap: 6, alignItems: 'baseline' } },
-                      h(
-                        'span',
-                        { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 } },
-                        convTitle(entry),
-                      ),
-                      entry.unread
-                        ? h(
-                            'span',
-                            {
-                              style: {
-                                flex: '0 0 auto',
-                                fontSize: TOKENS.font.xs,
-                                padding: '1px 6px',
-                                borderRadius: 8,
-                                background: TOKENS.color.primary,
-                                color: TOKENS.color.onPrimary,
-                              },
-                            },
-                            String(entry.unread),
-                          )
-                        : null,
-                    ),
-                    h(
-                      'div',
-                      {
-                        style: {
-                          fontSize: TOKENS.font.sm,
-                          opacity: 0.65,
-                          marginTop: 2,
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
-                        },
-                      },
-                      convSubtitle(entry) + ' · ' + (entry.peers ?? []).join(', '),
-                    ),
-                  ),
-                ),
-          ),
-          h(
-            'div',
-            {
-              onMouseDown: startDrag,
-              title: '拖动调整宽度',
-              style: { flex: '0 0 5px', cursor: 'col-resize', background: 'rgba(127,127,127,0.18)' },
-            },
-          ),
-          h(
-            'div',
-            { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' } },
-            activeConv
-              ? h(
-                  'div',
-                  { style: { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 } },
-                  h(
-                    'div',
-                    {
-                      style: {
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                        gap: 8,
-                        padding: '8px 12px',
-                        borderBottom: '1px solid rgba(127,127,127,0.2)',
-                      },
-                    },
-                    h(
-                      'div',
-                      { style: { fontSize: TOKENS.font.md, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-                      convLabel(activeConv),
-                    ),
-                    ui.button(
-                      { type: 'button', variant: 'ghost', size: 'sm', onClick: markConvRead },
-                      '标为已读',
-                    ),
-                  ),
-                  h(
-                    'div',
-                    { style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '6px 12px 10px' } },
-                    thread.map((message) => {
-                      const mine = message.sender === roster.self
-                      return h(
-                        'div',
-                        {
-                          key: message.id,
-                          style: { display: 'flex', justifyContent: mine ? 'flex-end' : 'flex-start', margin: '6px 0' },
-                        },
-                        h(
-                          'div',
-                          {
-                            style: {
-                              maxWidth: '78%',
-                              padding: '8px 10px',
-                              borderRadius: 10,
-                              background: mine ? 'rgba(16,185,129,0.13)' : 'rgba(99,102,241,0.11)',
-                              border: '1px solid ' + (mine ? 'rgba(16,185,129,0.28)' : 'rgba(99,102,241,0.22)'),
-                            },
-                          },
-                          h(
-                            'div',
-                            { style: { display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: TOKENS.font.sm, opacity: 0.7 } },
-                            h('span', null, mine ? '发出 → ' + message.recipient : '← 收到 · ' + message.sender),
-                            h('span', null, new Date(Number(message.created_at)).toLocaleString()),
-                          ),
-                          message.subject ? h('div', { style: { fontSize: TOKENS.font.md, fontWeight: 600, marginTop: 3 } }, message.subject) : null,
-                          h('div', { style: { fontSize: TOKENS.font.md, whiteSpace: 'pre-wrap', marginTop: 2, lineHeight: 1.55 } }, message.body),
-                          h(
-                            'div',
-                            { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 4 } },
-                            ui.button(
-                              {
-                                type: 'button',
-                                style: { cursor: 'pointer', fontSize: TOKENS.font.sm, background: 'transparent', border: 'none', opacity: message.pinned ? 1 : 0.65 },
-                                onClick: () => void togglePin(message.id, !message.pinned),
-                              },
-                              message.pinned ? '★ 重要' : '标为重要',
-                            ),
-                          ),
-                        ),
-                      )
-                    }),
-                  ),
-                )
-              : h('div', { style: { margin: 'auto', fontSize: TOKENS.font.md, opacity: 0.5 } }, '← 选择一个会话'),
-          ),
         ),
         note ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.65, paddingTop: 12 } }, note) : null,
       )
@@ -3097,7 +2826,6 @@ try {
       return h(
         'div',
         { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, fontSize: TOKENS.font.md } },
-        h(TaskTabSummary),
         h(
           'div',
           {
@@ -3325,7 +3053,8 @@ try {
     return {
       // uiWorkspace is a declared dependency: without it ctx.uiWorkspace is undefined and
       // "open session" silently degrades to a clipboard write (the 2026-10-31 dead button).
-      // `layout` provides selectPanel(id), which is how a plugin switches the main view.
+      // `layout` stays declared for hosts that only wire the panel when the dependency exists;
+      // T-340 removed the last selectPanel() call, so nothing switches the main view anymore.
       inject: ['slots', 'uiWorkspace', 'layout'],
       apply(ctx) {
         hostCtx = ctx

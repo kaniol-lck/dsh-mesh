@@ -2865,18 +2865,17 @@ async function main() {
     report('client: package.json injects the ui-workspace client package', ok, `inject=${inject.join(',')}`)
   })
 
-  await runCase('client: the task-panel entry navigates through layout.selectPanel', async () => {
+  // T-340: the owner removed the "jump to the task panel" affordances — the sidebar tabs are
+  // the only entry now, so no UI code may call layout.selectPanel.
+  await runCase('client: the sidebar never jumps away through layout.selectPanel', async () => {
     const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
-    const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'package.json'), 'utf8'))
-    const inject = pkg?.dsh?.client?.inject ?? []
-    const entryPoints = (source.match(/requestTasksPanel\(\)/g) ?? []).length
     const ok =
-      /selectPanel\('mesh-inbox'\)/.test(source) &&
-      /inject:\s*\[[^\]]*'layout'/.test(source) &&
-      inject.includes('@deepseek-ai/dsh-client-ui-layout') &&
-      entryPoints >= 2 &&
-      source.includes('宿主导航不可用')
-    report('client: the task-panel entry navigates through layout.selectPanel', ok, `selectPanel=${/selectPanel\('mesh-inbox'\)/.test(source)} layoutInject=${inject.includes('@deepseek-ai/dsh-client-ui-layout')} entryPoints=${entryPoints}`)
+      !/requestTasksPanel\(/.test(source) &&
+      !/selectPanel\('mesh-inbox'\)/.test(source) &&
+      /function MeshTasksPanel\(\)/.test(source) &&
+      /const bindHere = /.test(source) &&
+      /const openAllMail = /.test(source)
+    report('client: the sidebar never jumps away through layout.selectPanel', ok, `requests=${/requestTasksPanel\(/.test(source)} selectPanel=${/selectPanel\('mesh-inbox'\)/.test(source)}`)
   })
 
   await runCase('client: a second right-side tab embeds the task list', async () => {
