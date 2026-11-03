@@ -27,6 +27,12 @@ const TOKENS = {
     onPrimary: '#fff', // 主色上的前景
     maskOpaque: '#000', // 遮罩渐变的不透明端（mask 只取 alpha）
     transparent: '#0000', // 完全透明
+    // 官方设置页卡片（T-333）：外层卡片 + 稍深的内嵌区；折叠头 hover 用同一档灰。
+    card: 'var(--dsw-alias-bg-layer-2)', // 卡片底
+    cardBorder: 'var(--dsw-alias-border-l1)', // 卡片 1px 边框 / 标题与内容间的分隔线
+    interactive: 'var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,0.12))', // 内嵌区底 / 折叠头 hover
+    labelPrimary: 'var(--dsw-alias-label-primary)', // 卡片标题
+    labelSecondary: 'var(--dsw-alias-label-secondary)', // 卡片说明文字、箭头
   },
   font: { xs: 10, sm: 11, md: 12, lg: 13 }, // 徽标 / 标签 / 正文 / 标题
 }
@@ -692,7 +698,7 @@ try {
       primary: { ...buttonBase, border: `1px solid ${TOKENS.color.primaryBorder}`, background: TOKENS.color.primary, color: TOKENS.color.onPrimary },
       secondary: { ...buttonBase, border: '1px solid currentColor', background: 'transparent', color: 'inherit' },
       danger: { ...buttonBase, border: `1px solid ${TOKENS.color.dangerBorder}`, background: 'transparent', color: TOKENS.color.danger },
-      link: { ...buttonBase, border: 'none', background: 'transparent', color: 'inherit', textDecoration: 'underline', padding: 0 },
+      ghost: { ...buttonBase, border: 'none', background: 'transparent', color: 'inherit', padding: 0 },
     }
     const BUTTON_SIZES = {
       md: { padding: '4px 10px', fontSize: TOKENS.font.md },
@@ -840,52 +846,88 @@ try {
       )
     }
 
-    /** Collapsible settings chapter: title + one-line purpose + its rows (open by default). */
+    /** Collapsible settings chapter: official card — outer surface plus an inset content area. */
     function SettingsSection({ title, description, defaultOpen = true, children }) {
       const [open, setOpen] = React.useState(defaultOpen)
+      const [hover, setHover] = React.useState(false)
       return h(
         'section',
-        { style: { borderBottom: '1px solid var(--dsw-alias-border-l2)', padding: '2px 0 6px' } },
-        ui.button(
+        {
+          style: {
+            background: TOKENS.color.card,
+            border: '1px solid ' + TOKENS.color.cardBorder,
+            borderRadius: 'var(--dsw-radius-lg, 10px)',
+            padding: 16,
+            marginBottom: 12,
+          },
+        },
+        h(
+          'div',
           {
-            type: 'button',
-            onClick: () => setOpen((value) => !value),
-            'aria-expanded': open,
+            onMouseEnter: () => setHover(true),
+            onMouseLeave: () => setHover(false),
             style: {
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              width: '100%',
-              minHeight: 32,
-              padding: '6px 0',
-              border: 'none',
-              background: 'transparent',
-              color: 'inherit',
-              cursor: 'pointer',
-              textAlign: 'left',
+              padding: '6px 8px',
+              margin: '-6px -8px',
+              borderRadius: 'var(--dsw-radius-lg, 10px)',
+              background: hover ? TOKENS.color.interactive : 'transparent',
+              transition: 'background .12s',
             },
           },
-          h('span', { style: { fontSize: TOKENS.font.lg, fontWeight: 600, flexShrink: 0 } }, (open ? '▾ ' : '▸ ') + title),
-          description
-            ? h(
-                'span',
-                {
-                  title: description,
-                  style: {
-                    fontSize: TOKENS.font.md,
-                    opacity: 0.65,
-                    minWidth: 0,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                    wordBreak: 'keep-all',
+          ui.button(
+            {
+              type: 'button',
+              variant: 'ghost',
+              onClick: () => setOpen((value) => !value),
+              'aria-expanded': open,
+              style: { display: 'flex', alignItems: 'center', gap: 8, width: '100%', minHeight: 32, textAlign: 'left' },
+            },
+            h('span', { style: { fontSize: TOKENS.font.lg, fontWeight: 600, color: TOKENS.color.labelPrimary, flexShrink: 0 } }, title),
+            description
+              ? h(
+                  'span',
+                  {
+                    title: description,
+                    style: {
+                      fontSize: TOKENS.font.md,
+                      color: TOKENS.color.labelSecondary,
+                      minWidth: 0,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      wordBreak: 'keep-all',
+                    },
                   },
-                },
-                description,
-              )
-            : null,
+                  description,
+                )
+              : null,
+            h(
+              'span',
+              {
+                'aria-hidden': 'true',
+                style: { marginLeft: 'auto', width: 16, textAlign: 'center', color: TOKENS.color.labelSecondary, fontSize: TOKENS.font.md, lineHeight: '20px' },
+              },
+              open ? '▾' : '▸',
+            ),
+          ),
         ),
-        open ? h('div', { style: { display: 'grid', gap: 0 } }, children) : null,
+        open
+          ? h(
+              'div',
+              {
+                style: {
+                  marginTop: 10,
+                  padding: 12,
+                  background: TOKENS.color.interactive,
+                  borderRadius: 'var(--dsw-radius-lg, 10px)',
+                  borderTop: '1px solid ' + TOKENS.color.cardBorder,
+                  display: 'grid',
+                  gap: 0,
+                },
+              },
+              children,
+            )
+          : null,
       )
     }
 
@@ -1127,6 +1169,7 @@ try {
       const [selectedId, setSelectedId] = React.useState(null)
       const [detail, setDetail] = React.useState(null)
       const [collapsed, setCollapsed] = React.useState({})
+      const [hoverGroup, setHoverGroup] = React.useState(null)
       const [note, setNote] = React.useState(null)
       const narrow = useIsNarrow()
 
@@ -1288,30 +1331,37 @@ try {
                 return h(
                   'div',
                   { key: group.key },
-                  ui.button(
+                  h(
+                    'div',
                     {
-                      type: 'button',
-                      onClick: () => setCollapsed({ ...collapsed, [group.key]: !isCollapsed }),
+                      onMouseEnter: () => setHoverGroup(group.key),
+                      onMouseLeave: () => setHoverGroup(null),
                       style: {
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 8,
-                        width: '100%',
-                        minHeight: 28,
                         padding: '4px 10px',
-                        border: 'none',
-                        borderBottom: '0.5px solid var(--dsw-alias-border-l3)',
-                        background: 'transparent',
-                        color: 'inherit',
-                        cursor: 'pointer',
-                        fontSize: TOKENS.font.sm,
-                        fontWeight: 600,
-                        textAlign: 'left',
+                        borderRadius: 'var(--dsw-radius-lg, 10px)',
+                        background: hoverGroup === group.key ? TOKENS.color.interactive : 'transparent',
+                        borderBottom: '1px solid ' + TOKENS.color.cardBorder,
+                        transition: 'background .12s',
                       },
                     },
-                    h('span', { style: { flexShrink: 0 } }, (isCollapsed ? '▸ ' : '▾ ') + group.label),
-                    h('span', { style: { opacity: 0.7, flexShrink: 0 } }, group.done + '/' + group.total),
-                    h('span', { style: { opacity: 0.7, marginLeft: 'auto' } }, '总耗时 ' + formatDuration(group.durationMs)),
+                    ui.button(
+                      {
+                        type: 'button',
+                        variant: 'ghost',
+                        size: 'sm',
+                        onClick: () => setCollapsed({ ...collapsed, [group.key]: !isCollapsed }),
+                        'aria-expanded': !isCollapsed,
+                        style: { display: 'flex', alignItems: 'center', gap: 8, width: '100%', minHeight: 24, fontWeight: 600, textAlign: 'left' },
+                      },
+                      h('span', { style: { flexShrink: 0, color: TOKENS.color.labelPrimary } }, group.label),
+                      h('span', { style: { color: TOKENS.color.labelSecondary, flexShrink: 0 } }, group.done + '/' + group.total),
+                      h('span', { style: { color: TOKENS.color.labelSecondary, marginLeft: 'auto' } }, '总耗时 ' + formatDuration(group.durationMs)),
+                      h(
+                        'span',
+                        { 'aria-hidden': 'true', style: { width: 16, textAlign: 'center', color: TOKENS.color.labelSecondary } },
+                        isCollapsed ? '▸' : '▾',
+                      ),
+                    ),
                   ),
                   isCollapsed
                     ? null
@@ -2176,7 +2226,7 @@ try {
                       convLabel(activeConv),
                     ),
                     ui.button(
-                      { type: 'button', variant: 'link', size: 'sm', onClick: markConvRead },
+                      { type: 'button', variant: 'ghost', size: 'sm', onClick: markConvRead },
                       '标为已读',
                     ),
                   ),
