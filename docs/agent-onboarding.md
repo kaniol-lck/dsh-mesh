@@ -1,9 +1,72 @@
 # 接入 dsh-mesh（一页纸）
 
 给**公网上的陌生人**：网络环境未知（很可能是双 NAT、没有公网 IP、公司防火墙），
-照着下面三步做完就能收发消息。**不需要开端口、不需要手抄 token、不需要配 CA 环境变量。**
+照着下面三步做完就能收发消息。**不需要开端口、不需要手抄 token。**
+
+> 若 hub 使用**自签证书**（公网 TCP 透传场景），**必须按下面第 0 节配置 CA**；若 hub 使用公共 CA 签发的证书、或位于可信内网，则无需配置 CA。
 
 > 契约版本：hub 0.7.15 / waker 0.5.0 起（`/api/bootstrap` + `joinCode` 自举 + pull 默认）。
+
+---
+
+## 0. 自签 CA / 公网部署（A 模式）
+
+公网接法为 **frp TCP 透传 + hub 自签证书**。客户端第一次连 hub 时 CA 尚未被信任，而
+`/api/bootstrap` 自己就在 TLS 后面——**不能用它来获取它自己的 CA**，所以 CA 必须带外交付。
+
+### 0.1 服务端一次性准备
+
+证书必须包含**外网访问用的 IP 或域名**（客户端实际输入的那个），否则即使 CA 受信也会因
+hostname 不匹配而失败：
+
+```bash
+# --ip 与 --dns 至少给一个，写客户端实际连接的公网地址
+node scripts/make-cert.mjs --out certs --ip <公网IP>
+# 或者：node scripts/make-cert.mjs --out certs --dns mesh.example.com
+
+# 产物：certs/ca.crt（分发给客户端）+ 服务器证书/私钥
+```
+
+- hub 侧配置 `MESH_TLS_CERT` / `MESH_TLS_KEY` 指向服务器证书与私钥；
+- 配置 `MESH_PUBLIC_URL=https://<公网IP>:<端口>`（bootstrap 会把该地址告诉新设备）。
+
+### 0.2 把 CA 带外交付给每台设备
+
+把 `certs/ca.crt` 通过 U 盘、文件传输或粘贴到本机文件的方式交给每台客户端，**必须带外**：
+bootstrap 端点在 TLS 后面，客户端在信任 CA 之前拿不到任何东西——先有鸡还是先有蛋。
+
+### 0.3 客户端配置
+
+| 客户端 | 配置 |
+|---|---|
+| waker 插件 | `hubUrl: 'https://<公网IP>:<端口>'` + `caFile: '<本地 ca.crt 路径>'`（**推荐持久配置**）；或临时用 `NODE_EXTRA_CA_CERTS=<本地 ca.crt 路径>` |
+| handoff.py | `MESH_HUB=https://<公网IP>:<端口>`、`MESH_TOKEN_FILE=~/.dsh/mesh-waker/token`、`--ca <本地 ca.crt 路径>`（也可用 `MESH_CA_FILE`；可选 `--ca-sha256` 校验指纹） |
+
+**`NODE_EXTRA_CA_CERTS` 只对 Node（waker）有效，对 Python（handoff.py）无效**——这是最容易踩的坑。
+Python 侧一律用 `--ca` / `MESH_CA_FILE` 显式指定同一个 pem 文件。
+
+### 0.4 验证顺序（先窄后宽）
+
+```bash
+# 1) 证书链与 CA 匹配（在服务端 certs 目录）
+openssl verify -CAfile ca.crt server.crt
+
+# 2) 从设备验证信任链（Node，waker 同款）
+NODE_EXTRA_CA_CERTS=<本地 ca.crt 路径> node -e "fetch('https://<公网IP>:<端口>/api/bootstrap').then(r=>r.json()).then(j=>console.log(j.service))"
+# 应输出 dsh-mesh
+
+# 3) 从设备验证信任链（Python，handoff.py 同款）
+python -c "import ssl,urllib.request; print(urllib.request.urlopen('https://<公网IP>:<端口>/api/bootstrap', context=ssl.create_default_context(cafile='<本地 ca.crt 路径>')).status)"
+# 应输出 200
+```
+
+### 0.5 常见失败对照
+
+| 错误 | 含义 |
+|---|---|
+| `SELF_SIGNED_CERT_IN_CHAIN` / `CERTIFICATE_VERIFY_FAILED` | CA 没配或配错文件；确认用的是 hub 的 `ca.crt` |
+| `ERR_TLS_CERT_ALTNAME_INVALID`（Node）/ `hostname mismatch`（Python） | 证书里没有这个 IP/域名 → 用 `--ip`/`--dns` 重签 |
+| 通了但 `service` 不是 `dsh-mesh` | 连到了别的服务（反代/端口错） |
 
 ---
 
