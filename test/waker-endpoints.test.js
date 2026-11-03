@@ -5798,6 +5798,35 @@ async function main() {
     report('receipt flow: lib/receipt-flow.mjs imports without index.js', ok, `sessionId=${resolved.sessionId ?? '-'} exports=${Object.keys(module).join(',')}`)
   })
 
+  // 266-267. Design tokens (T-330): the panel must draw every colour and font size from the
+  // TOKENS vocabulary. The gate only proves the counts; the second case proves the vocabulary
+  // has no dead entries (a token nobody references is drift waiting to happen).
+  await runCase('ui tokens: client.js has no raw colours or font sizes left', async () => {
+    const { execFileSync } = require('node:child_process')
+    const raw = execFileSync(process.execPath, ['scripts/check-ui-tokens.mjs', '--paths', 'plugins/mesh-waker/client.js', '--json'], {
+      cwd: REPO,
+      encoding: 'utf8',
+    })
+    const parsed = JSON.parse(raw.slice(raw.indexOf('{')))
+    const file = parsed.files.find((entry) => entry.path === 'plugins/mesh-waker/client.js')
+    const ok = Boolean(file) && file.rawColorCount === 0 && file.rawFontSizeCount === 0 && file.tokenRefCount > 61
+    report('ui tokens: client.js has no raw colours or font sizes left', ok, `rawColor=${file?.rawColorCount} rawFontSize=${file?.rawFontSizeCount} tokenRef=${file?.tokenRefCount}`)
+  })
+
+  await runCase('ui tokens: every declared token is referenced at least once', async () => {
+    const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
+    const parts = source.split('// BEGIN UI TOKENS')
+    const tail = parts[1] ? parts[1].split('// END UI TOKENS') : ['', '']
+    const block = tail[0] ?? ''
+    const outside = `${parts[0] ?? ''}${tail[1] ?? ''}`
+    const keys = [...block.matchAll(/^\s{2,4}([a-zA-Z]+): \{([^}]*)\}/gms)].flatMap((match) =>
+      [...match[2].matchAll(/([a-zA-Z]+):/g)].map((entry) => `${match[1]}.${entry[1]}`),
+    )
+    const unused = keys.filter((key) => !outside.includes(`TOKENS.${key}`))
+    const ok = keys.length > 0 && unused.length === 0
+    report('ui tokens: every declared token is referenced at least once', ok, `tokens=${keys.length} unused=${unused.join(',') || '-'}`)
+  })
+
   // 241. Boot diagnostics (T-299): a listener that cannot bind must fail fast and name the
   // real error instead of burning the 5s probe budget and reporting "never answered".
   {

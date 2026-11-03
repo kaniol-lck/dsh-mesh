@@ -27,7 +27,11 @@ const BASELINE = path.join(ROOT, 'scripts', 'ui-token-baseline.json')
 const ALLOWED_TOKEN_FILE = /(^|\/)(ui-tokens|theme|tokens)[^/]*$/i
 const RAW_COLOR = /#[0-9a-fA-F]{3,8}\b/g
 const RAW_FONT_SIZE = /fontSize\s*:\s*\d+(?:\.\d+)?\b|font-size\s*:\s*\d+(?:\.\d+)?px\b/g
-const TOKEN_REF = /--dsw-[a-zA-Z0-9_-]+/g
+// A JS vocabulary object (`TOKENS.color.surface`) is the same contract for files that cannot
+// import a token module; both forms count as token references.
+const JSON_TOKEN_REF = /--dsw-[a-zA-Z0-9_-]+|TOKENS\.[a-zA-Z]+\.[a-zA-Z]+/g
+// Declarations between these markers are the vocabulary itself — raw values allowed there.
+const UI_TOKEN_REGION = /\/\/ BEGIN UI TOKENS[\s\S]*?\/\/ END UI TOKENS/g
 const USAGE = `check-ui-tokens.mjs — raw colour / font-size vs design tokens
 
 Usage:
@@ -36,8 +40,10 @@ Usage:
 Checks (per file):
   rawColor     hex literal #rgb / #rrggbb / #rrggbbaa
   rawFontSize  "fontSize: <number>" or "font-size: <number>px"
-  tokenRef     --dsw-* token references — counted, never a violation
+  tokenRef     --dsw-* and TOKENS.x.y references — counted, never a violation
 Files named ui-tokens*, theme*, tokens* may contain raw values.
+A block between "// BEGIN UI TOKENS" and "// END UI TOKENS" declares the vocabulary and is
+exempt from the raw-value counts (line numbers elsewhere stay accurate).
 
 Options:
   --paths <a,b>       files to scan (default: plugins/mesh-waker/client.js,hub/server.mjs)
@@ -85,7 +91,11 @@ export function scanText(text) {
   let rawFontSizeCount = 0
   let tokenRefCount = 0
   const colors = new Set()
-  text.split(/\r?\n/).forEach((line, index) => {
+  // A `// BEGIN UI TOKENS` … `// END UI TOKENS` block is the vocabulary itself: the literals
+  // inside it are the single source of truth, not drift. Blank the block out but keep its
+  // newlines so reported line numbers stay accurate.
+  const scannable = text.replace(UI_TOKEN_REGION, (block) => block.replace(/[^\n]/g, ''))
+  scannable.split(/\r?\n/).forEach((line, index) => {
     for (const match of line.matchAll(RAW_COLOR)) {
       rawColorCount += 1
       colors.add(match[0].toLowerCase())
@@ -95,8 +105,10 @@ export function scanText(text) {
       rawFontSizeCount += 1
       violations.push({ line: index + 1, kind: 'rawFontSize', value: match[0] })
     }
-    tokenRefCount += (line.match(TOKEN_REF) ?? []).length
   })
+  // Token references: host `--dsw-*` aliases (counted in the whole text, including the
+  // declaration block) plus JS vocabulary references like `TOKENS.color.surface`.
+  for (const match of text.matchAll(JSON_TOKEN_REF)) tokenRefCount += 1
   return { rawColorCount, rawFontSizeCount, distinctColorCount: colors.size, tokenRefCount, violations }
 }
 

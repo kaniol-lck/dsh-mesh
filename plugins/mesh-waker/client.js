@@ -7,6 +7,31 @@
 // this copy was installed as (the profile-link name for a linked copy, the bare package name for
 // the npm package). Derive it from the running bundle's own URL; a hardcoded id registers
 // under the wrong name and the entry then fails to activate, aborting the whole web boot.
+// ── Design tokens (T-330) ────────────────────────────────────────────────────────────────
+// Single vocabulary for this panel: every colour and font size below comes from here, so a new
+// element can only pick an existing role instead of inventing a value. Host `--dsw-*` aliases
+// win when defined (the panel then follows the active theme); the literal fallbacks only matter
+// on hosts that predate those aliases.
+// BEGIN UI TOKENS
+const TOKENS = {
+  color: {
+    surface: 'var(--dsw-alias-bg-layer-2, #fff)', // 卡片 / 面板底
+    surfaceRaised: 'var(--dsw-alias-bg-layer-1, #fff)', // 浮层 / 高亮块
+    success: 'var(--dsw-alias-state-success-primary, #2f9e6e)', // 在线 / 成功
+    business: 'var(--dsw-alias-state-business-primary, #5b7cfa)', // 业务进行中
+    danger: '#d9534f', // 错误 / 危险
+    dangerBorder: 'rgba(217,83,79,0.9)', // 危险按钮描边
+    warning: '#b45309', // 告警
+    primary: 'rgba(99,102,241,0.85)', // 主色底（主按钮 / 胶囊）
+    primaryBorder: 'rgba(99,102,241,0.9)', // 主色描边
+    onPrimary: '#fff', // 主色上的前景
+    maskOpaque: '#000', // 遮罩渐变的不透明端（mask 只取 alpha）
+    transparent: '#0000', // 完全透明
+  },
+  font: { xs: 10, sm: 11, md: 12, lg: 13 }, // 徽标 / 标签 / 正文 / 标题
+}
+// END UI TOKENS
+
 const MESH_WAKER_ID = (() => {
   const fallback = 'dsh-mesh-waker'
   try {
@@ -147,7 +172,7 @@ try {
     }
 
     const styles = {
-      card: { display: 'grid', gap: 8, padding: '4px 0 8px', fontSize: 13 },
+      card: { display: 'grid', gap: 8, padding: '4px 0 8px', fontSize: TOKENS.font.lg },
       row: { display: 'flex', gap: 10, alignItems: 'center' },
       label: { opacity: 0.65, minWidth: 112, flexShrink: 0 },
       value: { fontFamily: 'monospace', wordBreak: 'break-all' },
@@ -159,7 +184,7 @@ try {
         border: '1px solid currentColor',
         background: 'transparent',
         color: 'inherit',
-        fontSize: 13,
+        fontSize: TOKENS.font.lg,
       },
       button: {
         padding: '4px 10px',
@@ -168,10 +193,10 @@ try {
         background: 'transparent',
         color: 'inherit',
         cursor: 'pointer',
-        fontSize: 12,
+        fontSize: TOKENS.font.md,
       },
-      err: { color: '#d9534f' },
-      hint: { fontSize: 12, opacity: 0.6, lineHeight: 1.5, wordBreak: 'break-all' },
+      err: { color: TOKENS.color.danger },
+      hint: { fontSize: TOKENS.font.md, opacity: 0.6, lineHeight: 1.5, wordBreak: 'break-all' },
       dirList: { maxHeight: 200, overflow: 'auto', border: '1px solid currentColor', borderRadius: 6, padding: 4, opacity: 0.9 },
       dirItem: { padding: '2px 6px', cursor: 'pointer', borderRadius: 4, fontFamily: 'monospace' },
       indent: { marginLeft: 122 },
@@ -179,10 +204,10 @@ try {
     }
 
     // Three button tiers, used everywhere in the task panel (one meaning = one style).
-    const buttonBase = { padding: '4px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, flexShrink: 0 }
-    const buttonPrimary = { ...buttonBase, border: '1px solid rgba(99,102,241,0.9)', background: 'rgba(99,102,241,0.85)', color: '#fff' }
+    const buttonBase = { padding: '4px 10px', borderRadius: 6, cursor: 'pointer', fontSize: TOKENS.font.md, flexShrink: 0 }
+    const buttonPrimary = { ...buttonBase, border: `1px solid ${TOKENS.color.primaryBorder}`, background: TOKENS.color.primary, color: TOKENS.color.onPrimary }
     const buttonSecondary = { ...buttonBase, border: '1px solid currentColor', background: 'transparent', color: 'inherit' }
-    const buttonDanger = { ...buttonBase, border: '1px solid rgba(217,83,79,0.9)', background: 'transparent', color: '#d9534f' }
+    const buttonDanger = { ...buttonBase, border: `1px solid ${TOKENS.color.dangerBorder}`, background: 'transparent', color: TOKENS.color.danger }
 
     async function json(url, init) {
       const res = await fetch(url, { cache: 'no-store', ...init })
@@ -510,7 +535,7 @@ try {
     }
 
     // Copied from the shell's own select rule (GRgSLq_select): no native chrome, inline
-    // chevron, filled pill. The chevron colour is the host's fixed neutral #81858C.
+    // chevron, filled pill. The chevron colour is the host's fixed neutral grey.
     const SELECT_CHEVRON =
       "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%2381858C' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\")"
 
@@ -529,7 +554,7 @@ try {
       backgroundRepeat: 'no-repeat',
       backgroundSize: '12px 12px',
       color: 'var(--dsw-alias-label-primary)',
-      fontSize: 13,
+      fontSize: TOKENS.font.lg,
       fontFamily: 'inherit',
       lineHeight: '20px',
       cursor: 'pointer',
@@ -623,7 +648,7 @@ try {
                   padding: 4,
                   maxHeight: 280,
                   overflowY: 'auto',
-                  background: 'var(--dsw-alias-bg-layer-2, #fff)',
+                  background: TOKENS.color.surface,
                   border: '0.5px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.2))',
                   borderRadius: 'var(--dsw-radius-lg, 10px)',
                   boxShadow: '0 10px 30px rgba(0,0,0,0.16)',
@@ -653,7 +678,7 @@ try {
                           : 'transparent',
                       color: 'var(--dsw-alias-label-primary)',
                       font: 'inherit',
-                      fontSize: 13,
+                      fontSize: TOKENS.font.lg,
                       padding: '6px 10px',
                       cursor: 'pointer',
                       whiteSpace: 'nowrap',
@@ -673,7 +698,7 @@ try {
       border: '0.5px solid var(--dsw-alias-border-l4)',
       background: 'var(--dsw-alias-bg-layer-2)',
       color: 'var(--dsw-alias-label-primary)',
-      fontSize: 13,
+      fontSize: TOKENS.font.lg,
       fontFamily: 'inherit',
       lineHeight: '20px',
       outline: 'none',
@@ -713,7 +738,7 @@ try {
             width: 16,
             height: 16,
             borderRadius: '50%',
-            background: '#fff',
+            background: TOKENS.color.surface,
             boxShadow: '0 1px 2px rgba(0,0,0,0.25)',
             transition: 'transform .15s',
           },
@@ -763,7 +788,7 @@ try {
             {
               title,
               style: {
-                fontSize: 13,
+                fontSize: TOKENS.font.lg,
                 fontWeight: 500,
                 lineHeight: '20px',
                 color: 'var(--dsw-alias-label-primary)',
@@ -781,7 +806,7 @@ try {
                 {
                   title: description,
                   style: {
-                    fontSize: 12,
+                    fontSize: TOKENS.font.md,
                     color: 'var(--dsw-alias-label-secondary)',
                     lineHeight: '18px',
                     overflow: 'hidden',
@@ -824,14 +849,14 @@ try {
               textAlign: 'left',
             },
           },
-          h('span', { style: { fontSize: 13, fontWeight: 600, flexShrink: 0 } }, (open ? '▾ ' : '▸ ') + title),
+          h('span', { style: { fontSize: TOKENS.font.lg, fontWeight: 600, flexShrink: 0 } }, (open ? '▾ ' : '▸ ') + title),
           description
             ? h(
                 'span',
                 {
                   title: description,
                   style: {
-                    fontSize: 12,
+                    fontSize: TOKENS.font.md,
                     opacity: 0.65,
                     minWidth: 0,
                     overflow: 'hidden',
@@ -863,8 +888,8 @@ try {
 
       const toneColor = (tone) =>
         tone === 'out'
-          ? 'var(--dsw-alias-state-success-primary, #2f9e6e)'
-          : 'var(--dsw-alias-state-business-primary, #5b7cfa)'
+          ? TOKENS.color.success
+          : TOKENS.color.business
 
       const showPreview = (event, index) => {
         const frame = frameRef.current
@@ -899,8 +924,8 @@ try {
               overflowX: 'hidden',
               scrollbarWidth: 'none',
               pointerEvents: 'auto',
-              WebkitMaskImage: 'linear-gradient(#0000 0, #000 24px calc(100% - 24px), #0000 100%)',
-              maskImage: 'linear-gradient(#0000 0, #000 24px calc(100% - 24px), #0000 100%)',
+              WebkitMaskImage: `linear-gradient(${TOKENS.color.transparent} 0, ${TOKENS.color.maskOpaque} 24px calc(100% - 24px), ${TOKENS.color.transparent} 100%)`,
+              maskImage: `linear-gradient(${TOKENS.color.transparent} 0, ${TOKENS.color.maskOpaque} 24px calc(100% - 24px), ${TOKENS.color.transparent} 100%)`,
             },
           },
           h(
@@ -967,7 +992,7 @@ try {
                   overflow: 'hidden',
                   padding: '10px 12px',
                   borderRadius: 'var(--dsw-radius-lg, 10px)',
-                  background: 'var(--dsw-alias-bg-layer-1, #fff)',
+                  background: TOKENS.color.surfaceRaised,
                   border: '0.5px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.18))',
                   borderLeft: '3px solid ' + toneColor(toneOf ? toneOf(items[preview.index]) : 'in'),
                   boxShadow: 'var(--dsw-elevation-panel, 0 10px 30px rgba(0,0,0,0.16))',
@@ -980,7 +1005,7 @@ try {
                 'div',
                 {
                   style: {
-                    fontSize: 13,
+                    fontSize: TOKENS.font.lg,
                     fontWeight: 600,
                     whiteSpace: 'nowrap',
                     overflow: 'hidden',
@@ -995,7 +1020,7 @@ try {
                 {
                   style: {
                     marginTop: 4,
-                    fontSize: 12,
+                    fontSize: TOKENS.font.md,
                     lineHeight: 1.5,
                     color: 'var(--dsw-alias-label-caption, var(--dsw-alias-label-secondary))',
                     display: '-webkit-box',
@@ -1205,7 +1230,7 @@ try {
         },
         h(
           'div',
-          { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', padding: '8px 10px', borderBottom: '0.5px solid var(--dsw-alias-border-l3)', fontSize: 12 } },
+          { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', padding: '8px 10px', borderBottom: '0.5px solid var(--dsw-alias-border-l3)', fontSize: TOKENS.font.md } },
           h('span', { style: { opacity: 0.8 } }, 'pending ' + pending + ' · 进行中 ' + running + ' · 今日完成 ' + doneToday + ' · 停滞 ' + stalled),
           h(
             'select',
@@ -1228,7 +1253,7 @@ try {
             ].map(([value, label]) => h('option', { key: value, value }, label)),
           ),
           h('input', {
-            style: { ...controlStyle, width: 150, fontSize: 12, padding: '2px 6px' },
+            style: { ...controlStyle, width: 150, fontSize: TOKENS.font.md, padding: '2px 6px' },
             placeholder: '目标会话 id（回车过滤）',
             value: filter.session,
             onChange: (event) => setFilter({ ...filter, session: event.target.value }),
@@ -1238,12 +1263,12 @@ try {
           }),
           h('button', { type: 'button', style: buttonSecondary, onClick: () => void load(filter) }, '刷新'),
         ),
-        note ? h('div', { style: { fontSize: 11, opacity: 0.75, padding: '4px 10px' } }, note) : null,
+        note ? h('div', { style: { fontSize: TOKENS.font.sm, opacity: 0.75, padding: '4px 10px' } }, note) : null,
         h(
           'div',
           { style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '4px 0' } },
           groups.length === 0
-            ? h('div', { style: { padding: 12, fontSize: 12, opacity: 0.6 } }, '（暂无任务）')
+            ? h('div', { style: { padding: 12, fontSize: TOKENS.font.md, opacity: 0.6 } }, '（暂无任务）')
             : groups.map((group) => {
                 const isCollapsed = collapsed[group.key] === true
                 return h(
@@ -1266,7 +1291,7 @@ try {
                         background: 'transparent',
                         color: 'inherit',
                         cursor: 'pointer',
-                        fontSize: 11,
+                        fontSize: TOKENS.font.sm,
                         fontWeight: 600,
                         textAlign: 'left',
                       },
@@ -1298,7 +1323,7 @@ try {
                               background: selectedId === task.taskId ? 'rgba(99,102,241,0.14)' : 'transparent',
                               color: 'inherit',
                               cursor: 'pointer',
-                              fontSize: 11,
+                              fontSize: TOKENS.font.sm,
                               textAlign: 'left',
                             },
                           },
@@ -1323,8 +1348,8 @@ try {
         selected
           ? h(
               'div',
-              { style: { display: 'grid', gap: 8, fontSize: 12 } },
-              h('div', { style: { fontSize: 14, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, selected.subject || '(未命名任务)'),
+              { style: { display: 'grid', gap: 8, fontSize: TOKENS.font.md } },
+              h('div', { style: { fontSize: TOKENS.font.lg, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, selected.subject || '(未命名任务)'),
               h(
                 'div',
                 { style: { display: 'flex', gap: 10, flexWrap: 'wrap', opacity: 0.8 } },
@@ -1357,13 +1382,13 @@ try {
                   : null,
               ),
               h('div', { style: { fontWeight: 600, marginTop: 4 } }, '正文'),
-              h('pre', { style: { maxHeight: 260, overflow: 'auto', whiteSpace: 'pre-wrap', margin: 0, fontSize: 11, background: 'rgba(127,127,127,0.06)', padding: 8, borderRadius: 6 } }, selected.text || '（无正文）'),
+              h('pre', { style: { maxHeight: 260, overflow: 'auto', whiteSpace: 'pre-wrap', margin: 0, fontSize: TOKENS.font.sm, background: 'rgba(127,127,127,0.06)', padding: 8, borderRadius: 6 } }, selected.text || '（无正文）'),
               h('div', { style: { fontWeight: 600 } }, '回执'),
               h('div', { style: { opacity: 0.85 } }, selected.receiptSummary || selected.receiptRef || '（无）'),
               selected.refs && selected.refs.length ? h('div', { style: { fontWeight: 600 } }, '引用') : null,
               selected.refs && selected.refs.length ? h('div', { style: { opacity: 0.85, fontFamily: 'monospace' } }, selected.refs.join(' · ')) : null,
             )
-          : h('div', { style: { display: 'grid', placeItems: 'center', height: '100%', opacity: 0.55, fontSize: 12 } }, '选择左侧任务查看详情'),
+          : h('div', { style: { display: 'grid', placeItems: 'center', height: '100%', opacity: 0.55, fontSize: TOKENS.font.md } }, '选择左侧任务查看详情'),
       )
 
       return h(
@@ -1411,7 +1436,7 @@ try {
 
       return h(
         'div',
-        { style: { display: 'flex', flexDirection: 'column', gap: 2, padding: '4px 8px', borderBottom: '0.5px solid var(--dsw-alias-border-l3)', fontSize: 11 } },
+        { style: { display: 'flex', flexDirection: 'column', gap: 2, padding: '4px 8px', borderBottom: '0.5px solid var(--dsw-alias-border-l3)', fontSize: TOKENS.font.sm } },
         h(
           'div',
           { style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 } },
@@ -1420,7 +1445,7 @@ try {
             'button',
             {
               type: 'button',
-              style: { ...buttonPrimary, marginLeft: 'auto', padding: '2px 8px', fontSize: 11 },
+              style: { ...buttonPrimary, marginLeft: 'auto', padding: '2px 8px', fontSize: TOKENS.font.sm },
               title: '打开 ' + entryLabel + ' 页面的「派活任务」标签',
               onClick: openTasks,
             },
@@ -1428,7 +1453,7 @@ try {
           ),
           h(
             'button',
-            { type: 'button', style: { ...buttonSecondary, padding: '2px 8px', fontSize: 11 }, title: '复制入口路径', onClick: () => void copyEntry() },
+            { type: 'button', style: { ...buttonSecondary, padding: '2px 8px', fontSize: TOKENS.font.sm }, title: '复制入口路径', onClick: () => void copyEntry() },
             '复制入口',
           ),
         ),
@@ -1658,7 +1683,7 @@ try {
         }
       }
 
-      if (!config) return h('div', { style: { padding: '24px 0', fontSize: 13, opacity: 0.7 } }, '加载中…')
+      if (!config) return h('div', { style: { padding: '24px 0', fontSize: TOKENS.font.lg, opacity: 0.7 } }, '加载中…')
 
       const others = (roster.peers ?? []).filter((peer) => peer.name !== roster.self)
       const trustByPeer = config.trustByPeer ?? {}
@@ -1676,22 +1701,22 @@ try {
                   borderRadius: 6,
                   background: 'rgba(217, 119, 6, 0.12)',
                   border: '1px solid rgba(217, 119, 6, 0.45)',
-                  color: '#b45309',
-                  fontSize: 13,
+                  color: TOKENS.color.warning,
+                  fontSize: TOKENS.font.lg,
                   fontWeight: 600,
                 },
               },
               '⚠ ' + staleVersionNotice(status),
             )
           : null,
-        note ? h('div', { style: { fontSize: 12, opacity: 0.8, padding: '4px 0' } }, note) : null,
+        note ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.8, padding: '4px 0' } }, note) : null,
         h(
           SettingsSection,
           { title: '接入', description: '中枢登记、控制台与本机唤醒端口；接入向导开发中。' },
           h(
             Row,
             { title: '中枢登记', description: status && status.wakeUrl ? status.wakeUrl : '未配置 hubUrl 时为 standalone' },
-            h('span', { style: { fontSize: 13, opacity: 0.8 } }, status && status.registered ? '已登记' : '未登记'),
+            h('span', { style: { fontSize: TOKENS.font.lg, opacity: 0.8 } }, status && status.registered ? '已登记' : '未登记'),
           ),
           status && status.hubConsoleUrl
             ? h(
@@ -1705,14 +1730,14 @@ try {
             { title: '本机唤醒端口', description: '面板、注入与 push 共用的 loopback 端口' },
             h(
               'span',
-              { style: { fontFamily: 'monospace', fontSize: 12 } },
+              { style: { fontFamily: 'monospace', fontSize: TOKENS.font.md } },
               status && status.listenPort ? '127.0.0.1:' + status.listenPort : '127.0.0.1:8795',
             ),
           ),
           h(
             Row,
             { title: '接入向导', description: '开发中：后续版本提供 hubUrl / 注册码的可视化配置' },
-            h('span', { style: { fontSize: 12, opacity: 0.6 } }, '接入向导开发中'),
+            h('span', { style: { fontSize: TOKENS.font.md, opacity: 0.6 } }, '接入向导开发中'),
           ),
         ),
         h(
@@ -1752,7 +1777,7 @@ try {
               type: 'number',
               min: 1,
               step: 1,
-              style: { ...controlStyle, width: 96, fontSize: 12, padding: '2px 6px' },
+              style: { ...controlStyle, width: 96, fontSize: TOKENS.font.md, padding: '2px 6px' },
               value: draftMaxWakes,
               onChange: (event) => setDraftMaxWakes(event.target.value),
             }),
@@ -1765,7 +1790,7 @@ try {
               type: 'number',
               min: 0.1,
               step: 0.5,
-              style: { ...controlStyle, width: 96, fontSize: 12, padding: '2px 6px' },
+              style: { ...controlStyle, width: 96, fontSize: TOKENS.font.md, padding: '2px 6px' },
               value: draftResetAfterHours,
               onChange: (event) => setDraftResetAfterHours(event.target.value),
             }),
@@ -1818,7 +1843,7 @@ try {
             { title: '唤醒会话标题', description: '新建唤醒会话时使用的标题（≤60 字）' },
             h('input', {
               type: 'text',
-              style: { ...controlStyle, width: 220, fontSize: 12, padding: '2px 6px' },
+              style: { ...controlStyle, width: 220, fontSize: TOKENS.font.md, padding: '2px 6px' },
               value: draftSessionTitle,
               onChange: (event) => setDraftSessionTitle(event.target.value),
             }),
@@ -1831,7 +1856,7 @@ try {
               type: 'number',
               min: 0.5,
               step: 1,
-              style: { ...controlStyle, width: 96, fontSize: 12, padding: '2px 6px' },
+              style: { ...controlStyle, width: 96, fontSize: TOKENS.font.md, padding: '2px 6px' },
               value: draftBranchReuseHours,
               onChange: (event) => setDraftBranchReuseHours(event.target.value),
             }),
@@ -1844,7 +1869,7 @@ try {
               type: 'number',
               min: 0,
               step: 500,
-              style: { ...controlStyle, width: 110, fontSize: 12, padding: '2px 6px' },
+              style: { ...controlStyle, width: 110, fontSize: TOKENS.font.md, padding: '2px 6px' },
               value: draftCatchUpDelayMs,
               onChange: (event) => setDraftCatchUpDelayMs(event.target.value),
             }),
@@ -1854,7 +1879,7 @@ try {
           others.length
             ? h(
                 'table',
-                { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12, marginBottom: 8 } },
+                { style: { width: '100%', borderCollapse: 'collapse', fontSize: TOKENS.font.md, marginBottom: 8 } },
                 h(
                   'thead',
                   null,
@@ -1895,7 +1920,7 @@ try {
                         h(
                           MiniSelect,
                           {
-                            style: { ...selectStyle, height: 28, padding: '0 24px 0 8px', fontSize: 12 },
+                            style: { ...selectStyle, height: 28, padding: '0 24px 0 8px', fontSize: TOKENS.font.md },
                             value: trustByPeer[peer.name] ?? '',
                             onChange: (event) => void setPeerTrust(peer.name, event.target.value),
                           },
@@ -1911,7 +1936,7 @@ try {
                   ),
                 ),
               )
-            : h('div', { style: { fontSize: 12, opacity: 0.6, padding: '8px 0' } }, '（暂无其他 agent）'),
+            : h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.6, padding: '8px 0' } }, '（暂无其他 agent）'),
         ),
         h(
           SettingsSection,
@@ -1924,7 +1949,7 @@ try {
             },
             h('span', {
               title: '需改配置文件并重启',
-              style: { fontSize: 12, opacity: 0.5 },
+              style: { fontSize: TOKENS.font.md, opacity: 0.5 },
             }, config && config.entryLabel ? config.entryLabel : 'Mesh 信箱'),
           ),
           h(
@@ -1933,7 +1958,7 @@ try {
             h(
               'span',
               {
-                style: { fontFamily: 'monospace', fontSize: 12, opacity: 0.7, maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                style: { fontFamily: 'monospace', fontSize: TOKENS.font.md, opacity: 0.7, maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
                 title: config.workspacePath ?? '',
               },
               config.workspacePath || '（未设置）',
@@ -1957,7 +1982,7 @@ try {
                   },
                   h(
                     'span',
-                    { style: { flex: 1, minWidth: 0, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                    { style: { flex: 1, minWidth: 0, fontSize: TOKENS.font.md, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
                     row.title,
                   ),
                   row.label
@@ -1966,7 +1991,7 @@ try {
                         {
                           style: {
                             flexShrink: 0,
-                            fontSize: 11,
+                            fontSize: TOKENS.font.sm,
                             padding: '1px 6px',
                             borderRadius: 4,
                             background: 'rgba(120, 120, 120, 0.2)',
@@ -1982,14 +2007,14 @@ try {
                         'button',
                         {
                           type: 'button',
-                          style: { ...styles.button, flexShrink: 0, width: 56, height: 24, padding: 0, fontSize: 11 },
+                          style: { ...styles.button, flexShrink: 0, width: 56, height: 24, padding: 0, fontSize: TOKENS.font.sm },
                           onClick: () => archiveSession(session),
                         },
                         '归档',
                       ),
                 )
               }),
-              (sessions ?? []).length ? null : h('span', { style: { fontSize: 12, opacity: 0.6 } }, '（无会话）'),
+              (sessions ?? []).length ? null : h('span', { style: { fontSize: TOKENS.font.md, opacity: 0.6 } }, '（无会话）'),
             ),
           ),
         ),
@@ -2001,7 +2026,7 @@ try {
             { title: '任务回执', description: '带 taskId 的 inject 在回合结束时写一条 JSONL；queue/wake 会再通知回执会话' },
             h(
               'span',
-              { style: { fontSize: 12, opacity: 0.8 } },
+              { style: { fontSize: TOKENS.font.md, opacity: 0.8 } },
               (status && status.receiptMode ? status.receiptMode : 'file') +
                 (status && status.lastReceipt
                   ? ' · 最近 ' + status.lastReceipt.taskId + ' ' + status.lastReceipt.status + ' ' + new Date(status.lastReceipt.at).toLocaleTimeString()
@@ -2015,7 +2040,7 @@ try {
             { title: '任务库保留策略', description: '只读：tasksRetentionDays / tasksMaxRows（需改配置文件并重启）' },
             h(
               'span',
-              { title: '需改配置文件并重启', style: { fontSize: 12, opacity: 0.8 } },
+              { title: '需改配置文件并重启', style: { fontSize: TOKENS.font.md, opacity: 0.8 } },
               (config && config.tasksRetentionDays ? config.tasksRetentionDays : '?') +
                 ' 天 / ' +
                 (config && config.tasksMaxRows ? config.tasksMaxRows : '?') +
@@ -2062,7 +2087,7 @@ try {
               h(Btn, { onClick: () => void loadHistory() }, '刷新'),
             ),
           ),
-          historyNote ? h('div', { style: { fontSize: 12, opacity: 0.7, padding: '4px 0 8px' } }, historyNote) : null,
+          historyNote ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.7, padding: '4px 0 8px' } }, historyNote) : null,
           h(
             Row,
             { title: '本地缓存与本机令牌', description: '缓存状态只读；清空/轮换为高风险动作' },
@@ -2090,9 +2115,9 @@ try {
           h(
             Row,
             { title: '右栏信箱', description: '侧边栏「开始」里的卡片状态，便于排查' },
-            h('span', { style: { fontSize: 12, opacity: 0.8 } }, String(rightTabState ?? 'unknown')),
+            h('span', { style: { fontSize: TOKENS.font.md, opacity: 0.8 } }, String(rightTabState ?? 'unknown')),
           ),
-          maintenanceNote ? h('div', { style: { fontSize: 12, opacity: 0.75, padding: '2px 0 8px' } }, maintenanceNote) : null,
+          maintenanceNote ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.75, padding: '2px 0 8px' } }, maintenanceNote) : null,
         ),
         h(
           'div',
@@ -2128,7 +2153,7 @@ try {
               h(
                 MiniSelect,
                 {
-                  style: { ...selectStyle, width: '100%', height: 28, fontSize: 12, padding: '0 24px 0 8px' },
+                  style: { ...selectStyle, width: '100%', height: 28, fontSize: TOKENS.font.md, padding: '0 24px 0 8px' },
                   value: peerFilter,
                   onChange: (event) => setPeerFilter(event.target.value),
                 },
@@ -2139,7 +2164,7 @@ try {
               ),
             ),
             (historyList ?? []).filter((entry) => !peerFilter || (entry.peers ?? []).includes(peerFilter)).length === 0
-              ? h('div', { style: { fontSize: 12, opacity: 0.6, padding: 12 } }, '暂无历史，点「从中枢同步」')
+              ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.6, padding: 12 } }, '暂无历史，点「从中枢同步」')
               : (historyList ?? [])
                   .filter((entry) => !peerFilter || (entry.peers ?? []).includes(peerFilter))
                   .map((entry) =>
@@ -2157,7 +2182,7 @@ try {
                         borderBottom: '1px solid rgba(127,127,127,0.14)',
                         padding: '8px 10px',
                         cursor: 'pointer',
-                        fontSize: 12,
+                        fontSize: TOKENS.font.md,
                         background: activeConv === entry.conversation ? 'rgba(99,102,241,0.14)' : 'transparent',
                       },
                     },
@@ -2175,11 +2200,11 @@ try {
                             {
                               style: {
                                 flex: '0 0 auto',
-                                fontSize: 10,
+                                fontSize: TOKENS.font.xs,
                                 padding: '1px 6px',
                                 borderRadius: 8,
-                                background: 'rgba(99,102,241,0.85)',
-                                color: '#fff',
+                                background: TOKENS.color.primary,
+                                color: TOKENS.color.onPrimary,
                               },
                             },
                             String(entry.unread),
@@ -2190,7 +2215,7 @@ try {
                       'div',
                       {
                         style: {
-                          fontSize: 11,
+                          fontSize: TOKENS.font.sm,
                           opacity: 0.65,
                           marginTop: 2,
                           overflow: 'hidden',
@@ -2232,7 +2257,7 @@ try {
                     },
                     h(
                       'div',
-                      { style: { fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                      { style: { fontSize: TOKENS.font.md, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
                       convLabel(activeConv),
                     ),
                     h(
@@ -2265,12 +2290,12 @@ try {
                           },
                           h(
                             'div',
-                            { style: { display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 11, opacity: 0.7 } },
+                            { style: { display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: TOKENS.font.sm, opacity: 0.7 } },
                             h('span', null, mine ? '发出 → ' + message.recipient : '← 收到 · ' + message.sender),
                             h('span', null, new Date(Number(message.created_at)).toLocaleString()),
                           ),
-                          message.subject ? h('div', { style: { fontSize: 12, fontWeight: 600, marginTop: 3 } }, message.subject) : null,
-                          h('div', { style: { fontSize: 12, whiteSpace: 'pre-wrap', marginTop: 2, lineHeight: 1.55 } }, message.body),
+                          message.subject ? h('div', { style: { fontSize: TOKENS.font.md, fontWeight: 600, marginTop: 3 } }, message.subject) : null,
+                          h('div', { style: { fontSize: TOKENS.font.md, whiteSpace: 'pre-wrap', marginTop: 2, lineHeight: 1.55 } }, message.body),
                           h(
                             'div',
                             { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 4 } },
@@ -2278,7 +2303,7 @@ try {
                               'button',
                               {
                                 type: 'button',
-                                style: { cursor: 'pointer', fontSize: 11, background: 'transparent', border: 'none', opacity: message.pinned ? 1 : 0.65 },
+                                style: { cursor: 'pointer', fontSize: TOKENS.font.sm, background: 'transparent', border: 'none', opacity: message.pinned ? 1 : 0.65 },
                                 onClick: () => void togglePin(message.id, !message.pinned),
                               },
                               message.pinned ? '★ 重要' : '标为重要',
@@ -2289,10 +2314,10 @@ try {
                     }),
                   ),
                 )
-              : h('div', { style: { margin: 'auto', fontSize: 12, opacity: 0.5 } }, '← 选择一个会话'),
+              : h('div', { style: { margin: 'auto', fontSize: TOKENS.font.md, opacity: 0.5 } }, '← 选择一个会话'),
           ),
         ),
-        note ? h('div', { style: { fontSize: 12, opacity: 0.65, paddingTop: 12 } }, note) : null,
+        note ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.65, paddingTop: 12 } }, note) : null,
       )
     }
 
@@ -2494,7 +2519,7 @@ try {
               minWidth: 0,
             },
           },
-          h('div', { style: { fontSize: 15, fontWeight: 600 } }, entryLabel),
+          h('div', { style: { fontSize: TOKENS.font.lg, fontWeight: 600 } }, entryLabel),
           h(
             'div',
             {
@@ -2520,7 +2545,7 @@ try {
                     border: 'none',
                     background: view === key ? 'rgba(99,102,241,0.16)' : 'transparent',
                     color: 'inherit',
-                    fontSize: 12,
+                    fontSize: TOKENS.font.md,
                     padding: '3px 10px',
                     cursor: 'pointer',
                     fontWeight: view === key ? 600 : 400,
@@ -2530,13 +2555,13 @@ try {
               ),
             ),
           ),
-          unread ? h('span', { style: { fontSize: 11, padding: '1px 7px', borderRadius: 9, background: 'rgba(99,102,241,0.85)', color: '#fff' } }, unread + ' 未读') : null,
+          unread ? h('span', { style: { fontSize: TOKENS.font.sm, padding: '1px 7px', borderRadius: 9, background: TOKENS.color.primary, color: TOKENS.color.onPrimary } }, unread + ' 未读') : null,
           h('div', { style: { flex: 1 } }),
           h('button', { type: 'button', style: buttonStyle, onClick: currentSession }, '当前会话'),
           h('button', { type: 'button', style: buttonStyle, onClick: sync }, '从中枢同步'),
           h('button', { type: 'button', style: buttonStyle, onClick: () => void loadList() }, '刷新'),
         ),
-        note ? h('div', { style: { fontSize: 12, opacity: 0.7, paddingBottom: 8 } }, note) : null,
+        note ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.7, paddingBottom: 8 } }, note) : null,
         view === 'tasks'
           ? h(
               'div',
@@ -2563,12 +2588,12 @@ try {
               { style: { display: 'flex', gap: 6, padding: 8, borderBottom: '1px solid rgba(127,127,127,0.18)' } },
               h(
                 MiniSelect,
-                { style: { ...selectStyle, flex: '1 1 auto', height: 28, fontSize: 12, padding: '0 24px 0 8px' }, value: peer, onChange: (e) => setPeer(e.target.value) },
+                { style: { ...selectStyle, flex: '1 1 auto', height: 28, fontSize: TOKENS.font.md, padding: '0 24px 0 8px' }, value: peer, onChange: (e) => setPeer(e.target.value) },
                 h('option', { value: '' }, '全部目标'),
                 [...new Set((list ?? []).flatMap((entry) => entry.peers ?? []))].map((name) => h('option', { key: name, value: name }, name)),
               ),
               h('input', {
-                style: { ...controlStyle, width: 96, fontSize: 12, padding: '2px 6px' },
+                style: { ...controlStyle, width: 96, fontSize: TOKENS.font.md, padding: '2px 6px' },
                 placeholder: 'conv/…',
                 value: query,
                 onChange: (e) => setQuery(e.target.value),
@@ -2578,7 +2603,7 @@ try {
               'div',
               { style: { flex: 1, minHeight: 0, overflowY: 'auto' } },
               filtered.length === 0
-                ? h('div', { style: { fontSize: 12, opacity: 0.6, padding: 12 } }, '没有匹配的会话')
+                ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.6, padding: 12 } }, '没有匹配的会话')
                 : filtered.map((entry) =>
                     h(
                       'button',
@@ -2594,7 +2619,7 @@ try {
                           borderBottom: '1px solid rgba(127,127,127,0.14)',
                           padding: '8px 10px',
                           cursor: 'pointer',
-                          fontSize: 12,
+                          fontSize: TOKENS.font.md,
                           background: active === entry.conversation ? 'rgba(99,102,241,0.14)' : 'transparent',
                         },
                       },
@@ -2603,10 +2628,10 @@ try {
                         { style: { display: 'flex', justifyContent: 'space-between', gap: 6, alignItems: 'baseline' } },
                         h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 } }, convTitle(entry)),
                         entry.unread
-                          ? h('span', { style: { fontSize: 10, padding: '1px 6px', borderRadius: 8, background: 'rgba(99,102,241,0.85)', color: '#fff' } }, String(entry.unread))
+                          ? h('span', { style: { fontSize: TOKENS.font.xs, padding: '1px 6px', borderRadius: 8, background: TOKENS.color.primary, color: TOKENS.color.onPrimary } }, String(entry.unread))
                           : null,
                       ),
-                      h('div', { style: { fontSize: 11, opacity: 0.65, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, convSubtitle(entry) + ' · ' + (entry.peers ?? []).join(', ')),
+                      h('div', { style: { fontSize: TOKENS.font.sm, opacity: 0.65, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, convSubtitle(entry) + ' · ' + (entry.peers ?? []).join(', ')),
                     ),
                   ),
             ),
@@ -2617,7 +2642,7 @@ try {
             { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 } },
             active
               ? [
-                  h('div', { key: 'head', style: { padding: '8px 12px', borderBottom: '1px solid rgba(127,127,127,0.2)', fontSize: 12, fontWeight: 600 } }, active === 'default' ? '（未分组）' : active),
+                  h('div', { key: 'head', style: { padding: '8px 12px', borderBottom: '1px solid rgba(127,127,127,0.2)', fontSize: TOKENS.font.md, fontWeight: 600 } }, active === 'default' ? '（未分组）' : active),
                   h(
                     'div',
                     { key: 'bodywrap', style: { position: 'relative', flex: 1, minHeight: 0 } },
@@ -2649,12 +2674,12 @@ try {
                           },
                           h(
                             'div',
-                            { style: { display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 11, opacity: 0.7 } },
+                            { style: { display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: TOKENS.font.sm, opacity: 0.7 } },
                             h('span', null, (mine ? '发出 → ' : '← 收到 · ') + (mine ? message.recipient : message.sender)),
                             h('span', null, new Date(Number(message.created_at)).toLocaleString()),
                           ),
-                          message.subject ? h('div', { style: { fontSize: 12, fontWeight: 600, marginTop: 3 } }, message.subject) : null,
-                          h('div', { style: { fontSize: 12, whiteSpace: 'pre-wrap', marginTop: 2, lineHeight: 1.55 } }, message.body),
+                          message.subject ? h('div', { style: { fontSize: TOKENS.font.md, fontWeight: 600, marginTop: 3 } }, message.subject) : null,
+                          h('div', { style: { fontSize: TOKENS.font.md, whiteSpace: 'pre-wrap', marginTop: 2, lineHeight: 1.55 } }, message.body),
                         ),
                       )
                     }),
@@ -2701,13 +2726,13 @@ try {
                               height: 32,
                               borderRadius: 999,
                               border: '0.5px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.25))',
-                              background: 'var(--dsw-alias-bg-layer-2, #fff)',
+                              background: TOKENS.color.surface,
                               color: 'var(--dsw-alias-label-secondary)',
                               cursor: 'pointer',
                               boxShadow: '0 6px 18px rgba(0,0,0,0.16)',
                               display: 'grid',
                               placeItems: 'center',
-                              fontSize: 15,
+                              fontSize: TOKENS.font.lg,
                               zIndex: 5,
                             },
                           },
@@ -2715,7 +2740,7 @@ try {
                         ),
                   ),
                 ]
-              : h('div', { key: 'empty', style: { margin: 'auto', fontSize: 12, opacity: 0.5 } }, '← 选择一个会话'),
+              : h('div', { key: 'empty', style: { margin: 'auto', fontSize: TOKENS.font.md, opacity: 0.5 } }, '← 选择一个会话'),
           ),
         ),
       )
@@ -2926,7 +2951,7 @@ try {
 
       return h(
         'div',
-        { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, fontSize: 12 } },
+        { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, fontSize: TOKENS.font.md } },
         h(TaskTabSummary),
         h(
           'div',
@@ -2940,7 +2965,7 @@ try {
             },
           },
           h('span', { style: { fontWeight: 600, flex: '0 0 auto' } }, 'Mesh 信箱'),
-          unread ? h('span', { style: { fontSize: 10, padding: '1px 6px', borderRadius: 8, background: 'rgba(99,102,241,0.85)', color: '#fff' } }, unread + ' 未读') : null,
+          unread ? h('span', { style: { fontSize: TOKENS.font.xs, padding: '1px 6px', borderRadius: 8, background: TOKENS.color.primary, color: TOKENS.color.onPrimary } }, unread + ' 未读') : null,
           h('div', { style: { flex: 1 } }),
           active && isBound
             ? h(
@@ -2950,11 +2975,11 @@ try {
                   'span',
                   {
                     style: {
-                      fontSize: 10,
+                      fontSize: TOKENS.font.xs,
                       padding: '1px 6px',
                       borderRadius: 8,
                       background: 'rgba(16,185,129,0.16)',
-                      color: 'var(--dsw-alias-state-success-primary, #2f9e6e)',
+                      color: TOKENS.color.success,
                     },
                   },
                   '已绑定',
@@ -2981,7 +3006,7 @@ try {
                       overflowY: 'auto',
                       zIndex: 1500,
                       padding: 4,
-                      background: 'var(--dsw-alias-bg-layer-2, #fff)',
+                      background: TOKENS.color.surface,
                       border: '0.5px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.2))',
                       borderRadius: 'var(--dsw-radius-lg, 10px)',
                       boxShadow: '0 10px 30px rgba(0,0,0,0.16)',
@@ -3005,7 +3030,7 @@ try {
                             },
                           },
                           h('div', { style: { fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, convTitle(entry)),
-                          h('div', { style: { fontSize: 10, color: 'var(--dsw-alias-label-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, convSubtitle(entry)),
+                          h('div', { style: { fontSize: TOKENS.font.xs, color: 'var(--dsw-alias-label-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, convSubtitle(entry)),
                         ),
                       ),
                 )
@@ -3041,7 +3066,7 @@ try {
                       borderRadius: 999,
                       border: 'none',
                       cursor: 'pointer',
-                      fontSize: 11,
+                      fontSize: TOKENS.font.sm,
                       background:
                         entry.conversation === active
                           ? 'var(--dsw-alias-interactive-bg-active, rgba(127,127,127,0.18))'
@@ -3089,7 +3114,7 @@ try {
                     },
                     h(
                       'div',
-                      { style: { fontSize: 10, opacity: 0.65, display: 'flex', justifyContent: 'space-between', gap: 8 } },
+                      { style: { fontSize: TOKENS.font.xs, opacity: 0.65, display: 'flex', justifyContent: 'space-between', gap: 8 } },
                       h('span', null, (mine ? '发出 → ' : '← 收到 · ') + (mine ? message.recipient : message.sender)),
                       h('span', null, new Date(Number(message.created_at)).toLocaleTimeString()),
                     ),
@@ -3139,13 +3164,13 @@ try {
                     height: 30,
                     borderRadius: 999,
                     border: '0.5px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.25))',
-                    background: 'var(--dsw-alias-bg-layer-2, #fff)',
+                    background: TOKENS.color.surface,
                     color: 'var(--dsw-alias-label-secondary)',
                     cursor: 'pointer',
                     boxShadow: '0 6px 18px rgba(0,0,0,0.16)',
                     display: 'grid',
                     placeItems: 'center',
-                    fontSize: 14,
+                    fontSize: TOKENS.font.lg,
                     zIndex: 5,
                   },
                 },
