@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -76,8 +77,40 @@ def token(args) -> str:
     sys.exit("no token: set MESH_TOKEN, MESH_TOKEN_FILE or pass --token-file")
 
 
-def opener() -> urllib.request.OpenerDirector:
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def normalize_sha(value: str) -> str:
+    """Same normalisation as the waker's caSha256: hex only, lowercase."""
+    return re.sub(r"[^0-9a-fA-F]", "", value or "").lower()
+
+
+def ca_context(args):
+    """SSL context trusting --ca / $MESH_CA_FILE, or None for the system trust store.
+
+    A self-signed hub is reached through an frp TCP tunnel, so the CA must be
+    delivered out of band: /api/bootstrap is itself behind TLS, and NODE_EXTRA_CA_CERTS
+    only affects Node, not Python.
+    """
+    ca_file = getattr(args, "ca", None) or os.environ.get("MESH_CA_FILE", "")
+    expected = getattr(args, "ca_sha256", None) or os.environ.get("MESH_CA_SHA256", "")
+    if not ca_file:
+        if expected:
+            sys.exit("--ca-sha256 needs --ca (or MESH_CA_FILE): cannot check a fingerprint without the file")
+        return None
+    path = Path(ca_file)
+    if not path.is_file():
+        sys.exit(f"CA file not found: {path}")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if expected:
+        wanted = normalize_sha(expected)
+        if wanted != actual:
+            sys.exit(f"CA fingerprint mismatch: expected {wanted[:16]}… actual {actual[:16]}…")
+    return ssl.create_default_context(cafile=str(path))
+
+
+def opener(args=None) -> urllib.request.OpenerDirector:
+    context = ca_context(args) if args is not None else None
+    if context is None:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
 
 
 def api(args, path: str, payload=None, method: str = None, ctype: str = "application/json", timeout: int = 60):
@@ -91,12 +124,21 @@ def api(args, path: str, payload=None, method: str = None, ctype: str = "applica
         method=method or ("POST" if data is not None else "GET"),
     )
     try:
-        with opener().open(request, timeout=timeout) as response:
+        with opener(args).open(request, timeout=timeout) as response:
             body = response.read()
             return json.loads(body.decode()) if body else {}
     except urllib.error.HTTPError as error:
         detail = error.read().decode(errors="replace")[:300]
         raise SystemExit(f"hub HTTP {error.code}: {detail}")
+    except urllib.error.URLError as error:
+        reason = error.reason
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            raise SystemExit(
+                "TLS verification failed: the hub certificate is not trusted. "
+                "For a self-signed hub pass --ca <ca.crt> (or MESH_CA_FILE); "
+                "the CA cannot be downloaded from /api/bootstrap because that endpoint is also behind TLS."
+            )
+        raise SystemExit(f"cannot reach hub: {reason}")
 
 
 # --------------------------------------------------------------------------- helpers
@@ -398,6 +440,20 @@ def cmd_msg(args) -> int:
 def add_hub_args(parser) -> None:
     parser.add_argument("--hub", default="", help="hub base URL (default: $MESH_HUB)")
     parser.add_argument("--token-file", default="", help="token file (default: $MESH_TOKEN_FILE)")
+    parser.add_argument(
+        "--ca",
+        default="",
+        help="PEM file of the CA to trust (default: $MESH_CA_FILE). Use the hub's ca.crt for a "
+        "self-signed hub; it is the same file the waker configures as caFile. The CA cannot be "
+        "fetched from /api/bootstrap because that endpoint is itself behind TLS, so it must be "
+        "delivered out of band.",
+    )
+    parser.add_argument(
+        "--ca-sha256",
+        default="",
+        help="expected SHA-256 of the CA file, hex (default: $MESH_CA_SHA256); a mismatch exits 1. "
+        "Same value as the waker's caSha256.",
+    )
 
 
 def main(argv=None) -> int:
