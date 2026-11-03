@@ -1253,6 +1253,107 @@ try {
       return narrow
     }
 
+    /** Shared task fetch (T-335): the full task page and the narrow sidebar tab use one call. */
+    async function fetchTaskRows({ limit = 100, status = '', session = '' } = {}) {
+      const params = new URLSearchParams({ limit: String(limit) })
+      if (status) params.set('status', status)
+      if (session) params.set('session', session.trim())
+      return (await json(BASE + '/mesh/tasks?' + params.toString())) ?? { tasks: [] }
+    }
+
+    /**
+     * Right-sidebar task tab (T-335): the same rows the task page shows, rendered for a narrow
+     * column. Data and formatting are shared (fetchTaskRows / formatTaskStatus); only the
+     * layout differs — no fixed width, no horizontal scroll.
+     */
+    function MeshTasksPanel() {
+      const [tasks, setTasks] = React.useState(null)
+      const [note, setNote] = React.useState(null)
+      const [showSettled, setShowSettled] = React.useState(false)
+
+      const load = React.useCallback(async () => {
+        try {
+          const value = await fetchTaskRows({ limit: 100 })
+          setTasks(Array.isArray(value.tasks) ? value.tasks : [])
+          setNote(null)
+        } catch (error) {
+          setNote('读取任务失败：' + error.message)
+        }
+      }, [])
+
+      React.useEffect(() => {
+        void load()
+      }, [load])
+
+      const rows = tasks ?? []
+      const active = rows.filter((row) => row.status === 'pending' || row.status === 'started')
+      const settled = rows.filter((row) => row.status !== 'pending' && row.status !== 'started')
+      const visible = showSettled ? rows : active
+      const summaryOf = (row) => row.receiptSummary || row.subject || row.targetTitle || row.taskId
+
+      return h(
+        'div',
+        { style: { display: 'flex', flexDirection: 'column', minWidth: 0, width: '100%', height: '100%', overflow: 'hidden', fontSize: TOKENS.font.sm } },
+        h(
+          'div',
+          {
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              minWidth: 0,
+              padding: '8px 10px',
+              borderBottom: '1px solid ' + TOKENS.color.cardBorder,
+            },
+          },
+          h('span', { style: { fontWeight: 600, color: TOKENS.color.labelPrimary, flexShrink: 0 } }, '派活任务'),
+          h('span', { style: { color: TOKENS.color.labelSecondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, '待办/进行中 ' + active.length),
+          h('span', { style: { marginLeft: 'auto', flexShrink: 0 } }, ui.button({ variant: 'ghost', size: 'sm', onClick: () => void load() }, '刷新')),
+        ),
+        note ? h('div', { style: { padding: '6px 10px', color: TOKENS.color.danger } }, note) : null,
+        h(
+          'div',
+          { style: { flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden' } },
+          visible.length === 0
+            ? h('div', { style: { padding: 12, color: TOKENS.color.labelSecondary } }, '暂无派活任务')
+            : visible.map((row) =>
+                h(
+                  'div',
+                  {
+                    key: row.taskId,
+                    style: { display: 'grid', gap: 2, minWidth: 0, padding: '6px 10px', borderBottom: '1px solid ' + TOKENS.color.cardBorder },
+                  },
+                  h(
+                    'div',
+                    { style: { display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0 } },
+                    h(
+                      'span',
+                      {
+                        title: row.taskId,
+                        style: { fontFamily: 'monospace', fontSize: TOKENS.font.xs, color: TOKENS.color.labelSecondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 },
+                      },
+                      row.taskId,
+                    ),
+                    h('span', { style: { flexShrink: 0, fontSize: TOKENS.font.xs, color: TOKENS.color.labelSecondary } }, formatTaskStatus(row.status)),
+                  ),
+                  h(
+                    'div',
+                    { title: summaryOf(row), style: { color: TOKENS.color.labelPrimary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 } },
+                    summaryOf(row),
+                  ),
+                ),
+              ),
+        ),
+        settled.length
+          ? h(
+              'div',
+              { style: { padding: '4px 10px', borderTop: '1px solid ' + TOKENS.color.cardBorder } },
+              ui.button({ variant: 'ghost', size: 'sm', onClick: () => setShowSettled((value) => !value) }, (showSettled ? '▾ ' : '▸ ') + '已完成 ' + settled.length),
+            )
+          : null,
+      )
+    }
+
     /** Task registry panel: left = batch-grouped list, right = detail (inbox-style split). */
     function TaskRegistryPanel() {
       const [tasks, setTasks] = React.useState(null)
@@ -1265,11 +1366,8 @@ try {
       const narrow = useIsNarrow()
 
       const load = React.useCallback(async (next = { status: '', session: '' }) => {
-        const params = new URLSearchParams({ limit: '100' })
-        if (next.status) params.set('status', next.status)
-        if (next.session) params.set('session', next.session.trim())
         try {
-          setTasks(await json(BASE + '/mesh/tasks?' + params.toString()))
+          setTasks(await fetchTaskRows({ limit: 100, status: next.status, session: next.session }))
         } catch (error) {
           setNote('读取任务库失败：' + error.message)
         }
@@ -3343,6 +3441,52 @@ try {
             )
           } catch (error) {
             rightTabState += ' | body: ' + (error && error.message ? error.message : String(error))
+          }
+          // Second right-side tab (T-335): 「派活任务」 embeds the task list instead of jumping.
+          // Registered under the same right-side switch, so T-334 hides it together.
+          try {
+            const unregisterTasks = rightTabs.register({
+              id: 'mesh-tasks',
+              kind: 'mesh-tasks',
+              multiple: false,
+              keepMounted: true,
+              priority: 'extension',
+              title: () => '派活任务',
+              guide: [
+                {
+                  id: 'open',
+                  order: 31,
+                  title: () => '派活任务',
+                  description: () => '不跳转：直接在这里看待办与进行中的任务',
+                  icon: MeshInboxGlyph,
+                },
+              ],
+            })
+            if (typeof unregisterTasks === 'function') sidebarSwitches.rightDisposers.push(unregisterTasks)
+          } catch (error) {
+            const message = String(error && error.message ? error.message : error)
+            if (typeof console !== 'undefined') console.warn('[mesh-waker] right tasks tab type:', message)
+          }
+          try {
+            sidebarSwitches.rightDisposers.push(
+              ctx.slots.inject('sidebar.right.pane.tab', () =>
+                ctx.slots.register(
+                  {
+                    name: 'sidebar.right.pane.tab',
+                    key: 'mesh-tasks',
+                    inject: (sessionId) => ({ sessionId }),
+                  },
+                  MeshTasksPanel,
+                ),
+              ),
+            )
+            sidebarSwitches.rightDisposers.push(
+              ctx.slots.inject('sidebar.panellist', () =>
+                ctx.slots.register({ name: 'sidebar.panellist', id: 'mesh-tasks', order: 41, label: '派活任务' }, MeshTasksPanel),
+              ),
+            )
+          } catch (error) {
+            rightTabState += ' | tasks body: ' + (error && error.message ? error.message : String(error))
           }
           sidebarSwitches.rightRegistered = true
         }

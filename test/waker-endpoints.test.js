@@ -2879,6 +2879,19 @@ async function main() {
     report('client: the task-panel entry navigates through layout.selectPanel', ok, `selectPanel=${/selectPanel\('mesh-inbox'\)/.test(source)} layoutInject=${inject.includes('@deepseek-ai/dsh-client-ui-layout')} entryPoints=${entryPoints}`)
   })
 
+  await runCase('client: a second right-side tab embeds the task list', async () => {
+    const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
+    const ok =
+      /id: 'mesh-tasks'/.test(source) &&
+      /order: 41/.test(source) &&
+      /label: '派活任务'/.test(source) &&
+      /function MeshTasksPanel\(\)/.test(source) &&
+      /async function fetchTaskRows\(/.test(source) &&
+      // the sidebar tab must not jump: its panel never calls selectPanel
+      !/function MeshTasksPanel[\s\S]{0,4000}?selectPanel\(/.test(source)
+    report('client: a second right-side tab embeds the task list', ok, `tab=${/id: 'mesh-tasks'/.test(source)} sharedFetch=${/async function fetchTaskRows\(/.test(source)}`)
+  })
+
   // 124-125. Host schema subset guard (T-236): type arrays silently block registration.
   await runCase('tools: both output schemas pass the host JSON Schema subset', async () => {
     const { DISPATCH_OUTPUT, ASK_OUTPUT, THREAD_OUTPUT, COMPLETE_OUTPUT, validateToolSchema } = await import(pathToFileURL(ENTRY).href)
