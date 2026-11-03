@@ -4786,22 +4786,52 @@ export function apply(ctx, config) {
   const selfFile = process.env.MESH_WAKER_SELF_FILE || fileURLToPath(import.meta.url)
   const selfDir = dirname(selfFile)
   const bootedAt = new Date().toISOString()
-  const bootedCodeHash = sha256OfFile(selfFile)
-  let diskCodeCache = { at: 0, computed: false, hash: null }
-  function diskCodeHash(refresh = false) {
-    const now = Date.now()
-    if (!refresh && diskCodeCache.computed && now - diskCodeCache.at < 5000) return diskCodeCache.hash
-    const hash = sha256OfFile(selfFile)
-    diskCodeCache = { at: now, computed: true, hash }
-    return hash
-  }
-  if (!bootedCodeHash) {
-    fileLog('WARN cannot read own index.js; code staleness will be unknown')
-  } else {
-    const current = sha256OfFile(selfFile)
-    if (current && current !== bootedCodeHash) {
-      fileLog('code on disk is newer than the running process; restart to apply')
+
+  // T-339: hashing index.js alone reported "fresh" while the browser still ran the old
+  // client.js (the host reads that file from disk per request). The fingerprint now covers
+  // every code file the plugin actually loads, in a stable order: the entry, the client
+  // bundle and lib/**/*.mjs. Tests, node_modules and source maps stay out.
+  function codeFiles() {
+    const files = [
+      { rel: 'index.js', file: selfFile },
+      { rel: 'client.js', file: join(selfDir, 'client.js') },
+    ]
+    let libEntries = []
+    try {
+      libEntries = readdirSync(join(selfDir, 'lib'))
+        .filter((name) => name.endsWith('.mjs'))
+        .sort()
+    } catch {
+      /* a missing lib directory surfaces as an unreadable file below */
     }
+    for (const name of libEntries) files.push({ rel: 'lib/' + name, file: join(selfDir, 'lib', name) })
+    return files
+  }
+
+  /** Per-file hashes plus their aggregate; a missing file is recorded, never skipped. */
+  function codeSnapshot() {
+    const files = codeFiles().map(({ rel, file }) => ({ rel, hash: sha256OfFile(file) }))
+    const aggregate = createHash('sha256')
+      .update(files.map((entry) => entry.rel + ':' + (entry.hash ?? 'missing')).join('\n'))
+      .digest('hex')
+    return { aggregate, files }
+  }
+
+  const bootedCode = codeSnapshot()
+  if (bootedCode.files.some((entry) => entry.hash === null)) {
+    fileLog('WARN cannot read every plugin code file; code staleness may be incomplete')
+  } else {
+    const changed = bootedCode.files.filter((entry) => entry.hash !== sha256OfFile(join(selfDir, entry.rel))).map((entry) => entry.rel)
+    if (changed.length) fileLog('code on disk is newer than the running process (' + changed.join(', ') + '); restart to apply')
+  }
+
+  let diskCodeCache = { at: 0, snapshot: null }
+  function diskCodeSnapshot(refresh = false) {
+    const now = Date.now()
+    if (!refresh && diskCodeCache.snapshot && now - diskCodeCache.at < 5000) return diskCodeCache.snapshot
+    const snapshot = codeSnapshot()
+    diskCodeCache = { at: now, snapshot }
+    return snapshot
   }
 
   // package resolves, otherwise the same JSON Schema definition. Question traffic is
@@ -5431,10 +5461,21 @@ export function apply(ctx, config) {
           } catch {
             refresh = false
           }
-          const diskHash = diskCodeHash(refresh)
+          const diskCode = diskCodeSnapshot(refresh)
           const versionStale = diskVersion !== null && diskVersion !== PLUGIN_INFO.version
-          // null means "cannot tell" (file unreadable); never pretend the code is fresh.
-          const codeStale = bootedCodeHash !== null && diskHash !== null ? diskHash !== bootedCodeHash : null
+          // Per-file diff so the status can say WHICH file changed, not just "something did".
+          const codeDiff = []
+          for (const before of bootedCode.files) {
+            const after = diskCode.files.find((entry) => entry.rel === before.rel)
+            if (!after || after.hash !== before.hash) codeDiff.push(before.rel)
+          }
+          for (const after of diskCode.files) {
+            if (!bootedCode.files.some((entry) => entry.rel === after.rel)) codeDiff.push(after.rel)
+          }
+          // null means "cannot tell" (every file unreadable); never pretend the code is fresh.
+          const unreadable = diskCode.files.every((entry) => entry.hash === null)
+          const bootedUnreadable = bootedCode.files.every((entry) => entry.hash === null)
+          const codeStale = unreadable ? null : diskCode.aggregate !== bootedCode.aggregate
           res.end(
             JSON.stringify({
               ok: true,
@@ -5449,8 +5490,13 @@ export function apply(ctx, config) {
                 // say why a restart is needed: version and/or code changed on disk.
                 versionStale,
                 codeStale,
-                codeHash: bootedCodeHash ? bootedCodeHash.slice(0, 12) : null,
-                diskCodeHash: diskHash ? diskHash.slice(0, 12) : null,
+                // null means "cannot tell": every file unreadable (T-339 keeps the T-284 shape).
+                codeHash: bootedUnreadable ? null : bootedCode.aggregate.slice(0, 12),
+                diskCodeHash: unreadable ? null : diskCode.aggregate.slice(0, 12),
+                // T-339: which files differ from the boot-time snapshot, and how many files
+                // the fingerprint covers (text banner and JSON read the same values).
+                codeDiff,
+                codeFileCount: bootedCode.files.length,
                 bootedAt,
               },
               // Pull/standalone surface (contract sections 3 and 4): the panel shows the

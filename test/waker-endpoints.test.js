@@ -4814,7 +4814,76 @@ async function main() {
     })
   })
 
-  // 198-204. Workspace registry quality (T-286): meaningful slugs, newest coordinator,
+  // 197b. Fingerprint coverage (T-339): the browser bundle and lib/**/*.mjs are loaded code
+  // too; hashing index.js alone reported "fresh" while the page still ran the old UI.
+  const withFakePluginTree = async (fn) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-tree-'))
+    const realPlugin = path.join(__dirname, '..', 'plugins', 'mesh-waker')
+    fs.copyFileSync(path.join(realPlugin, 'index.js'), path.join(dir, 'index.js'))
+    fs.writeFileSync(path.join(dir, 'client.js'), '// client bundle\n')
+    fs.mkdirSync(path.join(dir, 'lib'))
+    fs.writeFileSync(path.join(dir, 'lib', 'a.mjs'), 'export const a = 1\n')
+    fs.writeFileSync(path.join(dir, 'lib', 'b.mjs'), 'export const b = 2\n')
+    const realVersion = JSON.parse(fs.readFileSync(path.join(realPlugin, 'package.json'), 'utf8')).version
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'dsh-mesh-waker', version: realVersion }))
+    const previous = process.env.MESH_WAKER_SELF_FILE
+    process.env.MESH_WAKER_SELF_FILE = path.join(dir, 'index.js')
+    try {
+      return await fn(dir)
+    } finally {
+      if (previous === undefined) delete process.env.MESH_WAKER_SELF_FILE
+      else process.env.MESH_WAKER_SELF_FILE = previous
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  await runCase('stale: editing client.js is detected and named', async (boot) => {
+    await withFakePluginTree(async (dir) => {
+      const h = await boot({})
+      const before = (await request(h.base, '/mesh/status?refresh=1')).json?.pluginVersions ?? {}
+      fs.appendFileSync(path.join(dir, 'client.js'), '\n// ui edit\n')
+      const after = (await request(h.base, '/mesh/status?refresh=1')).json?.pluginVersions ?? {}
+      const ok =
+        before.codeStale === false &&
+        before.codeDiff.length === 0 &&
+        after.codeStale === true &&
+        after.codeDiff.includes('client.js') &&
+        after.codeFileCount >= 4
+      report('stale: editing client.js is detected and named', ok, `before=${before.codeStale} after=${after.codeStale} diff=${(after.codeDiff ?? []).join('|')} count=${after.codeFileCount}`)
+    })
+  })
+
+  await runCase('stale: editing a lib module is detected and named', async (boot) => {
+    await withFakePluginTree(async (dir) => {
+      const h = await boot({})
+      fs.appendFileSync(path.join(dir, 'lib', 'a.mjs'), '\n// lib edit\n')
+      const after = (await request(h.base, '/mesh/status?refresh=1')).json?.pluginVersions ?? {}
+      const ok = after.codeStale === true && after.codeDiff.includes('lib/a.mjs') && !after.codeDiff.includes('lib/b.mjs')
+      report('stale: editing a lib module is detected and named', ok, `stale=${after.codeStale} diff=${(after.codeDiff ?? []).join('|')}`)
+    })
+  })
+
+  await runCase('stale: untouched files stay quiet with the expanded fingerprint', async (boot) => {
+    await withFakePluginTree(async () => {
+      const h = await boot({})
+      const versions = (await request(h.base, '/mesh/status?refresh=1')).json?.pluginVersions ?? {}
+      const ok = versions.codeStale === false && versions.stale === false && Array.isArray(versions.codeDiff) && versions.codeDiff.length === 0 && versions.codeHash === versions.diskCodeHash
+      report('stale: untouched files stay quiet with the expanded fingerprint', ok, `codeStale=${versions.codeStale} diff=${(versions.codeDiff ?? []).length} count=${versions.codeFileCount}`)
+    })
+  })
+
+  await runCase('stale: restoring the original content clears codeStale (content, not mtime)', async (boot) => {
+    await withFakePluginTree(async (dir) => {
+      const h = await boot({})
+      const original = fs.readFileSync(path.join(dir, 'client.js'), 'utf8')
+      fs.writeFileSync(path.join(dir, 'client.js'), original + '\n// ui edit\n')
+      const dirty = (await request(h.base, '/mesh/status?refresh=1')).json?.pluginVersions ?? {}
+      fs.writeFileSync(path.join(dir, 'client.js'), original)
+      const restored = (await request(h.base, '/mesh/status?refresh=1')).json?.pluginVersions ?? {}
+      const ok = dirty.codeStale === true && dirty.codeDiff.includes('client.js') && restored.codeStale === false && restored.codeDiff.length === 0
+      report('stale: restoring the original content clears codeStale (content, not mtime)', ok, `dirty=${dirty.codeStale} restored=${restored.codeStale}`)
+    })
+  })
   // ephemeral cleanup, and idempotent convergence of registries written before this change.
   const registryOf = (h) => JSON.parse(fs.readFileSync(path.join(h.home, '.dsh', 'mesh-waker', 'workspaces.json'), 'utf8'))
   const wsDirOf = (h, slug) => path.join(h.home, '.dsh', 'mesh-waker', 'ws', slug)

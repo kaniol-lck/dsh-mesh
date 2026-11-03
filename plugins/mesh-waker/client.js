@@ -77,7 +77,9 @@ function staleVersionNotice(status) {
   // A version bump is the loud case; a same-version code change is the quiet one that used
   // to stay invisible (T-284). Say which one so the user knows why a restart is needed.
   if (versions.codeStale === true && versions.versionStale !== true) {
-    return `检测到磁盘代码已更新（版本仍为 ${process}）—— 重启 DSH 后生效`
+    // T-339: name the changed files so "restart to apply" is actionable.
+    const changed = Array.isArray(versions.codeDiff) && versions.codeDiff.length ? '（' + versions.codeDiff.slice(0, 3).join('、') + (versions.codeDiff.length > 3 ? ' 等' : '') + '）' : ''
+    return `检测到磁盘代码已更新${changed}（版本仍为 ${process}）—— 重启 DSH 后生效`
   }
   return `检测到磁盘版本 ${disk}，进程版本 ${process} —— 重启 DSH 后生效`
 }
