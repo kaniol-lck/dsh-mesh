@@ -2883,13 +2883,104 @@ async function main() {
     const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
     const ok =
       /id: 'mesh-tasks'/.test(source) &&
-      /order: 41/.test(source) &&
-      /label: '派活任务'/.test(source) &&
+      /kind: 'mesh-tasks'/.test(source) &&
+      /title: \(\) => '派活任务'/.test(source) &&
       /function MeshTasksPanel\(\)/.test(source) &&
       /async function fetchTaskRows\(/.test(source) &&
       // the sidebar tab must not jump: its panel never calls selectPanel
       !/function MeshTasksPanel[\s\S]{0,4000}?selectPanel\(/.test(source)
     report('client: a second right-side tab embeds the task list', ok, `tab=${/id: 'mesh-tasks'/.test(source)} sharedFetch=${/async function fetchTaskRows\(/.test(source)}`)
+  })
+
+  // T-337: the left/right switches used to be crossed — registerRight() also pushed a
+  // `sidebar.panellist` (left) registration into rightDisposers, so toggling the right switch
+  // changed the LEFT sidebar. This drives real apply() in a VM and counts per-slot registrations.
+  await runCase('client: the right switch never touches left-sidebar registrations', async () => {
+    const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
+    const runApply = async (statusConfig) => {
+      let definition = null
+      const registrations = []
+      const noop = () => {}
+      const fakeReact = {
+        createElement: () => null,
+        useState: (value) => [typeof value === 'function' ? value() : value, noop],
+        useEffect: noop,
+        useCallback: (fn) => fn,
+        useRef: () => ({ current: null }),
+        useMemo: (fn) => fn(),
+      }
+      const slots = {
+        register(def) {
+          const entry = { slot: def.name, id: def.id ?? def.key ?? '', disposed: false }
+          registrations.push(entry)
+          return () => {
+            entry.disposed = true
+          }
+        },
+        inject(name, cb) {
+          const disposeInner = cb()
+          return () => {
+            if (typeof disposeInner === 'function') disposeInner()
+          }
+        },
+      }
+      const sandbox = {
+        console: { info: noop, warn: noop, log: noop },
+        setTimeout,
+        clearTimeout,
+        setInterval: () => 0,
+        clearInterval: noop,
+        fetch: async () => ({ ok: true, json: async () => ({ ok: true, config: statusConfig }) }),
+        navigator: { clipboard: { writeText: async () => {} } },
+        window: {
+          __ModuleLoader__: {
+            load: (value) => {
+              definition = value
+            },
+          },
+          __DSH_BOOT__: { entries: [{ id: 'dsh-mesh-waker', url: 'http://host/client.js' }] },
+          document: { currentScript: { src: 'http://host/client.js' } },
+          addEventListener: noop,
+          removeEventListener: noop,
+          requestAnimationFrame: () => 0,
+          cancelAnimationFrame: noop,
+        },
+        document: { currentScript: null, addEventListener: noop, removeEventListener: noop },
+      }
+      sandbox.globalThis = sandbox
+      vm.runInNewContext(source, sandbox, { filename: 'client.js' })
+      const module = definition.factory((name) => {
+        if (name === 'react') return fakeReact
+        throw new Error('unknown module ' + name)
+      })
+      const ctx = {
+        slots,
+        inject: (deps, cb) => {
+          cb({ get: (name) => (name === 'sidebarRightTabs' ? { register: () => noop } : undefined) })
+          return noop
+        },
+        effect: () => noop,
+      }
+      module.apply(ctx)
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      return (slot) => registrations.filter((entry) => entry.slot === slot && !entry.disposed).length
+    }
+
+    const both = await runApply({ sidebarLeft: true, sidebarRight: true })
+    const rightOff = await runApply({ sidebarLeft: true, sidebarRight: false })
+    const leftOff = await runApply({ sidebarLeft: false, sidebarRight: true })
+    const ok =
+      both('sidebar.panellist') === 1 &&
+      both('sidebar.right.pane.tab') === 2 &&
+      rightOff('sidebar.panellist') === 1 &&
+      rightOff('sidebar.right.pane.tab') === 0 &&
+      leftOff('sidebar.panellist') === 0 &&
+      leftOff('sidebar.right.pane.tab') === 2
+    report(
+      'client: the right switch never touches left-sidebar registrations',
+      ok,
+      `both=${both('sidebar.panellist')}/${both('sidebar.right.pane.tab')} rightOff=${rightOff('sidebar.panellist')}/${rightOff('sidebar.right.pane.tab')} leftOff=${leftOff('sidebar.panellist')}/${leftOff('sidebar.right.pane.tab')} (panellist/rightTab)`,
+    )
   })
 
   // 124-125. Host schema subset guard (T-236): type arrays silently block registration.

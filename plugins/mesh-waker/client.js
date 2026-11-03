@@ -3483,11 +3483,6 @@ try {
                 ),
               ),
             )
-            sidebarSwitches.rightDisposers.push(
-              ctx.slots.inject('sidebar.panellist', () =>
-                ctx.slots.register({ name: 'sidebar.panellist', id: 'mesh-tasks', order: 41, label: '派活任务' }, MeshTasksPanel),
-              ),
-            )
           } catch (error) {
             rightTabState += ' | tasks body: ' + (error && error.message ? error.message : String(error))
           }
