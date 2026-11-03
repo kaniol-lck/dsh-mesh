@@ -1788,6 +1788,49 @@ async function main() {
     }
   })
 
+  // T-342: the notice subject used to be the literal 'question', so every conversation in the
+  // inbox list had the same unreadable title. It is now derived from the question itself.
+  const askSubject = async (boot, question) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await startQuestionHarness(boot, fake)
+      const pending = meshAskTool(h).execute({ question })
+      await waitFor(() => fake.sends.length > 0, 8000)
+      const notice = fake.sends[0]
+      fake.push({ id: 'm-subj-' + Date.now(), sender: 'peer-owner', conversation: notice.conversation, body: 'ok' })
+      await pending
+      return notice.subject
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  }
+
+  await runCase('mesh_ask: subject is derived from the question first line', async (boot) => {
+    const subject = await askSubject(boot, 'Ship it?')
+    report('mesh_ask: subject is derived from the question first line', subject === 'Ship it?', `subject=${JSON.stringify(subject)}`)
+  })
+
+  await runCase('mesh_ask: a long CJK question is truncated with an ellipsis, never half a character', async (boot) => {
+    const long = '请确认是否需要把这个非常长的提问标题截断到五十个字符以内并且保证中文不会被截成半个字，这句话故意超过五十个字符'
+    const subject = await askSubject(boot, long)
+    const ok = Array.from(subject).length <= 51 && subject.endsWith('…') && !subject.includes('\uFFFD') && subject.startsWith('请确认')
+    report('mesh_ask: a long CJK question is truncated with an ellipsis, never half a character', ok, `subject=${JSON.stringify(subject)} chars=${Array.from(subject).length}`)
+  })
+
+  await runCase('mesh_ask: an empty question falls back to the historical subject', async () => {
+    const { questionSubject } = await import(pathToFileURL(ENTRY).href)
+    const ok = questionSubject('   ') === 'question' && questionSubject('') === 'question' && questionSubject(null) === 'question'
+    report('mesh_ask: an empty question falls back to the historical subject', ok, `blank=${JSON.stringify(questionSubject('   '))}`)
+  })
+
+  await runCase('mesh_ask: a multi-line question yields a single-line subject', async (boot) => {
+    const subject = await askSubject(boot, 'Deploy today?\nsecond line\nthird line')
+    const ok = subject === 'Deploy today?' && !/[\r\n]/.test(subject)
+    report('mesh_ask: a multi-line question yields a single-line subject', ok, `subject=${JSON.stringify(subject)}`)
+  })
+
   await runCase('mesh_ask: reply from outside allowFrom is ignored, then unanswered', async (boot) => {
     const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
     let h = null

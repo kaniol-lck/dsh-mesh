@@ -86,6 +86,19 @@ function sha256OfFile(file) {
 }
 
 /**
+ * Subject for a question notice (T-342): derived from the question itself so the inbox list
+ * shows what is being asked instead of "question" for every entry. First line only, single
+ * line, whitespace collapsed, at most 50 characters counted by code point (CJK safe), with
+ * an ellipsis when truncated. An empty question keeps the historical subject.
+ */
+function questionSubject(question) {
+  const firstLine = String(question ?? '').split(/\r?\n/)[0].replace(/\s+/g, ' ').trim()
+  if (!firstLine) return 'question'
+  const chars = Array.from(firstLine)
+  return chars.length > 50 ? chars.slice(0, 50).join('').trimEnd() + '…' : firstLine
+}
+
+/**
  * One-time realignment (T-300): a receipt must live in the same tier as its task row.
  * Older code routed receipts from the target session's cwd at settle/migration time while
  * the task used LCA(origin, target), so a cross-workspace receipt landed in a workspace
@@ -239,6 +252,9 @@ export function realignReceiptTiers({ meshHome, storageTiers = true, log = () =>
 
 /** A task id already used by a different target in the same tier file (T-301). */
 export { TaskIdCollisionError } from './lib/task-lifecycle.mjs'
+
+// Pure helper exported for its own contract test (T-342): the derived question subject.
+export { questionSubject }
 
 export const name = 'mesh-waker'
 export const inject = ['sessionController', 'agents', 'workspaceRegistry', 'configEditor', 'commands', 'attachments']
@@ -1636,7 +1652,7 @@ export function apply(ctx, config) {
           to: recipient,
           conversation,
           silent: true,
-          subject: 'question',
+          subject: questionSubject(question),
           body: noticeBody,
         }),
         signal: AbortSignal.timeout(8000),
