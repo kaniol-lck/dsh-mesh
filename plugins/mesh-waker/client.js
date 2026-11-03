@@ -31,11 +31,17 @@ const TOKENS = {
     maskOpaque: '#000', // 遮罩渐变的不透明端（mask 只取 alpha）
     transparent: '#0000', // 完全透明
     // 官方设置页卡片（T-333）：外层卡片 + 稍深的内嵌区；折叠头 hover 用同一档灰。
-    card: 'var(--dsw-alias-bg-layer-2, #fff)', // 卡片底（官方 bg-layer-2 = #fff）
-    cardBorder: 'var(--dsw-alias-border-l1, #0000000a)', // 卡片 1px 边框 / 标题与内容间的分隔线（官方 border-l1 = #0000000a）
-    interactive: 'var(--dsw-alias-interactive-bg-hover, #2631480f)', // 内嵌区底 / 折叠头 hover（官方 interactive-bg-hover = #2631480f）
+    card: 'var(--dsw-alias-bg-layer-1, #fff)', // 卡片底（官方 bg-layer-1 = #fff，不是遮罩灰）
+    cardBorder: 'var(--dsw-alias-border-l1, #0000000a)', // 卡片内部分隔线（官方 border-l1 = #0000000a）
+    cardBorderOuter: 'var(--dsw-alias-border-l2, #0000001a)', // 卡片外框（官方 border-l2 = #0000001a）
+    inset: 'var(--dsw-static-neutral-bluish-50, #f9fafb)', // 卡片内嵌区底（官方 neutral-bluish-50）
+    interactive: 'var(--dsw-alias-interactive-bg-hover, #2631480f)', // 仅 hover：折叠头（官方 interactive-bg-hover = #2631480f）
     labelPrimary: 'var(--dsw-alias-label-primary, #0f1115)', // 卡片标题（官方 = neutral-bluish-1000）
     labelSecondary: 'var(--dsw-alias-label-secondary, #61666b)', // 卡片说明文字、箭头（官方 = neutral-bluish-700）
+    // 官方开关（T-338）：外壳 CSS 里的 .switch/.thumb 规则，尺寸与颜色逐条照抄。
+    switchTrack: 'var(--dsw-alias-border-l3, #0000001f)', // 未选中轨道（官方 border-l3）
+    switchBrand: 'var(--dsw-alias-brand-primary, #0f1115)', // 选中轨道（官方 brand-primary）
+    switchThumb: 'var(--dsw-alias-switch-thumb, #fff)', // 滑块（官方 switch-thumb）
   },
   font: { xs: 10, sm: 11, md: 12, lg: 13 }, // 徽标 / 标签 / 正文 / 标题
 }
@@ -386,9 +392,8 @@ try {
             h(
               'label',
               { style: { ...styles.hint, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
-              h(SwitchControl, {
+              ui.switch({
                 checked: Boolean(peerDraft.important),
-                label: '重要信件',
                 onChange: (next) => setPeerDraft({ ...peerDraft, important: next }),
               }),
               '重要（云端不随 7 天过期）',
@@ -773,107 +778,66 @@ try {
       cell(children) {
         return h('td', { style: CELL_STYLE }, children)
       },
-      toggle({ checked = false, onChange, disabled = false, title }, ...children) {
-        return h(
+      switch({ checked = false, onChange, disabled = false, title, label }, ...children) {
+        const on = Boolean(checked)
+        const node = h(
           'button',
           {
             type: 'button',
             role: 'switch',
-            'aria-checked': checked ? 'true' : 'false',
+            'aria-checked': on ? 'true' : 'false',
             disabled,
             title,
             onClick: () => {
-              if (!disabled && typeof onChange === 'function') onChange(!checked)
+              if (!disabled && typeof onChange === 'function') onChange(!on)
+            },
+            // focus-visible cannot be expressed inline; mutate the node so keyboard focus
+            // still draws the official outline (T-338).
+            onFocus: (event) => {
+              event.currentTarget.style.outline = '2px solid ' + TOKENS.color.switchFocus
+              event.currentTarget.style.outlineOffset = '2px'
+            },
+            onBlur: (event) => {
+              event.currentTarget.style.outline = 'none'
             },
             style: {
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 8,
-              padding: 0,
-              border: 'none',
-              background: 'transparent',
-              color: 'inherit',
+              boxSizing: 'border-box',
+              position: 'relative',
+              flex: '0 0 auto',
+              width: 36,
+              height: 20,
+              padding: 2,
+              border: 0,
+              borderRadius: 999,
+              background: on ? TOKENS.color.switchBrand : TOKENS.color.switchTrack,
               cursor: disabled ? 'default' : 'pointer',
-              fontSize: TOKENS.font.sm,
-              opacity: disabled ? 0.6 : 1,
+              opacity: disabled ? 0.5 : 1,
             },
           },
-          h(
-            'span',
-            {
-              style: {
-                position: 'relative',
-                display: 'inline-flex',
-                alignItems: 'center',
-                width: 32,
-                height: 18,
-                borderRadius: 999,
-                background: checked ? TOKENS.color.primary : TOKENS.color.interactive,
-                border: '1px solid ' + TOKENS.color.cardBorder,
-                flexShrink: 0,
-              },
+          h('span', {
+            style: {
+              display: 'block',
+              width: 16,
+              height: 16,
+              borderRadius: '50%',
+              background: TOKENS.color.switchThumb,
+              transition: 'transform .12s ease',
+              transform: on ? 'translateX(16px)' : 'translateX(0)',
             },
-            h('span', {
-              style: {
-                position: 'absolute',
-                top: 1,
-                left: checked ? 15 : 1,
-                width: 14,
-                height: 14,
-                borderRadius: 999,
-                background: checked ? TOKENS.color.onPrimary : TOKENS.color.labelSecondary,
-                transition: 'left .12s',
-              },
-            }),
-          ),
-          ...children,
+          }),
         )
+        return children.length || label
+          ? h(
+              'span',
+              { style: { display: 'inline-flex', alignItems: 'center', gap: 8 } },
+              node,
+              label ? h('span', { style: { fontSize: TOKENS.font.sm, color: TOKENS.color.labelSecondary } }, label) : null,
+              ...children,
+            )
+          : node
       },
     }
     // END UI CONTROLS
-
-    /** Local fallback toggle (used only when the host primitives are unavailable). */
-    function FallbackSwitch({ checked, onChange, disabled }) {
-      const on = Boolean(checked)
-      return ui.button(
-        {
-          type: 'button',
-          role: 'switch',
-          'aria-checked': on ? 'true' : 'false',
-          disabled: Boolean(disabled),
-          onClick: () => {
-            if (!disabled) onChange(!on)
-          },
-          style: {
-            width: 36,
-            height: 20,
-            padding: 2,
-            borderRadius: 10,
-            border: 'none',
-            cursor: disabled ? 'default' : 'pointer',
-            opacity: disabled ? 0.6 : 1,
-            background: on ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l4)',
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: on ? 'flex-end' : 'flex-start',
-            transition: 'background .15s',
-            flex: '0 0 auto',
-          },
-        },
-        h('span', {
-          style: {
-            width: 16,
-            height: 16,
-            borderRadius: '50%',
-            background: TOKENS.color.surface,
-            boxShadow: '0 1px 2px rgba(0,0,0,0.25)',
-            transition: 'transform .15s',
-          },
-        }),
-      )
-    }
-
-    const SwitchControl = (primitives && primitives.Switch) || FallbackSwitch
 
     /** Host Button when available, otherwise a token-styled button. */
     function Btn({ children, onClick, variant = 'outline', size = 'sm', disabled, title }) {
@@ -940,7 +904,7 @@ try {
       )
     }
 
-    /** Collapsible settings chapter: official card — outer surface plus an inset content area. */
+    /** Collapsible settings chapter: official card — white layer-1 surface, 1px border-l2. */
     function SettingsSection({ title, description, defaultOpen = true, children }) {
       const [open, setOpen] = React.useState(defaultOpen)
       const [hover, setHover] = React.useState(false)
@@ -949,7 +913,7 @@ try {
         {
           style: {
             background: TOKENS.color.card,
-            border: '1px solid ' + TOKENS.color.cardBorder,
+            border: '1px solid ' + TOKENS.color.cardBorderOuter,
             borderRadius: 'var(--dsw-radius-lg, 16px)',
             padding: 16,
             marginBottom: 12,
@@ -1012,7 +976,7 @@ try {
                 style: {
                   marginTop: 10,
                   padding: 12,
-                  background: TOKENS.color.interactive,
+                  background: TOKENS.color.inset,
                   borderRadius: 'var(--dsw-radius-lg, 16px)',
                   borderTop: '1px solid ' + TOKENS.color.cardBorder,
                   display: 'grid',
@@ -2035,9 +1999,8 @@ try {
           h(
             Row,
             { title: '启动时补收未读', description: 'dsh 启动约 12 秒后扫一次未读，补上关机期间错过的消息' },
-            h(SwitchControl, {
+            ui.switch({
               checked: Boolean(config.catchUpOnStart),
-              label: '启动时补收未读',
               onChange: (next) => void save({ catchUpOnStart: next }),
             }),
           ),
@@ -2068,9 +2031,8 @@ try {
           h(
             Row,
             { title: '发送方指定', description: '允许对方在消息里指定排队/插队/分支；关闭后只按本机默认值' },
-            h(SwitchControl, {
+            ui.switch({
               checked: Boolean(config && config.allowSenderDeliveryMode),
-              label: '允许发送方指定',
               onChange: (next) => void save({ allowSenderDeliveryMode: next }),
             }),
           ),
@@ -2238,7 +2200,7 @@ try {
           h(
             Row,
             { title: '左侧「Mesh 信箱」', description: '左侧边栏的 panellist 条目与它的主页面' },
-            ui.toggle(
+            ui.switch(
               {
                 checked: !(status && status.config && status.config.sidebarLeft === false),
                 onChange: (value) => void save({ sidebarLeft: value }),
@@ -2249,7 +2211,7 @@ try {
           h(
             Row,
             { title: '右侧「Mesh 信箱」页签', description: '右侧 pane 的 tab 与它的内容' },
-            ui.toggle(
+            ui.switch(
               {
                 checked: !(status && status.config && status.config.sidebarRight === false),
                 onChange: (value) => void save({ sidebarRight: value }),
