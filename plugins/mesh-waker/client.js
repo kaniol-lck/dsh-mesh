@@ -203,11 +203,8 @@ try {
       hr: { border: 0, borderTop: '1px solid currentColor', opacity: 0.15, margin: '4px 0' },
     }
 
-    // Three button tiers, used everywhere in the task panel (one meaning = one style).
+    // Button tiers live in BUTTON_VARIANTS inside the ui vocabulary (T-331).
     const buttonBase = { padding: '4px 10px', borderRadius: 6, cursor: 'pointer', fontSize: TOKENS.font.md, flexShrink: 0 }
-    const buttonPrimary = { ...buttonBase, border: `1px solid ${TOKENS.color.primaryBorder}`, background: TOKENS.color.primary, color: TOKENS.color.onPrimary }
-    const buttonSecondary = { ...buttonBase, border: '1px solid currentColor', background: 'transparent', color: 'inherit' }
-    const buttonDanger = { ...buttonBase, border: `1px solid ${TOKENS.color.dangerBorder}`, background: 'transparent', color: TOKENS.color.danger }
 
     async function json(url, init) {
       const res = await fetch(url, { cache: 'no-store', ...init })
@@ -317,7 +314,7 @@ try {
           'div',
           { style: styles.card },
           h('div', { style: styles.err }, '读取插件状态失败：' + error + '（插件可能正在重启）'),
-          h('button', { type: 'button', style: styles.button, onClick: load }, '重试'),
+          ui.button({ type: 'button', onClick: load }, '重试'),
         )
       }
       if (!status || !draft) return h('div', { style: styles.card }, '加载中…')
@@ -332,7 +329,7 @@ try {
           'div',
           { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
           h('strong', null, 'Mesh 收件箱'),
-          h('button', { type: 'button', style: styles.button, onClick: load }, '刷新'),
+          ui.button({ type: 'button', onClick: load }, '刷新'),
         ),
         h(Field, { label: '已向中枢登记' }, h('span', null, status.registered ? '是' : '否')),
         h(
@@ -369,7 +366,7 @@ try {
           Field,
           { label: '其他 agent' },
           h('span', { style: styles.hint }, roster.map((peer) => `${peer.name}${peer.host ? '(' + peer.host + ')' : ''}·${peer.online ? '在线' : '离线'}`).join('  ') || '（暂无）'),
-          h('button', { type: 'button', style: styles.button, onClick: loadPeers }, '刷新'),
+          ui.button({ type: 'button', onClick: loadPeers }, '刷新'),
         ),
         h(
           'div',
@@ -387,15 +384,15 @@ try {
               h('option', { value: '*' }, '* 广播给所有 agent'),
               others.map((peer) => h('option', { key: peer.name, value: peer.name }, peer.name)),
             ),
-            h('input', {
-              style: styles.input,
+            ui.input({
+              
               placeholder: '主题（可选）',
               value: peerDraft.subject,
               onChange: (event) => setPeerDraft({ ...peerDraft, subject: event.target.value }),
             }),
           ),
-          h('textarea', {
-            style: { ...styles.input, minHeight: 56, fontFamily: 'inherit' },
+          ui.textarea({
+            style: { minHeight: 56 },
             placeholder: '要发给对方的内容（会落库，离线也不丢）',
             value: peerDraft.body,
             onChange: (event) => setPeerDraft({ ...peerDraft, body: event.target.value }),
@@ -403,7 +400,7 @@ try {
           h(
             'div',
             { style: styles.row },
-            h('button', { type: 'button', style: styles.button, onClick: sendPeer }, '发送'),
+            ui.button({ type: 'button', onClick: sendPeer }, '发送'),
             h(
               'label',
               { style: { ...styles.hint, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' } },
@@ -422,13 +419,13 @@ try {
         h(
           Field,
           { label: '收件箱工作区' },
-          h('input', {
-            style: styles.input,
+          ui.input({
+            
             value: draft.workspacePath,
             placeholder: '选择或输入目录',
             onChange: (event) => setDraft({ ...draft, workspacePath: event.target.value }),
           }),
-          h('button', { type: 'button', style: styles.button, onClick: () => browse(draft.workspacePath || null) }, '浏览…'),
+          ui.button({ type: 'button', onClick: () => browse(draft.workspacePath || null) }, '浏览…'),
         ),
         browser && browser.ok
           ? h(
@@ -448,11 +445,10 @@ try {
               h(
                 'div',
                 { style: { display: 'flex', gap: 8, marginTop: 6 } },
-                h(
-                  'button',
+                ui.button(
                   {
                     type: 'button',
-                    style: styles.button,
+                    
                     onClick: () => {
                       setDraft({ ...draft, workspacePath: browser.path })
                       setBrowser(null)
@@ -460,15 +456,15 @@ try {
                   },
                   '用这个目录',
                 ),
-                h('button', { type: 'button', style: styles.button, onClick: () => setBrowser(null) }, '取消'),
+                ui.button({ type: 'button', onClick: () => setBrowser(null) }, '取消'),
               ),
             )
           : browser && browser.ok === false
             ? h('div', { style: { ...styles.err, ...styles.indent } }, '浏览失败：' + browser.error)
             : null,
-        h(Field, { label: '会话标题' }, h('input', { style: styles.input, value: draft.sessionTitle, onChange: (event) => setDraft({ ...draft, sessionTitle: event.target.value }) })),
-        h(Field, { label: '轮转（小时）' }, h('input', { style: styles.input, value: draft.resetAfterHours, onChange: (event) => setDraft({ ...draft, resetAfterHours: event.target.value }) })),
-        h(Field, { label: '轮转（次数）' }, h('input', { style: styles.input, value: draft.maxWakes, onChange: (event) => setDraft({ ...draft, maxWakes: event.target.value }) })),
+        h(Field, { label: '会话标题' }, ui.input({ value: draft.sessionTitle, onChange: (event) => setDraft({ ...draft, sessionTitle: event.target.value }) })),
+        h(Field, { label: '轮转（小时）' }, ui.input({ value: draft.resetAfterHours, onChange: (event) => setDraft({ ...draft, resetAfterHours: event.target.value }) })),
+        h(Field, { label: '轮转（次数）' }, ui.input({ value: draft.maxWakes, onChange: (event) => setDraft({ ...draft, maxWakes: event.target.value }) })),
         h(
           'div',
           { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 2 } },
@@ -613,8 +609,7 @@ try {
       return h(
         'div',
         { ref: boxRef, style: wrapperStyle },
-        h(
-          'button',
+        ui.button(
           {
             type: 'button',
             disabled: Boolean(disabled),
@@ -655,8 +650,7 @@ try {
                 },
               },
               options.map((option) =>
-                h(
-                  'button',
+                ui.button(
                   {
                     key: String(option.value),
                     type: 'button',
@@ -704,11 +698,71 @@ try {
       outline: 'none',
     }
 
+    // ── Control vocabulary (T-331) ───────────────────────────────────────────────────────
+    // One constructor per control shape, so a call site picks a role instead of copying a
+    // neighbour's inline style. Variants are closed sets: 4 button tones, 2 sizes, 4 badge
+    // tones. `style` on a call site is layout only (width / margins / flex); appearance keys
+    // are stripped, so a control cannot drift into a one-off look.
+    // BEGIN UI CONTROLS
+    const CONTROL_APPEARANCE = new Set([
+      'padding', 'border', 'background', 'color', 'fontSize', 'fontFamily', 'lineHeight',
+      'cursor', 'borderRadius', 'opacity', 'outline', 'appearance', 'WebkitAppearance',
+      'backgroundImage', 'backgroundPosition', 'backgroundRepeat', 'backgroundSize', 'height',
+    ])
+    const layoutOnly = (style) => {
+      const out = {}
+      if (!style) return out
+      for (const [key, value] of Object.entries(style)) if (!CONTROL_APPEARANCE.has(key)) out[key] = value
+      return out
+    }
+    const BUTTON_VARIANTS = {
+      primary: { ...buttonBase, border: `1px solid ${TOKENS.color.primaryBorder}`, background: TOKENS.color.primary, color: TOKENS.color.onPrimary },
+      secondary: { ...buttonBase, border: '1px solid currentColor', background: 'transparent', color: 'inherit' },
+      danger: { ...buttonBase, border: `1px solid ${TOKENS.color.dangerBorder}`, background: 'transparent', color: TOKENS.color.danger },
+      link: { ...buttonBase, border: 'none', background: 'transparent', color: 'inherit', textDecoration: 'underline', padding: 0 },
+    }
+    const BUTTON_SIZES = {
+      md: { padding: '4px 10px', fontSize: TOKENS.font.md },
+      sm: { padding: '2px 8px', fontSize: TOKENS.font.sm },
+    }
+    const BADGE_BASE = { display: 'inline-flex', alignItems: 'center', padding: '1px 6px', borderRadius: 8, fontSize: TOKENS.font.xs, lineHeight: '16px', whiteSpace: 'nowrap' }
+    const BADGE_TONES = {
+      success: { background: TOKENS.color.success, color: TOKENS.color.onPrimary },
+      danger: { background: TOKENS.color.danger, color: TOKENS.color.onPrimary },
+      warning: { background: TOKENS.color.warning, color: TOKENS.color.onPrimary },
+      accent: { background: TOKENS.color.primary, color: TOKENS.color.onPrimary },
+    }
+    const CELL_STYLE = { padding: '5px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' }
+    const ui = {
+      button({ variant = 'secondary', size = 'md', style, type = 'button', ...rest }, ...children) {
+        if (!BUTTON_VARIANTS[variant]) throw new Error('unknown button variant: ' + variant)
+        if (!BUTTON_SIZES[size]) throw new Error('unknown button size: ' + size)
+        return h('button', { type, ...rest, style: { ...BUTTON_VARIANTS[variant], ...BUTTON_SIZES[size], ...layoutOnly(style) } }, ...children)
+      },
+      input({ size = 'md', style, ...rest }) {
+        const base = size === 'sm' ? { ...controlStyle, padding: '2px 6px', fontSize: TOKENS.font.md } : styles.input
+        return h('input', { ...rest, style: { ...base, ...layoutOnly(style) } })
+      },
+      textarea({ style, ...rest }) {
+        return h('textarea', { ...rest, style: { ...styles.input, minHeight: 56, fontFamily: 'inherit', ...layoutOnly(style) } })
+      },
+      select({ style, ...rest }, ...children) {
+        return h('select', { ...rest, style: { ...selectStyle, ...layoutOnly(style) } }, ...children)
+      },
+      badge({ tone = 'accent', style, ...rest }, ...children) {
+        if (!BADGE_TONES[tone]) throw new Error('unknown badge tone: ' + tone)
+        return h('span', { ...rest, style: { ...BADGE_BASE, ...BADGE_TONES[tone], ...layoutOnly(style) } }, ...children)
+      },
+      cell(children) {
+        return h('td', { style: CELL_STYLE }, children)
+      },
+    }
+    // END UI CONTROLS
+
     /** Local fallback toggle (used only when the host primitives are unavailable). */
     function FallbackSwitch({ checked, onChange, disabled }) {
       const on = Boolean(checked)
-      return h(
-        'button',
+      return ui.button(
         {
           type: 'button',
           role: 'switch',
@@ -753,17 +807,7 @@ try {
       if (primitives && primitives.Button) {
         return h(primitives.Button, { variant, size, disabled, title, onClick }, children)
       }
-      return h(
-        'button',
-        {
-          type: 'button',
-          onClick,
-          disabled,
-          title,
-          style: { ...controlStyle, cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.6 : 1 },
-        },
-        children,
-      )
+      return ui.button({ variant: variant === 'primary' ? 'primary' : 'secondary', size, disabled, title, onClick }, children)
     }
 
     /** One preference row: label + description on the left, control on the right. */
@@ -829,8 +873,7 @@ try {
       return h(
         'section',
         { style: { borderBottom: '1px solid var(--dsw-alias-border-l2)', padding: '2px 0 6px' } },
-        h(
-          'button',
+        ui.button(
           {
             type: 'button',
             onClick: () => setOpen((value) => !value),
@@ -935,8 +978,7 @@ try {
               const tone = toneOf ? toneOf(message) : 'in'
               const active = message.id === activeId
               const hovered = preview !== null && preview.index === index
-              return h(
-                'button',
+              return ui.button(
                 {
                   key: message.id,
                   type: 'button',
@@ -1232,10 +1274,9 @@ try {
           'div',
           { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', padding: '8px 10px', borderBottom: '0.5px solid var(--dsw-alias-border-l3)', fontSize: TOKENS.font.md } },
           h('span', { style: { opacity: 0.8 } }, 'pending ' + pending + ' · 进行中 ' + running + ' · 今日完成 ' + doneToday + ' · 停滞 ' + stalled),
-          h(
-            'select',
+          ui.select(
             {
-              style: selectStyle,
+              
               value: filter.status,
               onChange: (event) => {
                 const next = { ...filter, status: event.target.value }
@@ -1252,8 +1293,8 @@ try {
               ['cancelled', '已取消'],
             ].map(([value, label]) => h('option', { key: value, value }, label)),
           ),
-          h('input', {
-            style: { ...controlStyle, width: 150, fontSize: TOKENS.font.md, padding: '2px 6px' },
+          ui.input({
+            size: 'sm', style: { width: 150 },
             placeholder: '目标会话 id（回车过滤）',
             value: filter.session,
             onChange: (event) => setFilter({ ...filter, session: event.target.value }),
@@ -1261,7 +1302,7 @@ try {
               if (event.key === 'Enter') void load(filter)
             },
           }),
-          h('button', { type: 'button', style: buttonSecondary, onClick: () => void load(filter) }, '刷新'),
+          ui.button({ type: 'button', onClick: () => void load(filter) }, '刷新'),
         ),
         note ? h('div', { style: { fontSize: TOKENS.font.sm, opacity: 0.75, padding: '4px 10px' } }, note) : null,
         h(
@@ -1274,8 +1315,7 @@ try {
                 return h(
                   'div',
                   { key: group.key },
-                  h(
-                    'button',
+                  ui.button(
                     {
                       type: 'button',
                       onClick: () => setCollapsed({ ...collapsed, [group.key]: !isCollapsed }),
@@ -1303,8 +1343,7 @@ try {
                   isCollapsed
                     ? null
                     : group.tasks.map((task) =>
-                        h(
-                          'button',
+                        ui.button(
                           {
                             key: task.taskId,
                             type: 'button',
@@ -1366,19 +1405,17 @@ try {
                 h('span', null, '正文：' + selected.textBytes + ' B'),
               ),
               h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-                h('button', { type: 'button', style: buttonPrimary, onClick: () => void openSession(selected.taskId, selected.targetSessionId) }, '打开会话'),
-                h(
-                  'button',
-                  { type: 'button', style: buttonSecondary, onClick: () => void copyText(selected.targetSessionId || '', '会话 id') },
+                ui.button({ type: 'button', variant: 'primary', onClick: () => void openSession(selected.taskId, selected.targetSessionId) }, '打开会话'),
+                ui.button(
+                  { type: 'button', onClick: () => void copyText(selected.targetSessionId || '', '会话 id') },
                   '复制会话 id',
                 ),
-                h(
-                  'button',
-                  { type: 'button', style: buttonSecondary, onClick: () => void copyText('[TASK ' + selected.taskId + ']', '任务标记') },
+                ui.button(
+                  { type: 'button', onClick: () => void copyText('[TASK ' + selected.taskId + ']', '任务标记') },
                   '复制任务标记',
                 ),
                 selected.status === 'pending'
-                  ? h('button', { type: 'button', style: buttonDanger, onClick: () => void cancelTask(selected.taskId) }, '取消任务')
+                  ? ui.button({ type: 'button', variant: 'danger', onClick: () => void cancelTask(selected.taskId) }, '取消任务')
                   : null,
               ),
               h('div', { style: { fontWeight: 600, marginTop: 4 } }, '正文'),
@@ -1441,19 +1478,17 @@ try {
           'div',
           { style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 } },
           h('span', { style: { opacity: 0.8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, '派活任务：' + (counts === null ? '…' : counts) + ' 条待办/进行中'),
-          h(
-            'button',
+          ui.button(
             {
               type: 'button',
-              style: { ...buttonPrimary, marginLeft: 'auto', padding: '2px 8px', fontSize: TOKENS.font.sm },
+              variant: 'primary', size: 'sm', style: { marginLeft: 'auto' },
               title: '打开 ' + entryLabel + ' 页面的「派活任务」标签',
               onClick: openTasks,
             },
             '打开任务面板',
           ),
-          h(
-            'button',
-            { type: 'button', style: { ...buttonSecondary, padding: '2px 8px', fontSize: TOKENS.font.sm }, title: '复制入口路径', onClick: () => void copyEntry() },
+          ui.button(
+            { type: 'button', size: 'sm', title: '复制入口路径', onClick: () => void copyEntry() },
             '复制入口',
           ),
         ),
@@ -1748,7 +1783,7 @@ try {
             { title: '信任级别（默认）', description: 'strict 只读 / normal 需批准 / full 直接执行；只在本机生效' },
             h(
               MiniSelect,
-              { style: selectStyle, value: config.trust ?? 'normal', onChange: (event) => void save({ trust: event.target.value }) },
+              { value: config.trust ?? 'normal', onChange: (event) => void save({ trust: event.target.value }) },
               [
                 ['normal', 'normal（默认）'],
                 ['strict', 'strict（只读）'],
@@ -1761,7 +1796,7 @@ try {
             { title: '消息投递方式', description: '唤醒时把未读正文写进提示词；附件失败会自动回退为内联' },
             h(
               MiniSelect,
-              { style: selectStyle, value: config.delivery ?? 'inline', onChange: (event) => void save({ delivery: event.target.value }) },
+              { value: config.delivery ?? 'inline', onChange: (event) => void save({ delivery: event.target.value }) },
               [
                 ['inline', 'inline（内联正文）'],
                 ['both', 'both（内联+附件）'],
@@ -1773,11 +1808,11 @@ try {
           h(
             Row,
             { title: '最大唤醒次数', description: '同一会话自动唤醒的上限（正整数，超出后等人工介入）' },
-            h('input', {
+            ui.input({
               type: 'number',
               min: 1,
               step: 1,
-              style: { ...controlStyle, width: 96, fontSize: TOKENS.font.md, padding: '2px 6px' },
+              size: 'sm', style: { width: 96 },
               value: draftMaxWakes,
               onChange: (event) => setDraftMaxWakes(event.target.value),
             }),
@@ -1786,11 +1821,11 @@ try {
           h(
             Row,
             { title: '重置会话间隔（小时）', description: '超过该时长重新开一个唤醒会话（正数）' },
-            h('input', {
+            ui.input({
               type: 'number',
               min: 0.1,
               step: 0.5,
-              style: { ...controlStyle, width: 96, fontSize: TOKENS.font.md, padding: '2px 6px' },
+              size: 'sm', style: { width: 96 },
               value: draftResetAfterHours,
               onChange: (event) => setDraftResetAfterHours(event.target.value),
             }),
@@ -1811,7 +1846,7 @@ try {
             h(
               MiniSelect,
               {
-                style: selectStyle,
+                
                 value: (config && config.boundDeliveryMode) || 'queue',
                 onChange: async (event) => {
                   const value = event.target.value
@@ -1841,9 +1876,9 @@ try {
           h(
             Row,
             { title: '唤醒会话标题', description: '新建唤醒会话时使用的标题（≤60 字）' },
-            h('input', {
+            ui.input({
               type: 'text',
-              style: { ...controlStyle, width: 220, fontSize: TOKENS.font.md, padding: '2px 6px' },
+              size: 'sm', style: { width: 220 },
               value: draftSessionTitle,
               onChange: (event) => setDraftSessionTitle(event.target.value),
             }),
@@ -1852,11 +1887,11 @@ try {
           h(
             Row,
             { title: '分支复用时长（小时）', description: 'branch 模式下复用同一侧会话的时间窗（正数）' },
-            h('input', {
+            ui.input({
               type: 'number',
               min: 0.5,
               step: 1,
-              style: { ...controlStyle, width: 96, fontSize: TOKENS.font.md, padding: '2px 6px' },
+              size: 'sm', style: { width: 96 },
               value: draftBranchReuseHours,
               onChange: (event) => setDraftBranchReuseHours(event.target.value),
             }),
@@ -1865,11 +1900,11 @@ try {
           h(
             Row,
             { title: '启动补收延迟（毫秒）', description: '启动后等待多久再扫未读，给宿主留初始化时间（≥0）' },
-            h('input', {
+            ui.input({
               type: 'number',
               min: 0,
               step: 500,
-              style: { ...controlStyle, width: 110, fontSize: TOKENS.font.md, padding: '2px 6px' },
+              size: 'sm', style: { width: 110 },
               value: draftCatchUpDelayMs,
               onChange: (event) => setDraftCatchUpDelayMs(event.target.value),
             }),
@@ -1911,9 +1946,9 @@ try {
                     h(
                       'tr',
                       { key: peer.name },
-                      h('td', { style: { padding: '5px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } }, peer.name),
-                      h('td', { style: { padding: '5px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } }, peer.host || '—'),
-                      h('td', { style: { padding: '5px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } }, peer.online ? '在线' : '离线'),
+                      ui.cell(peer.name),
+                      ui.cell(peer.host || '—'),
+                      ui.cell(peer.online ? '在线' : '离线'),
                       h(
                         'td',
                         { style: { padding: '4px 8px', borderBottom: '1px solid rgba(127,127,127,0.09)' } },
@@ -2003,11 +2038,10 @@ try {
                     : null,
                   row.disabled
                     ? null
-                    : h(
-                        'button',
+                    : ui.button(
                         {
                           type: 'button',
-                          style: { ...styles.button, flexShrink: 0, width: 56, height: 24, padding: 0, fontSize: TOKENS.font.sm },
+                          size: 'sm', style: { flexShrink: 0, width: 56, height: 24 },
                           onClick: () => archiveSession(session),
                         },
                         '归档',
@@ -2050,11 +2084,10 @@ try {
           h(
             Row,
             { title: '派活任务', description: '任务面板在「' + entryLabel + '」页面顶部标签「派活任务」，设置页不放表格' },
-            h(
-              'button',
+            ui.button(
               {
                 type: 'button',
-                style: buttonPrimary,
+                variant: 'primary',
                 onClick: () => {
                   // ctx.layout.selectPanel('mesh-inbox') switches the window to our main panel;
                   // the shared tab store makes the page open on 「派活任务」. Every outcome
@@ -2168,8 +2201,7 @@ try {
               : (historyList ?? [])
                   .filter((entry) => !peerFilter || (entry.peers ?? []).includes(peerFilter))
                   .map((entry) =>
-                  h(
-                    'button',
+                  ui.button(
                     {
                       key: entry.conversation,
                       type: 'button',
@@ -2260,9 +2292,8 @@ try {
                       { style: { fontSize: TOKENS.font.md, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
                       convLabel(activeConv),
                     ),
-                    h(
-                      'button',
-                      { type: 'button', style: { ...controlStyle, cursor: 'pointer', padding: '2px 8px' }, onClick: markConvRead },
+                    ui.button(
+                      { type: 'button', variant: 'link', size: 'sm', onClick: markConvRead },
                       '标为已读',
                     ),
                   ),
@@ -2299,8 +2330,7 @@ try {
                           h(
                             'div',
                             { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 4 } },
-                            h(
-                              'button',
+                            ui.button(
                               {
                                 type: 'button',
                                 style: { cursor: 'pointer', fontSize: TOKENS.font.sm, background: 'transparent', border: 'none', opacity: message.pinned ? 1 : 0.65 },
@@ -2490,8 +2520,6 @@ try {
           (!query || String(entry.conversation).toLowerCase().includes(query.toLowerCase())),
       )
 
-      const buttonStyle = { ...controlStyle, cursor: 'pointer', padding: '3px 10px' }
-
       return h(
         'div',
         {
@@ -2535,8 +2563,7 @@ try {
               ['inbox', '信箱'],
               ['tasks', '派活任务'],
             ].map(([key, label]) =>
-              h(
-                'button',
+              ui.button(
                 {
                   key,
                   type: 'button',
@@ -2555,11 +2582,11 @@ try {
               ),
             ),
           ),
-          unread ? h('span', { style: { fontSize: TOKENS.font.sm, padding: '1px 7px', borderRadius: 9, background: TOKENS.color.primary, color: TOKENS.color.onPrimary } }, unread + ' 未读') : null,
+          unread ? ui.badge({ tone: 'accent' }, unread + ' 未读') : null,
           h('div', { style: { flex: 1 } }),
-          h('button', { type: 'button', style: buttonStyle, onClick: currentSession }, '当前会话'),
-          h('button', { type: 'button', style: buttonStyle, onClick: sync }, '从中枢同步'),
-          h('button', { type: 'button', style: buttonStyle, onClick: () => void loadList() }, '刷新'),
+          ui.button({ type: 'button', size: 'sm', onClick: currentSession }, '当前会话'),
+          ui.button({ type: 'button', size: 'sm', onClick: sync }, '从中枢同步'),
+          ui.button({ type: 'button', size: 'sm', onClick: () => void loadList() }, '刷新'),
         ),
         note ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.7, paddingBottom: 8 } }, note) : null,
         view === 'tasks'
@@ -2592,8 +2619,8 @@ try {
                 h('option', { value: '' }, '全部目标'),
                 [...new Set((list ?? []).flatMap((entry) => entry.peers ?? []))].map((name) => h('option', { key: name, value: name }, name)),
               ),
-              h('input', {
-                style: { ...controlStyle, width: 96, fontSize: TOKENS.font.md, padding: '2px 6px' },
+              ui.input({
+                size: 'sm', style: { width: 96 },
                 placeholder: 'conv/…',
                 value: query,
                 onChange: (e) => setQuery(e.target.value),
@@ -2605,8 +2632,7 @@ try {
               filtered.length === 0
                 ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.6, padding: 12 } }, '没有匹配的会话')
                 : filtered.map((entry) =>
-                    h(
-                      'button',
+                    ui.button(
                       {
                         key: entry.conversation,
                         type: 'button',
@@ -2628,7 +2654,7 @@ try {
                         { style: { display: 'flex', justifyContent: 'space-between', gap: 6, alignItems: 'baseline' } },
                         h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 } }, convTitle(entry)),
                         entry.unread
-                          ? h('span', { style: { fontSize: TOKENS.font.xs, padding: '1px 6px', borderRadius: 8, background: TOKENS.color.primary, color: TOKENS.color.onPrimary } }, String(entry.unread))
+                          ? ui.badge({ tone: 'accent' }, String(entry.unread))
                           : null,
                       ),
                       h('div', { style: { fontSize: TOKENS.font.sm, opacity: 0.65, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, convSubtitle(entry) + ' · ' + (entry.peers ?? []).join(', ')),
@@ -2711,8 +2737,7 @@ try {
                       : null,
                     pageAtBottom
                       ? null
-                      : h(
-                          'button',
+                      : ui.button(
                           {
                             key: 'jump',
                             type: 'button',
@@ -2965,7 +2990,7 @@ try {
             },
           },
           h('span', { style: { fontWeight: 600, flex: '0 0 auto' } }, 'Mesh 信箱'),
-          unread ? h('span', { style: { fontSize: TOKENS.font.xs, padding: '1px 6px', borderRadius: 8, background: TOKENS.color.primary, color: TOKENS.color.onPrimary } }, unread + ' 未读') : null,
+          unread ? ui.badge({ tone: 'accent' }, unread + ' 未读') : null,
           h('div', { style: { flex: 1 } }),
           active && isBound
             ? h(
@@ -3015,8 +3040,7 @@ try {
                   list.length === 0
                     ? h('div', { style: { padding: 8, opacity: 0.6 } }, '（没有会话）')
                     : list.map((entry) =>
-                        h(
-                          'button',
+                        ui.button(
                           {
                             key: entry.conversation,
                             type: 'button',
@@ -3050,8 +3074,7 @@ try {
                 },
               },
               boundConvs.map((entry) =>
-                h(
-                  'button',
+                ui.button(
                   {
                     key: entry.conversation,
                     type: 'button',
@@ -3150,8 +3173,7 @@ try {
             : null,
           atBottom
             ? null
-            : h(
-                'button',
+            : ui.button(
                 {
                   type: 'button',
                   onClick: jumpToLatest,

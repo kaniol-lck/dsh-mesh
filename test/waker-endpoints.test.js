@@ -5827,6 +5827,54 @@ async function main() {
     report('ui tokens: every declared token is referenced at least once', ok, `tokens=${keys.length} unused=${unused.join(',') || '-'}`)
   })
 
+  // 268-270. Control vocabulary (T-331): one constructor per shape. The gate proves call
+  // sites stopped building raw controls; the style cases prove the constructors really share
+  // one style per variant (and do not collapse every variant into the same look).
+  const loadClientUi = () => {
+    const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
+    const tokenBlock = source.split('// BEGIN UI TOKENS')[1]?.split('// END UI TOKENS')[0] ?? ''
+    const controlBlock = source.split('// BEGIN UI CONTROLS')[1]?.split('// END UI CONTROLS')[0] ?? ''
+    const sandbox = {
+      h: (tag, props, ...children) => ({ tag, props: props ?? {}, children }),
+      styles: { input: { flex: 1, minWidth: 0 } },
+      controlStyle: { padding: '6px 12px' },
+      selectStyle: { appearance: 'none' },
+      buttonBase: { borderRadius: 6, cursor: 'pointer' },
+    }
+    const code = `${tokenBlock}\n${controlBlock}\n;globalThis.__ui = ui`
+    vm.runInNewContext(code, sandbox)
+    return sandbox.__ui
+  }
+
+  await runCase('ui controls: client.js builds no raw controls outside the vocabulary', async () => {
+    const { execFileSync } = require('node:child_process')
+    const raw = execFileSync(process.execPath, ['scripts/check-ui-tokens.mjs', '--paths', 'plugins/mesh-waker/client.js', '--json'], {
+      cwd: REPO,
+      encoding: 'utf8',
+    })
+    const parsed = JSON.parse(raw.slice(raw.indexOf('{')))
+    const file = parsed.files.find((entry) => entry.path === 'plugins/mesh-waker/client.js')
+    const ok = Boolean(file) && file.rawControlCount === 0
+    report('ui controls: client.js builds no raw controls outside the vocabulary', ok, `rawControl=${file?.rawControlCount}`)
+  })
+
+  await runCase('ui controls: the same variant yields one shared style', async () => {
+    const ui = loadClientUi()
+    const first = ui.button({ variant: 'secondary' }).props.style
+    const second = ui.button({ variant: 'secondary', style: { width: 80 } }).props.style
+    const ok = JSON.stringify(ui.button({}).props.style) === JSON.stringify(first) && JSON.stringify({ ...second, width: undefined }) === JSON.stringify({ ...first, width: undefined }) && second.width === 80
+    report('ui controls: the same variant yields one shared style', ok, `secondary=${JSON.stringify(first)}`)
+  })
+
+  await runCase('ui controls: danger and primary buttons stay different', async () => {
+    const ui = loadClientUi()
+    const danger = ui.button({ variant: 'danger' }).props.style
+    const primary = ui.button({ variant: 'primary' }).props.style
+    const secondary = ui.button({ variant: 'secondary' }).props.style
+    const ok = JSON.stringify(danger) !== JSON.stringify(primary) && JSON.stringify(danger) !== JSON.stringify(secondary) && danger.color !== primary.color
+    report('ui controls: danger and primary buttons stay different', ok, `danger=${danger.color} primary=${primary.color}`)
+  })
+
   // 241. Boot diagnostics (T-299): a listener that cannot bind must fail fast and name the
   // real error instead of burning the 5s probe budget and reporting "never answered".
   {

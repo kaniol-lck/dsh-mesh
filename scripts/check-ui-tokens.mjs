@@ -32,6 +32,10 @@ const RAW_FONT_SIZE = /fontSize\s*:\s*\d+(?:\.\d+)?\b|font-size\s*:\s*\d+(?:\.\d
 const JSON_TOKEN_REF = /--dsw-[a-zA-Z0-9_-]+|TOKENS\.[a-zA-Z]+\.[a-zA-Z]+/g
 // Declarations between these markers are the vocabulary itself — raw values allowed there.
 const UI_TOKEN_REGION = /\/\/ BEGIN UI TOKENS[\s\S]*?\/\/ END UI TOKENS/g
+// Raw control construction outside the ui constructors is the second drift source: one shape
+// must have one entry point. `h('button', …)` and the multiline `h(\n 'button',` form both count.
+const RAW_CONTROL = /\bh\(\s*'(button|input|select|textarea)'/g
+const UI_CONTROL_REGION = /\/\/ BEGIN UI CONTROLS[\s\S]*?\/\/ END UI CONTROLS/g
 const USAGE = `check-ui-tokens.mjs — raw colour / font-size vs design tokens
 
 Usage:
@@ -40,10 +44,13 @@ Usage:
 Checks (per file):
   rawColor     hex literal #rgb / #rrggbb / #rrggbbaa
   rawFontSize  "fontSize: <number>" or "font-size: <number>px"
+  rawControl   h('button'|'input'|'select'|'textarea') outside the ui constructors
   tokenRef     --dsw-* and TOKENS.x.y references — counted, never a violation
 Files named ui-tokens*, theme*, tokens* may contain raw values.
 A block between "// BEGIN UI TOKENS" and "// END UI TOKENS" declares the vocabulary and is
 exempt from the raw-value counts (line numbers elsewhere stay accurate).
+A block between "// BEGIN UI CONTROLS" and "// END UI CONTROLS" is the control vocabulary and
+is exempt from rawControl (the constructors themselves must call h('button') etc.).
 
 Options:
   --paths <a,b>       files to scan (default: plugins/mesh-waker/client.js,hub/server.mjs)
@@ -89,12 +96,15 @@ export function scanText(text) {
   const violations = []
   let rawColorCount = 0
   let rawFontSizeCount = 0
+  let rawControlCount = 0
   let tokenRefCount = 0
   const colors = new Set()
   // A `// BEGIN UI TOKENS` … `// END UI TOKENS` block is the vocabulary itself: the literals
   // inside it are the single source of truth, not drift. Blank the block out but keep its
   // newlines so reported line numbers stay accurate.
-  const scannable = text.replace(UI_TOKEN_REGION, (block) => block.replace(/[^\n]/g, ''))
+  const scannable = text
+    .replace(UI_TOKEN_REGION, (block) => block.replace(/[^\n]/g, ''))
+    .replace(UI_CONTROL_REGION, (block) => block.replace(/[^\n]/g, ''))
   scannable.split(/\r?\n/).forEach((line, index) => {
     for (const match of line.matchAll(RAW_COLOR)) {
       rawColorCount += 1
@@ -106,10 +116,14 @@ export function scanText(text) {
       violations.push({ line: index + 1, kind: 'rawFontSize', value: match[0] })
     }
   })
+  for (const match of scannable.matchAll(RAW_CONTROL)) {
+    rawControlCount += 1
+    violations.push({ line: scannable.slice(0, match.index).split('\n').length, kind: 'rawControl', value: match[0] })
+  }
   // Token references: host `--dsw-*` aliases (counted in the whole text, including the
   // declaration block) plus JS vocabulary references like `TOKENS.color.surface`.
   for (const match of text.matchAll(JSON_TOKEN_REF)) tokenRefCount += 1
-  return { rawColorCount, rawFontSizeCount, distinctColorCount: colors.size, tokenRefCount, violations }
+  return { rawColorCount, rawFontSizeCount, rawControlCount, distinctColorCount: colors.size, tokenRefCount, violations }
 }
 
 function relPath(file) {
@@ -120,7 +134,7 @@ function relPath(file) {
 
 function scanFile(file) {
   const relative = relPath(file)
-  if (ALLOWED_TOKEN_FILE.test(relative)) return { path: relative, allowed: true, rawColorCount: 0, rawFontSizeCount: 0, distinctColorCount: 0, tokenRefCount: 0, violations: [] }
+  if (ALLOWED_TOKEN_FILE.test(relative)) return { path: relative, allowed: true, rawColorCount: 0, rawFontSizeCount: 0, rawControlCount: 0, distinctColorCount: 0, tokenRefCount: 0, violations: [] }
   const absolute = path.resolve(ROOT, file)
   if (!existsSync(absolute)) {
     console.error(`missing file: ${relative}`)
@@ -145,9 +159,10 @@ function main() {
     (acc, file) => ({
       rawColorCount: acc.rawColorCount + file.rawColorCount,
       rawFontSizeCount: acc.rawFontSizeCount + file.rawFontSizeCount,
+      rawControlCount: acc.rawControlCount + file.rawControlCount,
       tokenRefCount: acc.tokenRefCount + file.tokenRefCount,
     }),
-    { rawColorCount: 0, rawFontSizeCount: 0, tokenRefCount: 0 },
+    { rawColorCount: 0, rawFontSizeCount: 0, rawControlCount: 0, tokenRefCount: 0 },
   )
   const allViolations = files.flatMap((file) => file.violations.map((violation) => ({ ...violation, path: file.path })))
   const byLine = new Map()
@@ -164,7 +179,7 @@ function main() {
     const body = {
       generatedAt: new Date().toISOString(),
       files: Object.fromEntries(
-        files.map((file) => [file.path, { rawColor: file.rawColorCount, rawFontSize: file.rawFontSizeCount }]),
+        files.map((file) => [file.path, { rawColor: file.rawColorCount, rawFontSize: file.rawFontSizeCount, rawControl: file.rawControlCount }]),
       ),
     }
     writeFileSync(options.baseline, JSON.stringify(body, null, 2) + '\n', 'utf8')
@@ -180,14 +195,16 @@ function main() {
       process.exit(2)
     }
     for (const file of files) {
-      const allowed = baseline.files?.[file.path] ?? { rawColor: 0, rawFontSize: 0 }
-      if (file.rawColorCount > allowed.rawColor || file.rawFontSizeCount > allowed.rawFontSize) {
+      const allowed = baseline.files?.[file.path] ?? { rawColor: 0, rawFontSize: 0, rawControl: 0 }
+      if (file.rawColorCount > allowed.rawColor || file.rawFontSizeCount > allowed.rawFontSize || file.rawControlCount > (allowed.rawControl ?? 0)) {
         exceeded.push({
           path: file.path,
           rawColor: file.rawColorCount,
           rawColorBaseline: allowed.rawColor,
           rawFontSize: file.rawFontSizeCount,
           rawFontSizeBaseline: allowed.rawFontSize,
+          rawControl: file.rawControlCount,
+          rawControlBaseline: allowed.rawControl ?? 0,
         })
       }
     }
@@ -201,6 +218,7 @@ function main() {
       rawColorCount: file.rawColorCount,
       distinctColorCount: file.distinctColorCount,
       rawFontSizeCount: file.rawFontSizeCount,
+      rawControlCount: file.rawControlCount,
       tokenRefCount: file.tokenRefCount,
     })),
     totals: { ...totals, distinctColorCount: files.reduce((sum, file) => sum + file.distinctColorCount, 0) },
@@ -217,10 +235,11 @@ function main() {
       const name = path.basename(file.path).padEnd(12)
       const color = `裸色 ${file.rawColorCount}（${file.distinctColorCount} 种）`
       const font = `裸字号 ${file.rawFontSizeCount}`
-      console.log(`${name}${color} / ${font}   令牌引用 ${file.tokenRefCount}${file.allowed ? '（令牌文件，跳过）' : ''}`)
+      const control = `裸控件 ${file.rawControlCount}`
+      console.log(`${name}${color} / ${font} / ${control}   令牌引用 ${file.tokenRefCount}${file.allowed ? '（令牌文件，跳过）' : ''}`)
     }
     console.log('-'.repeat(60))
-    console.log(`合计 裸色 ${totals.rawColorCount} / 裸字号 ${totals.rawFontSizeCount} / 令牌引用 ${totals.tokenRefCount}`)
+    console.log(`合计 裸色 ${totals.rawColorCount} / 裸字号 ${totals.rawFontSizeCount} / 裸控件 ${totals.rawControlCount} / 令牌引用 ${totals.tokenRefCount}`)
     if (topSpots.length) {
       console.log('\n最集中的 5 处：')
       for (const spot of topSpots) console.log(`  ${spot.path}:${spot.line}  ${[...new Set(spot.values)].join(' ')}`)
