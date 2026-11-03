@@ -11,7 +11,7 @@
 
 ## 0. 自签 CA / 公网部署（A 模式）
 
-公网接法为 **frp TCP 透传 + hub 自签证书**。客户端第一次连 hub 时 CA 尚未被信任，而
+公网接法为 **frp TCP 透传 + 自签证书**（本机现用形态是**边缘代理终止 TLS**）。客户端第一次连 hub 时 CA 尚未被信任，而
 `/api/bootstrap` 自己就在 TLS 后面——**不能用它来获取它自己的 CA**，所以 CA 必须带外交付。
 
 ### 0.1 服务端一次性准备
@@ -27,8 +27,16 @@ node scripts/make-cert.mjs --out certs --ip <公网IP>
 # 产物：certs/ca.crt（分发给客户端）+ 服务器证书/私钥
 ```
 
-- hub 侧配置 `MESH_TLS_CERT` / `MESH_TLS_KEY` 指向服务器证书与私钥；
-- 配置 `MESH_PUBLIC_URL=https://<公网IP>:<端口>`（bootstrap 会把该地址告诉新设备）。
+证书装在**哪里**取决于部署形态——两种都支持，**客户端做法完全相同**（拿 `ca.crt` 信任）：
+
+| 形态 | 证书装在哪 | hub 的 env |
+|---|---|---|
+| **边缘终止**（本机现用） | frp / nginx 等边缘代理 | **不设** TLS 变量；hub 只监听明文，由代理加 TLS |
+| hub 自己终止 | hub 进程 | 设 `MESH_TLS_CERT` / `MESH_TLS_KEY`（可选 `MESH_TLS_CA_FILE`，让 `/api/bootstrap` 发布 CA） |
+
+- 配置 `MESH_PUBLIC_URL=https://<公网IP>:<端口>`（bootstrap 会把该地址告诉新设备）；
+- 边缘终止时，代理必须**透传真实来源地址**（`X-Forwarded-For` 等），否则 `MESH_CONSOLE_ALLOW`
+  白名单看到的是代理 IP——见 [`auth-and-console.md`](auth-and-console.md) 的来源限制一节。
 
 ### 0.2 把 CA 带外交付给每台设备
 
@@ -51,6 +59,13 @@ Python 侧一律用 `--ca` / `MESH_CA_FILE` 显式指定同一个 pem 文件。
 # 1) 证书链与 CA 匹配（在服务端 certs 目录）
 openssl verify -CAfile ca.crt server.crt
 
+# 1b) 公网入口实际出示的证书（看 issuer 与 SAN 是否含你访问用的 IP/域名）
+openssl s_client -connect <公网IP>:<端口> -servername <公网IP> </dev/null 2>/dev/null \
+  | openssl x509 -noout -issuer -subject -ext subjectAltName
+
+# 1c) 没有 openssl 时（Windows 常见）用 Node 读 peer 证书：
+node -e "const t=require('tls').connect({host:'<公网IP>',port:<端口>,servername:'<公网IP>'},()=>{const c=t.getPeerCertificate();console.log(c.issuer,c.subjectaltname||'')});t.on('error',e=>{console.error(e.message);process.exit(1)})"
+
 # 2) 从设备验证信任链（Node，waker 同款）
 NODE_EXTRA_CA_CERTS=<本地 ca.crt 路径> node -e "fetch('https://<公网IP>:<端口>/api/bootstrap').then(r=>r.json()).then(j=>console.log(j.service))"
 # 应输出 dsh-mesh
@@ -67,6 +82,7 @@ python -c "import ssl,urllib.request; print(urllib.request.urlopen('https://<公
 | `SELF_SIGNED_CERT_IN_CHAIN` / `CERTIFICATE_VERIFY_FAILED` | CA 没配或配错文件；确认用的是 hub 的 `ca.crt` |
 | `ERR_TLS_CERT_ALTNAME_INVALID`（Node）/ `hostname mismatch`（Python） | 证书里没有这个 IP/域名 → 用 `--ip`/`--dns` 重签 |
 | 通了但 `service` 不是 `dsh-mesh` | 连到了别的服务（反代/端口错） |
+| `/api/bootstrap` 的 `tls` 为 `null` | hub 未配 `MESH_TLS_CA_FILE`（**边缘终止时这是正常的**，不是错误——TLS 由代理负责，hub 不发布 CA） |
 
 ---
 
