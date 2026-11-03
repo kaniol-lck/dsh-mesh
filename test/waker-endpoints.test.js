@@ -2878,6 +2878,19 @@ async function main() {
     report('client: the sidebar never jumps away through layout.selectPanel', ok, `requests=${/requestTasksPanel\(/.test(source)} selectPanel=${/selectPanel\('mesh-inbox'\)/.test(source)}`)
   })
 
+  // T-341: conversation and task lists share one row component; rows must not grow a
+  // permanent border again (that is what made every entry look like a card).
+  await runCase('client: list rows share one component without a permanent border', async () => {
+    const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
+    const rowUses = (source.match(/ui\.listRow\(/g) ?? []).length
+    const ok =
+      /listRow\(\{ title, meta, selected = false/.test(source) &&
+      rowUses >= 3 &&
+      !/borderBottom: '1px solid rgba\(127,127,127,0\.14\)'/.test(source) &&
+      !/pickerRowStyle/.test(source)
+    report('client: list rows share one component without a permanent border', ok, `rowUses=${rowUses} pickerStyle=${/pickerRowStyle/.test(source)}`)
+  })
+
   await runCase('client: a second right-side tab embeds the task list', async () => {
     const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
     const ok =

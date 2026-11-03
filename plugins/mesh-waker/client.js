@@ -36,6 +36,7 @@ const TOKENS = {
     cardBorderOuter: 'var(--dsw-alias-border-l2, #0000001a)', // 卡片外框（官方 border-l2 = #0000001a）
     inset: 'var(--dsw-static-neutral-bluish-50, #f9fafb)', // 卡片内嵌区底（官方 neutral-bluish-50）
     interactive: 'var(--dsw-alias-interactive-bg-hover, #2631480f)', // 仅 hover：折叠头（官方 interactive-bg-hover = #2631480f）
+    interactiveActive: 'var(--dsw-alias-interactive-bg-active, #2631481a)', // 列表选中行（官方 interactive-bg-active = #2631481a）
     labelPrimary: 'var(--dsw-alias-label-primary, #0f1115)', // 卡片标题（官方 = neutral-bluish-1000）
     labelSecondary: 'var(--dsw-alias-label-secondary, #61666b)', // 卡片说明文字、箭头（官方 = neutral-bluish-700）
     // 官方开关（T-338）：外壳 CSS 里的 .switch/.thumb 规则，尺寸与颜色逐条照抄。
@@ -838,6 +839,67 @@ try {
             )
           : node
       },
+      /**
+       * Official list row (T-341): no permanent border, hover/selected background, two text
+       * levels (title + meta) with ellipsis, 8px/10px padding. No onClick renders a plain div
+       * so read-only lists (tasks) share the same geometry.
+       */
+      listRow({ title, meta, selected = false, onClick, trailing, titleAttr, key }, ...children) {
+        const interactive = Boolean(onClick)
+        const props = {
+          key,
+          title: titleAttr,
+          'aria-current': selected ? 'true' : undefined,
+          onClick,
+          onMouseEnter: interactive
+            ? (event) => {
+                if (!selected) event.currentTarget.style.background = TOKENS.color.interactive
+              }
+            : undefined,
+          onMouseLeave: interactive
+            ? (event) => {
+                if (!selected) event.currentTarget.style.background = 'transparent'
+              }
+            : undefined,
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            width: '100%',
+            minWidth: 0,
+            padding: '8px 10px',
+            border: 'none',
+            borderRadius: 6,
+            background: selected ? TOKENS.color.interactiveActive : 'transparent',
+            color: 'inherit',
+            textAlign: 'left',
+            cursor: interactive ? 'pointer' : 'default',
+            font: 'inherit',
+            transition: 'background .12s',
+          },
+        }
+        const body = [
+          h(
+            'span',
+            { style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: 1 } },
+            h(
+              'span',
+              { style: { fontSize: TOKENS.font.md, color: TOKENS.color.labelPrimary, fontWeight: selected ? 600 : 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+              title,
+            ),
+            meta
+              ? h(
+                  'span',
+                  { style: { fontSize: TOKENS.font.xs, color: TOKENS.color.labelSecondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                  meta,
+                )
+              : null,
+          ),
+          trailing ? h('span', { style: { flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6 } }, trailing) : null,
+          ...children,
+        ]
+        return interactive ? h('button', { type: 'button', ...props }, ...body) : h('div', props, ...body)
+      },
     }
     // END UI CONTROLS
 
@@ -1271,31 +1333,12 @@ try {
           visible.length === 0
             ? h('div', { style: { padding: 12, color: TOKENS.color.labelSecondary } }, '暂无派活任务')
             : visible.map((row) =>
-                h(
-                  'div',
-                  {
-                    key: row.taskId,
-                    style: { display: 'grid', gap: 2, minWidth: 0, padding: '6px 10px', borderBottom: '1px solid ' + TOKENS.color.cardBorder },
-                  },
-                  h(
-                    'div',
-                    { style: { display: 'flex', alignItems: 'baseline', gap: 6, minWidth: 0 } },
-                    h(
-                      'span',
-                      {
-                        title: row.taskId,
-                        style: { fontFamily: 'monospace', fontSize: TOKENS.font.xs, color: TOKENS.color.labelSecondary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 },
-                      },
-                      row.taskId,
-                    ),
-                    h('span', { style: { flexShrink: 0, fontSize: TOKENS.font.xs, color: TOKENS.color.labelSecondary } }, formatTaskStatus(row.status)),
-                  ),
-                  h(
-                    'div',
-                    { title: summaryOf(row), style: { color: TOKENS.color.labelPrimary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 } },
-                    summaryOf(row),
-                  ),
-                ),
+                ui.listRow({
+                  key: row.taskId,
+                  title: summaryOf(row),
+                  meta: row.taskId + ' · ' + formatTaskStatus(row.status),
+                  titleAttr: row.taskId,
+                }),
               ),
         ),
         settled.length
@@ -2481,33 +2524,15 @@ try {
               filtered.length === 0
                 ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.6, padding: 12 } }, '没有匹配的会话')
                 : filtered.map((entry) =>
-                    ui.button(
-                      {
-                        key: entry.conversation,
-                        type: 'button',
-                        onClick: () => void openThread(entry.conversation),
-                        style: {
-                          display: 'block',
-                          width: '100%',
-                          textAlign: 'left',
-                          border: 'none',
-                          borderBottom: '1px solid rgba(127,127,127,0.14)',
-                          padding: '8px 10px',
-                          cursor: 'pointer',
-                          fontSize: TOKENS.font.md,
-                          background: active === entry.conversation ? 'rgba(99,102,241,0.14)' : 'transparent',
-                        },
-                      },
-                      h(
-                        'div',
-                        { style: { display: 'flex', justifyContent: 'space-between', gap: 6, alignItems: 'baseline' } },
-                        h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 } }, convTitle(entry)),
-                        entry.unread
-                          ? ui.badge({ tone: 'accent' }, String(entry.unread))
-                          : null,
-                      ),
-                      h('div', { style: { fontSize: TOKENS.font.sm, opacity: 0.65, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, convSubtitle(entry) + ' · ' + (entry.peers ?? []).join(', ')),
-                    ),
+                    ui.listRow({
+                      key: entry.conversation,
+                      title: convTitle(entry),
+                      meta: convSubtitle(entry) + ((entry.peers ?? []).length ? ' · ' + entry.peers.join(', ') : ''),
+                      selected: active === entry.conversation,
+                      onClick: () => void openThread(entry.conversation),
+                      titleAttr: entry.conversation,
+                      trailing: entry.unread ? ui.badge({ tone: 'accent' }, String(entry.unread)) : null,
+                    }),
                   ),
             ),
           ),
@@ -2810,19 +2835,6 @@ try {
       const activeEntry = list.find((entry) => entry.conversation === active)
       const unread = list.reduce((sum, entry) => sum + (entry.unread ?? 0), 0)
 
-      const pickerRowStyle = {
-        display: 'block',
-        width: '100%',
-        textAlign: 'left',
-        border: 'none',
-        borderRadius: 6,
-        background: 'transparent',
-        color: 'var(--dsw-alias-label-primary)',
-        font: 'inherit',
-        padding: '6px 8px',
-        cursor: 'pointer',
-      }
-
       return h(
         'div',
         { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, fontSize: TOKENS.font.md } },
@@ -2888,22 +2900,16 @@ try {
                   list.length === 0
                     ? h('div', { style: { padding: 8, opacity: 0.6 } }, '（没有会话）')
                     : list.map((entry) =>
-                        ui.button(
-                          {
-                            key: entry.conversation,
-                            type: 'button',
-                            onClick: () => {
-                              setPicker(false)
-                              void openThread(entry.conversation)
-                            },
-                            style: {
-                              ...pickerRowStyle,
-                              background: entry.conversation === active ? 'var(--dsw-alias-interactive-bg-active, rgba(127,127,127,0.14))' : 'transparent',
-                            },
+                        ui.listRow({
+                          key: entry.conversation,
+                          title: convTitle(entry),
+                          meta: convSubtitle(entry),
+                          selected: entry.conversation === active,
+                          onClick: () => {
+                            setPicker(false)
+                            void openThread(entry.conversation)
                           },
-                          h('div', { style: { fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, convTitle(entry)),
-                          h('div', { style: { fontSize: TOKENS.font.xs, color: 'var(--dsw-alias-label-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, convSubtitle(entry)),
-                        ),
+                        }),
                       ),
                 )
               : null,
