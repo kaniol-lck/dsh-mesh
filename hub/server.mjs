@@ -33,6 +33,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
 import { config } from './config.mjs'
+import { TOKENS } from './console/tokens.mjs'
 
 // Hub version. Advisory: it drives drift hints in /api/peers and /api/status, never
 // authorization. Keep this literal here — scripts/check-version-sync.mjs reads it
@@ -1286,37 +1287,92 @@ function sendHtml(res, status, body, extraHeaders) {
   res.end(body)
 }
 
+const TOKENS_CSS = `
+:root {
+  --mesh-surface: ${TOKENS.color.surface};
+  --mesh-surface-muted: ${TOKENS.color.surfaceMuted};
+  --mesh-surface-inset: ${TOKENS.color.surfaceInset};
+  --mesh-border: ${TOKENS.color.border};
+  --mesh-border-subtle: ${TOKENS.color.borderSubtle};
+  --mesh-border-strong: ${TOKENS.color.borderStrong};
+  --mesh-border-dashed: ${TOKENS.color.borderDashed};
+  --mesh-text: ${TOKENS.color.text};
+  --mesh-text-muted: ${TOKENS.color.textMuted};
+  --mesh-text-faint: ${TOKENS.color.textFaint};
+  --mesh-success: ${TOKENS.color.success};
+  --mesh-success-bg: ${TOKENS.color.successBg};
+  --mesh-success-border: ${TOKENS.color.successBorder};
+  --mesh-warning: ${TOKENS.color.warning};
+  --mesh-warning-bg: ${TOKENS.color.warningBg};
+  --mesh-warning-border: ${TOKENS.color.warningBorder};
+  --mesh-danger: ${TOKENS.color.danger};
+  --mesh-primary: ${TOKENS.color.primary};
+  --mesh-on-primary: ${TOKENS.color.onPrimary};
+  --mesh-font-xs: ${TOKENS.font.xs}px;
+  --mesh-font-sm: ${TOKENS.font.sm}px;
+  --mesh-font-md: ${TOKENS.font.md}px;
+  --mesh-font-lg: ${TOKENS.font.lg}px;
+  --mesh-font-xl: ${TOKENS.font.xl}px;
+  --mesh-font-display: ${TOKENS.font.display}px;
+  --mesh-font-hero: ${TOKENS.font.hero}px;
+  --mesh-radius-lg: ${TOKENS.radius.lg}px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --mesh-surface: ${TOKENS.dark.surface};
+    --mesh-surface-muted: ${TOKENS.dark.surfaceMuted};
+    --mesh-surface-inset: ${TOKENS.dark.surfaceInset};
+    --mesh-border: ${TOKENS.dark.border};
+    --mesh-border-subtle: ${TOKENS.dark.borderSubtle};
+    --mesh-border-strong: ${TOKENS.dark.borderStrong};
+    --mesh-border-dashed: ${TOKENS.dark.borderDashed};
+    --mesh-text: ${TOKENS.dark.text};
+    --mesh-text-muted: ${TOKENS.dark.textMuted};
+    --mesh-text-faint: ${TOKENS.dark.textFaint};
+    --mesh-success: ${TOKENS.dark.success};
+    --mesh-success-bg: ${TOKENS.dark.successBg};
+    --mesh-success-border: ${TOKENS.dark.successBorder};
+    --mesh-warning: ${TOKENS.dark.warning};
+    --mesh-warning-bg: ${TOKENS.dark.warningBg};
+    --mesh-warning-border: ${TOKENS.dark.warningBorder};
+    --mesh-danger: ${TOKENS.dark.danger};
+    --mesh-primary: ${TOKENS.dark.primary};
+    --mesh-on-primary: ${TOKENS.dark.onPrimary};
+  }
+}
+`
+
 const CONSOLE_STYLE = `
+${TOKENS_CSS}
 :root { color-scheme: light dark; }
 * { box-sizing: border-box; }
-body { margin: 0; font: 14px/1.55 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
-       background: #f6f7f9; color: #1c1f23; }
-@media (prefers-color-scheme: dark) { body { background: #16181c; color: #e6e8eb; } .card { background: #1f2227 !important; border-color: #2c3036 !important; } th { color: #9aa0a6 !important; } td, th { border-color: #2c3036 !important; } input, select { background: #1f2227; color: #e6e8eb; border-color: #2c3036; } }
+body { margin: 0; font: ${TOKENS.font.lg}px/1.55 -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+       background: var(--mesh-surface-muted); color: var(--mesh-text); }
 main { max-width: 1040px; margin: 0 auto; padding: 28px 20px 60px; }
-h1 { font-size: 20px; margin: 0 0 4px; }
-.sub { color: #6b7280; font-size: 12.5px; margin-bottom: 22px; }
+h1 { font-size: var(--mesh-font-xl); margin: 0 0 4px; }
+.sub { color: var(--mesh-text-muted); font-size: var(--mesh-font-sm); margin-bottom: 22px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 22px; }
-.card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 16px; }
-.card .k { font-size: 12px; color: #6b7280; }
-.card .v { font-size: 22px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
-h2 { font-size: 14px; margin: 26px 0 10px; }
-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden; }
-th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #eef0f2; font-size: 13px; vertical-align: top; }
-th { color: #6b7280; font-weight: 600; font-size: 12px; }
+.card { background: var(--mesh-surface); border: 1px solid var(--mesh-border); border-radius: var(--mesh-radius-lg); padding: 14px 16px; }
+.card .k { font-size: var(--mesh-font-sm); color: var(--mesh-text-muted); }
+.card .v { font-size: var(--mesh-font-display); font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+h2 { font-size: var(--mesh-font-lg); margin: 26px 0 10px; }
+table { width: 100%; border-collapse: collapse; background: var(--mesh-surface); border: 1px solid var(--mesh-border); border-radius: var(--mesh-radius-lg); overflow: hidden; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--mesh-border-subtle); font-size: var(--mesh-font-md); vertical-align: top; }
+th { color: var(--mesh-text-muted); font-weight: 600; font-size: var(--mesh-font-sm); }
 tr:last-child td { border-bottom: none; }
-.badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11.5px; border: 1px solid transparent; }
-.ok { color: #15803d; background: #dcfce7; border-color: #bbf7d0; }
-.warn { color: #b45309; background: #fef3c7; border-color: #fde68a; }
-.off { color: #6b7280; background: #f1f3f5; border-color: #e5e7eb; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: var(--mesh-font-xs); border: 1px solid transparent; }
+.ok { color: var(--mesh-success); background: var(--mesh-success-bg); border-color: var(--mesh-success-border); }
+.warn { color: var(--mesh-warning); background: var(--mesh-warning-bg); border-color: var(--mesh-warning-border); }
+.off { color: var(--mesh-text-muted); background: var(--mesh-surface-inset); border-color: var(--mesh-border); }
 form.inline { display: inline-block; margin: 0 6px 0 0; }
-input[type=password], input[type=text] { padding: 7px 10px; border-radius: 8px; border: 1px solid #d1d5db; font-size: 13px; }
-button { margin-top: 6px; padding: 6px 12px; border-radius: 8px; border: 1px solid #111827;
-         background: #111827; color: #fff; font-size: 13px; cursor: pointer; }
-button.danger { background: #b91c1c; border-color: #b91c1c; }
-.token { font-family: ui-monospace, Consolas, monospace; font-size: 13px; padding: 10px 12px;
-         background: #f1f3f5; border: 1px dashed #9ca3af; border-radius: 8px; word-break: break-all; }
-.err { color: #b91c1c; margin: 8px 0 0; font-size: 13px; }
-.muted { color: #6b7280; font-size: 12px; }
+input[type=password], input[type=text] { padding: 7px 10px; border-radius: 8px; border: 1px solid var(--mesh-border-strong); font-size: var(--mesh-font-md); }
+button { margin-top: 6px; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--mesh-primary);
+         background: var(--mesh-primary); color: var(--mesh-on-primary); font-size: var(--mesh-font-md); cursor: pointer; }
+button.danger { background: var(--mesh-danger); border-color: var(--mesh-danger); }
+.token { font-family: ui-monospace, Consolas, monospace; font-size: var(--mesh-font-md); padding: 10px 12px;
+         background: var(--mesh-surface-inset); border: 1px dashed var(--mesh-border-dashed); border-radius: 8px; word-break: break-all; }
+.err { color: var(--mesh-danger); margin: 8px 0 0; font-size: var(--mesh-font-md); }
+.muted { color: var(--mesh-text-muted); font-size: var(--mesh-font-sm); }
 `
 
 function consoleLoginPage(error) {
@@ -1373,13 +1429,13 @@ ${auth.role === 'admin' ? '' : '<p class="muted">只读会话：需要轮换令�
 <p class="muted">注册码 10 分钟有效、单次使用。也可以让新节点自己发起设备码，由你在这里批准。</p>
 ${auth.role === 'admin' ? '<button type="button" id="genEnroll">生成注册码</button>' : '<p class="muted">只读会话：用管理员令牌登录后可生成注册码或批准设备。</p>'}
 <div id="enrollOut" style="display:none; margin-top:10px">
-  <div class="token" id="enrollCode" style="font-size:26px; letter-spacing:4px; display:inline-block"></div>
+  <div class="token" id="enrollCode" style="font-size:var(--mesh-font-hero); letter-spacing:4px; display:inline-block"></div>
   <span class="muted" id="enrollMeta"></span>
   <button type="button" id="copyEnroll" style="margin-left:8px">复制码</button>
   <pre class="token" id="enrollCmds" style="white-space:pre-wrap; margin-top:10px"></pre>
   <p class="muted">token 只返回一次；落盘 0600；配置 tokenFile 后重载插件。</p>
 </div>
-<h3 style="font-size:13px;margin-top:20px">待批准设备</h3>
+<h3 style="font-size:var(--mesh-font-md);margin-top:20px">待批准设备</h3>
 <table><thead><tr><th>用户码</th><th>请求名</th><th>主机</th><th>请求时间</th><th>剩余</th><th>操作</th></tr></thead>
 <tbody id="pending"></tbody></table>
 <p class="muted" id="pendingEmpty" style="display:none">暂无待配对设备</p>

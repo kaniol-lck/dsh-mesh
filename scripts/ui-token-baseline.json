@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-03T15:55:17.416Z",
+  "generatedAt": "2026-11-04T15:03:58.300Z",
   "files": {
     "plugins/mesh-waker/client.js": {
       "rawColor": 0,
@@ -7,8 +7,8 @@
       "rawControl": 0
     },
     "hub/server.mjs": {
-      "rawColor": 38,
-      "rawFontSize": 15,
+      "rawColor": 0,
+      "rawFontSize": 0,
       "rawControl": 0
     }
   }
