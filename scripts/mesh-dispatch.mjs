@@ -1,315 +1,131 @@
 #!/usr/bin/env node
 /**
- * Send a task text to a DSH session through the waker's loopback API.
+ * mesh-dispatch — shell over the single implementation
+ * (plugins/mesh-waker/bin/dispatch.mjs) plus two local-only extras.
  *
- * Why this exists: on PowerShell 5.1, ConvertTo-Json serialises a multi-line
- * string as {"value":"..."}, which arrives at /mesh/inject as the 15-character
- * string "[object Object]". Node's fetch sends the file content as plain UTF-8
- * JSON, so the receiver gets the real text.
- *
- *
- * Prerequisites: local DSH with the waker plugin installed (MESH_WAKER_URL,
- * default http://127.0.0.1:8795). This is an optional local helper: without a
- * waker, use mesh messages or open the session yourself.
- * Usage:
- *   node scripts/mesh-dispatch.mjs --title "<project> · <role>" --file dispatch/task.txt
- *   node scripts/mesh-dispatch.mjs --session <id> --file task.txt --mode steer
- *   node scripts/mesh-dispatch.mjs --title "<project> · coordinator" --wake --text "[WAKE] P0: TLS 示例误导"
- *   node scripts/mesh-dispatch.mjs --title "<project> · docs" --file dispatch/task.txt --dry-run
- *
- * Target resolution by title: only active sessions (archived:false) whose cwd is
- * the repo root are considered; if several match, the one with the newest
- * last_active wins. --repo overrides process.cwd().
- *
- * --wake is for waking the coordinator session (local only, never the hub):
- * the text must start with "[WAKE]", and the same target + payload is suppressed
- * for 60 seconds so a retry or a double-run does not ring twice.
+ * Line budget: ~30 lines of shell/forwarding, the rest is the two extensions the
+ * plugin CLI cannot know about:
+ *   --title  resolve a session title to an id via ~/.dsh/mesh-waker/sessions-index.json
+ *   --wake   wake the local coordinator through the waker's inject API (60s dedupe)
+ * --repo is only used by those two; every other flag (--target, --thread, --task,
+ * --receipt, --requester, --file, --text, --mode, --batch, --deadline, --dry-run,
+ * --json, --create, --session→--target) is passed through verbatim.
  */
-
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
+import { fileURLToPath } from 'node:url'
 
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const PLUGIN_CLI = path.join(ROOT, 'plugins', 'mesh-waker', 'bin', 'dispatch.mjs')
+const INDEX = path.join(os.homedir(), '.dsh', 'mesh-waker', 'sessions-index.json')
 const BASE = process.env.MESH_WAKER_URL ?? 'http://127.0.0.1:8795'
 const WAKE_PREFIX = /^\[WAKE\]/
-const WAKE_DEBOUNCE_MS = 60_000
-
-const USAGE = `mesh-dispatch — send text to a local DSH session (waker :8795)
+const DEBOUNCE_MS = 60_000
+const USAGE = `mesh-dispatch — dispatch via the waker plugin CLI (single implementation)
 
 Usage:
-  node scripts/mesh-dispatch.mjs --title "<project> · <role>" --file dispatch/task.txt
-  node scripts/mesh-dispatch.mjs --session <id> --file task.txt [--mode queue|steer]
-  node scripts/mesh-dispatch.mjs --title "<project> · coordinator" --wake --text "[WAKE] P0: ..."
-  node scripts/mesh-dispatch.mjs --title "<project> · docs" --file dispatch/task.txt --dry-run
+  node scripts/mesh-dispatch.mjs --title "<project> · <role>" --file task.txt
+  node scripts/mesh-dispatch.mjs --target <id|title> --thread TH-1 --text "..."
+  node scripts/mesh-dispatch.mjs --title "<project> · coordinator" --wake --text "[WAKE] ..."
+  node scripts/mesh-dispatch.mjs --session <id> --text "..." --dry-run
 
-Options:
-  --title <title>    target session by exact title
-  --session <id>     target session by id (with or without "session-" prefix)
-  --file <path>      UTF-8 task text (exactly one of --file / --text)
-  --text <string>    task text inline (exactly one of --file / --text)
-  --wake             coordinator wake-up: require the "[WAKE]" first line and
-                     dedupe the same target+payload for 60s
-  --mode <mode>      queue (default) or steer
-  --task [id]        attach a task id so the waker writes a receipt when the turn
-                     ends; "--task" alone generates T-<base36 timestamp>
-  --receipt <mode>   file | queue | wake (waker default when omitted); implies --task
-  --requester <id>   session id or title that should receive the receipt (default: waker receiptTo)
-  --batch [id]       join a batch barrier: one aggregate receipt when every task ends;
-                     "--batch" alone generates B-<base36 timestamp>
-  --deadline <dur>   batch deadline like 2h / 90m / 600s (waker default when omitted)
-  --repo <path>      repo root used to filter by cwd (default: process.cwd())
-  --dry-run          resolve and print the target, send nothing
-  -h, --help         show this help
-
-Exit codes:
-  0  success
-  1  general error (network failure, unparsable response, target not found)
-  2  server refused (HTTP 4xx, e.g. 409 task-id conflict) or usage error
+Local extensions (not part of the plugin CLI):
+  --title <s>   resolve title -> session id (sessions-index.json, filtered by --repo)
+  --wake        send directly to the waker inject API; text must start with "[WAKE]"
+  --repo <path> workspace used by --title and the wake dedupe file (default: cwd)
+Everything else is forwarded unchanged (--target/--thread/--task/--receipt/
+--requester/--file/--text/--mode/--batch/--deadline/--dry-run/--json/--create).
 `
 
-class DispatchError extends Error {
-  constructor(message, code = 1) {
-    super(message)
-    this.code = code
-  }
-}
-
-function fail(message, code = 1) {
-  // Never process.exit() while a fetch body or keep-alive handle is still open:
-  // on Windows that aborts the process with a libuv UV_HANDLE_CLOSING assertion.
-  throw new DispatchError(message, code)
-}
-
-/** HTTP status -> exit code: 4xx means "the server refused", everything else is a general error. */
-function httpCode(status) {
-  return status >= 400 && status < 500 ? 2 : 1
-}
-
-function parseArgs(argv) {
-  const options = { mode: 'queue', dryRun: false, wake: false, requester: undefined, task: undefined, receipt: undefined, batch: undefined, deadline: undefined }
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index]
-    const takeValue = () => {
-      const value = argv[index + 1]
-      if (value === undefined) fail(`${arg} requires a value`, 2)
-      index += 1
-      return value
-    }
-    switch (arg) {
-      case '--title': options.title = takeValue(); break
-      case '--session': options.session = takeValue(); break
-      case '--file': options.file = takeValue(); break
-      case '--text': options.text = takeValue(); break
-      case '--repo': options.repo = takeValue(); break
-      case '--mode': options.mode = takeValue(); break
-      // Optional value: "--task" alone means "generate one", "--task T-1" uses T-1.
-      case '--task': {
-        const next = argv[index + 1]
-        options.task = next !== undefined && !String(next).startsWith('--') ? String(next) : ''
-        if (options.task) index += 1
-        break
-      }
-      case '--receipt': options.receipt = takeValue(); break
-      case '--requester': options.requester = takeValue(); break
-      // Same optional-value shape as --task: bare flag generates an id.
-      case '--batch': {
-        const next = argv[index + 1]
-        options.batch = next !== undefined && !String(next).startsWith('--') ? String(next) : ''
-        if (options.batch) index += 1
-        break
-      }
-      case '--deadline': options.deadline = takeValue(); break
-      case '--wake': options.wake = true; break
-      case '--dry-run': options.dryRun = true; break
-      case '-h':
-      case '--help':
-        console.log(USAGE)
-        process.exit(0)
-        break
-      default:
-        fail(`unknown argument: ${arg}\n\n${USAGE}`, 2)
-    }
-  }
-  const hasFile = options.file !== undefined
-  const hasText = options.text !== undefined
-  if (hasFile === hasText) fail('pass exactly one of --file or --text', 2)
-  if (!options.title && !options.session) fail('pass --title or --session', 2)
-  if (options.title && options.session) fail('--title and --session are mutually exclusive', 2)
-  if (!['queue', 'steer'].includes(options.mode)) fail('--mode must be queue or steer', 2)
-  if (options.receipt !== undefined && !['file', 'queue', 'wake'].includes(options.receipt)) {
-    fail('--receipt must be file, queue or wake', 2)
-  }
-  // Asking for a receipt destination or a batch implies task tracking.
-  if (options.receipt !== undefined && options.task === undefined) options.task = ''
-  if (options.batch !== undefined && options.task === undefined) options.task = ''
-  if (options.deadline !== undefined) parseDuration(options.deadline)
-  return options
-}
-
-/** "2h" / "90m" / "600s" -> milliseconds (fails the process on a malformed value). */
-function parseDuration(value) {
-  const match = /^(\d+)(ms|s|m|h)$/i.exec(String(value).trim())
-  if (!match) fail(`--deadline must look like 600s, 90m or 2h (got ${value})`, 2)
-  const unit = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[match[2].toLowerCase()]
-  return Number(match[1]) * unit
-}
-
-function normalizePath(value) {
+function normalize(value) {
   const resolved = path.resolve(String(value))
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
 
-function describe(session) {
-  return `${session.id}  ${session.title ?? '(no title)'}  live=${session.live}`
+function resolveTitle(title, repo) {
+  if (!existsSync(INDEX)) throw new Error(`sessions index not found: ${INDEX}`)
+  const index = JSON.parse(readFileSync(INDEX, 'utf8'))
+  const wanted = normalize(repo ?? process.cwd())
+  const matches = Object.entries(index)
+    .filter(([, session]) => session && session.title === title && session.cwd && normalize(session.cwd) === wanted)
+    .sort((left, right) => Number(right[1].mtime ?? 0) - Number(left[1].mtime ?? 0))
+  if (!matches.length) throw new Error(`no session titled "${title}" in ${wanted}`)
+  return matches[0][0]
 }
 
-function dedupePath(repoPath) {
-  return path.join(repoPath, '.worklog', 'dispatch', '.wake-dedupe.json')
+function valueOf(argv, index) {
+  return argv[index + 1] !== undefined && !String(argv[index + 1]).startsWith('--') ? argv[index + 1] : undefined
 }
 
-async function readDedupe(file) {
-  try {
-    const parsed = JSON.parse(await readFile(file, 'utf8'))
-    return parsed.entries && typeof parsed.entries === 'object' ? parsed.entries : {}
-  } catch {
-    return {}
+async function wake(argv) {
+  const titleIndex = argv.indexOf('--title')
+  const repoIndex = argv.indexOf('--repo')
+  const sessionIndex = argv.indexOf('--session')
+  const title = titleIndex >= 0 ? valueOf(argv, titleIndex) : undefined
+  const session = sessionIndex >= 0 ? valueOf(argv, sessionIndex) : undefined
+  const repo = repoIndex >= 0 ? valueOf(argv, repoIndex) : process.cwd()
+  const textIndex = argv.indexOf('--text')
+  const fileIndex = argv.indexOf('--file')
+  const text = textIndex >= 0 ? valueOf(argv, textIndex) : fileIndex >= 0 ? readFileSync(path.resolve(valueOf(argv, fileIndex)), 'utf8') : undefined
+  if (text === undefined) throw new Error('--wake needs --text or --file')
+  if (!WAKE_PREFIX.test(text.replace(/^\uFEFF/, ''))) {
+    throw new Error('wake payload must start with "[WAKE] <one-line summary>"')
   }
-}
-
-async function saveDedupe(file, entries) {
-  try {
-    await mkdir(path.dirname(file), { recursive: true })
-    await writeFile(file, JSON.stringify({ entries }), 'utf8')
-  } catch {
-    /* dedupe is best effort; never block a real wake on it */
+  const target = session ?? resolveTitle(title ?? 'mesh · 协调', repo)
+  const dedupeFile = path.join(path.resolve(repo), '.worklog', 'dispatch', '.wake-dedupe.json')
+  const key = `${target}|${createHash('sha256').update(text).digest('hex').slice(0, 16)}`
+  let entries = {}
+  try { entries = JSON.parse(readFileSync(dedupeFile, 'utf8')).entries ?? {} } catch { /* first run */ }
+  const now = Date.now()
+  if (entries[key] && now - entries[key] < DEBOUNCE_MS) { console.log('deduped: same payload within 60s'); return }
+  const response = await fetch(`${BASE}/mesh/inject`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ session: target, text, mode: 'queue' }),
+  })
+  const raw = await response.text()
+  if (!response.ok) {
+    console.error(`POST /mesh/inject -> HTTP ${response.status}: ${raw}`)
+    process.exit(response.status >= 400 && response.status < 500 ? 2 : 1)
   }
+  entries[key] = now
+  for (const [oldKey, stamp] of Object.entries(entries)) if (now - Number(stamp) >= DEBOUNCE_MS) delete entries[oldKey]
+  try { mkdirSync(path.dirname(dedupeFile), { recursive: true }); writeFileSync(dedupeFile, JSON.stringify({ entries }), 'utf8') } catch { /* best effort */ }
+  console.log(`sent session=${target} chars=${text.length} wake=yes`)
 }
 
 async function main() {
-  const options = parseArgs(process.argv.slice(2))
-  const repoPath = path.resolve(options.repo ?? process.cwd())
-  const repo = normalizePath(repoPath)
-  const text = options.text !== undefined ? String(options.text) : await readFile(path.resolve(options.file), 'utf8')
-
-  if (options.wake && !WAKE_PREFIX.test(text.replace(/^\uFEFF/, ''))) {
-    fail(
-      'wake payload must start with "[WAKE] <one-line summary>"; put the summary on the first line and details below',
-      2,
-    )
+  const argv = process.argv.slice(2)
+  if (argv.includes('-h') || argv.includes('--help')) { console.log(USAGE); return 0 }
+  if (argv.includes('--wake')) { await wake(argv); return 0 }
+  const forwarded = []
+  let title
+  let repo
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    if (arg === '--title') { title = argv[index + 1]; index += 1; continue }
+    if (arg === '--repo') { repo = argv[index + 1]; index += 1; continue }
+    if (arg === '--session') { forwarded.push('--target', argv[index + 1]); index += 1; continue }
+    forwarded.push(arg)
   }
-
-  const response = await fetch(`${BASE}/mesh/sessions`)
-  if (!response.ok) fail(`GET /mesh/sessions -> HTTP ${response.status}`, httpCode(response.status))
-  const payload = await response.json()
-  if (!payload?.ok) fail(`GET /mesh/sessions -> unexpected body: ${JSON.stringify(payload).slice(0, 300)}`)
-
-  const sessions = Array.isArray(payload.sessions) ? payload.sessions : []
-  let target
-
-  if (options.session) {
-    const wanted = String(options.session).trim()
-    target = sessions.find((session) => session.id === wanted || session.id === `session-${wanted}`)
-    if (!target) fail(`session not found: ${wanted}`)
-  } else {
-    const candidates = sessions.filter(
-      (session) =>
-        session.archived !== true &&
-        session.title === options.title &&
-        session.cwd &&
-        normalizePath(session.cwd) === repo,
-    )
-    if (candidates.length === 0) {
-      const inRepo = sessions.filter(
-        (session) => session.archived !== true && session.cwd && normalizePath(session.cwd) === repo,
-      )
-      fail(
-        `no active session titled "${options.title}" in ${repo}\n` +
-          `active sessions in this repo:\n${inRepo.map((session) => `  ${describe(session)}`).join('\n') || '  (none)'}`,
-      )
-    }
-    candidates.sort((left, right) => Number(right.last_active) - Number(left.last_active))
-    target = candidates[0]
-    if (candidates.length > 1) console.error(`note: ${candidates.length} sessions match, using the most recent`)
-  }
-
-  const chars = text.length
-  const wakeFlag = options.wake ? 'yes' : 'no'
-  // --task without a value generates one; --receipt implies task tracking (parseArgs).
-  const taskId =
-    options.task === undefined ? null : options.task || `T-${Date.now().toString(36)}`
-  const batchId = options.batch === undefined ? null : options.batch || `B-${Date.now().toString(36)}`
-  const deadlineMs = options.deadline !== undefined ? parseDuration(options.deadline) : undefined
-  const meta = taskId
-    ? {
-        taskId,
-        ...(options.receipt ? { receipt: options.receipt } : {}),
-        ...(options.requester ? { requester: options.requester } : {}),
-        ...(batchId ? { batchId, ...(deadlineMs ? { deadlineMs } : {}) } : {}),
-      }
-    : undefined
-
-  if (options.dryRun) {
-    console.log(
-      `dry-run: session=${target.id} requester=${options.requester ?? '-'} chars=${chars} wake=${wakeFlag}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}${deadlineMs ? ` deadline=${deadlineMs}ms` : ''} (not sent)`,
-    )
-    return
-  }
-
-  let dedupeFile = null
-  let dedupeEntries = {}
-  let dedupeKey = null
-  if (options.wake) {
-    dedupeFile = dedupePath(repoPath)
-    dedupeEntries = await readDedupe(dedupeFile)
-    const now = Date.now()
-    dedupeKey = `${target.id}|${createHash('sha256').update(text).digest('hex').slice(0, 16)}`
-    const last = Number(dedupeEntries[dedupeKey] ?? 0)
-    if (last && now - last < WAKE_DEBOUNCE_MS) {
-      console.log('deduped: same payload within 60s')
-      return
+  if (title !== undefined && !forwarded.includes('--target') && !forwarded.includes('--thread')) {
+    try {
+      forwarded.push('--target', resolveTitle(title, repo))
+    } catch (error) {
+      console.error(`ERROR ${error.message}`)
+      return 1
     }
   }
-
-  const sent = await fetch(`${BASE}/mesh/inject`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ session: target.id, text, mode: options.mode, ...(meta ? { meta } : {}) }),
-  })
-  const raw = await sent.text()
-  let result
   try {
-    result = JSON.parse(raw)
-  } catch {
-    // 4xx bodies are already fully consumed, so print them verbatim; others are truncated.
-    const shown = sent.status >= 400 && sent.status < 500 ? raw : raw.slice(0, 300)
-    fail(`POST /mesh/inject -> HTTP ${sent.status}: ${shown}`, httpCode(sent.status))
+    execFileSync(process.execPath, [PLUGIN_CLI, ...forwarded], { stdio: 'inherit' })
+    return 0
+  } catch (error) {
+    return typeof error.status === 'number' ? error.status : 1
   }
-  if (sent.status !== 200 || result.ok === false) {
-    const shown = sent.status >= 400 && sent.status < 500 ? raw : raw.slice(0, 300)
-    fail(`POST /mesh/inject -> HTTP ${sent.status}: ${shown}`, httpCode(sent.status))
-  }
-
-  if (dedupeFile && dedupeKey) {
-    const now = Date.now()
-    for (const [key, stamp] of Object.entries(dedupeEntries)) {
-      if (now - Number(stamp) >= WAKE_DEBOUNCE_MS) delete dedupeEntries[key]
-    }
-    dedupeEntries[dedupeKey] = now
-    await saveDedupe(dedupeFile, dedupeEntries)
-  }
-
-  console.log(
-    `sent session=${target.id} chars=${chars} mode=${options.mode} wake=${wakeFlag}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}`,
-  )
 }
 
-main().catch((error) => {
-  if (error instanceof DispatchError) {
-    console.error(error.message)
-    process.exitCode = error.code
-    return
-  }
-  console.error(error?.stack ?? String(error))
-  process.exitCode = 1
-})
+main().then((code) => { process.exitCode = code }).catch((error) => { console.error(`ERROR ${error.message}`); process.exitCode = 1 })

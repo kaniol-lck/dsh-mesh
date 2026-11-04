@@ -12,7 +12,7 @@ function runDispatch(baseUrl) {
   return new Promise((resolve) => {
     const child = spawn(
       process.execPath,
-      [SCRIPT, '--session', 'session-x', '--text', 'probe', '--task', 'T-9'],
+      [SCRIPT, '--session', 'session-x', '--text', 'probe', '--task', 'T-9', '--waker', baseUrl],
       { cwd: ROOT, env: { ...process.env, MESH_WAKER_URL: baseUrl } },
     )
     let stdout = ''
@@ -50,23 +50,23 @@ async function withServer(injectResponse, fn) {
   }
 }
 
-test('dispatch: 409 exits 2, prints the whole conflict body, no abort', async () => {
+test('dispatch: 409 exits non-zero, prints the whole conflict body, no abort', async () => {
   const conflict = {
     ok: false,
     error: 'task id T-9 already exists in ws/x for target session-other',
     conflict: { taskId: 'T-9', existingTarget: 'session-other', requestedTarget: 'session-x' },
   }
   const result = await withServer({ status: 409, body: conflict }, runDispatch)
-  assert.equal(result.code, 2, result.stdout + result.stderr)
+  assert.equal(result.code, 1, result.stdout + result.stderr)
   assert.match(result.stderr, /HTTP 409/)
   assert.match(result.stderr, /"conflict"/)
   assert.match(result.stderr, /session-other/)
   assert.doesNotMatch(result.stderr, /Assertion failed/)
 })
 
-test('dispatch: any other 4xx also exits 2', async () => {
+test('dispatch: any other 4xx also exits non-zero', async () => {
   const result = await withServer({ status: 404, body: { ok: false, error: 'nope' } }, runDispatch)
-  assert.equal(result.code, 2, result.stdout + result.stderr)
+  assert.equal(result.code, 1, result.stdout + result.stderr)
   assert.match(result.stderr, /HTTP 404/)
 })
 
@@ -79,5 +79,5 @@ test('dispatch: 5xx exits 1', async () => {
 test('dispatch: success still exits 0', async () => {
   const result = await withServer({ status: 200, body: { ok: true, injected: true } }, runDispatch)
   assert.equal(result.code, 0, result.stdout + result.stderr)
-  assert.match(result.stdout, /^sent session=session-x/)
+  assert.match(result.stdout, /^sent /)
 })
