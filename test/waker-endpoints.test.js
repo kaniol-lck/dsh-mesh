@@ -4939,6 +4939,21 @@ async function main() {
       report('stale: restoring the original content clears codeStale (content, not mtime)', ok, `dirty=${dirty.codeStale} restored=${restored.codeStale}`)
     })
   })
+
+  // T-343: the settings page dropped its read-only right-tab diagnostic row; the browser half
+  // reports that state to /mesh/status instead, so nothing is lost for diagnostics.
+  await runCase('status: the browser half can report its right-tab state', async (boot) => {
+    const h = await boot({})
+    const before = await request(h.base, '/mesh/status')
+    const posted = await request(h.base, '/mesh/ui-state', { method: 'POST', body: { rightTab: 'ok' } })
+    const after = await request(h.base, '/mesh/status')
+    const ok =
+      before.json?.ui?.rightTab === null &&
+      posted.json?.ok === true &&
+      after.json?.ui?.rightTab === 'ok' &&
+      typeof after.json?.ui?.reportedAt === 'string'
+    report('status: the browser half can report its right-tab state', ok, `before=${JSON.stringify(before.json?.ui)} after=${JSON.stringify(after.json?.ui)}`)
+  })
   // ephemeral cleanup, and idempotent convergence of registries written before this change.
   const registryOf = (h) => JSON.parse(fs.readFileSync(path.join(h.home, '.dsh', 'mesh-waker', 'workspaces.json'), 'utf8'))
   const wsDirOf = (h, slug) => path.join(h.home, '.dsh', 'mesh-waker', 'ws', slug)

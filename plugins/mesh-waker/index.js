@@ -751,6 +751,9 @@ export function apply(ctx, config) {
     registered: false,
     plugin: PLUGIN_INFO,
     mode: effectiveMode,
+    // The browser half reports its own UI state here (T-343): the right-side tab registration
+    // outcome lives in the page, so the status page is the only place both halves can be seen.
+    uiReport: null,
     sessionId: null,
     conversations: 0,
     wakes: 0,
@@ -5518,6 +5521,12 @@ export function apply(ctx, config) {
               // Pull/standalone surface (contract sections 3 and 4): the panel shows the
               // sync mode and the last pull, and the countdown is handy when debugging.
               mode: state.mode,
+              // Browser half (T-343): the settings page no longer shows a read-only diagnostic
+              // row, so the right-tab registration outcome is reported here instead.
+              ui: {
+                rightTab: state.uiReport?.rightTab ?? null,
+                reportedAt: state.uiReport?.at ?? null,
+              },
               lastPullAt: state.lastPullAt,
               pollIntervalMs: state.pollIntervalMs,
               nextPollIn: nextPullAt ? Math.max(0, Math.round((nextPullAt - Date.now()) / 1000)) : null,
@@ -5620,6 +5629,35 @@ export function apply(ctx, config) {
           try {
             const patch = JSON.parse(Buffer.concat(parts).toString('utf8') || '{}')
             res.end(JSON.stringify(await saveConfig(patch)))
+          } catch (error) {
+            res.end(JSON.stringify({ ok: false, error: error.message }))
+          }
+          return
+        }
+        if (req.method === 'POST' && path === '/mesh/ui-state') {
+          // The browser half reports its own UI state (T-343). Loopback only: it is the page
+          // on this machine talking, and the value is a short status string, never data.
+          if (!fromLoopback(req)) {
+            res.writeHead(403, { 'content-type': 'application/json' })
+            res.end('{"error":"loopback only"}')
+            return
+          }
+          const parts = []
+          let size = 0
+          for await (const chunk of req) {
+            size += chunk.length
+            if (size > MAX_BODY) {
+              res.writeHead(413).end()
+              return
+            }
+            parts.push(chunk)
+          }
+          res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+          try {
+            const payload = JSON.parse(Buffer.concat(parts).toString('utf8') || '{}')
+            const rightTab = typeof payload.rightTab === 'string' ? payload.rightTab.slice(0, 32) : null
+            state.uiReport = { rightTab, at: new Date().toISOString() }
+            res.end(JSON.stringify({ ok: true, ui: state.uiReport }))
           } catch (error) {
             res.end(JSON.stringify({ ok: false, error: error.message }))
           }

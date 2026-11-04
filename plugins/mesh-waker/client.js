@@ -505,6 +505,23 @@ try {
       }
     }
 
+    /**
+     * Report the page-side state to the status endpoint (T-343): the settings page no longer
+     * shows the right-tab diagnostic row, so /mesh/status carries it instead. Best effort —
+     * a failed report must never affect registration.
+     */
+    function reportUiState() {
+      try {
+        void json(BASE + '/mesh/ui-state', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ rightTab: rightTabState }),
+        }).catch(() => {})
+      } catch {
+        /* diagnostics only */
+      }
+    }
+
     /** Conversations read like mail: the newest subject is the title, the id is the subtitle. */
     const convTitle = (entry) =>
       (entry && entry.last_subject) ||
@@ -1881,7 +1898,7 @@ try {
         note ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.8, padding: '4px 0' } }, note) : null,
         h(
           SettingsSection,
-          { title: '接入', description: '中枢登记、控制台与本机唤醒端口；接入向导开发中。' },
+          { title: '接入', description: '中枢登记、本机唤醒端口与会话缓存/本机令牌；接入向导开发中。' },
           h(
             Row,
             { title: '中枢登记', description: status && status.wakeUrl ? status.wakeUrl : '未配置 hubUrl 时为 standalone' },
@@ -1908,6 +1925,49 @@ try {
             { title: '接入向导', description: '开发中：后续版本提供 hubUrl / 注册码的可视化配置' },
             h('span', { style: { fontSize: TOKENS.font.md, opacity: 0.6 } }, '接入向导开发中'),
           ),
+          // T-343: the old 维护 group was folded in here — cache/token maintenance is part of
+          // "how this machine is wired to the hub", not a separate chapter.
+          h(
+            Row,
+            {
+              title: '会话历史（本地缓存）',
+              description:
+                (status && status.historyCached ? status.historyCached : 0) +
+                ' 条已缓存 · 中枢保留 7 天，重要消息不过期，本地永久',
+            },
+            h(
+              'div',
+              { style: { display: 'flex', gap: 8 } },
+              h(Btn, { onClick: syncHistory }, '从中枢同步'),
+              h(Btn, { onClick: () => void loadHistory() }, '刷新'),
+            ),
+          ),
+          historyNote ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.7, padding: '4px 0 8px' } }, historyNote) : null,
+          h(
+            Row,
+            { title: '本地缓存与本机令牌', description: '缓存状态只读；清空/轮换为高风险动作' },
+            h(
+              'div',
+              { style: { display: 'flex', gap: 8 } },
+              h(
+                Btn,
+                {
+                  onClick: async () => {
+                    try {
+                      const cache = await json(BASE + '/mesh/admin/cache')
+                      setMaintenanceNote('本地缓存 ' + (cache.messages ?? 0) + ' 条 · ' + Math.round((cache.bytes ?? 0) / 1024) + ' KB · ' + (cache.path ?? ''))
+                    } catch (error) {
+                      setMaintenanceNote('读取缓存信息失败：' + error.message)
+                    }
+                  },
+                },
+                '缓存状态',
+              ),
+              h(Btn, { onClick: () => void clearLocalCache() }, '清空本地缓存'),
+              h(Btn, { onClick: () => void rotateToken() }, '轮换本机令牌'),
+            ),
+          ),
+          maintenanceNote ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.75, padding: '2px 0 8px' } }, maintenanceNote) : null,
         ),
         h(
           SettingsSection,
@@ -2107,7 +2167,7 @@ try {
         ),
         h(
           SettingsSection,
-          { title: '界面', description: '入口名称与本机会话目录；只读项需改配置文件并重启。' },
+          { title: '界面', description: '入口名称、收件箱目录与左右侧边栏入口；只读项需改配置文件并重启。' },
           h(
             Row,
             {
@@ -2131,6 +2191,30 @@ try {
               config.workspacePath || '（未设置）',
             ),
             h(Btn, { onClick: pickDir }, '选择目录…'),
+          ),
+          // T-343: the old 侧边栏入口 group was folded in here — both rows describe what the
+          // panel shows, which is the "界面" chapter.
+          h(
+            Row,
+            { title: '左侧「Mesh 信箱」', description: '左侧边栏的 panellist 条目与它的主页面' },
+            ui.switch(
+              {
+                checked: !(status && status.config && status.config.sidebarLeft === false),
+                onChange: (value) => void save({ sidebarLeft: value }),
+              },
+              status && status.config && status.config.sidebarLeft === false ? '隐藏' : '显示',
+            ),
+          ),
+          h(
+            Row,
+            { title: '右侧「Mesh 信箱」页签', description: '右侧 pane 的 tab 与它的内容' },
+            ui.switch(
+              {
+                checked: !(status && status.config && status.config.sidebarRight === false),
+                onChange: (value) => void save({ sidebarRight: value }),
+              },
+              status && status.config && status.config.sidebarRight === false ? '隐藏' : '显示',
+            ),
           ),
         ),
         h(
@@ -2162,82 +2246,6 @@ try {
                 ' 条',
             ),
           ),
-        ),
-        h(
-          SettingsSection,
-          { title: '侧边栏入口', description: '关闭后对应一侧不再出现 Mesh 入口；立即生效，设置页本身始终保留。' },
-          h(
-            Row,
-            { title: '左侧「Mesh 信箱」', description: '左侧边栏的 panellist 条目与它的主页面' },
-            ui.switch(
-              {
-                checked: !(status && status.config && status.config.sidebarLeft === false),
-                onChange: (value) => void save({ sidebarLeft: value }),
-              },
-              status && status.config && status.config.sidebarLeft === false ? '隐藏' : '显示',
-            ),
-          ),
-          h(
-            Row,
-            { title: '右侧「Mesh 信箱」页签', description: '右侧 pane 的 tab 与它的内容' },
-            ui.switch(
-              {
-                checked: !(status && status.config && status.config.sidebarRight === false),
-                onChange: (value) => void save({ sidebarRight: value }),
-              },
-              status && status.config && status.config.sidebarRight === false ? '隐藏' : '显示',
-            ),
-          ),
-        ),
-        h(
-          SettingsSection,
-          { title: '维护', description: '本地缓存、本机令牌与面板状态；绑定管理在「' + entryLabel + '」页面。' },
-          h(
-            Row,
-            {
-              title: '会话历史（本地缓存）',
-              description:
-                (status && status.historyCached ? status.historyCached : 0) +
-                ' 条已缓存 · 中枢保留 7 天，重要消息不过期，本地永久',
-            },
-            h(
-              'div',
-              { style: { display: 'flex', gap: 8 } },
-              h(Btn, { onClick: syncHistory }, '从中枢同步'),
-              h(Btn, { onClick: () => void loadHistory() }, '刷新'),
-            ),
-          ),
-          historyNote ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.7, padding: '4px 0 8px' } }, historyNote) : null,
-          h(
-            Row,
-            { title: '本地缓存与本机令牌', description: '缓存状态只读；清空/轮换为高风险动作' },
-            h(
-              'div',
-              { style: { display: 'flex', gap: 8 } },
-              h(
-                Btn,
-                {
-                  onClick: async () => {
-                    try {
-                      const cache = await json(BASE + '/mesh/admin/cache')
-                      setMaintenanceNote('本地缓存 ' + (cache.messages ?? 0) + ' 条 · ' + Math.round((cache.bytes ?? 0) / 1024) + ' KB · ' + (cache.path ?? ''))
-                    } catch (error) {
-                      setMaintenanceNote('读取缓存信息失败：' + error.message)
-                    }
-                  },
-                },
-                '缓存状态',
-              ),
-              h(Btn, { onClick: () => void clearLocalCache() }, '清空本地缓存'),
-              h(Btn, { onClick: () => void rotateToken() }, '轮换本机令牌'),
-            ),
-          ),
-          h(
-            Row,
-            { title: '右栏信箱', description: '侧边栏「开始」里的卡片状态，便于排查' },
-            h('span', { style: { fontSize: TOKENS.font.md, opacity: 0.8 } }, String(rightTabState ?? 'unknown')),
-          ),
-          maintenanceNote ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.75, padding: '2px 0 8px' } }, maintenanceNote) : null,
         ),
         note ? h('div', { style: { fontSize: TOKENS.font.md, opacity: 0.65, paddingTop: 12 } }, note) : null,
       )
@@ -3186,6 +3194,7 @@ try {
             rightTabState += ' | tasks body: ' + (error && error.message ? error.message : String(error))
           }
           sidebarSwitches.rightRegistered = true
+          reportUiState()
         }
         sidebarSwitches.registerRight = registerRight
         if (typeof ctx.inject === 'function') {
@@ -3194,6 +3203,7 @@ try {
               const rightTabs = scoped.get ? scoped.get('sidebarRightTabs') : undefined
               if (!rightTabs || !rightTabs.register) {
                 rightTabState = 'missing'
+                reportUiState()
                 return
               }
               sidebarSwitches.rightTabs = rightTabs
@@ -3203,6 +3213,7 @@ try {
           )
         } else {
           rightTabState = 'unsupported'
+          reportUiState()
         }
         // Persisted switches arrive with the status payload; correct the default here.
         json(BASE + '/mesh/status')
