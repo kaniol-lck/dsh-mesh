@@ -27,6 +27,9 @@ import { fileURLToPath } from 'node:url'
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const WORKLOG = path.join(ROOT, '.worklog')
 const BASELINE = path.join(WORKLOG, 'ledger-baseline.json')
+const TRIAGE_DIR = path.join(WORKLOG, 'ops', 'triage')
+const TRIAGE_SINCE = '2026-11-04'
+const DONE_STATUS = /done|deployed|已完成|verified/i
 const CODE_PREFIXES = ['plugins/mesh-waker/', 'hub/', 'plugins/mesh-approval/', 'scripts/', 'skills/', 'test/']
 const USAGE = `check-ledger.mjs — code commits must be referenced by the ledger
 
@@ -40,7 +43,14 @@ Options:
                       .worklog/ledger-baseline.json; default is dry-run)
   -h, --help          show this help
 
-Exit codes: 0 all accounted, 1 unaccounted commits, 2 usage error.`
+Triage rule (since 2026-11-04):
+  A queue.md row whose status is done / deployed / 已完成 / verified must have a
+  .worklog/ops/triage/<taskId>.json stamp from progress-watch --task. Rows dated
+  before 2026-11-04 are exempt. A stamp with needsReview=true is accepted but
+  listed, so red-triage closures stay visible.
+
+Exit codes: 0 all accounted, 1 unaccounted commits or missing triage stamps,
+2 usage error.`
 
 function parseArgs(argv) {
   const options = { days: 7, json: false, updateBaseline: false }
@@ -123,6 +133,36 @@ function readBaseline() {
   }
 }
 
+/** Rows marked done since TRIAGE_SINCE must carry a progress-watch stamp. */
+export function queueTriage(queueFile = path.join(WORKLOG, 'dispatch', 'queue.md'), triageDir = TRIAGE_DIR) {
+  const missing = []
+  const reviewed = []
+  if (!existsSync(queueFile)) return { missing, reviewed }
+  const lines = readFileSync(queueFile, 'utf8').split(/\r?\n/)
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (!/^\|\s*[A-Za-z0-9][A-Za-z0-9-]*\s*\|/.test(line)) continue
+    const cells = line.split('|').map((cell) => cell.trim())
+    const taskId = cells[1]
+    const date = /^(\d{4}-\d{2}-\d{2})/.exec(cells[4] ?? '')?.[1]
+    const status = cells[cells.length - 2] ?? ''
+    if (!taskId || !date || date < TRIAGE_SINCE || !DONE_STATUS.test(status)) continue
+    const stamp = path.join(triageDir, `${taskId}.json`)
+    if (!existsSync(stamp)) {
+      missing.push({ taskId, line: index + 1 })
+      continue
+    }
+    let needsReview = false
+    try {
+      needsReview = JSON.parse(readFileSync(stamp, 'utf8')).needsReview === true
+    } catch {
+      /* unreadable stamp counts as present but not red */
+    }
+    if (needsReview) reviewed.push({ taskId, line: index + 1, needsReview: true })
+  }
+  return { missing, reviewed }
+}
+
 function main() {
   const options = parseArgs(process.argv.slice(2))
   const baseline = readBaseline()
@@ -152,6 +192,7 @@ function main() {
     process.exit(0)
   }
 
+  const triage = queueTriage()
   const report = {
     days: options.days,
     commits: commits.length,
@@ -159,7 +200,12 @@ function main() {
     exempt: baseline.exempt.length,
     since: baseline.since,
     unaccounted: unaccounted.map((commit) => ({ hash: commit.short, subject: commit.subject })),
-    ok: unaccounted.length === 0,
+    triage: {
+      since: TRIAGE_SINCE,
+      missingStamp: triage.missing,
+      needsReviewStamps: triage.reviewed,
+    },
+    ok: unaccounted.length === 0 && triage.missing.length === 0,
   }
   if (options.json) {
     console.log(JSON.stringify(report, null, 2))
@@ -168,8 +214,12 @@ function main() {
     for (const commit of unaccounted) console.log(`  UNLEDGERED ${commit.short} ${commit.subject}`)
     if (!unaccounted.length) console.log('OK 所有代码提交都在账本里')
     else console.log('hint: 在 .worklog/todo/<角色>.md 或 dispatch/queue.md 引用短哈希；历史遗留可 --update-baseline')
+    console.log(`triage: ${TRIAGE_SINCE} 起已完结单缺初筛戳 ${triage.missing.length}`)
+    for (const item of triage.missing) console.log(`  MISSING ${item.taskId}（queue.md:${item.line}）—— 先跑 progress-watch --task ${item.taskId}`)
+    for (const item of triage.reviewed) console.log(`  REVIEWED ${item.taskId}（queue.md:${item.line}）needsReview=true（带红结论收单，已知悉）`)
+    if (!triage.missing.length) console.log('OK 已完结单都有初筛戳')
   }
-  process.exit(unaccounted.length ? 1 : 0)
+  process.exit(report.ok ? 0 : 1)
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()
