@@ -2,18 +2,30 @@
 
 ## 拓扑
 
-```
-                 ┌──────────────── 中枢（唯一真源）────────────────┐
-                 │  hub-host：MCP Streamable HTTP + REST + 控制台   │
-                 │  SQLite：agents / messages / board / board_log /│
-                 │          audit / blobs / mcp_sessions           │
-                 └──────┬───────────────┬───────────────┬──────────┘
-        MCP / REST      │     wake POST     │      MCP / REST
-                 ┌──────┴─────┐   ┌───────┴──────┐  ┌──────┴─────┐
-                 │ dsh + waker │   │  laptop     │  │ gateway    │
-                 │ (可 push)   │   │ +waker      │  │ 无 waker   │
-                 └────────────┘   └──────────────┘  └────────────┘
-                 文件/代码：本仓库（git），大文件走 blob 接口
+```mermaid
+flowchart TB
+  subgraph HUB["中枢 hub-host（唯一真源）"]
+    MCP["MCP Streamable HTTP"]
+    REST["REST /api/*"]
+    CONSOLE["控制台"]
+    DB[("SQLite：agents / messages / board / board_log / audit / blobs / mcp_sessions")]
+    MCP --> DB
+    REST --> DB
+    CONSOLE --> DB
+  end
+  DSH["dsh + waker（可 push）"]
+  LAPTOP["laptop + waker"]
+  GATEWAY["gateway（无 waker）"]
+  DSH -->|"MCP / REST"| HUB
+  LAPTOP -->|"MCP / REST"| HUB
+  GATEWAY -->|"MCP / REST"| HUB
+  HUB -->|"wake POST（HMAC 签名，无正文）"| DSH
+  HUB -->|"wake POST"| LAPTOP
+  GIT["本仓库（git）：文件 / 代码"]
+  BLOB["blob 接口（大文件）"]
+  DSH -.->|"小文件"| GIT
+  DSH -.->|"大文件"| BLOB
+  BLOB --- HUB
 ```
 
 ## 中枢职责
@@ -83,6 +95,15 @@
 - 进程崩溃/超时：租约过期后消息可被重新 claim → **至少一次投递**，不丢消息；代价是可能重复处理，靠 conversation 冷却与去重避免重复开 turn；
 - 第二次 claim 在租约内不会延长租约（只有 `claimed_at IS NULL` 或已过期才更新）。
 
+```mermaid
+stateDiagram-v2
+  [*] --> 未读
+  未读 --> 已领取: GET /api/inbox?claim=1（写 claimed_at，租约 5 分钟）
+  已领取 --> 已读: mark_read=1 / POST /api/read（写 read_at）
+  已领取 --> 未读: 租约过期（可再次 claim，至少一次投递）
+  已读 --> [*]
+```
+
 ## 同步模型（pull 基线，push 加速）
 
 | 模式 | 链路 | 前提 |
@@ -92,6 +113,22 @@
 | **auto**（默认值） | pull 常开；有 `advertiseHost` 且注册成功时叠加 push，不可达静默回落 | 同上 |
 
 **设计原则：pull 是基线，push 是加速。** 双 NAT、无公网 IP、公司防火墙环境下「零入站」才能装完即用；push 只省轮询间隔，不能成为接入前提。延迟：pull 常态 30s、有消息后 5s、连续空轮询退到 60s；push 通常十几秒内。
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as 客户端（waker）
+  participant H as 中枢
+  Note over C,H: pull 是基线（只要出站 HTTPS 可达）
+  C->>H: GET /api/inbox?unread=1&order=desc&limit=20&claim=1
+  H-->>C: messages[] + claimed_at（租约 5 分钟）
+  C->>C: 处理消息（开 turn）
+  C->>H: mark_read=1（或 POST /api/read）
+  H-->>C: 写 read_at，之后不再返回
+  Note over H,C: push 只是加速（中枢能入站连到你时）
+  H->>C: POST wake_url（HMAC-SHA256，无正文）
+  C->>H: 立即 pull 一次
+```
 
 ## 鉴权模型（0.7.12+）
 
