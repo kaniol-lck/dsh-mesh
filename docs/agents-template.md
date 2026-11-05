@@ -1,3 +1,4 @@
+<!-- drift: waker=* hub=* owner=docs -->
 # <项目名> 协作约定
 
 <!-- workspace-template: v1 (2026-10-31) -->

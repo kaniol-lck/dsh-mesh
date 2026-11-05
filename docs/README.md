@@ -1,3 +1,4 @@
+<!-- drift: waker=* hub=* owner=docs -->
 # 公开文档索引
 
 | 文档 | 定位 |

@@ -1,3 +1,4 @@
+<!-- drift: waker=* hub=* owner=docs -->
 # 发布流程
 
 目标：**坏版本不进 `latest`**。发布分三级，任何一级都可以停下。

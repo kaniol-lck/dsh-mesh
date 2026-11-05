@@ -1,3 +1,4 @@
+<!-- drift: waker=* hub=* owner=docs -->
 # dsh-mesh
 
 [中文](README.md) | [English](README.en.md)

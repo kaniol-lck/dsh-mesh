@@ -1,3 +1,4 @@
+<!-- drift: waker=* hub=* owner=docs -->
 # 贡献指南
 
 ## 仓库结构
