@@ -4250,6 +4250,37 @@ async function main() {
     report('stall: a task that starts immediately is unchanged', ok, `status=${settled?.json?.task?.status ?? '-'} receipts=${receipts.length}`)
   })
 
+  // T-354 (the reported incident): a task queued behind a long-running one must survive
+  // SEVERAL stall windows without ever being reported, then start and settle normally.
+  await runCase('stall: a queued task survives multiple stall windows and still settles', async (boot) => {
+    const logFile = fileLogFile()
+    const h = await boot({ seedSessions: [{ id: 'session-long-queue', title: 'long queue target' }], config: { ...stallConfig, logFile } })
+    await dispatchTo(h, 'long queue target', 'long running first task', 'T-LQ1')
+    h.emit('session/event', { id: 'session-long-queue' }, { type: 'turn/start', turn: 1 })
+    await dispatchTo(h, 'long queue target', 'queued behind the long one', 'T-LQ2')
+    // 2.6 stall windows: two re-arms for the queued task, none for the running one.
+    await sleep(2600)
+    const duringRun = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-LQ1' || receipt.taskId === 'T-LQ2')
+    const rearmed = (threadLog(logFile).match(/T-LQ2 stall re-armed/g) ?? []).length
+    h.emit('session/event', { id: 'session-long-queue' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    h.emit('session/event', { id: 'session-long-queue' }, { type: 'turn/start', turn: 2 })
+    h.emit('session/event', { id: 'session-long-queue' }, { type: 'turn/end', turn: 2, reason: { kind: 'completed' } })
+    const settled = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-LQ2')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const queuedReceipts = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-LQ2')
+    const notStarted = queuedReceipts.filter((receipt) => receipt.status === 'not-started').length
+    const ok =
+      duringRun.length === 0 &&
+      rearmed >= 2 &&
+      settled?.json?.task?.status === 'settled' &&
+      queuedReceipts.length === 1 &&
+      queuedReceipts[0].status === 'completed' &&
+      notStarted === 0
+    report('stall: a queued task survives multiple stall windows and still settles', ok, `during=${duringRun.length} rearmed=${rearmed} settled=${settled?.json?.task?.status ?? '-'} notStarted=${notStarted}`)
+  })
+
   // 186-192. Storage tiers (T-282): records live at the LCA of both ends; legacy files split
   // once into ws/<slug>/ and local/, and reads aggregate every layer.
   const meshOf = (h) => path.join(h.home, '.dsh', 'mesh-waker')
