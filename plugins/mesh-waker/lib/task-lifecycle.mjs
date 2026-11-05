@@ -149,6 +149,7 @@ export function createTaskLifecycle(deps) {
       settledTurn: details.turn ?? null,
       injectedDuringTurn: task.injectedDuringTurn === true,
       source: details.source ?? task.source ?? 'observed',
+      routedTo: task.routedTo ?? null,
     })
     deps.writeReceiptFile(receipt, task.recordDir ?? deps.receiptDirForTask(taskId) ?? deps.receiptDirFor(receipt))
     // Registry status mirrors the receipt: not-started is the stall path, everything else
@@ -276,6 +277,8 @@ export function createTaskLifecycle(deps) {
       mode: taskMode,
       receiptMode,
       batchId,
+      // How the caller addressed this task (T-355): workspace:<slug> | session:<id> | thread:<id>.
+      routedTo: meta?.routedTo ? String(meta.routedTo).slice(0, 120) : null,
       settled: false,
       stallTimer: null,
       ...(idWarning ? { idWarning } : {}),
@@ -290,6 +293,7 @@ export function createTaskLifecycle(deps) {
       requesterSessionId: requester.sessionId,
       deadlineMs: Number(meta?.deadlineMs) || null,
       route,
+      routedTo: task.routedTo ?? null,
       // Persist the actual mode so a restart can still notify the dispatcher (T-273).
       receiptMode,
     })

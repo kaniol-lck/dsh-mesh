@@ -4170,10 +4170,10 @@ export function apply(ctx, config) {
     const rows = []
     for (const [taskId, row] of batch.tasks) {
       if (row.settledAt !== null) {
-        rows.push({ taskId, status: row.status, durationMs: row.durationMs, summary: row.summary, settled: true })
+        rows.push({ taskId, status: row.status, durationMs: row.durationMs, summary: row.summary, settled: true, workspace: row.workspace ?? null })
       } else {
         const derived = taskLiveness(row.sessionId, taskId)
-        rows.push({ taskId, status: derived.state, durationMs: null, summary: '', detail: derived.detail || null, settled: false })
+        rows.push({ taskId, status: derived.state, durationMs: null, summary: '', detail: derived.detail || null, settled: false, workspace: row.workspace ?? null })
       }
     }
     const { record, body } = buildBatchReceipt({
@@ -4255,6 +4255,8 @@ export function apply(ctx, config) {
       sessionId: task.sessionId,
       requester: task.requester ?? null,
       requesterSessionId: task.requesterSessionId ?? null,
+      // T-355: the aggregate names the workspace each member belongs to.
+      workspace: task.workspace ?? task.scope ?? null,
       status: 'pending',
       settledAt: null,
       durationMs: null,
@@ -5410,6 +5412,10 @@ export function apply(ctx, config) {
         if (subject && !meta.subject) meta.subject = subject
         const thread = normalizeThread(draft.thread ?? meta.thread ?? '')
         if (thread) meta.thread = thread
+        // How the caller addressed this dispatch (T-355): workspace:<slug> | session:<id> |
+        // thread:<id>. Persisted on the task row so a later reader never has to guess.
+        const routedTo = String(draft.routedTo ?? meta.routedTo ?? '').trim()
+        if (routedTo) meta.routedTo = routedTo.slice(0, 120)
         const explicitTarget = Boolean(String(draft.session ?? draft.title ?? '').trim())
         let target
         if (!explicitTarget) {

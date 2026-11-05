@@ -74,6 +74,7 @@ export function buildReceipt({
   settledTurn = null,
   injectedDuringTurn = false,
   source = 'observed',
+  routedTo = null,
 } = {}) {
   const at = endedAt ?? Date.now()
   return {
@@ -94,6 +95,8 @@ export function buildReceipt({
     baselineTurn: baselineTurn ?? null,
     settledTurn: settledTurn ?? turn ?? null,
     injectedDuringTurn: injectedDuringTurn === true,
+    // How the dispatcher addressed this task (T-355): workspace:<slug> | session:<id> | thread:<id>.
+    routedTo: routedTo ? String(routedTo).slice(0, 120) : null,
   }
 }
 
@@ -164,6 +167,8 @@ export function buildBatchReceipt({ batchId, tasks = [], startedAt = 0, endedAt 
     summary: truncateText(task.summary ?? '', summaryChars),
     detail: task.detail ?? null,
     settled: task.settled !== false,
+    // T-355: every member carries its workspace so a failure names the right one.
+    workspace: task.workspace ? String(task.workspace) : null,
   }))
   const pendingStates = ['pending', 'not-started', 'stalled', 'working', 'waiting-approval', 'waiting-job', 'waiting-tool']
   // done counts settled tasks (a failed turn still finished); open ones stay out.
@@ -178,13 +183,18 @@ export function buildBatchReceipt({ batchId, tasks = [], startedAt = 0, endedAt 
     total: normalized.length,
   }
   const header = `[BATCH] ${batchId} ${done}/${normalized.length} done in ${humanDuration(endedAt - (startedAt || endedAt))}`
-  const width = normalized.reduce((max, task) => Math.max(max, Array.from(task.taskId ?? '').length), 0)
+  const idWidth = normalized.reduce((max, task) => Math.max(max, Array.from(task.taskId ?? '').length), 0)
+  const workspaceWidth = normalized.reduce((max, task) => Math.max(max, Array.from(task.workspace ?? '').length), 0)
   const lines = normalized.map((task) => {
     const icon = BATCH_STATUS_ICON[task.status] ?? '⏳'
-    const id = String(task.taskId ?? '').padEnd(width, ' ')
+    const id = String(task.taskId ?? '').padEnd(idWidth, ' ')
     const took = task.durationMs === null ? '' : humanDuration(task.durationMs)
     const status = task.detail ? `${task.status}(${task.detail})` : task.status
-    return `${icon} ${id}  ${took}  ${status}`.replace(/\s+$/, '')
+    const workspace = task.workspace ? String(task.workspace).padEnd(workspaceWidth, ' ') : ''
+    // A failure names its workspace explicitly; success keeps the column aligned.
+    const failed = ['error', 'lost', 'not-started', 'stalled'].includes(task.status)
+    const ws = workspace ? `  ${workspace}${failed ? '  ← 失败' : ''}` : ''
+    return `${icon} ${id}  ${took}  ${status}${ws}`.replace(/\s+$/, '')
   })
   return { record, body: [header, ...lines].join('\n') }
 }

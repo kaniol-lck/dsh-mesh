@@ -21,10 +21,16 @@ export const USAGE = `dsh-mesh-dispatch — dispatch a task into a local DSH ses
 
 Usage:
   dsh-mesh-dispatch --target <id|title> (--text <s> | --file <path>) [options]
+  dsh-mesh-dispatch --coordinator <slug> (--text <s> | --file <path>) [options]
   dsh-mesh-dispatch --thread <id> (--text <s> | --file <path>) [options]
 
 Options:
   --target <s>       session id, full title, or a unique title substring
+  --coordinator <slug> dispatch to that workspace's coordinator session (equivalent to
+                     targeting the coordinator of that workspace; resolved from
+                     /mesh/workspaces). Exits 2 when the workspace has no coordinator or
+                     when its session is no longer on this machine. Not combinable with
+                     --target / --thread.
   --text <s>         task text (exactly one of --text / --file)
   --file <path>      UTF-8 task file (exactly one of --text / --file)
   --mode <m>         queue (default) or steer
@@ -49,6 +55,13 @@ const DEFAULT_WAKER = 'http://127.0.0.1:8795'
 function fail(message) {
   const error = new Error(`${message}\n\n${USAGE}`)
   error.usage = true
+  throw error
+}
+
+/** Addressing failures are not usage errors: the CLI already validated argv. Exit code 2. */
+function addressFail(message) {
+  const error = new Error(message)
+  error.exitCode = 2
   throw error
 }
 
@@ -78,6 +91,7 @@ function normalizeCliThread(value) {
 export function parseArgs(argv) {
   const options = {
     target: undefined,
+    coordinator: undefined,
     text: undefined,
     file: undefined,
     mode: 'queue',
@@ -104,6 +118,12 @@ export function parseArgs(argv) {
     }
     switch (arg) {
       case '--target': options.target = takeValue(); break
+      case '--coordinator': {
+        const value = String(takeValue()).trim()
+        if (!value) fail('--coordinator requires a non-empty slug')
+        options.coordinator = value
+        break
+      }
       case '--text': options.text = takeValue(); break
       case '--file': options.file = takeValue(); break
       case '--mode': options.mode = takeValue(); break
@@ -142,8 +162,14 @@ export function parseArgs(argv) {
   }
   if (options.help) return options
   if (options.thread !== undefined) options.thread = normalizeCliThread(options.thread)
+  // Two addressing modes at once would be ambiguous: refuse instead of guessing.
+  if (options.coordinator !== undefined && (options.target !== undefined || options.thread !== undefined)) {
+    fail('--coordinator cannot be combined with --target or --thread')
+  }
   // A known thread resolves the target server-side, so --target may be omitted (T-296).
-  if (!options.target && options.thread === undefined) fail('pass --target (or --thread for a known thread)')
+  if (!options.target && options.coordinator === undefined && options.thread === undefined) {
+    fail('pass --target, --coordinator or --thread for a known thread')
+  }
   if (options.create && !options.target) fail('--create needs --target')
   const hasText = options.text !== undefined
   const hasFile = options.file !== undefined
@@ -176,9 +202,64 @@ async function postJson(url, body, timeoutMs = 15000) {
   return { status: res.status, json, text }
 }
 
+/**
+ * Resolve --coordinator to the coordinator session through the waker's own registry. A missing
+ * coordinator or a vanished session is an addressing error (exit 2), never a guess (T-355).
+ */
+export async function resolveCoordinator(base, slug, fetchImpl = fetch) {
+  const registryRes = await fetchImpl(`${base}/mesh/workspaces`)
+  let registry = null
+  try {
+    registry = await registryRes.json()
+  } catch {
+    registry = null
+  }
+  if (!registryRes.ok || !registry || registry.ok === false) {
+    addressFail(`读取工作区注册表失败：HTTP ${registryRes.status}`)
+  }
+  const workspaces = registry.workspaces && typeof registry.workspaces === 'object' ? registry.workspaces : {}
+  const entry = workspaces[slug]
+  if (!entry) {
+    const known = Object.keys(workspaces).sort().join(', ')
+    addressFail(`工作区 "${slug}" 不在本机注册表里${known ? `（已登记：${known}）` : '（注册表为空）'}`)
+  }
+  const coordinator = String(entry.coordinator ?? '').trim()
+  if (!coordinator) {
+    const roles = Array.isArray(entry.roles) && entry.roles.length ? entry.roles.join(', ') : '无'
+    addressFail(`工作区 "${slug}" 没有协调会话（workspaces.json 无 coordinator；角色：${roles}）；先在该工作区开一个协调会话，或改用 --target`)
+  }
+  const sessionsRes = await fetchImpl(`${base}/mesh/sessions?limit=500`)
+  let sessions = null
+  try {
+    sessions = await sessionsRes.json()
+  } catch {
+    sessions = null
+  }
+  const list = Array.isArray(sessions?.sessions) ? sessions.sessions : null
+  if (!list) addressFail(`读取会话列表失败：HTTP ${sessionsRes.status}`)
+  const found = list.find((session) => session.id === coordinator)
+  if (!found) {
+    addressFail(`工作区 "${slug}" 的协调会话 ${coordinator} 不在这台机器的会话里（可能已归档或轮换）；去 /mesh/workspaces 核对，或改用 --target`)
+  }
+  return { coordinator, cwd: entry.cwd ?? null, roles: entry.roles ?? [] }
+}
+
 /** Dispatch one task; returns the waker's result (plus created flag when it made a session). */
 export async function run(options, fetchImpl = fetch) {
   const base = String(options.waker ?? DEFAULT_WAKER).replace(/\/+$/, '')
+  let resolvedCoordinator = null
+  if (options.coordinator !== undefined) {
+    // Resolve before sending anything: a wrong address must never inject.
+    resolvedCoordinator = await resolveCoordinator(base, options.coordinator, fetchImpl)
+    options = { ...options, target: resolvedCoordinator.coordinator }
+  }
+  // How this task was addressed, recorded with the task so a later reader never has to guess.
+  const routedTo =
+    options.coordinator !== undefined
+      ? `workspace:${options.coordinator}`
+      : options.thread !== undefined
+        ? `thread:${options.thread}`
+        : `session:${options.target}`
   const text = options.file !== undefined ? await readFile(String(options.file), 'utf8') : String(options.text ?? '')
   if (!text.trim()) fail('task text is empty')
   const taskId = options.task === undefined ? null : options.task || `T-${Date.now().toString(36)}`
@@ -195,6 +276,8 @@ export async function run(options, fetchImpl = fetch) {
     ...(session ? { session } : options.target ? { session: options.target, title: options.target } : {}),
     text,
     mode: options.mode,
+    // Where this dispatch was addressed (T-355): the waker persists it on the task row.
+    routedTo,
     // Top level, exactly like the mesh_dispatch tool: /mesh/inject reads draft.thread.
     ...(options.thread ? { thread: options.thread } : {}),
     // Same place /mesh/inject reads the receipt target (draft.requester ?? meta.requester).
@@ -202,7 +285,15 @@ export async function run(options, fetchImpl = fetch) {
     ...(meta ? { meta } : {}),
   })
 
-  if (options.dryRun) return { dryRun: true, url: `${base}/mesh/inject`, payload: payload(null) }
+  if (options.dryRun) {
+    return {
+      dryRun: true,
+      url: `${base}/mesh/inject`,
+      routedTo,
+      ...(resolvedCoordinator ? { resolvedCoordinator } : {}),
+      payload: payload(null),
+    }
+  }
 
   let created = false
   let sent = await postJson(`${base}/mesh/inject`, payload(null))
@@ -236,6 +327,10 @@ async function main(argv = process.argv.slice(2)) {
   try {
     result = await run(options)
   } catch (error) {
+    if (error?.exitCode) {
+      console.error(error.message)
+      process.exit(error.exitCode)
+    }
     if (error?.cause?.code === 'ECONNREFUSED' || /ECONNREFUSED|fetch failed/i.test(String(error.message))) {
       console.error(`waker 未运行或未监听 ${DEFAULT_WAKER}（${error.message}）`)
       process.exit(2)
@@ -246,11 +341,14 @@ async function main(argv = process.argv.slice(2)) {
   if (options.dryRun) {
     const plan = result.payload ?? {}
     if (options.json) {
-      console.log(JSON.stringify(plan, null, 2))
+      console.log(JSON.stringify(result, null, 2))
       return
     }
     const parts = ['dry-run']
-    parts.push(options.target ? `target=${options.target}` : 'target=(via thread)')
+    // The resolved coordinator lands in plan.session; --target would show the raw flag value.
+    parts.push(plan.session ? `target=${plan.session}` : 'target=(via thread)')
+    if (plan.title && plan.session && plan.title !== plan.session) parts.push(`title=${plan.title}`)
+    if (result.routedTo) parts.push(`routedTo=${result.routedTo}`)
     parts.push(`requester=${plan.requester ?? '-'}`)
     parts.push(`task=${plan.meta?.taskId ?? '-'}`)
     if (plan.meta?.batchId) parts.push(`batch=${plan.meta.batchId}`)

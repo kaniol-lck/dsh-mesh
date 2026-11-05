@@ -147,6 +147,8 @@ export function createTaskRegistry(deps) {
       durationMs: null,
       receiptMode: extra.receiptMode ?? null,
       receiptRef: null,
+      // Addressing mode (T-355): workspace:<slug> | session:<id> | thread:<id>.
+      routedTo: extra.routedTo ?? null,
       ...deps.scopeFields(route),
       ...(reusedId ? { reusedId: true } : {}),
       refs: Array.isArray(meta?.refs)
@@ -182,6 +184,7 @@ export function createTaskRegistry(deps) {
       ...(Array.isArray(row.peers) && row.peers.length ? { peers: row.peers } : {}),
       ...(row.scopeUncertain === true ? { scopeUncertain: true } : {}),
       ...(row.workspace ? { workspace: row.workspace } : {}),
+      routedTo: row.routedTo ?? null,
       requester: row.requester ?? null,
       targetSessionId: row.targetSessionId ?? null,
       targetTitle: row.targetTitle ?? null,

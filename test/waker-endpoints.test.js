@@ -1404,6 +1404,126 @@ async function main() {
     report('CLI: --help explains the requester default', ok, `help=${options.help} requesterDoc=${/--requester/.test(USAGE)} defaultDoc=${/receiptTo/.test(USAGE)}`)
   })
 
+  // T-355: --coordinator addresses a workspace's coordinator (owner named the flag; it means
+  // "the coordinator of that workspace", not "the whole workspace"). A missing coordinator or
+  // a vanished session is an addressing error (exit 2), never a guess.
+  const fakeRegistryFetch = (workspaces, sessions) => async (url) => {
+    const target = String(url)
+    if (target.endsWith('/mesh/workspaces')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, workspaces }) }
+    }
+    if (target.includes('/mesh/sessions')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, sessions }) }
+    }
+    throw new Error(`unexpected request ${target}`)
+  }
+
+  await runCase('CLI: --coordinator resolves the coordinator and records routedTo', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--coordinator', 'dsh-mesh', '--text', 'hi', '--dry-run'])
+    const fetchStub = fakeRegistryFetch(
+      { 'dsh-mesh': { cwd: path.join('virtual', 'projects', 'dsh-mesh'), coordinator: 'session-coord-1', roles: ['waker'] } },
+      [{ id: 'session-coord-1', title: 'mesh · 协调' }],
+    )
+    const result = await run(options, fetchStub)
+    const ok =
+      result.dryRun === true &&
+      result.routedTo === 'workspace:dsh-mesh' &&
+      result.payload.session === 'session-coord-1' &&
+      result.payload.title === 'session-coord-1' &&
+      result.resolvedCoordinator.coordinator === 'session-coord-1'
+    report('CLI: --coordinator resolves the coordinator and records routedTo', ok, `target=${result.payload.session} routedTo=${result.routedTo}`)
+  })
+
+  await runCase('CLI: --coordinator on a workspace without a coordinator exits 2', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--coordinator', 'dshwork', '--text', 'hi', '--dry-run'])
+    const fetchStub = fakeRegistryFetch({ dshwork: { cwd: path.join('virtual', 'dshwork'), roles: [] } }, [])
+    let error = null
+    try {
+      await run(options, fetchStub)
+    } catch (caught) {
+      error = caught
+    }
+    const ok = error?.exitCode === 2 && /没有协调会话/.test(error.message)
+    report('CLI: --coordinator on a workspace without a coordinator exits 2', ok, `exit=${error?.exitCode ?? '-'} msg=${(error?.message ?? '').slice(0, 40)}`)
+  })
+
+  await runCase('CLI: --coordinator with an unknown slug exits 2', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--coordinator', 'no-such-workspace', '--text', 'hi', '--dry-run'])
+    const fetchStub = fakeRegistryFetch({ 'dsh-mesh': { coordinator: 'session-coord-1' } }, [{ id: 'session-coord-1' }])
+    let error = null
+    try {
+      await run(options, fetchStub)
+    } catch (caught) {
+      error = caught
+    }
+    const ok = error?.exitCode === 2 && /不在本机注册表/.test(error.message) && /已登记：dsh-mesh/.test(error.message)
+    report('CLI: --coordinator with an unknown slug exits 2', ok, `exit=${error?.exitCode ?? '-'} msg=${(error?.message ?? '').slice(0, 40)}`)
+  })
+
+  await runCase('CLI: --coordinator with an archived coordinator session exits 2', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--coordinator', 'dsh-mesh', '--text', 'hi', '--dry-run'])
+    const fetchStub = fakeRegistryFetch({ 'dsh-mesh': { coordinator: 'session-gone' } }, [{ id: 'session-other' }])
+    let error = null
+    try {
+      await run(options, fetchStub)
+    } catch (caught) {
+      error = caught
+    }
+    const ok = error?.exitCode === 2 && /不在这台机器的会话里/.test(error.message) && /\/mesh\/workspaces/.test(error.message)
+    report('CLI: --coordinator with an archived coordinator session exits 2', ok, `exit=${error?.exitCode ?? '-'}`)
+  })
+
+  await runCase('CLI: --coordinator refuses to be combined with --target', async () => {
+    const { parseArgs } = await import(cliUrl)
+    let message = ''
+    try {
+      parseArgs(['--coordinator', 'dsh-mesh', '--target', 'x', '--text', 'hi'])
+    } catch (error) {
+      message = error.message
+    }
+    const ok = /cannot be combined with --target or --thread/.test(message)
+    report('CLI: --coordinator refuses to be combined with --target', ok, `msg=${message.split('\n')[0].slice(0, 60)}`)
+  })
+
+  await runCase('CLI: --help documents only --coordinator (not --workspace)', async () => {
+    const { USAGE } = await import(cliUrl)
+    const ok = /--coordinator <slug>/.test(USAGE) && /equivalent to/.test(USAGE) && !/--workspace/.test(USAGE)
+    report('CLI: --help documents only --coordinator (not --workspace)', ok, `coordinatorDoc=${/--coordinator/.test(USAGE)} workspaceDoc=${/--workspace/.test(USAGE)}`)
+  })
+
+  await runCase('task record: routedTo is persisted and visible in the task API', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-routed', title: 'routed target' }] })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { session: 'session-routed', text: 'routed task', routedTo: 'workspace:dsh-mesh', meta: { taskId: 'T-ROUTED-1' } },
+    })
+    const snapshot = await request(h.base, '/mesh/tasks/T-ROUTED-1')
+    const ok = snapshot.json?.task?.routedTo === 'workspace:dsh-mesh'
+    report('task record: routedTo is persisted and visible in the task API', ok, `routedTo=${snapshot.json?.task?.routedTo ?? '-'}`)
+  })
+
+  await runCase('receipt: the batch aggregate names each member workspace and flags failures', async () => {
+    const { buildBatchReceipt } = await import(pathToFileURL(path.join(REPO, 'plugins', 'mesh-waker', 'lib', 'receipt.mjs')).href)
+    const { record, body } = buildBatchReceipt({
+      batchId: 'B-t355',
+      tasks: [
+        { taskId: 'T-ok', status: 'completed', workspace: 'dsh-mesh', settled: true },
+        { taskId: 'T-bad', status: 'error', workspace: 'util4freesub', settled: true, detail: 'exit 2' },
+      ],
+    })
+    const ok =
+      body.includes('dsh-mesh') &&
+      body.includes('util4freesub') &&
+      /util4freesub\s+← 失败/.test(body) &&
+      record.tasks.length === 2 &&
+      record.tasks.every((task) => typeof task.workspace === 'string')
+    report('receipt: the batch aggregate names each member workspace and flags failures', ok, `body=${JSON.stringify(body.split('\n')[1])}`)
+  })
+
   // 42-44. Regression: injection during a running turn must not settle on that turn's end.
   await runCase('task receipt: queue injection during a running turn waits for the next turn', async (boot) => {
     const h = await boot({ seedSessions: [{ id: 'session-running', title: 'running target' }] })
