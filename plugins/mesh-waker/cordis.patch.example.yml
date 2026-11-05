@@ -39,3 +39,11 @@
         # Receipt notices inject the status line only (the summary stays in receipts.jsonl and
         # the task API). Set true to restore the legacy "status line + summary" text.
         receiptNoticeSummary: false
+        # Origin routing (T-364): a reply to a message we sent is delivered to the session
+        # that sent it, not to the inbox. The sender is found in the session log (the hub MCP
+        # send is invisible to the waker); when that session is gone a replacement is created
+        # in the same workspace. Scan is bounded by window and tail bytes.
+        originScan: true
+        originScanWindowMs: 21600000
+        originScanTailBytes: 2000000
+        sendToolNames: ['mesh_send']

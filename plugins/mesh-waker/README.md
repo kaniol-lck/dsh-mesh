@@ -104,6 +104,10 @@ dsh plugin --profile web add dsh-mesh-waker
 | `workspaceTitle` | `Mesh 收件箱` | 侧栏里该工作区的显示名 |
 | `sidebarLeft` | `true` | 是否注册左侧「Mesh 信箱」panellist 条目与它的页面；设置页开关即时生效 |
 | `sidebarRight` | `true` | 是否注册右侧 pane 的「Mesh 信箱」页签；设置页开关即时生效 |
+| `originScan` | `true` | 回复投递前先从会话日志里找出「谁发的这条消息」，把回复投给发起会话；原会话已死时在同工作区新建 |
+| `originScanWindowMs` | `21600000` | 只扫这么多毫秒内改动过的会话日志（下限 60000，上限 604800000） |
+| `originScanTailBytes` | `2000000` | 每个会话日志只读尾部这么多字节（下限 131072，上限 8388608） |
+| `sendToolNames` | `["mesh_send"]` | 视作「发消息」的工具名（最多 5 个）；命中即记录 conversation → 会话 |
 | `branchReuseHours` | `12` | branch 侧会话复用窗口（小时） |
 | `branchTitlePrefix` | `mesh · ` | branch 侧会话标题前缀 |
 | `resetAfterHours` | `12` | 收件箱会话闲置多久后重置 |

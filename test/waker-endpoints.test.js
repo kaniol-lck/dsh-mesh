@@ -12,6 +12,7 @@ const net = require('node:net')
 const os = require('node:os')
 const path = require('node:path')
 const { randomUUID } = require('node:crypto')
+const { zstdCompressSync } = require('node:zlib')
 const { pathToFileURL } = require('node:url')
 const vm = require('node:vm')
 
@@ -1571,6 +1572,40 @@ async function main() {
     const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-fresh'), 4000)
     const ok = receipt?.turn === 1 && receipt?.baselineTurn === null && receipt?.injectedDuringTurn === false
     report('task receipt: no turn history still settles on the first turn/end', ok, `turn=${receipt?.turn ?? '-'} baseline=${receipt?.baselineTurn ?? '-'} during=${receipt?.injectedDuringTurn ?? '-'}`)
+  })
+
+  // T-364: the origin scan reads a session log's tool calls to learn who sent a message.
+  await runCase('origin scan: the session log names the sender of a conversation', async () => {
+    const { findOutboundSession, readLogTail } = await import(
+      pathToFileURL(path.join(REPO, 'plugins', 'mesh-waker', 'lib', 'origin-scan.mjs')).href
+    )
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'origin-scan-'))
+    try {
+      const log = path.join(dir, 'session.v4.jsonl.zstd')
+      const first = JSON.stringify({ type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } }) + '\n'
+      const second =
+        JSON.stringify({
+          type: 'tool/call',
+          seq: 2,
+          time: 2,
+          data: { turn: 1, step: 1, callId: 'c1', name: 'mesh_send', arguments: JSON.stringify({ to: 'peer-b', conversation: 'conv/reply', body: 'hi' }) },
+        }) + '\n'
+      fs.writeFileSync(log, Buffer.concat([zstdCompressSync(Buffer.from(first)), zstdCompressSync(Buffer.from(second))]))
+      const sessions = [{ id: 'session-A', workspace: 'ws', log, mtime: Date.now() }]
+      const hit = findOutboundSession({ sessions, conversation: 'conv/reply' })
+      const text = readLogTail(log)
+      const ok =
+        hit?.sessionId === 'session-A' &&
+        hit?.tool === 'mesh_send' &&
+        text.includes('"tool/call"') &&
+        text.includes('conv/reply') &&
+        findOutboundSession({ sessions, conversation: 'conv/other' }) === null &&
+        findOutboundSession({ sessions, conversation: 'conv/reply', toolNames: ['mesh_ask'] }) === null &&
+        findOutboundSession({ sessions, conversation: 'conv/reply', sinceMs: Date.now() + 60_000 }) === null
+      report('origin scan: the session log names the sender of a conversation', ok, `hit=${hit?.sessionId ?? '-'} tool=${hit?.tool ?? '-'}`)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   // 45-49. Topic routing: labels resolve locally; ids/titles never leave the machine.

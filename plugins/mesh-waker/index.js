@@ -32,6 +32,7 @@ import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_CO
 import { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, classifyRoleCandidates, ROLE_UNRECOGNIZED_MAX } from './lib/session.mjs'
 import { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settings.mjs'
+import { findOutboundSession, readLogTail } from './lib/origin-scan.mjs'
 import { createReceiptFlow } from './lib/receipt-flow.mjs'
 import { createThreads } from './lib/threads.mjs'
 import { createTaskRegistry } from './lib/task-registry.mjs'
@@ -584,6 +585,16 @@ function normalizeBase(config) {
     waitLongMs: clampInterval(c.waitLongMs, 1800000, 1000, 86_400_000),
     batchDeadlineMs: clampInterval(c.batchDeadlineMs, 7200000, 1000, 86_400_000),
     barrierMode: ['file', 'queue', 'wake'].includes(String(c.barrierMode)) ? String(c.barrierMode) : 'wake',
+    // Origin routing (T-364): when a peer replies, find the local session that sent the
+    // original message by reading its session log (the hub MCP send is invisible to us, but
+    // the tool call is recorded with its arguments). Bounded: recent sessions, tail bytes.
+    originScan: c.originScan !== false,
+    originScanWindowMs: clampInterval(c.originScanWindowMs, 21_600_000, 60_000, 604_800_000),
+    originScanTailBytes: clampInterval(c.originScanTailBytes, 2_000_000, 131_072, 8_388_608),
+    sendToolNames:
+      Array.isArray(c.sendToolNames) && c.sendToolNames.length
+        ? c.sendToolNames.map((name) => String(name)).filter(Boolean).slice(0, 5)
+        : ['mesh_send'],
     alertMode: ['file', 'queue', 'wake'].includes(String(c.alertMode)) ? String(c.alertMode) : 'queue',
     batchFile: c.batchFile ? String(c.batchFile) : join(homedir(), '.dsh', 'mesh-waker', 'batches.json'),
     // Layer-1 task registry retention: rows older than N days or beyond M rows are pruned.
@@ -2365,6 +2376,51 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Create a replacement session for an auto-bound conversation whose origin session died
+   * (T-364). The workspace is passed explicitly — the host otherwise mounts the default one
+   * silently — and the echo in the create result is checked instead of reading the registry
+   * (which lags several seconds behind).
+   */
+  async function recreateOriginSession(entry) {
+    const workspacePath = entry.deliverToAuto?.workspacePath || c.workspacePath || c.sessionCwd || undefined
+    const title = entry.deliverToAuto?.title || entry.title || 'mesh 会话'
+    try {
+      let workspaceId = null
+      if (workspacePath) {
+        try {
+          const resolved = await ctx.workspaceRegistry?.resolveByPath?.(workspacePath)
+          workspaceId = resolved?.id ?? null
+          if (!workspaceId) {
+            const createdWorkspace = await ctx.workspaceRegistry?.create?.(workspacePath, title)
+            workspaceId = createdWorkspace?.id ?? null
+          }
+        } catch (error) {
+          fileLog(`replacement session: workspace resolve failed (${error.message})`)
+        }
+      }
+      const created = await ctx.sessionController.create(
+        workspaceId ? { workspaceId, agentPreset: c.agentPreset } : { cwd: workspacePath, agentPreset: c.agentPreset },
+      )
+      const sessionId = created?.sessionId ?? created?.id
+      if (!sessionId) throw new Error('create returned no sessionId')
+      const echoed = created?.workspacePath ?? created?.cwd ?? null
+      if (workspacePath && echoed && String(echoed) !== String(workspacePath)) {
+        fileLog(`WARN replacement session ${sessionId} workspace echo ${echoed} != ${workspacePath}`)
+      }
+      try {
+        await ctx.sessionController.rename({ sessionId, title })
+      } catch (error) {
+        fileLog(`replacement session rename failed: ${error.message}`)
+      }
+      fileLog(`created replacement session ${sessionId} for dead origin (workspace=${workspacePath ?? '-'} title="${title}")`)
+      return sessionId
+    } catch (error) {
+      fileLog(`replacement session creation failed: ${error.message}`)
+      return null
+    }
+  }
+
+  /**
    * One session per conversation id: the same dialogue keeps landing in the same dsh
    * session, and a different dialogue gets its own, so their context never mixes.
    */
@@ -2410,6 +2466,49 @@ export function apply(ctx, config) {
     if (!entry) {
       entry = { sessionId: null, createdAt: 0, wakes: 0, title: null }
       conversations[conversation] = entry
+    }
+    // T-364: a reply to a message we sent should reach the session that sent it, not the
+    // inbox. The hub MCP send is invisible here, but the tool call is in the session log, so
+    // the origin session is discovered from there — nobody has to pass an id.
+    if (!entry.deliverTo && c.originScan && (messages ?? []).some((message) => message?.reply_to)) {
+      try {
+        const sessions = discoverSessions()
+        const origin = findOutboundSession({
+          sessions,
+          conversation,
+          toolNames: c.sendToolNames,
+          sinceMs: Date.now() - c.originScanWindowMs,
+          readTail: (file) => readLogTail(file, { tailBytes: c.originScanTailBytes }),
+        })
+        if (origin) {
+          const known = sessions.find((item) => item.id === origin.sessionId)
+          const knownMeta = known ? sessionMeta(known) : null
+          entry.deliverTo = origin.sessionId
+          entry.deliverToAuto = {
+            workspacePath: knownMeta?.cwd ?? null,
+            title: knownMeta?.title ?? entry.title ?? null,
+          }
+          saveConversations()
+          fileLog(`auto-bound ${conversation} to origin session ${origin.sessionId} tool=${origin.tool}`)
+        } else {
+          fileLog(`origin scan found no sender for ${conversation}; falling back to the inbox session`)
+        }
+      } catch (error) {
+        fileLog(`origin scan failed for ${conversation}: ${error.message}`)
+      }
+    }
+    // An auto-bound session that no longer exists is replaced in its own workspace (the
+    // conversation continues there); a manual binding keeps the historical inbox fallback.
+    if (entry.deliverTo && entry.deliverToAuto && !isLive(entry.deliverTo)) {
+      const replacement = await recreateOriginSession(entry)
+      if (replacement) {
+        entry.deliverTo = replacement
+        saveConversations()
+      } else {
+        entry.deliverTo = null
+        entry.deliverToAuto = null
+        saveConversations()
+      }
     }
     // Delivery target: a session the user bound this conversation to. Try it first — the
     // prompt goes in with mode 'queue', so it behaves like the user typing while the agent
