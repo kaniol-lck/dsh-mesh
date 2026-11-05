@@ -30,9 +30,14 @@ python skills/handoff/scripts/handoff.py pack \
   --next "解包|读摘要|继续构建" --max-bytes 67108864
 ```
 
-- 默认排除 `.git/`、`node_modules/`、构建产物、`*.env`、`token*`、`*.key`、`*.pem`；
-- **打包前做密钥扫描，命中即拒绝**（不会生成 bundle）；
-- 输出 JSON：bundle 路径、字节数、`sha256`、`handoffId`、自动探测的 `requirements`；
+- 默认排除 `.git/`、`node_modules/`、`build*/`、`dist/`、`__pycache__/`、`*.env`、`token*`、`*.key`、`*.pem`，
+  以及 `*.exe`/`*.dll`/`*.so`/`*.pyc`/`*.jar` 等二进制（扫描与打包共用同一套排除规则）；
+- **打包前做密钥扫描，命中即拒绝**（不会生成 bundle）；二进制不按文本扫，避免随机字节误报；
+- **超过 2 MB 的文件默认既不扫描也不打包**，`excludedLargeFiles` + `excludedLargeSample`（前 10 个路径）说明少了什么；
+  确需带走大文件时加 `--allow-large`：大文件会**分块流式扫描**后再入包，命中密钥仍然拒绝，
+  manifest 标记 `containsLargeFiles: true`；
+- 输出 JSON：bundle 路径、字节数、`sha256`、`handoffId`、`fileCount`、`excludedBinaryFiles`、
+  `excludedLargeFiles`、`excludedLargeSample`、`containsLargeFiles`、自动探测的 `requirements`；
 - 依赖探测：有 `package.json` → node ≥20（npm 非阻塞）；有 `requirements.txt`/`*.py` → python ≥3.10；
   也可以在 `handoff.requires.json` 里写自定义项（格式见 `examples/deps.example.json`）。
 

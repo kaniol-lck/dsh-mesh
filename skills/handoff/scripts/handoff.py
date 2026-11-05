@@ -183,17 +183,51 @@ def excluded(rel: str, patterns) -> bool:
     return False
 
 
-def scan_secrets(root: Path, patterns) -> dict:
-    """Scan files that would actually be packed; skip binaries instead of reading them as text.
+def secret_hit(text: str, suffix: str) -> bool:
+    """True when any pattern matches, with the false-positive filters applied."""
+    for index, pattern in enumerate(SECRET_PATTERNS):
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        if index == 7:
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            line_text = text[line_start:text.find("\n", match.start())]
+            if line_text.lstrip().startswith("#"):
+                continue
+            if not plausible_secret_value(match.group(2)):
+                continue
+        if index == 6 and suffix in DOC_SUFFIXES:
+            continue
+        return True
+    return False
 
-    Excluded paths are not scanned at all (same patterns as the tar loop), binary files are
-    skipped by extension or by a NUL byte in the first 8 KiB, and oversized files are counted
-    rather than silently ignored — "scanned and found nothing" must be distinguishable from
-    "never scanned".
+
+def stream_has_secret(path: Path) -> bool:
+    """Chunked scan for files above MAX_SECRET_SCAN_BYTES; never loads the whole file."""
+    suffix = path.suffix.lower()
+    overlap = ""
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            text = overlap + chunk.decode("utf-8", errors="ignore")
+            if secret_hit(text, suffix):
+                return True
+            overlap = text[-4096:]
+    return False
+
+
+def scan_secrets(root: Path, patterns, allow_large: bool = False) -> dict:
+    """Scan what would actually be packed, and decide what a large file means.
+
+    Excluded paths are never read. Binaries are skipped by extension or a NUL byte in the
+    first 8 KiB. Files above MAX_SECRET_SCAN_BYTES are excluded from the bundle by default
+    (excludedLargeFiles, with a sample) — not silently scanned-and-dropped; --allow-large
+    keeps them but requires a streaming scan first, so size never bypasses the check.
     """
     hits = []
-    skipped_binary = 0
-    skipped_large = 0
+    excluded_binary = 0
+    excluded_large = 0
+    large_sample = []
+    contains_large = False
     for path in root.rglob("*"):
         if not path.is_file():
             continue
@@ -202,40 +236,39 @@ def scan_secrets(root: Path, patterns) -> dict:
             continue
         try:
             size = path.stat().st_size
-        except OSError:
-            continue
-        if size > MAX_SECRET_SCAN_BYTES:
-            skipped_large += 1
-            continue
-        if path.suffix.lower() in BINARY_EXTENSIONS:
-            skipped_binary += 1
-            continue
-        try:
             with path.open("rb") as handle:
                 head = handle.read(8192)
-            if b"\x00" in head:
-                skipped_binary += 1
+        except OSError:
+            continue
+        if path.suffix.lower() in BINARY_EXTENSIONS or b"\x00" in head:
+            excluded_binary += 1
+            continue
+        if size > MAX_SECRET_SCAN_BYTES:
+            if not allow_large:
+                excluded_large += 1
+                if len(large_sample) < 10:
+                    large_sample.append(rel)
                 continue
+            contains_large = True
+            try:
+                if stream_has_secret(path):
+                    hits.append(rel)
+            except OSError:
+                continue
+            continue
+        try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        for index, pattern in enumerate(SECRET_PATTERNS):
-            match = re.search(pattern, text)
-            if not match:
-                continue
-            if index == 7:
-                line_start = text.rfind("\n", 0, match.start()) + 1
-                line_text = text[line_start:text.find("\n", match.start())]
-                if line_text.lstrip().startswith("#"):
-                    continue
-                if not plausible_secret_value(match.group(2)):
-                    continue
-            if index == 6 and path.suffix.lower() in DOC_SUFFIXES:
-                continue
+        if secret_hit(text, path.suffix.lower()):
             hits.append(rel)
-            break
-    return {"hits": hits, "skippedBinaryFiles": skipped_binary, "skippedLargeFiles": skipped_large}
-
+    return {
+        "hits": hits,
+        "excludedBinaryFiles": excluded_binary,
+        "excludedLargeFiles": excluded_large,
+        "excludedLargeSample": large_sample,
+        "containsLargeFiles": contains_large,
+    }
 
 def detect_requirements(workspace: Path) -> dict:
     requirements = {"commands": [], "python": [], "env": []}
@@ -281,14 +314,15 @@ def cmd_pack(args) -> int:
         return fail(f"workspace not found: {workspace}")
 
     patterns = DEFAULT_EXCLUDES + [item for item in (args.exclude or "").split(",") if item]
-    scan = scan_secrets(workspace, patterns)
+    scan = scan_secrets(workspace, patterns, allow_large=bool(args.allow_large))
     if scan["hits"]:
         print(json.dumps({
             "ok": False,
             "error": "refusing to pack: possible secrets",
             "files": scan["hits"][:20],
-            "skippedBinaryFiles": scan["skippedBinaryFiles"],
-            "skippedLargeFiles": scan["skippedLargeFiles"],
+            "excludedBinaryFiles": scan["excludedBinaryFiles"],
+            "excludedLargeFiles": scan["excludedLargeFiles"],
+            "excludedLargeSample": scan["excludedLargeSample"],
         }, ensure_ascii=False, indent=2))
         return 1
 
@@ -303,6 +337,9 @@ def cmd_pack(args) -> int:
         if args.requirements
         else detect_requirements(workspace),
         "nextSteps": [step for step in (args.next or "").split("|") if step],
+        "containsLargeFiles": scan["containsLargeFiles"],
+        "excludedLargeFiles": scan["excludedLargeFiles"],
+        "excludedBinaryFiles": scan["excludedBinaryFiles"],
     }
 
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -315,6 +352,12 @@ def cmd_pack(args) -> int:
                 continue
             rel = path.relative_to(workspace).as_posix()
             if excluded(rel, patterns):
+                continue
+            try:
+                too_large = path.stat().st_size > MAX_SECRET_SCAN_BYTES
+            except OSError:
+                too_large = False
+            if too_large and not args.allow_large:
                 continue
             tar.add(path, arcname="workspace/" + rel)
             packed += 1
@@ -331,8 +374,10 @@ def cmd_pack(args) -> int:
     print(json.dumps(
         {"bundle": str(out), "bytes": size, "sha256": digest, "handoffId": manifest["handoffId"],
          "fileCount": packed,
-         "skippedBinaryFiles": scan["skippedBinaryFiles"],
-         "skippedLargeFiles": scan["skippedLargeFiles"],
+         "excludedBinaryFiles": scan["excludedBinaryFiles"],
+         "excludedLargeFiles": scan["excludedLargeFiles"],
+         "excludedLargeSample": scan["excludedLargeSample"],
+         "containsLargeFiles": scan["containsLargeFiles"],
          "requirements": manifest["requirements"]},
         ensure_ascii=False, indent=2,
     ))
@@ -546,6 +591,17 @@ def main(argv=None) -> int:
     pack.add_argument("--next", default="", help='next steps, "|"-separated')
     pack.add_argument("--requirements", default="", help="JSON file with requirements (overrides auto-detect)")
     pack.add_argument("--max-bytes", type=int, default=0, help="refuse bundles larger than this")
+    pack.add_argument(
+        "--allow-large",
+        action="store_true",
+        help="include files over 2 MB (stream-scanned first; a secret hit still refuses the pack)",
+    )
+    pack.epilog = (
+        "Counts: fileCount = entries packed; excludedBinaryFiles = binary by extension or NUL byte "
+        "(never packed); excludedLargeFiles = over 2 MB, not packed unless --allow-large "
+        "(paths in excludedLargeSample, first 10); containsLargeFiles = true only when "
+        "--allow-large packed at least one large file."
+    )
     pack.set_defaults(func=cmd_pack)
 
     send = sub.add_parser("send", help="upload + notify the peer")
