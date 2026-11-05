@@ -57,14 +57,20 @@ export function toolNameMatches(name, want) {
 }
 
 /**
- * Newest local session whose log contains a tool call to `toolNames` whose arguments mention
- * `conversation`. Returns null when nothing matches — the caller falls back to the inbox.
+ * The session that FIRST sent into `conversation` (T-366). A reply is answered by whoever
+ * opened the dialogue, but every session that forwards a message also leaves a log entry, so
+ * "first match in directory order" picks the wrong one. Collect every hit, keep the earliest
+ * event.time; a hit without a finite time never wins; ties break on session id so the result
+ * never depends on enumeration order. Returns null when nothing matches (caller → inbox).
  */
 export function findOutboundSession({ sessions, conversation, toolNames = ['mesh_send', 'mcp__mesh__mesh_send'], sinceMs = 0, readTail = readLogTail } = {}) {
   const needle = JSON.stringify(String(conversation))
   const bare = needle.slice(1, -1)
+  let best = null
   for (const session of sessions) {
     if (sinceMs && Number(session.mtime ?? 0) < sinceMs) continue
+    const sessionId = String(session.id ?? '')
+    if (!sessionId) continue
     let text
     try {
       text = readTail(session.log)
@@ -85,13 +91,17 @@ export function findOutboundSession({ sessions, conversation, toolNames = ['mesh
       if (!toolNames.some((want) => toolNameMatches(name, want))) continue
       const args = String(data.arguments ?? '')
       if (!args.includes(bare)) continue
-      return {
-        sessionId: session.id,
-        workspace: session.workspace ?? null,
-        tool: name,
-        at: Number(event.time) > 0 ? Number(event.time) : null,
+      const at = Number(event.time)
+      // An entry without a usable timestamp must not pretend to be the earliest (0 would win).
+      if (!Number.isFinite(at)) continue
+      const better =
+        !best ||
+        at < best.at ||
+        (at === best.at && sessionId < best.sessionId)
+      if (better) {
+        best = { sessionId, workspace: session.workspace ?? null, tool: name, at }
       }
     }
   }
-  return null
+  return best
 }

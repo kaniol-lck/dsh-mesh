@@ -1649,6 +1649,39 @@ async function main() {
     }
   })
 
+  // T-366: every forwarding session also logs a send, so "first match" picked the wrong one.
+  // The origin is the session that sent FIRST; entries without a timestamp never win.
+  await runCase('origin scan: the earliest sender wins regardless of enumeration order', async () => {
+    const { findOutboundSession } = await import(pathToFileURL(path.join(REPO, 'plugins', 'mesh-waker', 'lib', 'origin-scan.mjs')).href)
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'origin-scan-order-'))
+    try {
+      const write = (id, at, conversation) => {
+        const log = path.join(dir, id + '.zstd')
+        const event = {
+          type: 'tool/call',
+          seq: 1,
+          ...(at === undefined ? {} : { time: at }),
+          data: { name: 'mcp__mesh__mesh_send', arguments: JSON.stringify({ conversation }) },
+        }
+        fs.writeFileSync(log, zstdCompressSync(Buffer.from(JSON.stringify(event) + '\n')))
+        return { id, workspace: 'ws', log, mtime: Date.now() }
+      }
+      const late = write('session-c-late', 3000, 'conv/order')
+      const early = write('session-a-early', 1000, 'conv/order')
+      const middle = write('session-b-middle', 2000, 'conv/order')
+      const noTime = write('session-0-missing-time', undefined, 'conv/order')
+      // Reverse of the time order, with the timestamp-less candidate first.
+      const hit = findOutboundSession({ sessions: [noTime, late, middle, early], conversation: 'conv/order' })
+      const tieHigh = write('session-zzz', 5000, 'conv/tie')
+      const tieLow = write('session-aaa', 5000, 'conv/tie')
+      const tieHit = findOutboundSession({ sessions: [tieHigh, tieLow], conversation: 'conv/tie' })
+      const ok = hit?.sessionId === 'session-a-early' && hit.at === 1000 && tieHit?.sessionId === 'session-aaa'
+      report('origin scan: the earliest sender wins regardless of enumeration order', ok, `hit=${hit?.sessionId ?? '-'} at=${hit?.at ?? '-'} tie=${tieHit?.sessionId ?? '-'}`)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   // T-365 end-to-end: a real plugin boot, a real session log with the host's tool name, and a
   // pulled reply — the conversation must bind to the origin session instead of the inbox.
   const e2eOriginLog = (h, sessionId, conversation, toolName = 'mcp__mesh__mesh_send') => {
