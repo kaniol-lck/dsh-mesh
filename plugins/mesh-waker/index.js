@@ -594,7 +594,7 @@ function normalizeBase(config) {
     sendToolNames:
       Array.isArray(c.sendToolNames) && c.sendToolNames.length
         ? c.sendToolNames.map((name) => String(name)).filter(Boolean).slice(0, 5)
-        : ['mesh_send'],
+        : ['mesh_send', 'mcp__mesh__mesh_send'],
     alertMode: ['file', 'queue', 'wake'].includes(String(c.alertMode)) ? String(c.alertMode) : 'queue',
     batchFile: c.batchFile ? String(c.batchFile) : join(homedir(), '.dsh', 'mesh-waker', 'batches.json'),
     // Layer-1 task registry retention: rows older than N days or beyond M rows are pruned.
@@ -1057,10 +1057,13 @@ export function apply(ctx, config) {
   // enumerate them and prompt one directly. This never touches the hub, which keeps the
   // latency in the millisecond range and works offline.
   // MESH_WAKER_SESSIONS_ROOT exists so tests can point discovery at a temp directory and
-  // never list (or delete) the real sessions of the machine running them.
-  const SESSIONS_ROOT = process.env.MESH_WAKER_SESSIONS_ROOT
-    ? String(process.env.MESH_WAKER_SESSIONS_ROOT)
-    : join(homedir(), '.dsh', 'sessions')
+  // never list (or delete) the real sessions of the machine running them. Read at call time:
+  // a test boot sets it per boot, and the origin scan must see the same root (T-365).
+  function sessionsRoot() {
+    return process.env.MESH_WAKER_SESSIONS_ROOT
+      ? String(process.env.MESH_WAKER_SESSIONS_ROOT)
+      : join(homedir(), '.dsh', 'sessions')
+  }
   const SESSION_INDEX_PATH = c.tokenFile ? join(dirname(c.tokenFile), 'sessions-index.json') : join(tmpdir(), 'mesh-waker-sessions.json')
   const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 
@@ -1120,21 +1123,21 @@ export function apply(ctx, config) {
     const found = []
     let workspaces = []
     try {
-      workspaces = readdirSync(SESSIONS_ROOT, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name)
+      workspaces = readdirSync(sessionsRoot(), { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name)
     } catch {
       return found
     }
     for (const workspace of workspaces) {
       let sessions = []
       try {
-        sessions = readdirSync(join(SESSIONS_ROOT, workspace), { withFileTypes: true })
+        sessions = readdirSync(join(sessionsRoot(), workspace), { withFileTypes: true })
           .filter((entry) => entry.isDirectory() && entry.name.startsWith('session-'))
           .map((entry) => entry.name)
       } catch {
         continue
       }
       for (const id of sessions) {
-        const log = join(SESSIONS_ROOT, workspace, id, 'session.v4.jsonl.zstd')
+        const log = join(sessionsRoot(), workspace, id, 'session.v4.jsonl.zstd')
         let stat
         try {
           stat = statSync(log)

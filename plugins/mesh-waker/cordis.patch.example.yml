@@ -46,4 +46,6 @@
         originScan: true
         originScanWindowMs: 21600000
         originScanTailBytes: 2000000
-        sendToolNames: ['mesh_send']
+        # MCP tools are logged with an `mcp__<server>__` prefix (the hub send appears as
+        # mcp__mesh__mesh_send), so both the bare name and the prefixed one are listed.
+        sendToolNames: ['mesh_send', 'mcp__mesh__mesh_send']

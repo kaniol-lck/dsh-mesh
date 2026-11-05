@@ -345,7 +345,11 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   } catch (error) {
     applyError = new Error(`the plugin apply() failed during boot: ${error?.message ?? error}`)
   } finally {
+    // HOME/USERPROFILE come back after apply, but the sessions root must stay: the plugin
+    // reads it per call (T-365 origin scan), and restoring it would point discovery at the
+    // real ~/.dsh/sessions of the machine running the suite.
     for (const key of Object.keys(previousEnv)) {
+      if (key === 'MESH_WAKER_SESSIONS_ROOT') continue
       if (previousEnv[key] === undefined) delete process.env[key]
       else process.env[key] = previousEnv[key]
     }
@@ -1605,6 +1609,127 @@ async function main() {
       report('origin scan: the session log names the sender of a conversation', ok, `hit=${hit?.sessionId ?? '-'} tool=${hit?.tool ?? '-'}`)
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // T-365: the host logs MCP tools as mcp__<server>__<tool>, so the bare default name never
+  // matched and the routing was dead by default. These cases use the real logged name.
+  await runCase('origin scan: the MCP-prefixed name matches and a look-alike does not', async () => {
+    const { findOutboundSession, toolNameMatches } = await import(
+      pathToFileURL(path.join(REPO, 'plugins', 'mesh-waker', 'lib', 'origin-scan.mjs')).href
+    )
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'origin-scan-mcp-'))
+    try {
+      const write = (name, conversation) => {
+        const log = path.join(dir, `${name.replace(/[^\w]/g, '_')}.zstd`)
+        const line =
+          JSON.stringify({ type: 'tool/call', seq: 2, time: 2, data: { turn: 1, step: 1, callId: 'c1', name, arguments: JSON.stringify({ to: 'peer-b', conversation }) } }) + '\n'
+        fs.writeFileSync(log, zstdCompressSync(Buffer.from(line)))
+        return { id: 'session-' + name, workspace: 'ws', log, mtime: Date.now() }
+      }
+      const prefixed = write('mcp__mesh__mesh_send', 'conv/prefixed')
+      const bare = write('mesh_send', 'conv/bare')
+      const evil = write('mesh_send_evil', 'conv/evil')
+      const other = write('mcp__other__mesh_send', 'conv/other')
+      const hitPrefixed = findOutboundSession({ sessions: [prefixed], conversation: 'conv/prefixed' })
+      const hitBare = findOutboundSession({ sessions: [bare], conversation: 'conv/bare' })
+      const missEvil = findOutboundSession({ sessions: [evil], conversation: 'conv/evil' })
+      const hitOtherServer = findOutboundSession({ sessions: [other], conversation: 'conv/other' })
+      const ok =
+        toolNameMatches('mcp__mesh__mesh_send', 'mesh_send') === true &&
+        toolNameMatches('mesh_send', 'mesh_send') === true &&
+        toolNameMatches('mesh_send_evil', 'mesh_send') === false &&
+        hitPrefixed?.sessionId === 'session-mcp__mesh__mesh_send' &&
+        hitBare?.sessionId === 'session-mesh_send' &&
+        missEvil === null &&
+        hitOtherServer !== null
+      report('origin scan: the MCP-prefixed name matches and a look-alike does not', ok, `prefixed=${hitPrefixed?.sessionId ?? '-'} bare=${hitBare?.sessionId ?? '-'} evil=${missEvil ? 'MATCHED' : 'miss'}`)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // T-365 end-to-end: a real plugin boot, a real session log with the host's tool name, and a
+  // pulled reply — the conversation must bind to the origin session instead of the inbox.
+  const e2eOriginLog = (h, sessionId, conversation, toolName = 'mcp__mesh__mesh_send') => {
+    const log = path.join(h.sessionsRoot, 'ws-test', sessionId, 'session.v4.jsonl.zstd')
+    const line =
+      JSON.stringify({ type: 'tool/call', seq: 9, time: Date.now(), data: { turn: 1, step: 1, callId: 'c9', name: toolName, arguments: JSON.stringify({ to: 'peer-b', conversation, body: 'outbound' }) } }) + '\n'
+    fs.writeFileSync(log, zstdCompressSync(Buffer.from(line)))
+  }
+
+  await runCase('origin routing: a reply is delivered to the live origin session', async (boot) => {
+    const conversation = `test-reply-live-${Date.now()}`
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-e2e-live', sender: 'peer-b', conversation, reply_to: 'm-out-live', subject: 're', body: 'a reply' }],
+    })
+    let h = null
+    try {
+      h = await boot({
+        seedSessions: [{ id: 'session-e2e-origin', title: 'origin session' }],
+        config: { hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 },
+      })
+      h.state.agents.set('session-e2e-origin', {})
+      e2eOriginLog(h, 'session-e2e-origin', conversation)
+      const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
+      const conversations = JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
+      const entry = conversations[conversation] ?? {}
+      const ok = delivered?.sessionId === 'session-e2e-origin' && entry.deliverTo === 'session-e2e-origin'
+      report('origin routing: a reply is delivered to the live origin session', ok, `deliverTo=${entry.deliverTo ?? '-'} prompt=${delivered?.sessionId ?? '-'}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('origin routing: a dead origin is replaced in its workspace', async (boot) => {
+    const conversation = `test-reply-dead-${Date.now()}`
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-e2e-dead', sender: 'peer-b', conversation, reply_to: 'm-out-dead', subject: 're', body: 'a reply' }],
+    })
+    let h = null
+    try {
+      h = await boot({
+        seedSessions: [{ id: 'session-e2e-gone', title: 'gone origin' }],
+        config: { hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 },
+      })
+      // Not live: the auto-bound session must be replaced, not used.
+      e2eOriginLog(h, 'session-e2e-gone', conversation)
+      const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
+      const conversations = JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
+      const entry = conversations[conversation] ?? {}
+      const replacement = h.state.created.find((item) => item.id === delivered?.sessionId)
+      const ok =
+        Boolean(replacement) &&
+        entry.deliverTo === delivered.sessionId &&
+        entry.deliverTo !== 'session-e2e-gone'
+      report('origin routing: a dead origin is replaced in its workspace', ok, `deliverTo=${entry.deliverTo ?? '-'} created=${h.state.created.length}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('origin routing: an unresolvable reply still lands in the inbox session', async (boot) => {
+    const conversation = `test-reply-unknown-${Date.now()}`
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-e2e-unknown', sender: 'peer-b', conversation, reply_to: 'm-out-unknown', subject: 're', body: 'a reply' }],
+    })
+    let h = null
+    try {
+      h = await boot({ config: { hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 } })
+      const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
+      const conversations = JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
+      const entry = conversations[conversation] ?? {}
+      // The inbox session is created by the wake path (h.state.created), never bound.
+      const ok = Boolean(delivered) && !entry.deliverTo && h.state.created.some((item) => item.id === delivered.sessionId)
+      report('origin routing: an unresolvable reply still lands in the inbox session', ok, `deliverTo=${entry.deliverTo ?? '(none)'} inbox=${delivered?.sessionId ?? '-'}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
     }
   })
 

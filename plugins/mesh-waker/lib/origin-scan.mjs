@@ -43,10 +43,24 @@ export function readLogTail(file, { tailBytes = 2_000_000, maxFrames = 400 } = {
 }
 
 /**
+ * Does a logged tool name refer to the configured tool? The host prefixes MCP tools with
+ * `mcp__<server>__`, so a bare `mesh_send` must match `mcp__mesh__mesh_send` — but nothing
+ * looser than that: `mesh_send_evil` or `my_mesh_send` must not match (T-365).
+ */
+export function toolNameMatches(name, want) {
+  const actual = String(name ?? '')
+  const expected = String(want ?? '')
+  if (!actual || !expected) return false
+  if (actual === expected) return true
+  if (actual === 'mcp__' + expected) return true
+  return actual.startsWith('mcp__') && actual.endsWith('__' + expected)
+}
+
+/**
  * Newest local session whose log contains a tool call to `toolNames` whose arguments mention
  * `conversation`. Returns null when nothing matches — the caller falls back to the inbox.
  */
-export function findOutboundSession({ sessions, conversation, toolNames = ['mesh_send'], sinceMs = 0, readTail = readLogTail } = {}) {
+export function findOutboundSession({ sessions, conversation, toolNames = ['mesh_send', 'mcp__mesh__mesh_send'], sinceMs = 0, readTail = readLogTail } = {}) {
   const needle = JSON.stringify(String(conversation))
   const bare = needle.slice(1, -1)
   for (const session of sessions) {
@@ -68,7 +82,7 @@ export function findOutboundSession({ sessions, conversation, toolNames = ['mesh
       }
       const data = event?.data && typeof event.data === 'object' ? event.data : {}
       const name = String(data.name ?? '')
-      if (!toolNames.includes(name)) continue
+      if (!toolNames.some((want) => toolNameMatches(name, want))) continue
       const args = String(data.arguments ?? '')
       if (!args.includes(bare)) continue
       return {
