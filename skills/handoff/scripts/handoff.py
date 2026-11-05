@@ -42,10 +42,33 @@ from pathlib import Path
 
 # Never packed by default: VCS, dependencies, build output, credentials.
 DEFAULT_EXCLUDES = [
-    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", "build*",
     "*.log", "*.env", ".env*", "token", "token*", "wake-secret", "*.secret",
     "*.key", "*.pem", "conversations.json", "trust.json",
+    # Vendored runtimes and build artifacts are binary; they never belong in a handoff
+    # bundle and reading them as text is what produced the false secret hits.
+    "*.exe", "*.dll", "*.so", "*.dylib", "*.pyc", "*.jar",
+    "*.png", "*.jpg", "*.jpeg", "*.zip", "*.gz", "*.woff2",
 ]
+BINARY_EXTENSIONS = {
+    ".exe", ".dll", ".so", ".dylib", ".pyc", ".jar", ".class", ".o", ".a", ".lib",
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".zip", ".gz", ".7z", ".woff", ".woff2",
+    ".ttf", ".otf", ".bin", ".dat", ".dylib", ".pyd",
+}
+MAX_SECRET_SCAN_BYTES = 2_000_000
+# Documentation may quote example keys ("-----BEGIN ... PRIVATE KEY-----", sample passwords).
+DOC_SUFFIXES = {".md", ".markdown", ".html", ".htm", ".txt", ".rst"}
+
+
+def plausible_secret_value(value: str) -> bool:
+    """Reject obvious non-secrets so vendored code/docs do not block a pack.
+
+    "prompt='Password: '", 'token=" + repr(raw)' and "${{ secrets.TOKEN }}" are code,
+    not credentials: a real literal has no spaces, braces, quotes or concatenation.
+    """
+    if len(value) < 16 or value.startswith(("/", "http://", "https://")):
+        return False
+    return re.fullmatch(r"[^\s{}`'+\"']+", value) is not None
 # Broad on purpose: a false positive is cheaper than leaking a credential.
 SECRET_PATTERNS = [
     r"mesh_[A-Za-z0-9_-]{20,}",
@@ -55,7 +78,7 @@ SECRET_PATTERNS = [
     r"AKIA[0-9A-Z]{16}",
     r"Bearer [A-Za-z0-9._-]{20,}",
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
-    r"(?i)(password|passwd|secret|token)\s*[:=]\s*['\"](?!/|https?://)[^'\"]{8,}['\"]",
+    r"(?i)(password|passwd|secret|token)\s*[:=]\s*['\"](?!/|https?://)([^'\"]{8,})['\"]",
 ]
 
 
@@ -160,20 +183,58 @@ def excluded(rel: str, patterns) -> bool:
     return False
 
 
-def scan_secrets(root: Path) -> list[str]:
+def scan_secrets(root: Path, patterns) -> dict:
+    """Scan files that would actually be packed; skip binaries instead of reading them as text.
+
+    Excluded paths are not scanned at all (same patterns as the tar loop), binary files are
+    skipped by extension or by a NUL byte in the first 8 KiB, and oversized files are counted
+    rather than silently ignored — "scanned and found nothing" must be distinguishable from
+    "never scanned".
+    """
     hits = []
+    skipped_binary = 0
+    skipped_large = 0
     for path in root.rglob("*"):
-        if not path.is_file() or path.stat().st_size > 2_000_000:
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if excluded(rel, patterns):
             continue
         try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > MAX_SECRET_SCAN_BYTES:
+            skipped_large += 1
+            continue
+        if path.suffix.lower() in BINARY_EXTENSIONS:
+            skipped_binary += 1
+            continue
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(8192)
+            if b"\x00" in head:
+                skipped_binary += 1
+                continue
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        for pattern in SECRET_PATTERNS:
-            if re.search(pattern, text):
-                hits.append(str(path.relative_to(root)))
-                break
-    return hits
+        for index, pattern in enumerate(SECRET_PATTERNS):
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            if index == 7:
+                line_start = text.rfind("\n", 0, match.start()) + 1
+                line_text = text[line_start:text.find("\n", match.start())]
+                if line_text.lstrip().startswith("#"):
+                    continue
+                if not plausible_secret_value(match.group(2)):
+                    continue
+            if index == 6 and path.suffix.lower() in DOC_SUFFIXES:
+                continue
+            hits.append(rel)
+            break
+    return {"hits": hits, "skippedBinaryFiles": skipped_binary, "skippedLargeFiles": skipped_large}
 
 
 def detect_requirements(workspace: Path) -> dict:
@@ -220,9 +281,15 @@ def cmd_pack(args) -> int:
         return fail(f"workspace not found: {workspace}")
 
     patterns = DEFAULT_EXCLUDES + [item for item in (args.exclude or "").split(",") if item]
-    hits = scan_secrets(workspace)
-    if hits:
-        print(json.dumps({"ok": False, "error": "refusing to pack: possible secrets", "files": hits[:20]}, ensure_ascii=False, indent=2))
+    scan = scan_secrets(workspace, patterns)
+    if scan["hits"]:
+        print(json.dumps({
+            "ok": False,
+            "error": "refusing to pack: possible secrets",
+            "files": scan["hits"][:20],
+            "skippedBinaryFiles": scan["skippedBinaryFiles"],
+            "skippedLargeFiles": scan["skippedLargeFiles"],
+        }, ensure_ascii=False, indent=2))
         return 1
 
     manifest = {
@@ -239,12 +306,18 @@ def cmd_pack(args) -> int:
     }
 
     out.parent.mkdir(parents=True, exist_ok=True)
+    packed = 0
     with tarfile.open(out, "w:gz") as tar:
         for path in sorted(workspace.rglob("*")):
+            # Files only: adding a directory makes tar recurse into it, and rglob then
+            # adds the same children again (duplicate entries in the bundle).
+            if not path.is_file():
+                continue
             rel = path.relative_to(workspace).as_posix()
             if excluded(rel, patterns):
                 continue
             tar.add(path, arcname="workspace/" + rel)
+            packed += 1
         blob = json.dumps(manifest, ensure_ascii=False, indent=2).encode()
         info = tarfile.TarInfo("handoff/manifest.json")
         info.size = len(blob)
@@ -257,6 +330,9 @@ def cmd_pack(args) -> int:
     digest = sha256_file(out)
     print(json.dumps(
         {"bundle": str(out), "bytes": size, "sha256": digest, "handoffId": manifest["handoffId"],
+         "fileCount": packed,
+         "skippedBinaryFiles": scan["skippedBinaryFiles"],
+         "skippedLargeFiles": scan["skippedLargeFiles"],
          "requirements": manifest["requirements"]},
         ensure_ascii=False, indent=2,
     ))
