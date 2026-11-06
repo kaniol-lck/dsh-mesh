@@ -3179,6 +3179,9 @@ export function apply(ctx, config) {
   const taskRows = new Map()
   const taskFiles = new Map()
   const workspaces = { machine: hostname(), workspaces: {} }
+  // Slugs this process changed since the last save; only these override the file (T-370).
+  const dirtyWorkspaces = new Set()
+  const removedWorkspaces = new Set()
 
   const tasksFileIn = (dir) => join(dir, 'tasks.jsonl')
   const receiptsFileIn = (dir) => join(dir, 'receipts.jsonl')
@@ -3201,14 +3204,78 @@ export function apply(ctx, config) {
 
   function saveWorkspaces() {
     try {
+      // Never write the boot-time snapshot over external edits (T-370): read the file first,
+      // keep the disk entries, and overlay only the slugs this process actually changed.
+      const disk = readWorkspacesFromDisk()
+      const merged = { machine: disk.machine || workspaces.machine, workspaces: { ...disk.workspaces } }
+      for (const [slug, value] of Object.entries(workspaces.workspaces)) {
+        if (!merged.workspaces[slug] || dirtyWorkspaces.has(slug)) merged.workspaces[slug] = value
+      }
+      for (const slug of removedWorkspaces) delete merged.workspaces[slug]
       mkdirSync(dirname(workspacesFile), { recursive: true })
       const temp = `${workspacesFile}.tmp`
-      writeFileSync(temp, `${JSON.stringify(workspaces, null, 2)}\n`, { mode: 0o600 })
+      writeFileSync(temp, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 })
       renameSync(temp, workspacesFile)
+      workspaces.machine = merged.machine
+      workspaces.workspaces = merged.workspaces
+      dirtyWorkspaces.clear()
+      removedWorkspaces.clear()
       return true
     } catch (error) {
       fileLog(`workspaces.json write failed: ${error.message}`)
       return false
+    }
+  }
+
+  /** Normalize one registry entry (shared by the loader and the on-demand reader). */
+  function normalizeWorkspaceEntry(value) {
+    return {
+      cwd: String(value.cwd ?? ''),
+      ...(value.coordinator ? { coordinator: String(value.coordinator) } : {}),
+      ...(value.coordinatorStale === true ? { coordinatorStale: true } : {}),
+      ...(Array.isArray(value.roles) ? { roles: value.roles.map(String) } : {}),
+      ...(Array.isArray(value.rolesUnrecognized)
+        ? { rolesUnrecognized: value.rolesUnrecognized.map(String).slice(0, ROLE_UNRECOGNIZED_MAX) }
+        : {}),
+      ...(typeof value.slug === 'string' && value.slug ? { slug: String(value.slug) } : {}),
+      ...(value.ephemeral === true ? { ephemeral: true } : {}),
+    }
+  }
+
+  /** Read workspaces.json without touching memory: the API and every save start from disk. */
+  function readWorkspacesFromDisk() {
+    const raw = readJsonOr(workspacesFile, null)
+    const result = { machine: workspaces.machine, workspaces: {}, mtimeMs: null, ok: false }
+    try {
+      result.mtimeMs = statSync(workspacesFile).mtimeMs
+    } catch {
+      /* file absent: an empty registry */
+    }
+    if (!raw || typeof raw !== 'object') return result
+    result.ok = true
+    if (typeof raw.machine === 'string' && raw.machine.trim()) result.machine = raw.machine.trim()
+    if (raw.workspaces && typeof raw.workspaces === 'object') {
+      for (const [slug, value] of Object.entries(raw.workspaces)) {
+        if (!value || typeof value !== 'object') continue
+        result.workspaces[slug] = normalizeWorkspaceEntry(value)
+      }
+    }
+    return result
+  }
+
+  /** Replace memory with the file (GET /mesh/workspaces and every mutation do this first). */
+  function refreshWorkspacesFromDisk() {
+    const disk = readWorkspacesFromDisk()
+    workspaces.machine = disk.machine
+    workspaces.workspaces = disk.workspaces
+    dirtyWorkspaces.clear()
+    removedWorkspaces.clear()
+    return {
+      reloadedAt: new Date().toISOString(),
+      fileMtimeMs: disk.mtimeMs,
+      fileReadable: disk.ok,
+      workspaceCount: Object.keys(disk.workspaces).length,
+      file: workspacesFile,
     }
   }
 
@@ -3254,24 +3321,7 @@ export function apply(ctx, config) {
   }
 
   function loadWorkspaces() {
-    const raw = readJsonOr(workspacesFile, null)
-    if (!raw || typeof raw !== 'object') return
-    if (typeof raw.machine === 'string' && raw.machine.trim()) workspaces.machine = raw.machine.trim()
-    if (!raw.workspaces || typeof raw.workspaces !== 'object') return
-    for (const [slug, value] of Object.entries(raw.workspaces)) {
-      if (!value || typeof value !== 'object') continue
-      workspaces.workspaces[slug] = {
-        cwd: String(value.cwd ?? ''),
-        ...(value.coordinator ? { coordinator: String(value.coordinator) } : {}),
-        ...(value.coordinatorStale === true ? { coordinatorStale: true } : {}),
-        ...(Array.isArray(value.roles) ? { roles: value.roles.map(String) } : {}),
-        ...(Array.isArray(value.rolesUnrecognized)
-          ? { rolesUnrecognized: value.rolesUnrecognized.map(String).slice(0, ROLE_UNRECOGNIZED_MAX) }
-          : {}),
-        ...(typeof value.slug === 'string' && value.slug ? { slug: String(value.slug) } : {}),
-        ...(value.ephemeral === true ? { ephemeral: true } : {}),
-      }
-    }
+    return refreshWorkspacesFromDisk()
   }
 
   /** The slug a registry entry is known by: an explicit human `slug` wins over the key. */
@@ -3284,6 +3334,9 @@ export function apply(ctx, config) {
   function ensureWorkspace(cwd) {
     const path = String(cwd ?? '').trim()
     if (!path) return null
+    // T-370: another process may have rewritten the registry; a stale memory snapshot would
+    // miss the existing cwd and create a duplicate slug (dsh-mesh-2).
+    refreshWorkspacesFromDisk()
     const keyPath = workspaceKeyPath(path)
     for (const [slug, value] of Object.entries(workspaces.workspaces)) {
       if (workspaceKeyPath(value.cwd) === keyPath) return canonicalSlugOf(slug, value)
@@ -3298,6 +3351,7 @@ export function apply(ctx, config) {
       Object.entries(workspaces.workspaces).some(([key, entry]) => canonicalSlugOf(key, entry) === candidate)
     while (taken(slug)) slug = `${base}-${suffix++}`
     workspaces.workspaces[slug] = { cwd: path, coordinator: null, roles: [] }
+    dirtyWorkspaces.add(slug)
     saveWorkspaces()
     fileLog(`workspace registered: ${slug} (${path})`)
     return slug
@@ -3402,6 +3456,9 @@ export function apply(ctx, config) {
    * `dsh-mesh`) while migrating their ws/ directory. Idempotent: a clean registry logs zeros.
    */
   function convergeWorkspaces() {
+    // Start from disk: converge must not resurrect entries another process removed or
+    // overwrite a cwd/coordinator it changed (T-370).
+    refreshWorkspacesFromDisk()
     let sessions = []
     try {
       sessions = listLocalSessions()
@@ -3494,16 +3551,27 @@ export function apply(ctx, config) {
       next[desired] = entry
     }
 
-    const before = JSON.stringify(workspaces.workspaces)
+    const beforeMap = workspaces.workspaces
+    const before = JSON.stringify(beforeMap)
     workspaces.workspaces = next
     const changed = JSON.stringify(workspaces.workspaces) !== before
-    if (changed) saveWorkspaces()
+    if (changed) {
+      for (const [slug, value] of Object.entries(next)) {
+        if (JSON.stringify(beforeMap[slug]) !== JSON.stringify(value)) dirtyWorkspaces.add(slug)
+      }
+      for (const slug of Object.keys(beforeMap)) {
+        if (!next[slug]) removedWorkspaces.add(slug)
+      }
+      saveWorkspaces()
+    }
     fileLog(`workspaces: converged merged=${merged} ephemeral=${ephemeral} reslugged=${reslugged}${changed ? '' : ' (no changes)'}`)
     return { merged, ephemeral, reslugged }
   }
 
   /** Seed/refresh the registry from the host session index: one entry per real workspace. */
   function registerWorkspacesFromSessions() {
+    refreshWorkspacesFromDisk()
+    const beforeSnapshot = JSON.stringify(workspaces.workspaces)
     localSessionsCache = { at: 0, list: null }
     const sessions = cachedLocalSessions()
     const byCwd = new Map()
@@ -3580,7 +3648,19 @@ export function apply(ctx, config) {
         changed = true
       }
     }
-    if (changed) saveWorkspaces()
+    if (changed) {
+      // Only the slugs this pass actually rewrote may override the file (T-370).
+      let beforeMap = {}
+      try {
+        beforeMap = JSON.parse(beforeSnapshot)
+      } catch {
+        beforeMap = {}
+      }
+      for (const [slug, value] of Object.entries(workspaces.workspaces)) {
+        if (JSON.stringify(beforeMap[slug]) !== JSON.stringify(value)) dirtyWorkspaces.add(slug)
+      }
+      saveWorkspaces()
+    }
   }
 
 
@@ -5089,11 +5169,13 @@ export function apply(ctx, config) {
     // Task registry API (0.7.11): list without bodies, detail with body, DELETE = cancel.
     if (path === '/mesh/workspaces' && req.method === 'GET') {
       // Read-only registry: who is on this machine and which workspace owns which cwd.
+      // T-370: always answer from the file, never from the boot-time snapshot.
       if (!fromLoopback(req)) {
         res.writeHead(403, { 'content-type': 'application/json' })
         res.end('{"error":"loopback only"}')
         return
       }
+      const reload = refreshWorkspacesFromDisk()
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
       res.end(
         JSON.stringify({
@@ -5101,6 +5183,33 @@ export function apply(ctx, config) {
           machine: workspaces.machine,
           count: Object.keys(workspaces.workspaces).length,
           workspaces: workspaces.workspaces,
+          // Self-describing: when the answer was read and from where.
+          reloadedAt: reload.reloadedAt,
+          fileMtimeMs: reload.fileMtimeMs,
+          fileReadable: reload.fileReadable,
+          source: 'file',
+        }),
+      )
+      return
+    }
+
+    if (path === '/mesh/workspaces/reload' && req.method === 'POST') {
+      // Explicit reload for scripts: same read, with the metadata that says what happened.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const reload = refreshWorkspacesFromDisk()
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(
+        JSON.stringify({
+          ok: true,
+          reloadedAt: reload.reloadedAt,
+          fileMtimeMs: reload.fileMtimeMs,
+          fileReadable: reload.fileReadable,
+          workspaceCount: reload.workspaceCount,
+          source: 'file',
         }),
       )
       return

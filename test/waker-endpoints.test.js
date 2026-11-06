@@ -5301,6 +5301,54 @@ async function main() {
   // ephemeral cleanup, and idempotent convergence of registries written before this change.
   const registryOf = (h) => JSON.parse(fs.readFileSync(path.join(h.home, '.dsh', 'mesh-waker', 'workspaces.json'), 'utf8'))
   const wsDirOf = (h, slug) => path.join(h.home, '.dsh', 'mesh-waker', 'ws', slug)
+  const workspacesFileOf = (h) => path.join(h.home, '.dsh', 'mesh-waker', 'workspaces.json')
+
+  // T-370: the API used to answer from the boot-time snapshot, so a file edited on disk was
+  // invisible until a restart (and a later save would write the stale map back).
+  await runCase('workspaces: the API reflects an external file change immediately', async (boot) => {
+    const h = await boot({})
+    const file = workspacesFileOf(h)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const write = (coordinator) =>
+      fs.writeFileSync(
+        file,
+        JSON.stringify({ machine: 'test-pc', workspaces: { 'dsh-mesh': { cwd: path.join('virtual', 'dsh-mesh', 'public'), coordinator } } }, null, 2),
+      )
+    write('session-file-1')
+    const first = await request(h.base, '/mesh/workspaces')
+    write('session-file-2')
+    const second = await request(h.base, '/mesh/workspaces')
+    const reload = await request(h.base, '/mesh/workspaces/reload', { method: 'POST' })
+    const ok =
+      first.json?.workspaces?.['dsh-mesh']?.coordinator === 'session-file-1' &&
+      second.json?.workspaces?.['dsh-mesh']?.coordinator === 'session-file-2' &&
+      second.json?.source === 'file' &&
+      reload.json?.ok === true &&
+      typeof reload.json?.reloadedAt === 'string' &&
+      typeof reload.json?.workspaceCount === 'number'
+    report('workspaces: the API reflects an external file change immediately', ok, `first=${first.json?.workspaces?.['dsh-mesh']?.coordinator ?? '-'} second=${second.json?.workspaces?.['dsh-mesh']?.coordinator ?? '-'} reload=${reload.json?.ok ?? '-'}`)
+  })
+
+  await runCase('workspaces: ensureWorkspace never rolls back the file or forks a -2 slug', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'virtual-ws-370', 'dsh-mesh', 'public')
+    const h = await boot({ seedSessions: [{ id: 'session-ws-370', title: 'ws worker', cwd }] })
+    const file = workspacesFileOf(h)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, JSON.stringify({ machine: 'test-pc', workspaces: { 'dsh-mesh': { cwd, coordinator: 'session-file-coord' } } }, null, 2))
+    // Three operations that route through ensureWorkspace(cwd): none may write a stale map.
+    for (let index = 0; index < 3; index += 1) {
+      const injected = await request(h.base, '/mesh/inject', {
+        method: 'POST',
+        body: { session: 'session-ws-370', text: `ws task ${index}`, meta: { taskId: `T-WS370-${index}` } },
+      })
+      if (injected.status !== 200) throw new Error(`inject ${index} failed: ${injected.status} ${injected.text.slice(0, 200)}`)
+    }
+    const after = registryOf(h)
+    const slugs = Object.keys(after.workspaces ?? {})
+    const entry = after.workspaces?.['dsh-mesh'] ?? {}
+    const ok = slugs.length === 1 && slugs[0] === 'dsh-mesh' && entry.cwd === cwd && entry.coordinator === 'session-file-coord'
+    report('workspaces: ensureWorkspace never rolls back the file or forks a -2 slug', ok, `slugs=${slugs.join(',')} cwd=${entry.cwd === cwd} coordinator=${entry.coordinator ?? '-'}`)
+  })
 
   await runCase('workspaces: a generic basename uses the parent project name', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'dsh-mesh', 'public')
