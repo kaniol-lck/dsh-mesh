@@ -3229,6 +3229,18 @@ export function apply(ctx, config) {
 
   /** Normalize one registry entry (shared by the loader and the on-demand reader). */
   function normalizeWorkspaceEntry(value) {
+    const workers = {}
+    if (value.workers && typeof value.workers === 'object') {
+      for (const [role, worker] of Object.entries(value.workers)) {
+        if (!worker || typeof worker !== 'object' || !worker.sessionId) continue
+        workers[sanitizeSlug(role)] = {
+          sessionId: String(worker.sessionId),
+          ...(worker.cwd ? { cwd: String(worker.cwd) } : {}),
+          ...(Array.isArray(worker.scopes) ? { scopes: worker.scopes.map(String).slice(0, 20) } : {}),
+          ...(Number.isFinite(Number(worker.updatedAt)) ? { updatedAt: Number(worker.updatedAt) } : {}),
+        }
+      }
+    }
     return {
       cwd: String(value.cwd ?? ''),
       ...(value.coordinator ? { coordinator: String(value.coordinator) } : {}),
@@ -3237,6 +3249,7 @@ export function apply(ctx, config) {
       ...(Array.isArray(value.rolesUnrecognized)
         ? { rolesUnrecognized: value.rolesUnrecognized.map(String).slice(0, ROLE_UNRECOGNIZED_MAX) }
         : {}),
+      ...(Object.keys(workers).length ? { workers } : {}),
       ...(typeof value.slug === 'string' && value.slug ? { slug: String(value.slug) } : {}),
       ...(value.ephemeral === true ? { ephemeral: true } : {}),
     }
@@ -3645,6 +3658,42 @@ export function apply(ctx, config) {
       if (JSON.stringify(unrecognized) !== JSON.stringify(previousUnrecognized)) {
         if (unrecognized.length) entry.rolesUnrecognized = unrecognized
         else delete entry.rolesUnrecognized
+        changed = true
+      }
+      // Workers (T-372): the most recently active session per role, so a dispatch can address
+      // a role instead of a session id. A coordinator title contributes no role.
+      const derivedWorkers = {}
+      for (const session of list) {
+        if (!session.id || !session.title) continue
+        let sessionRoles = []
+        try {
+          sessionRoles = classifyRoleCandidates([session.title]).roles
+        } catch {
+          sessionRoles = []
+        }
+        for (const role of sessionRoles) {
+          const candidate = {
+            sessionId: session.id,
+            ...(session.cwd ? { cwd: session.cwd } : {}),
+            updatedAt: Number(session.last_active ?? 0),
+          }
+          const previous = derivedWorkers[role]
+          if (!previous || candidate.updatedAt > previous.updatedAt) derivedWorkers[role] = candidate
+        }
+      }
+      const previousWorkers = entry.workers && typeof entry.workers === 'object' ? entry.workers : {}
+      const nextWorkers = { ...previousWorkers, ...derivedWorkers }
+      // Keep updatedAt stable when the role already points at the same session: a restart
+      // must not rewrite the registry just because the session log was touched.
+      for (const [role, worker] of Object.entries(nextWorkers)) {
+        const previous = previousWorkers[role]
+        if (previous && previous.sessionId === worker.sessionId && Number.isFinite(Number(previous.updatedAt))) {
+          nextWorkers[role] = { ...worker, updatedAt: Number(previous.updatedAt) }
+        }
+      }
+      if (JSON.stringify(nextWorkers) !== JSON.stringify(previousWorkers)) {
+        if (Object.keys(nextWorkers).length) entry.workers = nextWorkers
+        else delete entry.workers
         changed = true
       }
     }
@@ -5176,13 +5225,38 @@ export function apply(ctx, config) {
         return
       }
       const reload = refreshWorkspacesFromDisk()
+      // Workers (T-372) are returned with a computed `stale` flag: the registry says which
+      // session holds a role, liveness decides whether that session is still usable.
+      let sessionsById = new Map()
+      try {
+        sessionsById = new Map(listLocalSessions().map((session) => [session.id, session]))
+      } catch {
+        sessionsById = new Map()
+      }
+      const view = {}
+      for (const [slug, entry] of Object.entries(workspaces.workspaces)) {
+        if (!entry.workers || typeof entry.workers !== 'object') {
+          view[slug] = entry
+          continue
+        }
+        const workers = {}
+        for (const [role, worker] of Object.entries(entry.workers)) {
+          const session = sessionsById.get(worker.sessionId)
+          workers[role] = {
+            ...worker,
+            // Missing, archived, or not currently loaded: every one of them is stale.
+            stale: !session || session.archived === true || session.live !== true,
+          }
+        }
+        view[slug] = { ...entry, workers }
+      }
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
       res.end(
         JSON.stringify({
           ok: true,
           machine: workspaces.machine,
           count: Object.keys(workspaces.workspaces).length,
-          workspaces: workspaces.workspaces,
+          workspaces: view,
           // Self-describing: when the answer was read and from where.
           reloadedAt: reload.reloadedAt,
           fileMtimeMs: reload.fileMtimeMs,
@@ -5190,6 +5264,55 @@ export function apply(ctx, config) {
           source: 'file',
         }),
       )
+      return
+    }
+
+    if (path === '/mesh/workspaces/workers' && req.method === 'POST') {
+      // Write one role worker (T-372). Body: { slug | cwd, role, sessionId, cwd?, scopes? }.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const chunks = []
+      let size = 0
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size > MAX_BODY) {
+          res.writeHead(413).end()
+          return
+        }
+        chunks.push(chunk)
+      }
+      try {
+        const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        refreshWorkspacesFromDisk()
+        const role = sanitizeSlug(draft.role)
+        const sessionId = String(draft.sessionId ?? '').trim()
+        if (!role || !sessionId) throw new Error('role and sessionId are required')
+        let slug = String(draft.slug ?? '').trim()
+        if (!slug) {
+          const wanted = workspaceKeyPath(draft.cwd ?? '')
+          slug = Object.keys(workspaces.workspaces).find((key) => workspaceKeyPath(workspaces.workspaces[key].cwd) === wanted) ?? ''
+        }
+        const entry = workspaces.workspaces[slug]
+        if (!entry) throw new Error(`workspace ${slug || '(unknown)'} is not registered`)
+        const workers = { ...(entry.workers ?? {}) }
+        workers[role] = {
+          sessionId,
+          ...(draft.cwd ? { cwd: String(draft.cwd) } : {}),
+          ...(Array.isArray(draft.scopes) ? { scopes: draft.scopes.map(String).slice(0, 20) } : {}),
+          updatedAt: Date.now(),
+        }
+        entry.workers = workers
+        dirtyWorkspaces.add(slug)
+        saveWorkspaces()
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: true, slug, role, workers: entry.workers }))
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
       return
     }
 

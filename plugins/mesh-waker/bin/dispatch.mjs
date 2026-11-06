@@ -26,11 +26,16 @@ Usage:
 
 Options:
   --target <s>       session id, full title, or a unique title substring
+  --role <role>      dispatch to the worker registered for that role in the workspace that
+                     owns the current directory (workers come from /mesh/workspaces).
+                     Exits 2 with candidates when the role is missing or its session is
+                     stale. Not combinable with --target / --thread / --coordinator.
   --coordinator <slug> dispatch to that workspace's coordinator session (equivalent to
                      targeting the coordinator of that workspace; resolved from
-                     /mesh/workspaces). Exits 2 when the workspace has no coordinator or
-                     when its session is no longer on this machine. Not combinable with
-                     --target / --thread.
+                     /mesh/workspaces). Deprecated alias kept for existing scripts; --role is
+                     the forward-looking addressing. Exits 2 when the workspace has no
+                     coordinator or when its session is no longer on this machine. Not
+                     combinable with --target / --thread / --role.
   --text <s>         task text (exactly one of --text / --file)
   --file <path>      UTF-8 task file (exactly one of --text / --file)
   --mode <m>         queue (default) or steer
@@ -92,6 +97,7 @@ export function parseArgs(argv) {
   const options = {
     target: undefined,
     coordinator: undefined,
+    role: undefined,
     text: undefined,
     file: undefined,
     mode: 'queue',
@@ -122,6 +128,12 @@ export function parseArgs(argv) {
         const value = String(takeValue()).trim()
         if (!value) fail('--coordinator requires a non-empty slug')
         options.coordinator = value
+        break
+      }
+      case '--role': {
+        const value = String(takeValue()).trim()
+        if (!value) fail('--role requires a non-empty role')
+        options.role = value.toLowerCase()
         break
       }
       case '--text': options.text = takeValue(); break
@@ -166,9 +178,12 @@ export function parseArgs(argv) {
   if (options.coordinator !== undefined && (options.target !== undefined || options.thread !== undefined)) {
     fail('--coordinator cannot be combined with --target or --thread')
   }
+  if (options.role !== undefined && (options.target !== undefined || options.thread !== undefined || options.coordinator !== undefined)) {
+    fail('--role cannot be combined with --target, --thread or --coordinator')
+  }
   // A known thread resolves the target server-side, so --target may be omitted (T-296).
-  if (!options.target && options.coordinator === undefined && options.thread === undefined) {
-    fail('pass --target, --coordinator or --thread for a known thread')
+  if (!options.target && options.coordinator === undefined && options.role === undefined && options.thread === undefined) {
+    fail('pass --target, --coordinator, --role or --thread for a known thread')
   }
   if (options.create && !options.target) fail('--create needs --target')
   const hasText = options.text !== undefined
@@ -244,6 +259,60 @@ export async function resolveCoordinator(base, slug, fetchImpl = fetch) {
   return { coordinator, cwd: entry.cwd ?? null, roles: entry.roles ?? [] }
 }
 
+/**
+ * Resolve --role through the registry (T-372): the workspace that owns the current directory
+ * names the worker for that role. Missing / stale workers are addressing errors with the
+ * candidates listed — never a guess.
+ */
+export async function resolveRoleTarget(base, role, fetchImpl = fetch) {
+  const registryRes = await fetchImpl(`${base}/mesh/workspaces`)
+  let registry = null
+  try {
+    registry = await registryRes.json()
+  } catch {
+    registry = null
+  }
+  if (!registryRes.ok || !registry || registry.ok === false) {
+    addressFail(`读取工作区注册表失败：HTTP ${registryRes.status}`)
+  }
+  const workspaces = registry.workspaces && typeof registry.workspaces === 'object' ? registry.workspaces : {}
+  const normalize = (value) => String(value ?? '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  const cwd = normalize(process.cwd())
+  const slug = Object.keys(workspaces).find((key) => normalize(workspaces[key]?.cwd) === cwd)
+  if (!slug) {
+    const known = Object.entries(workspaces)
+      .slice(0, 12)
+      .map(([key, entry]) => `${key}=${entry?.cwd ?? '?'}`)
+      .join(', ')
+    addressFail(`当前目录 ${process.cwd()} 不对应任何已登记工作区（已登记：${known || '无'}）；在该目录启动一个会话，或改用 --coordinator / --target`)
+  }
+  const want = String(role ?? '').toLowerCase().replace(/[^a-z0-9-]/g, '')
+  const workers = workspaces[slug]?.workers && typeof workspaces[slug].workers === 'object' ? workspaces[slug].workers : {}
+  const worker = workers[want]
+  if (!worker || !worker.sessionId) {
+    const known = Object.keys(workers).join(', ') || '无'
+    addressFail(`工作区 ${slug} 没有 "${want}" worker（已登记角色：${known}）；先让该角色会话启动，或登记 worker，或改用 --coordinator / --target`)
+  }
+  if (worker.stale === true) {
+    const sessionsRes = await fetchImpl(`${base}/mesh/sessions?limit=500`)
+    let sessions = null
+    try {
+      sessions = await sessionsRes.json()
+    } catch {
+      sessions = null
+    }
+    const list = Array.isArray(sessions?.sessions) ? sessions.sessions : []
+    const candidates = list
+      .filter((session) => String(session.title ?? '').toLowerCase().includes(want))
+      .slice(0, 5)
+      .map((session) => `${session.id}(${session.title ?? '-'}${session.archived ? ', archived' : ''})`)
+    addressFail(
+      `工作区 ${slug} 的 "${want}" worker 会话 ${worker.sessionId} 已归档或不活跃；候选：${candidates.length ? candidates.join(', ') : '无（该角色没有其它会话）'}`,
+    )
+  }
+  return { sessionId: worker.sessionId, slug, role: want }
+}
+
 /** Dispatch one task; returns the waker's result (plus created flag when it made a session). */
 export async function run(options, fetchImpl = fetch) {
   const base = String(options.waker ?? DEFAULT_WAKER).replace(/\/+$/, '')
@@ -253,13 +322,20 @@ export async function run(options, fetchImpl = fetch) {
     resolvedCoordinator = await resolveCoordinator(base, options.coordinator, fetchImpl)
     options = { ...options, target: resolvedCoordinator.coordinator }
   }
+  let resolvedRole = null
+  if (options.role !== undefined) {
+    resolvedRole = await resolveRoleTarget(base, options.role, fetchImpl)
+    options = { ...options, target: resolvedRole.sessionId }
+  }
   // How this task was addressed, recorded with the task so a later reader never has to guess.
   const routedTo =
-    options.coordinator !== undefined
-      ? `workspace:${options.coordinator}`
-      : options.thread !== undefined
-        ? `thread:${options.thread}`
-        : `session:${options.target}`
+    options.role !== undefined
+      ? `role:${resolvedRole.slug}/${resolvedRole.role}`
+      : options.coordinator !== undefined
+        ? `workspace:${options.coordinator}`
+        : options.thread !== undefined
+          ? `thread:${options.thread}`
+          : `session:${options.target}`
   const text = options.file !== undefined ? await readFile(String(options.file), 'utf8') : String(options.text ?? '')
   if (!text.trim()) fail('task text is empty')
   const taskId = options.task === undefined ? null : options.task || `T-${Date.now().toString(36)}`
@@ -291,6 +367,7 @@ export async function run(options, fetchImpl = fetch) {
       url: `${base}/mesh/inject`,
       routedTo,
       ...(resolvedCoordinator ? { resolvedCoordinator } : {}),
+      ...(resolvedRole ? { resolvedRole } : {}),
       payload: payload(null),
     }
   }

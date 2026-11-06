@@ -1500,6 +1500,64 @@ async function main() {
     report('CLI: --help documents only --coordinator (not --workspace)', ok, `coordinatorDoc=${/--coordinator/.test(USAGE)} workspaceDoc=${/--workspace/.test(USAGE)}`)
   })
 
+  // T-372: --role addresses the worker registered for that role in the workspace that owns
+  // the current directory. Missing or stale workers are addressing errors with candidates.
+  await runCase('CLI: --role resolves the workspace worker', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--role', 'docs', '--text', 'hi', '--dry-run'])
+    const cwd = process.cwd()
+    const fetchStub = fakeRegistryFetch(
+      { 'dsh-mesh': { cwd, workers: { docs: { sessionId: 'session-docs-1', stale: false } } } },
+      [{ id: 'session-docs-1', title: 'dsh-mesh · docs' }],
+    )
+    const result = await run(options, fetchStub)
+    const ok =
+      result.dryRun === true &&
+      result.payload.session === 'session-docs-1' &&
+      result.routedTo === 'role:dsh-mesh/docs' &&
+      result.resolvedRole.sessionId === 'session-docs-1'
+    report('CLI: --role resolves the workspace worker', ok, `target=${result.payload.session} routedTo=${result.routedTo}`)
+  })
+
+  await runCase('CLI: --role on a stale worker exits 2 with candidates', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--role', 'docs', '--text', 'hi', '--dry-run'])
+    const cwd = process.cwd()
+    const fetchStub = fakeRegistryFetch(
+      { 'dsh-mesh': { cwd, workers: { docs: { sessionId: 'session-docs-old', stale: true } } } },
+      [
+        { id: 'session-docs-old', title: 'dsh-mesh · docs', archived: true },
+        { id: 'session-docs-new', title: 'dsh-mesh · docs', archived: false },
+      ],
+    )
+    let error = null
+    try {
+      await run(options, fetchStub)
+    } catch (caught) {
+      error = caught
+    }
+    const ok = error?.exitCode === 2 && /已归档或不活跃/.test(error.message) && /session-docs-new/.test(error.message)
+    report('CLI: --role on a stale worker exits 2 with candidates', ok, `exit=${error?.exitCode ?? '-'} candidates=${/session-docs-new/.test(error?.message ?? '')}`)
+  })
+
+  await runCase('CLI: --role on a missing role exits 2 and lists registered roles', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--role', 'ops', '--text', 'hi', '--dry-run'])
+    const cwd = process.cwd()
+    const fetchStub = fakeRegistryFetch(
+      { 'dsh-mesh': { cwd, workers: { docs: { sessionId: 'session-docs-1', stale: false } } } },
+      [],
+    )
+    let error = null
+    try {
+      await run(options, fetchStub)
+    } catch (caught) {
+      error = caught
+    }
+    const ok = error?.exitCode === 2 && /没有 "ops" worker/.test(error.message) && /已登记角色：docs/.test(error.message)
+    report('CLI: --role on a missing role exits 2 and lists registered roles', ok, `exit=${error?.exitCode ?? '-'} listed=${/已登记角色：docs/.test(error?.message ?? '')}`)
+  })
+
   await runCase('task record: routedTo is persisted and visible in the task API', async (boot) => {
     const h = await boot({ seedSessions: [{ id: 'session-routed', title: 'routed target' }] })
     await request(h.base, '/mesh/inject', {
@@ -5348,6 +5406,49 @@ async function main() {
     const entry = after.workspaces?.['dsh-mesh'] ?? {}
     const ok = slugs.length === 1 && slugs[0] === 'dsh-mesh' && entry.cwd === cwd && entry.coordinator === 'session-file-coord'
     report('workspaces: ensureWorkspace never rolls back the file or forks a -2 slug', ok, `slugs=${slugs.join(',')} cwd=${entry.cwd === cwd} coordinator=${entry.coordinator ?? '-'}`)
+  })
+
+  await runCase('workspaces: workers are returned with a stale flag and written via the API', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'virtual-ws-372', 'dsh-mesh', 'public')
+    const h = await boot({ seedSessions: [{ id: 'session-worker-docs', title: 'dsh-mesh · docs', cwd }] })
+    h.state.agents.set('session-worker-docs', {})
+    const file = workspacesFileOf(h)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(
+      file,
+      JSON.stringify(
+        {
+          machine: 'test-pc',
+          workspaces: {
+            'dsh-mesh': {
+              cwd,
+              workers: {
+                docs: { sessionId: 'session-worker-docs' },
+                ops: { sessionId: 'session-missing' },
+              },
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    )
+    const first = await request(h.base, '/mesh/workspaces')
+    const docs = first.json?.workspaces?.['dsh-mesh']?.workers?.docs
+    const ops = first.json?.workspaces?.['dsh-mesh']?.workers?.ops
+    const written = await request(h.base, '/mesh/workspaces/workers', {
+      method: 'POST',
+      body: { slug: 'dsh-mesh', role: 'waker', sessionId: 'session-worker-docs', scopes: ['mesh'] },
+    })
+    const second = await request(h.base, '/mesh/workspaces')
+    const waker = second.json?.workspaces?.['dsh-mesh']?.workers?.waker
+    const ok =
+      docs?.stale === false &&
+      ops?.stale === true &&
+      written.json?.ok === true &&
+      waker?.sessionId === 'session-worker-docs' &&
+      JSON.stringify(waker?.scopes) === JSON.stringify(['mesh'])
+    report('workspaces: workers are returned with a stale flag and written via the API', ok, `docs.stale=${docs?.stale} ops.stale=${ops?.stale} written=${written.json?.ok ?? '-'}`)
   })
 
   await runCase('workspaces: a generic basename uses the parent project name', async (boot) => {
