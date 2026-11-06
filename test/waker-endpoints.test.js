@@ -5620,6 +5620,49 @@ async function main() {
     report('workspaces: a coordinator idle for over a week is marked stale', ok, `coordinator=${entry?.coordinator ?? '-'} stale=${entry?.coordinatorStale ?? false} warned=${/coordinator idle/.test(log)}`)
   })
 
+  // T-376: an archived session can still be live and have the newest last_active (DSH refuses
+  // to delete live sessions), so derivation must exclude archived ones instead of picking them.
+  await runCase('workspaces: an archived coordinator is never derived', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'archived-coord-repo')
+    const now = Date.now()
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-coord-live', title: 'mesh · 协调', cwd, mtime: now - 60 * 60 * 1000 },
+        { id: 'session-coord-archived', title: 'mesh · 协调', cwd, mtime: now },
+      ],
+      archivedIds: ['session-coord-archived'],
+    })
+    const entry = registryOf(h).workspaces?.['archived-coord-repo']
+    const ok = entry?.coordinator === 'session-coord-live' && entry?.coordinator !== 'session-coord-archived'
+    report('workspaces: an archived coordinator is never derived', ok, `coordinator=${entry?.coordinator ?? '-'}`)
+  })
+
+  await runCase('workspaces: only archived coordinators leave the field empty', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'only-archived-coord-repo')
+    const h = await boot({
+      seedSessions: [{ id: 'session-coord-gone', title: 'mesh · 协调', cwd, mtime: Date.now() }],
+      archivedIds: ['session-coord-gone'],
+    })
+    const entry = registryOf(h).workspaces?.['only-archived-coord-repo']
+    const ok = entry !== undefined && !entry?.coordinator
+    report('workspaces: only archived coordinators leave the field empty', ok, `coordinator=${entry?.coordinator ?? '(none)'}`)
+  })
+
+  await runCase('workspaces: an archived session is never derived as a worker', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'archived-worker-repo')
+    const now = Date.now()
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-docs-live', title: 'mesh · docs', cwd, mtime: now - 60 * 60 * 1000 },
+        { id: 'session-docs-archived', title: 'mesh · docs', cwd, mtime: now },
+      ],
+      archivedIds: ['session-docs-archived'],
+    })
+    const entry = registryOf(h).workspaces?.['archived-worker-repo']
+    const ok = entry?.workers?.docs?.sessionId === 'session-docs-live'
+    report('workspaces: an archived session is never derived as a worker', ok, `docs=${entry?.workers?.docs?.sessionId ?? '-'}`)
+  })
+
   await runCase('workspaces: a human slug and roles survive restarts', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'custom-repo')
     const h = await boot({

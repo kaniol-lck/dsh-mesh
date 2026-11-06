@@ -3609,7 +3609,10 @@ export function apply(ctx, config) {
     for (const [slug, list] of sessionsBySlug) {
       const entry = workspaces.workspaces[slug]
       if (!entry) continue
-      const coordinators = list.filter((session) => isCoordinatorTitle(session.title))
+      // T-376: an archived session must never be derived as the coordinator. A just-archived
+      // test session can still be live and have the newest last_active, and DSH refuses to
+      // delete live sessions — derivation is the only place that can exclude it.
+      const coordinators = list.filter((session) => isCoordinatorTitle(session.title) && session.archived !== true)
       coordinators.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
       const coordinator = coordinators[0] ?? null
       const nextCoordinator = coordinator ? coordinator.id : null
@@ -3665,6 +3668,8 @@ export function apply(ctx, config) {
       const derivedWorkers = {}
       for (const session of list) {
         if (!session.id || !session.title) continue
+        // T-376: an archived session is not a worker candidate either.
+        if (session.archived === true) continue
         let sessionRoles = []
         try {
           sessionRoles = classifyRoleCandidates([session.title]).roles
