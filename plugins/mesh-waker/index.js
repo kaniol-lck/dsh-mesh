@@ -5242,10 +5242,18 @@ export function apply(ctx, config) {
         const workers = {}
         for (const [role, worker] of Object.entries(entry.workers)) {
           const session = sessionsById.get(worker.sessionId)
+          // T-374: split the old catch-all `stale` — a dormant worker (exists, not archived,
+          // simply not loaded right now) is still deliverable and must resolve.
+          const missing = !session
+          const archived = missing ? false : session.archived === true
+          const dormant = !missing && !archived && session.live !== true
           workers[role] = {
             ...worker,
-            // Missing, archived, or not currently loaded: every one of them is stale.
-            stale: !session || session.archived === true || session.live !== true,
+            missing,
+            archived,
+            dormant,
+            // Kept for older readers: true when the worker cannot be used as-is.
+            stale: missing || archived,
           }
         }
         view[slug] = { ...entry, workers }

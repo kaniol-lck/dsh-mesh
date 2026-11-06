@@ -293,7 +293,10 @@ export async function resolveRoleTarget(base, role, fetchImpl = fetch) {
     const known = Object.keys(workers).join(', ') || '无'
     addressFail(`工作区 ${slug} 没有 "${want}" worker（已登记角色：${known}）；先让该角色会话启动，或登记 worker，或改用 --coordinator / --target`)
   }
-  if (worker.stale === true) {
+  // T-374: a dormant worker (exists, not archived, not currently loaded) is still
+  // deliverable — the wake path loads it. Only a missing or archived session is fatal.
+  const archived = worker.archived === true || worker.missing === true
+  if (archived) {
     const sessionsRes = await fetchImpl(`${base}/mesh/sessions?limit=500`)
     let sessions = null
     try {
@@ -307,10 +310,10 @@ export async function resolveRoleTarget(base, role, fetchImpl = fetch) {
       .slice(0, 5)
       .map((session) => `${session.id}(${session.title ?? '-'}${session.archived ? ', archived' : ''})`)
     addressFail(
-      `工作区 ${slug} 的 "${want}" worker 会话 ${worker.sessionId} 已归档或不活跃；候选：${candidates.length ? candidates.join(', ') : '无（该角色没有其它会话）'}`,
+      `工作区 ${slug} 的 "${want}" worker 会话 ${worker.sessionId} ${worker.archived === true ? '已归档' : '不存在'}；候选：${candidates.length ? candidates.join(', ') : '无（该角色没有其它会话）'}`,
     )
   }
-  return { sessionId: worker.sessionId, slug, role: want }
+  return { sessionId: worker.sessionId, slug, role: want, dormant: worker.dormant === true || worker.stale === true }
 }
 
 /** Dispatch one task; returns the waker's result (plus created flag when it made a session). */
@@ -394,8 +397,11 @@ async function main(argv = process.argv.slice(2)) {
     options = parseArgs(argv)
   } catch (error) {
     console.error(error.message)
-    process.exit(1)
+    // T-374: never process.exit() here — an exit while fetch handles are closing trips
+    // libuv (UV_HANDLE_CLOSING assertion on Windows). Let the event loop drain.
+    process.exitCode = 1
   }
+  if (!options) return
   if (options.help) {
     console.log(USAGE)
     return
@@ -406,14 +412,20 @@ async function main(argv = process.argv.slice(2)) {
   } catch (error) {
     if (error?.exitCode) {
       console.error(error.message)
-      process.exit(error.exitCode)
+      process.exitCode = error.exitCode
+      return
     }
     if (error?.cause?.code === 'ECONNREFUSED' || /ECONNREFUSED|fetch failed/i.test(String(error.message))) {
       console.error(`waker 未运行或未监听 ${DEFAULT_WAKER}（${error.message}）`)
-      process.exit(2)
+      process.exitCode = 2
+      return
     }
     console.error(error.message)
-    process.exit(1)
+    process.exitCode = 1
+    return
+  }
+  if (result.resolvedRole?.dormant) {
+    console.error(`warn: 工作区 ${result.resolvedRole.slug} 的 "${result.resolvedRole.role}" worker 会话 ${result.resolvedRole.sessionId} 当前未加载（stale=true, dispatch will wake it）`)
   }
   if (options.dryRun) {
     const plan = result.payload ?? {}
@@ -426,6 +438,7 @@ async function main(argv = process.argv.slice(2)) {
     parts.push(plan.session ? `target=${plan.session}` : 'target=(via thread)')
     if (plan.title && plan.session && plan.title !== plan.session) parts.push(`title=${plan.title}`)
     if (result.routedTo) parts.push(`routedTo=${result.routedTo}`)
+    if (result.resolvedRole?.dormant) parts.push('stale=true')
     parts.push(`requester=${plan.requester ?? '-'}`)
     parts.push(`task=${plan.meta?.taskId ?? '-'}`)
     if (plan.meta?.batchId) parts.push(`batch=${plan.meta.batchId}`)

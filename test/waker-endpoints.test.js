@@ -1519,12 +1519,12 @@ async function main() {
     report('CLI: --role resolves the workspace worker', ok, `target=${result.payload.session} routedTo=${result.routedTo}`)
   })
 
-  await runCase('CLI: --role on a stale worker exits 2 with candidates', async () => {
+  await runCase('CLI: --role on an archived worker exits 2 with candidates', async () => {
     const { parseArgs, run } = await import(cliUrl)
     const options = parseArgs(['--role', 'docs', '--text', 'hi', '--dry-run'])
     const cwd = process.cwd()
     const fetchStub = fakeRegistryFetch(
-      { 'dsh-mesh': { cwd, workers: { docs: { sessionId: 'session-docs-old', stale: true } } } },
+      { 'dsh-mesh': { cwd, workers: { docs: { sessionId: 'session-docs-old', archived: true } } } },
       [
         { id: 'session-docs-old', title: 'dsh-mesh · docs', archived: true },
         { id: 'session-docs-new', title: 'dsh-mesh · docs', archived: false },
@@ -1536,8 +1536,86 @@ async function main() {
     } catch (caught) {
       error = caught
     }
-    const ok = error?.exitCode === 2 && /已归档或不活跃/.test(error.message) && /session-docs-new/.test(error.message)
-    report('CLI: --role on a stale worker exits 2 with candidates', ok, `exit=${error?.exitCode ?? '-'} candidates=${/session-docs-new/.test(error?.message ?? '')}`)
+    const ok = error?.exitCode === 2 && /已归档/.test(error.message) && /session-docs-new/.test(error.message) && !/Assertion failed/.test(error.message)
+    report('CLI: --role on an archived worker exits 2 with candidates', ok, `exit=${error?.exitCode ?? '-'} candidates=${/session-docs-new/.test(error?.message ?? '')}`)
+  })
+
+  // T-374: a dormant worker (exists, not archived, just not loaded) is deliverable — the wake
+  // path loads it. Only missing/archived is an addressing error.
+  await runCase('CLI: --role resolves a dormant worker with a wake warning', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--role', 'waker', '--text', 'hi', '--dry-run'])
+    const cwd = process.cwd()
+    const fetchStub = fakeRegistryFetch(
+      { 'dsh-mesh': { cwd, workers: { waker: { sessionId: 'session-waker-dormant', dormant: true, stale: false } } } },
+      [{ id: 'session-waker-dormant', title: 'dsh-mesh · waker', archived: false, live: false }],
+    )
+    const result = await run(options, fetchStub)
+    const ok = result.dryRun === true && result.payload.session === 'session-waker-dormant' && result.resolvedRole?.dormant === true
+    report('CLI: --role resolves a dormant worker with a wake warning', ok, `target=${result.payload.session} dormant=${result.resolvedRole?.dormant ?? '-'}`)
+  })
+
+  // T-374: the CLI must exit cleanly through a real process — a process.exit() after fetch
+  // trips libuv (UV_HANDLE_CLOSING assertion) and the script gets a crash code instead of 2.
+  const startRegistryStub = (workspaces, sessions) =>
+    new Promise((resolve) => {
+      const server = http.createServer((req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        res.writeHead(200, { 'content-type': 'application/json' })
+        if (url.pathname === '/mesh/workspaces') res.end(JSON.stringify({ ok: true, workspaces }))
+        else if (url.pathname === '/mesh/sessions') res.end(JSON.stringify({ ok: true, sessions }))
+        else res.end('{}')
+      })
+      server.listen(0, '127.0.0.1', () => resolve({ server, url: `http://127.0.0.1:${server.address().port}` }))
+    })
+
+  // Async spawn: spawnSync would block this process's event loop, so the registry stub above
+  // could never answer the child and every case would look like a connection failure.
+  const runCliProcess = (args) =>
+    new Promise((resolve) => {
+      const { spawn } = require('node:child_process')
+      const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk
+      })
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk
+      })
+      child.on('close', (code) => resolve({ status: code, stdout, stderr }))
+    })
+
+  await runCase('CLI process: a dormant worker exits 0 with a wake warning', async () => {
+    const cwd = process.cwd()
+    const stub = await startRegistryStub(
+      { 'dsh-mesh': { cwd, workers: { waker: { sessionId: 'session-waker-dormant', dormant: true } } } },
+      [{ id: 'session-waker-dormant', title: 'dsh-mesh · waker', archived: false, live: false }],
+    )
+    try {
+      const cliPath = path.join(REPO, 'plugins', 'mesh-waker', 'bin', 'dispatch.mjs')
+      const run = await runCliProcess([cliPath, '--role', 'waker', '--text', 'hi', '--dry-run', '--waker', stub.url])
+      const ok = run.status === 0 && /stale=true/.test(run.stdout) && /will wake/.test(run.stderr) && !/Assertion failed/.test(run.stderr)
+      report('CLI process: a dormant worker exits 0 with a wake warning', ok, `status=${run.status} staleDoc=${/stale=true/.test(run.stdout)} wake=${/will wake/.test(run.stderr)}`)
+    } finally {
+      stub.server.close()
+    }
+  })
+
+  await runCase('CLI process: an archived worker exits 2 without a libuv assertion', async () => {
+    const cwd = process.cwd()
+    const stub = await startRegistryStub(
+      { 'dsh-mesh': { cwd, workers: { docs: { sessionId: 'session-docs-old', archived: true } } } },
+      [{ id: 'session-docs-old', title: 'dsh-mesh · docs', archived: true }],
+    )
+    try {
+      const cliPath = path.join(REPO, 'plugins', 'mesh-waker', 'bin', 'dispatch.mjs')
+      const run = await runCliProcess([cliPath, '--role', 'docs', '--text', 'hi', '--dry-run', '--waker', stub.url])
+      const ok = run.status === 2 && /已归档/.test(run.stderr) && /archived/.test(run.stderr) && !/Assertion failed/.test(run.stderr)
+      report('CLI process: an archived worker exits 2 without a libuv assertion', ok, `status=${run.status} archivedDoc=${/archived/.test(run.stderr)} assertion=${/Assertion failed/.test(run.stderr)}`)
+    } finally {
+      stub.server.close()
+    }
   })
 
   await runCase('CLI: --role on a missing role exits 2 and lists registered roles', async () => {
@@ -5408,9 +5486,14 @@ async function main() {
     report('workspaces: ensureWorkspace never rolls back the file or forks a -2 slug', ok, `slugs=${slugs.join(',')} cwd=${entry.cwd === cwd} coordinator=${entry.coordinator ?? '-'}`)
   })
 
-  await runCase('workspaces: workers are returned with a stale flag and written via the API', async (boot) => {
+  await runCase('workspaces: workers expose missing, archived and dormant separately', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'virtual-ws-372', 'dsh-mesh', 'public')
-    const h = await boot({ seedSessions: [{ id: 'session-worker-docs', title: 'dsh-mesh · docs', cwd }] })
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-worker-docs', title: 'dsh-mesh · docs', cwd },
+        { id: 'session-worker-waker', title: 'dsh-mesh · waker', cwd },
+      ],
+    })
     h.state.agents.set('session-worker-docs', {})
     const file = workspacesFileOf(h)
     fs.mkdirSync(path.dirname(file), { recursive: true })
@@ -5425,6 +5508,7 @@ async function main() {
               workers: {
                 docs: { sessionId: 'session-worker-docs' },
                 ops: { sessionId: 'session-missing' },
+                waker: { sessionId: 'session-worker-waker' },
               },
             },
           },
@@ -5436,19 +5520,25 @@ async function main() {
     const first = await request(h.base, '/mesh/workspaces')
     const docs = first.json?.workspaces?.['dsh-mesh']?.workers?.docs
     const ops = first.json?.workspaces?.['dsh-mesh']?.workers?.ops
+    const waker = first.json?.workspaces?.['dsh-mesh']?.workers?.waker
     const written = await request(h.base, '/mesh/workspaces/workers', {
       method: 'POST',
-      body: { slug: 'dsh-mesh', role: 'waker', sessionId: 'session-worker-docs', scopes: ['mesh'] },
+      body: { slug: 'dsh-mesh', role: 'hub', sessionId: 'session-worker-docs', scopes: ['mesh'] },
     })
     const second = await request(h.base, '/mesh/workspaces')
-    const waker = second.json?.workspaces?.['dsh-mesh']?.workers?.waker
+    const hub = second.json?.workspaces?.['dsh-mesh']?.workers?.hub
     const ok =
+      docs?.dormant === false &&
       docs?.stale === false &&
+      ops?.missing === true &&
       ops?.stale === true &&
+      // Seeded but not loaded: deliverable (dormant), not an addressing error.
+      waker?.dormant === true &&
+      waker?.stale === false &&
       written.json?.ok === true &&
-      waker?.sessionId === 'session-worker-docs' &&
-      JSON.stringify(waker?.scopes) === JSON.stringify(['mesh'])
-    report('workspaces: workers are returned with a stale flag and written via the API', ok, `docs.stale=${docs?.stale} ops.stale=${ops?.stale} written=${written.json?.ok ?? '-'}`)
+      hub?.sessionId === 'session-worker-docs' &&
+      JSON.stringify(hub?.scopes) === JSON.stringify(['mesh'])
+    report('workspaces: workers expose missing, archived and dormant separately', ok, `docs=${docs?.dormant}/${docs?.stale} ops=${ops?.missing}/${ops?.stale} waker=${waker?.dormant}/${waker?.stale} written=${written.json?.ok ?? '-'}`)
   })
 
   await runCase('workspaces: a generic basename uses the parent project name', async (boot) => {
