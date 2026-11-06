@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const PLUGIN_CLI = path.join(ROOT, 'plugins', 'mesh-waker', 'bin', 'dispatch.mjs')
-const INDEX = path.join(os.homedir(), '.dsh', 'mesh-waker', 'sessions-index.json')
+const INDEX = process.env.MESH_SESSIONS_INDEX ?? path.join(os.homedir(), '.dsh', 'mesh-waker', 'sessions-index.json')
 const BASE = process.env.MESH_WAKER_URL ?? 'http://127.0.0.1:8795'
 const WAKE_PREFIX = /^\[WAKE\]/
 const DEBOUNCE_MS = 60_000
@@ -30,15 +30,22 @@ const USAGE = `mesh-dispatch — dispatch via the waker plugin CLI (single imple
 Usage:
   node scripts/mesh-dispatch.mjs --title "<project> · <role>" --file task.txt
   node scripts/mesh-dispatch.mjs --target <id|title> --thread TH-1 --text "..."
-  node scripts/mesh-dispatch.mjs --title "<project> · coordinator" --wake --text "[WAKE] ..."
+  node scripts/mesh-dispatch.mjs --coordinator <slug> --wake --text "[WAKE] ..."
   node scripts/mesh-dispatch.mjs --session <id> --text "..." --dry-run
 
 Local extensions (not part of the plugin CLI):
-  --title <s>   resolve title -> session id (sessions-index.json, filtered by --repo)
-  --wake        send directly to the waker inject API; text must start with "[WAKE]"
-  --repo <path> workspace used by --title and the wake dedupe file (default: cwd)
-Everything else is forwarded unchanged (--target/--thread/--task/--receipt/
---requester/--file/--text/--mode/--batch/--deadline/--dry-run/--json/--create).
+  --title <s>        resolve title -> session id (sessions-index.json, filtered by --repo);
+                     refuses when the title matches several active sessions or only archived ones
+  --coordinator <s>  resolve the live coordinator of workspace <s> (title "<s> · 协调…"),
+                     excluding archived/live=false sessions; preferred for --wake
+  --wake             send directly to the waker inject API; text must start with "[WAKE]"
+  --dry-run          with --wake: print target + dedupe key + 未投递, send nothing
+  --repo <path>      workspace used by --title/--coordinator and the wake dedupe file (default: cwd)
+
+Wake target precedence: --session > --coordinator > --title (fallback; current coordinator id is
+recorded in .worklog/dispatch/wake-target.txt). Everything else is forwarded unchanged
+(--target/--thread/--task/--receipt/--requester/--file/--text/--mode/--batch/--deadline/
+--dry-run/--json/--create).
 `
 
 function normalize(value) {
@@ -46,15 +53,88 @@ function normalize(value) {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
 
-function resolveTitle(title, repo) {
+function readIndex() {
   if (!existsSync(INDEX)) throw new Error(`sessions index not found: ${INDEX}`)
-  const index = JSON.parse(readFileSync(INDEX, 'utf8'))
+  return JSON.parse(readFileSync(INDEX, 'utf8'))
+}
+
+/** archived/live flags live in the waker, not in the local index (GET only, never inject). */
+async function sessionMeta() {
+  const response = await fetch(`${BASE}/mesh/sessions`)
+  if (!response.ok) throw new Error(`GET /mesh/sessions -> HTTP ${response.status}; pass --session <id> instead of resolving by title`)
+  const payload = await response.json()
+  const map = new Map()
+  for (const session of payload.sessions ?? []) map.set(session.id, session)
+  return map
+}
+
+function describeCandidate(id, session, meta) {
+  const live = meta.get(id) ?? {}
+  return `${id}  title=${JSON.stringify(session.title)}  archived=${live.archived ?? '?'}  live=${live.live ?? '?'}  mtime=${session.mtime ?? '?'}`
+}
+
+function wakeTargetFile() {
+  return process.env.MESH_WAKE_TARGET ?? path.join(ROOT, '.worklog', 'dispatch', 'wake-target.txt')
+}
+
+function recordedWakeTarget(activeIds) {
+  const file = wakeTargetFile()
+  if (!existsSync(file)) return null
+  const id = readFileSync(file, 'utf8').trim()
+  return activeIds.includes(id) ? id : null
+}
+
+function pickActive(title, active, archived, meta, hint) {
+  if (!active.length) {
+    if (archived.length) {
+      throw new Error(
+        `title ${JSON.stringify(title)} only matches archived session(s):\n  ${archived
+          .map(([id, session]) => describeCandidate(id, session, meta))
+          .join('\n  ')}\nuse --session <id> (current coordinator id: ${wakeTargetFile()})`,
+      )
+    }
+    throw new Error(
+      `no active session titled ${JSON.stringify(title)}${hint ? ` (${hint})` : ''}; ` +
+        `pass --session <id> (current coordinator id: ${wakeTargetFile()})`,
+    )
+  }
+  if (active.length === 1) return active[0][0]
+  const recorded = recordedWakeTarget(active.map(([id]) => id))
+  if (recorded) return recorded
+  throw new Error(
+    `title ${JSON.stringify(title)} matches ${active.length} active sessions:\n  ${active
+      .map(([id, session]) => describeCandidate(id, session, meta))
+      .join('\n  ')}\npass --session <id> or --coordinator <slug>`,
+  )
+}
+
+async function resolveTitle(title, repo) {
+  const index = readIndex()
   const wanted = normalize(repo ?? process.cwd())
-  const matches = Object.entries(index)
-    .filter(([, session]) => session && session.title === title && session.cwd && normalize(session.cwd) === wanted)
-    .sort((left, right) => Number(right[1].mtime ?? 0) - Number(left[1].mtime ?? 0))
-  if (!matches.length) throw new Error(`no session titled "${title}" in ${wanted}`)
-  return matches[0][0]
+  const meta = await sessionMeta()
+  const candidates = Object.entries(index).filter(
+    ([, session]) =>
+      session && session.title && (session.title === title || session.title.startsWith(`${title} `)) &&
+      session.cwd && normalize(session.cwd) === wanted,
+  )
+  const isArchived = ([id]) => meta.get(id)?.archived === true || meta.get(id)?.live === false
+  const active = candidates.filter((entry) => !isArchived(entry))
+  const archived = candidates.filter((entry) => isArchived(entry))
+  return pickActive(title, active, archived, meta, `repo ${wanted}`)
+}
+
+async function resolveCoordinator(slug, repo) {
+  const index = readIndex()
+  const wanted = normalize(repo ?? process.cwd())
+  const meta = await sessionMeta()
+  const prefix = `${slug} · 协调`
+  const candidates = Object.entries(index).filter(
+    ([, session]) => session && session.title && session.title.startsWith(prefix) && session.cwd && normalize(session.cwd) === wanted,
+  )
+  const isArchived = ([id]) => meta.get(id)?.archived === true || meta.get(id)?.live === false
+  const active = candidates.filter((entry) => !isArchived(entry))
+  const archived = candidates.filter((entry) => isArchived(entry))
+  return pickActive(`coordinator ${slug}`, active, archived, meta, `repo ${wanted}`)
 }
 
 function valueOf(argv, index) {
@@ -65,9 +145,12 @@ async function wake(argv) {
   const titleIndex = argv.indexOf('--title')
   const repoIndex = argv.indexOf('--repo')
   const sessionIndex = argv.indexOf('--session')
+  const coordinatorIndex = argv.indexOf('--coordinator')
   const title = titleIndex >= 0 ? valueOf(argv, titleIndex) : undefined
   const session = sessionIndex >= 0 ? valueOf(argv, sessionIndex) : undefined
+  const coordinator = coordinatorIndex >= 0 ? valueOf(argv, coordinatorIndex) : undefined
   const repo = repoIndex >= 0 ? valueOf(argv, repoIndex) : process.cwd()
+  const dryRun = argv.includes('--dry-run')
   const textIndex = argv.indexOf('--text')
   const fileIndex = argv.indexOf('--file')
   const text = textIndex >= 0 ? valueOf(argv, textIndex) : fileIndex >= 0 ? readFileSync(path.resolve(valueOf(argv, fileIndex)), 'utf8') : undefined
@@ -75,9 +158,13 @@ async function wake(argv) {
   if (!WAKE_PREFIX.test(text.replace(/^\uFEFF/, ''))) {
     throw new Error('wake payload must start with "[WAKE] <one-line summary>"')
   }
-  const target = session ?? resolveTitle(title ?? 'mesh · 协调', repo)
+  const target = session ?? (coordinator ? await resolveCoordinator(coordinator, repo) : await resolveTitle(title ?? 'mesh · 协调', repo))
   const dedupeFile = path.join(path.resolve(repo), '.worklog', 'dispatch', '.wake-dedupe.json')
   const key = `${target}|${createHash('sha256').update(text).digest('hex').slice(0, 16)}`
+  if (dryRun) {
+    console.log(`dry-run: session=${target} dedupeKey=${key} chars=${text.length} wake=yes 未投递（未写去重文件）`)
+    return
+  }
   let entries = {}
   try { entries = JSON.parse(readFileSync(dedupeFile, 'utf8')).entries ?? {} } catch { /* first run */ }
   const now = Date.now()
@@ -104,17 +191,19 @@ async function main() {
   if (argv.includes('--wake')) { await wake(argv); return 0 }
   const forwarded = []
   let title
+  let coordinator
   let repo
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     if (arg === '--title') { title = argv[index + 1]; index += 1; continue }
+    if (arg === '--coordinator') { coordinator = argv[index + 1]; index += 1; continue }
     if (arg === '--repo') { repo = argv[index + 1]; index += 1; continue }
     if (arg === '--session') { forwarded.push('--target', argv[index + 1]); index += 1; continue }
     forwarded.push(arg)
   }
-  if (title !== undefined && !forwarded.includes('--target') && !forwarded.includes('--thread')) {
+  if ((title !== undefined || coordinator !== undefined) && !forwarded.includes('--target') && !forwarded.includes('--thread')) {
     try {
-      forwarded.push('--target', resolveTitle(title, repo))
+      forwarded.push('--target', coordinator !== undefined ? await resolveCoordinator(coordinator, repo) : await resolveTitle(title, repo))
     } catch (error) {
       console.error(`ERROR ${error.message}`)
       return 1
