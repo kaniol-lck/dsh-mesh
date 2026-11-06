@@ -63,7 +63,7 @@ DOC_SUFFIXES = {".md", ".markdown", ".html", ".htm", ".txt", ".rst"}
 def plausible_secret_value(value: str) -> bool:
     """Reject obvious non-secrets so vendored code/docs do not block a pack.
 
-    "prompt='Password: '", 'token=" + repr(raw)' and "${{ secrets.TOKEN }}" are code,
+    "prompt='Password: '", 'token=" + repr(raw)' and "${{ secrets.TOKEN }}" are code,  # pragma: allowlist secret
     not credentials: a real literal has no spaces, braces, quotes or concatenation.
     """
     if len(value) < 16 or value.startswith(("/", "http://", "https://")):

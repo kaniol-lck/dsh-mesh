@@ -48,7 +48,7 @@ class PackTests(unittest.TestCase):
         workspace = self.tmp / "ws1"
         (workspace / "src").mkdir(parents=True)
         (workspace / "src" / "main.js").write_text("console.log(1)\n", encoding="utf-8")
-        (workspace / "fake.exe").write_bytes(b"\x00\x01token = 'aaaaaaaaaaaaaaaa'\x00\x02" * 10)
+        (workspace / "fake.exe").write_bytes(b"\x00\x01token = 'aaaaaaaaaaaaaaaa'\x00\x02" * 10)  # pragma: allowlist secret
         code, payload = pack(workspace, self.tmp / "b1.tar.gz")
         self.assertEqual(code, 0, payload)
         self.assertIn("bundle", payload)
@@ -88,7 +88,7 @@ class PackTests(unittest.TestCase):
     def test_large_text_with_secret_is_excluded_by_default(self) -> None:
         workspace = self.tmp / "ws5"
         workspace.mkdir()
-        secret = 'api_key = "sk-' + "b" * 30 + '"\n'
+        secret = 'api_key = "sk-' + "b" * 30 + '"\n'  # pragma: allowlist secret
         (workspace / "huge.txt").write_text(secret + "padding line\n" * 250_000, encoding="utf-8")
         code, payload = pack(workspace, self.tmp / "b5.tar.gz")
         self.assertEqual(code, 0, payload)
@@ -100,7 +100,7 @@ class PackTests(unittest.TestCase):
     def test_allow_large_still_refuses_a_large_file_with_a_secret(self) -> None:
         workspace = self.tmp / "ws6"
         workspace.mkdir()
-        secret = 'api_key = "sk-' + "c" * 30 + '"\n'
+        secret = 'api_key = "sk-' + "c" * 30 + '"\n'  # pragma: allowlist secret
         (workspace / "huge.txt").write_text(secret + "padding line\n" * 250_000, encoding="utf-8")
         code, payload = pack(workspace, self.tmp / "b6.tar.gz", "--allow-large")
         self.assertEqual(code, 1, payload)
