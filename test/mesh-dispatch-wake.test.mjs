@@ -24,9 +24,22 @@ function fixtureIndex() {
   return { dir, indexFile, wakeTarget }
 }
 
-function startWaker(sessions) {
-  const calls = { get: 0, post: 0 }
+function startWaker(sessions, options = {}) {
+  const calls = { get: 0, post: 0, create: 0 }
   const server = createServer((request, response) => {
+    if (request.url === '/mesh/workspaces') {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: true, workspaces: options.workspaces ?? {} }))
+      return
+    }
+    if (request.url === '/mesh/sessions/create' && request.method === 'POST') {
+      calls.create += 1
+      request.resume()
+      const title = options.createdTitle ?? 'demo-ws · 协调 2'
+      response.writeHead(201, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: true, sessionId: 'session-created', title, workspacePath: options.workspacePath ?? null, prompted: false }))
+      return
+    }
     if (request.url === '/mesh/sessions') {
       calls.get += 1
       response.writeHead(200, { 'content-type': 'application/json' })
@@ -59,8 +72,8 @@ function run(env, args) {
   })
 }
 
-async function withWaker(sessions, fn) {
-  const waker = await startWaker(sessions)
+async function withWaker(sessions, fn, options = {}) {
+  const waker = await startWaker(sessions, options)
   try {
     return await fn(waker)
   } finally {
@@ -140,4 +153,41 @@ test('wake: a real send posts once and the 60s dedupe suppresses the second', as
     assert.match(second.stdout, /deduped/)
     assert.equal(calls.post, 1)
   })
+})
+
+test('wake: no target and no --create exits 2 with the three explicit options', async () => {
+  const { dir, indexFile, wakeTarget } = fixtureIndex()
+  await withWaker(sessions, async ({ base, calls }) => {
+    const result = await run(
+      { MESH_WAKER_URL: base, MESH_SESSIONS_INDEX: indexFile, MESH_WAKE_TARGET: wakeTarget },
+      ['--wake', '--text', '[WAKE] probe', '--repo', dir],
+    )
+    assert.equal(result.code, 2, result.stdout + result.stderr)
+    assert.match(result.stderr, /--session/)
+    assert.match(result.stderr, /--coordinator/)
+    assert.match(result.stderr, /--create/)
+    assert.equal(calls.post, 0)
+    assert.equal(calls.create, 0)
+  })
+})
+
+test('wake: no target with --create makes <slug> · 协调 <n>, verifies workspacePath and injects', async () => {
+  const { dir, indexFile, wakeTarget } = fixtureIndex()
+  const createdTitle = `${path.basename(dir)} · 协调 2`
+  await withWaker(
+    sessions,
+    async ({ base, calls }) => {
+      const result = await run(
+        { MESH_WAKER_URL: base, MESH_SESSIONS_INDEX: indexFile, MESH_WAKE_TARGET: wakeTarget },
+        ['--wake', '--create', '--text', '[WAKE] probe', '--repo', dir],
+      )
+      assert.equal(result.code, 0, result.stdout + result.stderr)
+      assert.match(result.stdout, /session=session-created/)
+      assert.match(result.stdout, /created=true/)
+      assert.match(result.stdout, new RegExp(`workspacePath=`))
+      assert.equal(calls.create, 1)
+      assert.equal(calls.post, 1)
+    },
+    { workspaces: { 'demo-ws': { cwd: dir } }, createdTitle, workspacePath: dir },
+  )
 })

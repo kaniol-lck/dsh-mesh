@@ -31,19 +31,24 @@ Usage:
   node scripts/mesh-dispatch.mjs --title "<project> · <role>" --file task.txt
   node scripts/mesh-dispatch.mjs --target <id|title> --thread TH-1 --text "..."
   node scripts/mesh-dispatch.mjs --coordinator <slug> --wake --text "[WAKE] ..."
+  node scripts/mesh-dispatch.mjs --wake --create --text "[WAKE] ..."   # new <slug> · 协调 <n>
   node scripts/mesh-dispatch.mjs --session <id> --text "..." --dry-run
 
 Local extensions (not part of the plugin CLI):
   --title <s>        resolve title -> session id (sessions-index.json, filtered by --repo);
                      refuses when the title matches several active sessions or only archived ones
   --coordinator <s>  resolve the live coordinator of workspace <s> (title "<s> · 协调…"),
-                     excluding archived/live=false sessions; preferred for --wake
+                     excluding archived/live=false sessions; --role is an alias
+  --create           with --wake and no target: create "<slug> · 协调 <n>" for this workspace
   --wake             send directly to the waker inject API; text must start with "[WAKE]"
   --dry-run          with --wake: print target + dedupe key + 未投递, send nothing
   --repo <path>      workspace used by --title/--coordinator and the wake dedupe file (default: cwd)
 
-Wake target precedence: --session > --coordinator > --title (fallback; current coordinator id is
-recorded in .worklog/dispatch/wake-target.txt). Everything else is forwarded unchanged
+Wake target: explicit --session/--target/--thread/--coordinator/--role/--title is used as-is.
+With no target, --wake no longer falls back to the recorded coordinator: --create makes a new
+"<slug> · 协调 <n>" session bound to the current workspace (workspacePath echo is verified), and
+without --create it exits 2 with the three explicit options. --role is an alias of --coordinator.
+Everything else is forwarded unchanged
 (--target/--thread/--task/--receipt/--requester/--file/--text/--mode/--batch/--deadline/
 --dry-run/--json/--create).
 `
@@ -141,16 +146,83 @@ function valueOf(argv, index) {
   return argv[index + 1] !== undefined && !String(argv[index + 1]).startsWith('--') ? argv[index + 1] : undefined
 }
 
+async function workspaceSlug(repo) {
+  const wanted = normalize(repo)
+  try {
+    const response = await fetch(`${BASE}/mesh/workspaces`)
+    if (response.ok) {
+      const payload = await response.json()
+      for (const [slug, workspace] of Object.entries(payload.workspaces ?? {})) {
+        if (workspace?.cwd && normalize(workspace.cwd) === wanted) return slug
+      }
+    }
+  } catch {
+    /* fall back to the directory name below */
+  }
+  return path.basename(path.resolve(repo))
+}
+
+async function nextCoordinatorTitle(slug) {
+  const response = await fetch(`${BASE}/mesh/sessions`)
+  if (!response.ok) throw new Error(`GET /mesh/sessions -> HTTP ${response.status}`)
+  const payload = await response.json()
+  const prefix = `${slug} · 协调`
+  let highest = 0
+  for (const session of payload.sessions ?? []) {
+    const title = String(session.title ?? '')
+    if (title === prefix) highest = Math.max(highest, 1)
+    const match = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} (\\d+)$`).exec(title)
+    if (match) highest = Math.max(highest, Number(match[1]))
+  }
+  return `${prefix} ${highest + 1}`
+}
+
+/** Default target: create "<slug> · 协调 <n>" bound to the current workspace. */
+async function createCoordinator(repo) {
+  const slug = await workspaceSlug(repo)
+  const title = await nextCoordinatorTitle(slug)
+  const response = await fetch(`${BASE}/mesh/sessions/create`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title, workspacePath: path.resolve(repo), workspaceTitle: slug }),
+  })
+  const raw = await response.text()
+  if (!response.ok) {
+    console.error(`POST /mesh/sessions/create -> HTTP ${response.status}: ${raw}`)
+    process.exit(response.status >= 400 && response.status < 500 ? 2 : 1)
+  }
+  const created = JSON.parse(raw)
+  const sessionId = created.sessionId
+  if (!sessionId) throw new Error('create returned no sessionId')
+  const echoed = created.workspacePath ? normalize(created.workspacePath) : null
+  if (echoed !== normalize(repo)) {
+    throw new Error(`created session workspacePath mismatch: echoed ${created.workspacePath} != ${path.resolve(repo)}`)
+  }
+  // New sessions are not necessarily visible to /mesh/inject immediately; wait briefly.
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const listing = await fetch(`${BASE}/mesh/sessions`).then((response) => response.json()).catch(() => null)
+    if (listing?.sessions?.some((session) => session.id === sessionId)) break
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  return { sessionId, title: created.title ?? title, workspacePath: created.workspacePath, created: true }
+}
+
 async function wake(argv) {
   const titleIndex = argv.indexOf('--title')
   const repoIndex = argv.indexOf('--repo')
   const sessionIndex = argv.indexOf('--session')
   const coordinatorIndex = argv.indexOf('--coordinator')
+  const roleIndex = argv.indexOf('--role')
+  const targetIndex = argv.indexOf('--target')
+  const threadIndex = argv.indexOf('--thread')
   const title = titleIndex >= 0 ? valueOf(argv, titleIndex) : undefined
   const session = sessionIndex >= 0 ? valueOf(argv, sessionIndex) : undefined
-  const coordinator = coordinatorIndex >= 0 ? valueOf(argv, coordinatorIndex) : undefined
+  const coordinator = coordinatorIndex >= 0 ? valueOf(argv, coordinatorIndex) : roleIndex >= 0 ? valueOf(argv, roleIndex) : undefined
+  const explicitTarget = targetIndex >= 0 ? valueOf(argv, targetIndex) : undefined
+  const thread = threadIndex >= 0 ? valueOf(argv, threadIndex) : undefined
   const repo = repoIndex >= 0 ? valueOf(argv, repoIndex) : process.cwd()
   const dryRun = argv.includes('--dry-run')
+  const create = argv.includes('--create')
   const textIndex = argv.indexOf('--text')
   const fileIndex = argv.indexOf('--file')
   const text = textIndex >= 0 ? valueOf(argv, textIndex) : fileIndex >= 0 ? readFileSync(path.resolve(valueOf(argv, fileIndex)), 'utf8') : undefined
@@ -158,11 +230,33 @@ async function wake(argv) {
   if (!WAKE_PREFIX.test(text.replace(/^\uFEFF/, ''))) {
     throw new Error('wake payload must start with "[WAKE] <one-line summary>"')
   }
-  const target = session ?? (coordinator ? await resolveCoordinator(coordinator, repo) : await resolveTitle(title ?? 'mesh · 协调', repo))
+  let createdInfo = null
+  let target
+  if (session) {
+    target = session
+  } else if (coordinator) {
+    target = await resolveCoordinator(coordinator, repo)
+  } else if (explicitTarget) {
+    target = explicitTarget.startsWith('session-') ? explicitTarget : await resolveTitle(explicitTarget, repo)
+  } else if (thread) {
+    throw new Error('--wake cannot follow a thread binding; pass --session <id> or --coordinator <slug>')
+  } else if (title) {
+    target = await resolveTitle(title, repo)
+  } else if (create) {
+    createdInfo = await createCoordinator(repo)
+    target = createdInfo.sessionId
+  } else {
+    console.error(
+      '--wake needs an explicit target: --session <id> | --coordinator <slug> | --create ' +
+        '(creates "<slug> · 协调 <n>" bound to the current workspace)',
+    )
+    process.exit(2)
+  }
   const dedupeFile = path.join(path.resolve(repo), '.worklog', 'dispatch', '.wake-dedupe.json')
   const key = `${target}|${createHash('sha256').update(text).digest('hex').slice(0, 16)}`
+  const createdFlag = createdInfo ? ` created=true title=${JSON.stringify(createdInfo.title)} workspacePath=${createdInfo.workspacePath}` : ''
   if (dryRun) {
-    console.log(`dry-run: session=${target} dedupeKey=${key} chars=${text.length} wake=yes 未投递（未写去重文件）`)
+    console.log(`dry-run: session=${target} dedupeKey=${key} chars=${text.length} wake=yes 未投递（未写去重文件）${createdFlag}`)
     return
   }
   let entries = {}
@@ -182,7 +276,7 @@ async function wake(argv) {
   entries[key] = now
   for (const [oldKey, stamp] of Object.entries(entries)) if (now - Number(stamp) >= DEBOUNCE_MS) delete entries[oldKey]
   try { mkdirSync(path.dirname(dedupeFile), { recursive: true }); writeFileSync(dedupeFile, JSON.stringify({ entries }), 'utf8') } catch { /* best effort */ }
-  console.log(`sent session=${target} chars=${text.length} wake=yes`)
+  console.log(`sent session=${target} chars=${text.length} wake=yes${createdFlag}`)
 }
 
 async function main() {
