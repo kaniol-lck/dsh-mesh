@@ -25,9 +25,10 @@ import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const WORKLOG = path.join(ROOT, '.worklog')
+const WORKLOG = process.env.MESH_WORKLOG_DIR ?? path.join(ROOT, '.worklog')
 const BASELINE = path.join(WORKLOG, 'ledger-baseline.json')
 const TRIAGE_DIR = path.join(WORKLOG, 'ops', 'triage')
+const QUEUE_SHARD_DIR = path.join(WORKLOG, 'dispatch', 'queue')
 const TRIAGE_SINCE = '2026-11-04'
 const DONE_STATUS = /done|deployed|已完成|verified/i
 const CODE_PREFIXES = ['plugins/mesh-waker/', 'hub/', 'plugins/mesh-approval/', 'scripts/', 'skills/', 'test/']
@@ -133,6 +134,32 @@ function readBaseline() {
   }
 }
 
+/**
+ * The same taskId written by two originating sessions means one shard will silently
+ * shadow the other when the ledger is read by taskId. Report each conflict with
+ * file:line so the writer can be found.
+ */
+export function duplicateQueueTaskIds(queueDir = QUEUE_SHARD_DIR) {
+  if (!existsSync(queueDir)) return []
+  const byTask = new Map()
+  for (const name of readdirSync(queueDir)) {
+    if (!name.endsWith('.md')) continue
+    const file = path.join(queueDir, name)
+    const lines = readFileSync(file, 'utf8').split(/\r?\n/)
+    lines.forEach((line, index) => {
+      if (!/^\|\s*[A-Za-z0-9]/.test(line)) return
+      const cells = line.split('|').map((cell) => cell.trim())
+      const taskId = cells[1]
+      if (!taskId) return
+      if (!byTask.has(taskId)) byTask.set(taskId, [])
+      byTask.get(taskId).push({ file: name, line: index + 1 })
+    })
+  }
+  return [...byTask.entries()]
+    .filter(([, rows]) => new Set(rows.map((row) => row.file)).size > 1)
+    .map(([taskId, rows]) => ({ taskId, rows }))
+}
+
 /** Rows marked done since TRIAGE_SINCE must carry a progress-watch stamp. */
 export function queueTriage(queueFile = path.join(WORKLOG, 'dispatch', 'queue.md'), triageDir = TRIAGE_DIR) {
   const missing = []
@@ -193,6 +220,7 @@ function main() {
   }
 
   const triage = queueTriage()
+  const queueConflicts = duplicateQueueTaskIds()
   const report = {
     days: options.days,
     commits: commits.length,
@@ -205,7 +233,8 @@ function main() {
       missingStamp: triage.missing,
       needsReviewStamps: triage.reviewed,
     },
-    ok: unaccounted.length === 0 && triage.missing.length === 0,
+    queueConflicts,
+    ok: unaccounted.length === 0 && triage.missing.length === 0 && queueConflicts.length === 0,
   }
   if (options.json) {
     console.log(JSON.stringify(report, null, 2))
@@ -218,6 +247,10 @@ function main() {
     for (const item of triage.missing) console.log(`  MISSING ${item.taskId}（queue.md:${item.line}）—— 先跑 progress-watch --task ${item.taskId}`)
     for (const item of triage.reviewed) console.log(`  REVIEWED ${item.taskId}（queue.md:${item.line}）needsReview=true（带红结论收单，已知悉）`)
     if (!triage.missing.length) console.log('OK 已完结单都有初筛戳')
+    for (const conflict of queueConflicts) {
+      console.log(`CONFLICT ${conflict.taskId}：${conflict.rows.map((row) => `${row.file}:${row.line}`).join(' 与 ')}`)
+    }
+    if (!queueConflicts.length) console.log('OK 分片里没有同 taskId 跨会话重复')
   }
   process.exit(report.ok ? 0 : 1)
 }
