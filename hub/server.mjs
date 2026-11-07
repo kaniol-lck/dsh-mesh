@@ -69,6 +69,17 @@ if (Boolean(TLS_CERT_FILE) !== Boolean(TLS_KEY_FILE)) {
 }
 const FAIL_LIMIT = 8
 const FAIL_WINDOW_MS = 60_000
+
+// T1 tasks: lease defaults from the design (10 min, 3 attempts). A caller may ask for a
+// shorter lease on claim (min 1s) so a client can recover faster; the ceiling is 1h.
+const TASK_LEASE_MS = 10 * 60_000
+const TASK_LEASE_MIN_MS = 1000
+const TASK_LEASE_MAX_MS = 60 * 60_000
+const TASK_MAX_ATTEMPTS = 3
+const TASK_STATUSES = new Set(['pending', 'claimed', 'settled', 'parked', 'cancelled', 'expired'])
+// Cross-machine task ids must carry a project prefix and a date: bare "T-123" is only
+// safe inside one machine and would collide the moment it crosses the hub.
+const TASK_ID_RE = /^[A-Z][A-Z0-9]{1,11}-\d{8}-\d{1,6}$/
 if (!['token', 'open'].includes(AUTH_MODE)) {
   console.error(`[mesh] MESH_AUTH_MODE must be "token" or "open", got "${AUTH_MODE}"`)
   process.exit(1)
@@ -148,6 +159,49 @@ CREATE TABLE IF NOT EXISTS blobs (
   visible_to TEXT NOT NULL DEFAULT '*',
   expected_sha   TEXT,
   expected_bytes INTEGER
+);
+-- T1 cross-machine work. One row is authored by the origin machine; the hub is the only
+-- writer of its state (local ledgers keep at most a reference). Idempotent CREATE keeps
+-- older data dirs working: no ALTER of existing tables.
+CREATE TABLE IF NOT EXISTS tasks (
+  task_id        TEXT PRIMARY KEY,
+  origin_agent   TEXT NOT NULL,
+  origin_ws      TEXT NOT NULL,
+  target_agent   TEXT NOT NULL,
+  intent         TEXT NOT NULL DEFAULT 'auto',
+  target_ws      TEXT,
+  target_session TEXT,
+  workspace      TEXT,
+  requester      TEXT,
+  subject        TEXT NOT NULL,
+  expect         TEXT,
+  status         TEXT NOT NULL,
+  thread         TEXT,
+  batch_id       TEXT,
+  text_ref       TEXT,
+  text_bytes     INTEGER,
+  deadline_ms    INTEGER,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  claimed_at     INTEGER,
+  claim_agent    TEXT,
+  lease_until    INTEGER,
+  attempts       INTEGER NOT NULL DEFAULT 0,
+  settled_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_target ON tasks(target_agent, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_origin ON tasks(origin_agent, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_batch  ON tasks(batch_id);
+CREATE TABLE IF NOT EXISTS receipts (
+  task_id     TEXT PRIMARY KEY REFERENCES tasks(task_id),
+  status      TEXT NOT NULL,
+  source      TEXT NOT NULL,
+  summary     TEXT,
+  detail_ref  TEXT,
+  settled_by  TEXT NOT NULL,
+  routed_to   TEXT,
+  artifacts   TEXT,
+  settled_at  INTEGER NOT NULL
 );
 `)
 
@@ -625,6 +679,10 @@ function restScope(req, path) {
   if (path === '/api/board') return method === 'POST' ? 'board' : 'read'
   if (path === '/api/conversations' || path === '/api/conversation' || path === '/api/message' || path === '/api/pinned') return 'read'
   if (/^\/api\/message\/[0-9a-f-]{36}\/pin$/.test(path)) return 'send'
+  // T1 tasks: reading is a read; creating/claiming/heartbeating/settling mutates state, so
+  // it needs `send` (same bucket as mailbox writes).
+  if (path === '/api/tasks') return method === 'POST' ? 'send' : 'read'
+  if (/^\/api\/tasks\/[^/]+\/(claim|heartbeat|settle)$/.test(path)) return 'send'
   if (path === '/api/blob/init') return 'blob'
   if (/^\/api\/blob\/[0-9a-f-]{36}\/(chunk|commit)$/.test(path)) return 'blob'
   if (/^\/api\/blob\/[0-9a-f-]{36}(\/meta)?$/.test(path)) return method === 'GET' ? 'read' : 'blob'
@@ -652,6 +710,28 @@ function assertText(label, value, maxBytes) {
   const bytes = Buffer.byteLength(value, 'utf8')
   if (bytes > maxBytes) throw new BadRequest(`${label} is ${bytes} bytes; the limit is ${maxBytes}`)
   return value
+}
+
+// ---------------------------------------------------------------- tasks (T1)
+// Lease/deadline reclamation. Runs lazily before every task read/claim (so a single-node
+// deployment needs no scheduler) and on a 30s timer. A crashed worker's task returns to
+// pending with attempts+1; once attempts reach the ceiling it becomes parked — never
+// "lost": a parked row stays visible in the inbox until a human redispatches or cancels it.
+function reclaimTasks() {
+  const ts = now()
+  const expired = db.prepare("SELECT task_id FROM tasks WHERE status IN ('pending','claimed','parked') AND deadline_ms IS NOT NULL AND deadline_ms < ?").all(ts)
+  const expire = db.prepare("UPDATE tasks SET status = 'expired', updated_at = ? WHERE task_id = ?")
+  for (const row of expired) {
+    expire.run(ts, row.task_id)
+    audit('task.expire', null, null, true)
+  }
+  const stale = db.prepare("SELECT task_id, claim_agent, attempts FROM tasks WHERE status = 'claimed' AND lease_until IS NOT NULL AND lease_until < ?").all(ts)
+  const release = db.prepare('UPDATE tasks SET status = ?, attempts = attempts + 1, claim_agent = NULL, lease_until = NULL, claimed_at = NULL, updated_at = ? WHERE task_id = ?')
+  for (const row of stale) {
+    const next = Number(row.attempts ?? 0) + 1
+    release.run(next >= TASK_MAX_ATTEMPTS ? 'parked' : 'pending', ts, row.task_id)
+    audit('task.reclaim', row.claim_agent ?? null, null, true)
+  }
 }
 
 /** Parse a ?limit= query value; reject junk instead of binding NaN into SQL. */
@@ -1889,6 +1969,157 @@ async function handleConsole(req, res, url) {
   res.end('{"error":"not found"}')
 }
 
+const TASK_COLUMNS = 'task_id, origin_agent, origin_ws, target_agent, intent, target_ws, target_session, workspace, requester, subject, expect, status, thread, batch_id, text_ref, text_bytes, deadline_ms, created_at, updated_at, claimed_at, claim_agent, lease_until, attempts, settled_at'
+
+function taskById(taskId) {
+  return db.prepare(`SELECT ${TASK_COLUMNS} FROM tasks WHERE task_id = ?`).get(taskId)
+}
+
+/**
+ * T1 task API. The hub is the only writer of cross-machine task state; the origin creates,
+ * the target claims (conditional UPDATE, so two workers cannot both win), heartbeats while
+ * running, and settles with a receipt. See docs-internal/t1-hub-tasks.md §四/§五/§十.
+ */
+async function handleTasks(req, res, url, id, ip) {
+  if (AUTH_MODE === 'open') {
+    return sendJson(res, 403, { error: 'tasks require token auth; MESH_AUTH_MODE=open cannot be used for cross-machine tasks' })
+  }
+  const path = url.pathname
+  const q = url.searchParams
+  const ts = now()
+
+  try {
+    if (path === '/api/tasks' && req.method === 'POST') {
+      const body = await readJson(req)
+      const taskId = typeof body.task_id === 'string' ? body.task_id.trim() : ''
+      if (!TASK_ID_RE.test(taskId)) {
+        throw new BadRequest('task_id must be <PREFIX>-<YYYYMMDD>-<SEQ> (e.g. DMSH-20261107-01); bare ids are rejected')
+      }
+      if (db.prepare('SELECT 1 FROM tasks WHERE task_id = ?').get(taskId)) {
+        return sendJson(res, 409, { error: 'task already exists', task_id: taskId })
+      }
+      const target = typeof body.target_agent === 'string' ? body.target_agent.trim() : ''
+      if (!/^[A-Za-z0-9_-]{1,32}$/.test(target)) throw new BadRequest('target_agent must match [A-Za-z0-9_-]{1,32}')
+      const originWs = assertText('origin_ws', body.origin_ws, 120).trim()
+      if (!originWs) throw new BadRequest('origin_ws is required')
+      const subject = assertText('subject', body.subject, MAX_SUBJECT_BYTES).trim()
+      if (!subject) throw new BadRequest('subject is required')
+      const intent = body.intent === undefined ? 'auto' : String(body.intent)
+      if (!['auto', 'coordinator', 'inbox', 'session'].includes(intent)) throw new BadRequest('intent must be auto|coordinator|inbox|session')
+      const targetSession = body.target_session === undefined || body.target_session === null ? null : assertText('target_session', String(body.target_session), 80).trim()
+      if (intent === 'session' && !targetSession) throw new BadRequest('target_session is required when intent=session')
+      const targetWs = body.target_ws === undefined || body.target_ws === null ? null : assertText('target_ws', String(body.target_ws), 120)
+      const workspace = body.workspace === undefined || body.workspace === null ? null : assertText('workspace', String(body.workspace), 120)
+      const requester = body.requester === undefined || body.requester === null ? null : assertText('requester', String(body.requester), 120)
+      const expect = body.expect === undefined || body.expect === null ? null : assertText('expect', String(body.expect), 2048)
+      const thread = body.thread === undefined || body.thread === null ? null : assertText('thread', String(body.thread), 120)
+      const batchId = body.batch_id === undefined || body.batch_id === null ? null : assertText('batch_id', String(body.batch_id), 120)
+      const textRef = body.text_ref === undefined || body.text_ref === null ? null : String(body.text_ref)
+      if (textRef !== null && !/^sha256:[0-9a-f]{64}$/.test(textRef)) throw new BadRequest('text_ref must be sha256:<64 hex> (body lives in a blob)')
+      const textBytes = body.text_bytes === undefined || body.text_bytes === null ? null : Number(body.text_bytes)
+      if (textBytes !== null && (!Number.isFinite(textBytes) || textBytes < 0)) throw new BadRequest('text_bytes must be a non-negative number')
+      const deadline = body.deadline_ms === undefined || body.deadline_ms === null ? null : Number(body.deadline_ms)
+      if (deadline !== null && !Number.isFinite(deadline)) throw new BadRequest('deadline_ms must be epoch milliseconds')
+
+      const write = now()
+      db.prepare(`INSERT INTO tasks (task_id, origin_agent, origin_ws, target_agent, intent, target_ws, target_session, workspace, requester, subject, expect, status, thread, batch_id, text_ref, text_bytes, deadline_ms, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`)
+        .run(taskId, id.name, originWs, target, intent, targetWs, targetSession, workspace, requester, subject, expect, thread, batchId, textRef, textBytes, deadline, write, write)
+      audit('task.create', id.name, ip, true)
+      return sendJson(res, 201, { task: taskById(taskId) })
+    }
+
+    if (path === '/api/tasks' && req.method === 'GET') {
+      reclaimTasks()
+      const agent = q.get('agent') ?? id.name
+      if (agent !== id.name) return sendJson(res, 403, { error: 'you may only list your own tasks (as origin or target)' })
+      const status = q.get('status')
+      if (status !== null && !TASK_STATUSES.has(status)) throw new BadRequest(`status must be one of ${[...TASK_STATUSES].join(', ')}`)
+      const limit = parseLimit(q.get('limit'), 50, 200)
+      const clauses = ['(target_agent = ? OR origin_agent = ?)']
+      const params = [id.name, id.name]
+      if (status !== null) { clauses.push('status = ?'); params.push(status) }
+      params.push(limit)
+      const rows = db.prepare(`SELECT ${TASK_COLUMNS} FROM tasks WHERE ${clauses.join(' AND ')} ORDER BY updated_at DESC LIMIT ?`).all(...params)
+      const receiptOf = db.prepare('SELECT * FROM receipts WHERE task_id = ?')
+      for (const row of rows) {
+        const receipt = receiptOf.get(row.task_id)
+        if (receipt) row.receipt = receipt
+      }
+      return sendJson(res, 200, { tasks: rows, count: rows.length })
+    }
+
+    const match = path.match(/^\/api\/tasks\/([^/]+)\/(claim|heartbeat|settle)$/)
+    if (match && req.method === 'POST') {
+      reclaimTasks()
+      const taskId = decodeURIComponent(match[1])
+      const action = match[2]
+      const task = taskById(taskId)
+      if (!task) return sendJson(res, 404, { error: 'task not found' })
+      if (task.target_agent !== id.name) return sendJson(res, 403, { error: 'only target_agent may claim, heartbeat or settle this task' })
+      let body = {}
+      try { body = await readJson(req) } catch (error) { if (error instanceof BadRequest) throw error }
+
+      if (action === 'claim') {
+        if (task.status !== 'pending') return sendJson(res, 409, { error: `task is ${task.status}, not pending`, task })
+        const leaseMs = body.lease_ms === undefined ? TASK_LEASE_MS : Number(body.lease_ms)
+        if (!Number.isFinite(leaseMs) || leaseMs < TASK_LEASE_MIN_MS || leaseMs > TASK_LEASE_MAX_MS) {
+          throw new BadRequest(`lease_ms must be between ${TASK_LEASE_MIN_MS} and ${TASK_LEASE_MAX_MS}`)
+        }
+        const claimedAt = now()
+        const update = db.prepare("UPDATE tasks SET status = 'claimed', claim_agent = ?, lease_until = ?, claimed_at = ?, updated_at = ? WHERE task_id = ? AND target_agent = ? AND status = 'pending'")
+          .run(id.name, claimedAt + leaseMs, claimedAt, claimedAt, taskId, id.name)
+        if (!Number(update.changes ?? 0)) return sendJson(res, 409, { error: 'task was claimed by someone else', task: taskById(taskId) })
+        audit('task.claim', id.name, ip, true)
+        return sendJson(res, 200, { task: taskById(taskId) })
+      }
+
+      if (action === 'heartbeat') {
+        if (task.status !== 'claimed' || task.claim_agent !== id.name) {
+          return sendJson(res, 409, { error: 'only the lease holder may heartbeat a claimed task', task })
+        }
+        const leaseMs = body.lease_ms === undefined ? TASK_LEASE_MS : Number(body.lease_ms)
+        if (!Number.isFinite(leaseMs) || leaseMs < TASK_LEASE_MIN_MS || leaseMs > TASK_LEASE_MAX_MS) {
+          throw new BadRequest(`lease_ms must be between ${TASK_LEASE_MIN_MS} and ${TASK_LEASE_MAX_MS}`)
+        }
+        const beat = now()
+        db.prepare('UPDATE tasks SET lease_until = ?, updated_at = ? WHERE task_id = ? AND status = ? AND claim_agent = ?')
+          .run(beat + leaseMs, beat, taskId, 'claimed', id.name)
+        audit('task.heartbeat', id.name, ip, true)
+        return sendJson(res, 200, { task: taskById(taskId) })
+      }
+
+      // settle
+      const existing = db.prepare('SELECT * FROM receipts WHERE task_id = ?').get(taskId)
+      if (existing) return sendJson(res, 200, { receipt: existing, task: taskById(taskId), idempotent: true })
+      if (task.status !== 'claimed') return sendJson(res, 409, { error: `task is ${task.status}, not claimed`, task })
+      const result = String(body.status ?? '')
+      if (!['completed', 'error', 'lost', 'partial'].includes(result)) throw new BadRequest('status must be completed|error|lost|partial')
+      const summary = body.summary === undefined || body.summary === null ? null : assertText('summary', String(body.summary), 300)
+      const detailRef = body.detail_ref === undefined || body.detail_ref === null ? null : assertText('detail_ref', String(body.detail_ref), 200)
+      const routedTo = body.routed_to === undefined || body.routed_to === null ? null : assertText('routed_to', String(body.routed_to), 200)
+      let artifacts = null
+      if (body.artifacts !== undefined && body.artifacts !== null) {
+        if (!Array.isArray(body.artifacts)) throw new BadRequest('artifacts must be an array')
+        artifacts = JSON.stringify(body.artifacts)
+        if (Buffer.byteLength(artifacts) > 8192) throw new BadRequest('artifacts exceeds 8192 bytes')
+      }
+      const settledAt = now()
+      db.prepare('INSERT INTO receipts (task_id, status, source, summary, detail_ref, settled_by, routed_to, artifacts, settled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(taskId, result, 'declared', summary, detailRef, id.name, routedTo, artifacts, settledAt)
+      db.prepare("UPDATE tasks SET status = 'settled', settled_at = ?, updated_at = ? WHERE task_id = ?").run(settledAt, settledAt, taskId)
+      audit('task.settle', id.name, ip, true)
+      return sendJson(res, 201, { receipt: db.prepare('SELECT * FROM receipts WHERE task_id = ?').get(taskId), task: taskById(taskId) })
+    }
+
+    return sendJson(res, 404, { error: 'not found' })
+  } catch (error) {
+    if (error instanceof BadRequest) return sendJson(res, 400, { error: error.message })
+    console.error('[mesh] task API failed:', error.message)
+    return sendJson(res, 500, { error: 'task operation failed' })
+  }
+}
+
 async function handleRest(req, res, url) {
   const id = resolveIdentity(req)
   if (!id.ok) return sendJson(res, id.status, { error: id.reason })
@@ -1907,6 +2138,8 @@ async function handleRest(req, res, url) {
   }
 
   try {
+    if (path === '/api/tasks' || path.startsWith('/api/tasks/')) return await handleTasks(req, res, url, id, ip)
+
     if (path === '/api/register' && req.method === 'POST') {
       const body = await readJson(req)
       const wakeUrl = wakeUrlOf(body.wake_url)
@@ -2944,6 +3177,16 @@ setInterval(() => {
     console.error('[mesh] purge failed:', error.message)
   }
 }, PURGE_INTERVAL_MS).unref()
+
+// Task leases expire in minutes, not hours: reclaim on a short timer so a crashed worker's
+// task returns to the inbox even when nobody is polling. Task endpoints also reclaim lazily.
+setInterval(() => {
+  try {
+    reclaimTasks()
+  } catch (error) {
+    console.error('[mesh] task reclaim failed:', error.message)
+  }
+}, 30_000).unref()
 
 // Every minute: expire idle MCP sessions (ungraceful client shutdowns) and forget
 // stale failure counters, so memory stays flat over months of uptime.
