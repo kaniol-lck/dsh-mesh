@@ -2,6 +2,9 @@
 本项目从 0.1.0 开始记录。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 SemVer。
 ## [未发布]
 暂无变更。
+## [0.8.0] - 2026-11-08
+### Added
+- 跨机任务账本：`/api/tasks` 提供 tasks/receipts 表、claim/lease 租约与心跳、结算回执；失败转 `parked` 不丢，deadline 过期转 `expired`。
 ## [0.7.21] - 2026-10-31
 ### Fixed
 - 会话视图的 4 KiB 截断改为按 UTF-8 字节计算，不再超出上限或把中文/emoji 截成乱码。

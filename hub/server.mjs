@@ -38,7 +38,7 @@ import { TOKENS } from './console/tokens.mjs'
 // Hub version. Advisory: it drives drift hints in /api/peers and /api/status, never
 // authorization. Keep this literal here — scripts/check-version-sync.mjs reads it
 // with a regex against this file.
-const HUB_VERSION = '0.7.21'
+const HUB_VERSION = '0.8.0'
 
 const {
   MIN_WAKER, VIEW_TOKEN, CONSOLE_ALLOW,
