@@ -682,7 +682,8 @@ function restScope(req, path) {
   // T1 tasks: reading is a read; creating/claiming/heartbeating/settling mutates state, so
   // it needs `send` (same bucket as mailbox writes).
   if (path === '/api/tasks') return method === 'POST' ? 'send' : 'read'
-  if (/^\/api\/tasks\/[^/]+\/(claim|heartbeat|settle)$/.test(path)) return 'send'
+  if (/^\/api\/tasks\/[^/]+$/.test(path)) return 'read'
+  if (/^\/api\/tasks\/[^/]+\/(claim|heartbeat|settle|redispatch|cancel)$/.test(path)) return 'send'
   if (path === '/api/blob/init') return 'blob'
   if (/^\/api\/blob\/[0-9a-f-]{36}\/(chunk|commit)$/.test(path)) return 'blob'
   if (/^\/api\/blob\/[0-9a-f-]{36}(\/meta)?$/.test(path)) return method === 'GET' ? 'read' : 'blob'
@@ -2049,16 +2050,53 @@ async function handleTasks(req, res, url, id, ip) {
       return sendJson(res, 200, { tasks: rows, count: rows.length })
     }
 
-    const match = path.match(/^\/api\/tasks\/([^/]+)\/(claim|heartbeat|settle)$/)
+    const single = path.match(/^\/api\/tasks\/([^/]+)$/)
+    if (single && req.method === 'GET') {
+      reclaimTasks()
+      const task = taskById(decodeURIComponent(single[1]))
+      if (!task) return sendJson(res, 404, { error: 'task not found' })
+      if (task.origin_agent !== id.name && task.target_agent !== id.name) {
+        return sendJson(res, 403, { error: 'only origin_agent or target_agent may read this task' })
+      }
+      const receipt = db.prepare('SELECT * FROM receipts WHERE task_id = ?').get(task.task_id)
+      return sendJson(res, 200, receipt ? { task, receipt } : { task })
+    }
+
+    const match = path.match(/^\/api\/tasks\/([^/]+)\/(claim|heartbeat|settle|redispatch|cancel)$/)
     if (match && req.method === 'POST') {
       reclaimTasks()
       const taskId = decodeURIComponent(match[1])
       const action = match[2]
       const task = taskById(taskId)
       if (!task) return sendJson(res, 404, { error: 'task not found' })
-      if (task.target_agent !== id.name) return sendJson(res, 403, { error: 'only target_agent may claim, heartbeat or settle this task' })
+      const originAction = action === 'redispatch' || action === 'cancel'
+      if (originAction ? task.origin_agent !== id.name : task.target_agent !== id.name) {
+        return sendJson(res, 403, { error: originAction ? 'only origin_agent may redispatch or cancel this task' : 'only target_agent may claim, heartbeat or settle this task' })
+      }
       let body = {}
       try { body = await readJson(req) } catch (error) { if (error instanceof BadRequest) throw error }
+
+      if (action === 'redispatch') {
+        if (!['parked', 'expired'].includes(task.status)) {
+          return sendJson(res, 409, { error: `task is ${task.status}; only parked/expired can be redispatched`, task })
+        }
+        const at = now()
+        db.prepare("UPDATE tasks SET status = 'pending', attempts = 0, claim_agent = NULL, lease_until = NULL, claimed_at = NULL, settled_at = NULL, updated_at = ? WHERE task_id = ?")
+          .run(at, taskId)
+        audit('task.redispatch', id.name, ip, true)
+        return sendJson(res, 200, { task: taskById(taskId) })
+      }
+
+      if (action === 'cancel') {
+        if (!['pending', 'parked', 'expired'].includes(task.status)) {
+          return sendJson(res, 409, { error: `task is ${task.status}; only pending/parked/expired can be cancelled`, task })
+        }
+        const at = now()
+        db.prepare("UPDATE tasks SET status = 'cancelled', claim_agent = NULL, lease_until = NULL, claimed_at = NULL, updated_at = ? WHERE task_id = ?")
+          .run(at, taskId)
+        audit('task.cancel', id.name, ip, true)
+        return sendJson(res, 200, { task: taskById(taskId) })
+      }
 
       if (action === 'claim') {
         if (task.status !== 'pending') return sendJson(res, 409, { error: `task is ${task.status}, not pending`, task })
@@ -2095,6 +2133,8 @@ async function handleTasks(req, res, url, id, ip) {
       if (task.status !== 'claimed') return sendJson(res, 409, { error: `task is ${task.status}, not claimed`, task })
       const result = String(body.status ?? '')
       if (!['completed', 'error', 'lost', 'partial'].includes(result)) throw new BadRequest('status must be completed|error|lost|partial')
+      const source = body.source === undefined ? 'declared' : String(body.source)
+      if (!['observed', 'declared'].includes(source)) throw new BadRequest('source must be observed|declared')
       const summary = body.summary === undefined || body.summary === null ? null : assertText('summary', String(body.summary), 300)
       const detailRef = body.detail_ref === undefined || body.detail_ref === null ? null : assertText('detail_ref', String(body.detail_ref), 200)
       const routedTo = body.routed_to === undefined || body.routed_to === null ? null : assertText('routed_to', String(body.routed_to), 200)
@@ -2106,7 +2146,7 @@ async function handleTasks(req, res, url, id, ip) {
       }
       const settledAt = now()
       db.prepare('INSERT INTO receipts (task_id, status, source, summary, detail_ref, settled_by, routed_to, artifacts, settled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(taskId, result, 'declared', summary, detailRef, id.name, routedTo, artifacts, settledAt)
+        .run(taskId, result, source, summary, detailRef, id.name, routedTo, artifacts, settledAt)
       db.prepare("UPDATE tasks SET status = 'settled', settled_at = ?, updated_at = ? WHERE task_id = ?").run(settledAt, settledAt, taskId)
       audit('task.settle', id.name, ip, true)
       return sendJson(res, 201, { receipt: db.prepare('SELECT * FROM receipts WHERE task_id = ?').get(taskId), task: taskById(taskId) })
@@ -2576,10 +2616,14 @@ async function handleRest(req, res, url) {
     if (path === '/api/blobs' && req.method === 'GET') {
       const mine = q.get('mine') === '1'
       const admin = isAdmin(req)
+      const sha = q.get('sha256')
+      if (sha !== null && !/^[0-9a-f]{64}$/.test(sha.toLowerCase())) throw new BadRequest('sha256 must be 64 hex chars')
       const cols = 'id, name, bytes, sha256, uploader, created_at, expires_at, status, visible_to'
-      const rows = mine
+      let rows = mine
         ? db.prepare(`SELECT ${cols} FROM blobs WHERE uploader = ? ORDER BY created_at DESC LIMIT 100`).all(id.name)
         : db.prepare(`SELECT ${cols} FROM blobs ORDER BY created_at DESC LIMIT 1000`).all()
+      // sha256 is the reference stored in tasks.text_ref; exact match, case-insensitive input.
+      if (sha !== null) rows = rows.filter((row) => row.sha256 === sha.toLowerCase())
       // Never leak metadata for blobs the caller cannot read; filtered-out rows are simply
       // absent (no count, so the response does not confirm their existence).
       const visible = admin ? rows : rows.filter((row) => blobReadable(row, id.name, req))

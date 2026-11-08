@@ -6,7 +6,8 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import net from 'node:net'
@@ -124,7 +125,7 @@ test('old data dir gains tasks/receipts tables without touching the seven old ta
     assert.ok(!/\[mesh\] (task|tasks)/i.test(second.logs()), 'no new task WARN/ERROR')
     const health = await (await fetch(`${second.base}/health`)).json()
     assert.equal(health.ok, true)
-    assert.equal(health.version, '0.7.21')
+    assert.equal(health.version, JSON.parse(readFileSync(join(HUB, 'package.json'), 'utf8')).version)
     assert.equal('tasks' in health, false, '/health shape must stay unchanged')
   } finally {
     await second.stop()
@@ -180,19 +181,39 @@ test('settle writes a declared receipt, is idempotent, and the origin sees it', 
   const claim = await api(hub.base, '/api/tasks/T1T-20261107-04/claim', { token: bob, method: 'POST', body: { lease_ms: 5000 } })
   assert.equal(claim.status, 200)
   const settle = await api(hub.base, '/api/tasks/T1T-20261107-04/settle', {
-    token: bob, method: 'POST', body: { status: 'completed', summary: 'done', artifacts: [{ kind: 'git', commit: 'abc1234' }], routed_to: 'coordinator' },
+    token: bob, method: 'POST', body: { status: 'completed', source: 'observed', summary: 'done', artifacts: [{ kind: 'git', commit: 'abc1234' }], routed_to: 'coordinator' },
   })
   assert.equal(settle.status, 201, JSON.stringify(settle.body))
-  assert.equal(settle.body.receipt.source, 'declared')
+  assert.equal(settle.body.receipt.source, 'observed')
   assert.equal(settle.body.receipt.settled_by, 'task-target')
-  const again = await api(hub.base, '/api/tasks/T1T-20261107-04/settle', { token: bob, method: 'POST', body: { status: 'completed', summary: 'again' } })
+  const settledAt = settle.body.receipt.settled_at
+  const again = await api(hub.base, '/api/tasks/T1T-20261107-04/settle', { token: bob, method: 'POST', body: { status: 'completed', source: 'declared', summary: 'again' } })
   assert.equal(again.status, 200)
   assert.equal(again.body.idempotent, true)
+  assert.equal(again.body.receipt.settled_at, settledAt)
+  assert.equal(again.body.receipt.summary, 'done', 'repeat settle must not overwrite the receipt')
   const originView = await api(hub.base, '/api/tasks?agent=task-origin&status=settled', { token: alice })
   const settled = originView.body.tasks.find((row) => row.task_id === 'T1T-20261107-04')
   assert.equal(settled.receipt.summary, 'done')
+  // Single-row read: origin and target only.
+  const single = await api(hub.base, '/api/tasks/T1T-20261107-04', { token: alice })
+  assert.equal(single.status, 200)
+  assert.equal(single.body.receipt.source, 'observed')
+  assert.equal((await api(hub.base, '/api/tasks/T1T-20261107-04', { token: carol })).status, 403)
+  assert.equal((await api(hub.base, '/api/tasks/T1T-20990101-01', { token: alice })).status, 404)
   const audit = await adminAudit()
   assert.ok(audit.some((row) => row.action === 'task.settle'))
+})
+
+test('settle rejects an unknown source and leaves the task claimed for a valid retry', async () => {
+  await createTask('T1T-20261107-07')
+  assert.equal((await api(hub.base, '/api/tasks/T1T-20261107-07/claim', { token: bob, method: 'POST', body: { lease_ms: 5000 } })).status, 200)
+  const bad = await api(hub.base, '/api/tasks/T1T-20261107-07/settle', { token: bob, method: 'POST', body: { status: 'completed', source: 'guessed' } })
+  assert.equal(bad.status, 400)
+  const ok = await api(hub.base, '/api/tasks/T1T-20261107-07/settle', { token: bob, method: 'POST', body: { status: 'completed' } })
+  assert.equal(ok.status, 201)
+  assert.equal(ok.body.receipt.source, 'declared')
+  assert.equal((await api(hub.base, '/api/tasks/T1T-20261107-07/cancel', { token: alice, method: 'POST', body: {} })).status, 409)
 })
 
 test('lease expiry increments attempts, then parks at the ceiling; deadline expires', async () => {
@@ -223,4 +244,50 @@ test('lease expiry increments attempts, then parks at the ceiling; deadline expi
   const expired = await api(hub.base, '/api/tasks?agent=task-target&status=expired', { token: bob })
   const row = expired.body.tasks.find((task) => task.task_id === 'T1T-20261107-06')
   assert.equal(row?.status, 'expired')
+})
+
+test('redispatch resets a parked/expired task; cancel closes it; wrong role is refused', async () => {
+  await createTask('T1T-20261107-08')
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    assert.equal((await api(hub.base, '/api/tasks/T1T-20261107-08/claim', { token: bob, method: 'POST', body: { lease_ms: 1000 } })).status, 200)
+    await wait(1300)
+    const list = await api(hub.base, `/api/tasks?agent=task-target&status=${attempt < 2 ? 'pending' : 'parked'}`, { token: bob })
+    assert.ok(list.body.tasks.some((task) => task.task_id === 'T1T-20261107-08'))
+  }
+  assert.equal((await api(hub.base, '/api/tasks/T1T-20261107-08/redispatch', { token: bob, method: 'POST', body: {} })).status, 403)
+  const red = await api(hub.base, '/api/tasks/T1T-20261107-08/redispatch', { token: alice, method: 'POST', body: {} })
+  assert.equal(red.status, 200, JSON.stringify(red.body))
+  assert.equal(red.body.task.status, 'pending')
+  assert.equal(red.body.task.attempts, 0)
+  assert.equal((await api(hub.base, '/api/tasks/T1T-20261107-08/cancel', { token: bob, method: 'POST', body: {} })).status, 403)
+  const cancel = await api(hub.base, '/api/tasks/T1T-20261107-08/cancel', { token: alice, method: 'POST', body: {} })
+  assert.equal(cancel.status, 200)
+  assert.equal(cancel.body.task.status, 'cancelled')
+  assert.equal((await api(hub.base, '/api/tasks/T1T-20261107-08/cancel', { token: alice, method: 'POST', body: {} })).status, 409)
+
+  await createTask('T1T-20261107-09', { deadline_ms: Date.now() + 200 })
+  await wait(400)
+  const single = await api(hub.base, '/api/tasks/T1T-20261107-09', { token: alice })
+  assert.equal(single.body.task.status, 'expired')
+  const again = await api(hub.base, '/api/tasks/T1T-20261107-09/redispatch', { token: alice, method: 'POST', body: {} })
+  assert.equal(again.status, 200)
+  assert.equal(again.body.task.status, 'pending')
+  assert.equal(again.body.task.attempts, 0)
+})
+
+test('GET /api/blobs filters exactly by sha256', async () => {
+  const data = Buffer.from('t1 task body stored as a blob')
+  const sha = createHash('sha256').update(data).digest('hex')
+  const upload = await fetch(`${hub.base}/api/blob?name=t1-body.txt&sha256=${sha}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${alice}`, 'content-type': 'application/octet-stream' },
+    body: data,
+  })
+  assert.equal(upload.status, 201, await upload.text())
+  const hit = await api(hub.base, `/api/blobs?sha256=${sha}`, { token: alice })
+  assert.equal(hit.status, 200)
+  assert.ok(hit.body.blobs.some((blob) => blob.sha256 === sha))
+  const miss = await api(hub.base, `/api/blobs?sha256=${'0'.repeat(64)}`, { token: alice })
+  assert.deepEqual(miss.body.blobs, [])
+  assert.equal((await api(hub.base, '/api/blobs?sha256=not-hex', { token: alice })).status, 400)
 })
