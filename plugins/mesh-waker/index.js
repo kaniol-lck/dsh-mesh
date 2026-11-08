@@ -37,6 +37,7 @@ import { createReceiptFlow } from './lib/receipt-flow.mjs'
 import { createThreads } from './lib/threads.mjs'
 import { createTaskRegistry } from './lib/task-registry.mjs'
 import { createTaskLifecycle } from './lib/task-lifecycle.mjs'
+import { createHubTaskConsumer } from './lib/hub-tasks.mjs'
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
 export { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
@@ -596,6 +597,11 @@ function normalizeBase(config) {
         ? c.sendToolNames.map((name) => String(name)).filter(Boolean).slice(0, 5)
         : ['mesh_send', 'mcp__mesh__mesh_send'],
     alertMode: ['file', 'queue', 'wake'].includes(String(c.alertMode)) ? String(c.alertMode) : 'queue',
+    // Cross-machine tasks (T1 P5, T-388): opt-in until the hub is upgraded. The consumer
+    // pulls pending rows, claims them, heartbeats the lease and settles the receipt.
+    tasksPollEnabled: c.tasksPollEnabled === true,
+    tasksPollIntervalMs: clampInterval(c.tasksPollIntervalMs, clampInterval(c.pollIntervalMs, 60000, 1000, 86_400_000), 1000, 86_400_000),
+    taskLeaseMs: clampInterval(c.taskLeaseMs, 600000, 60000, 3_600_000),
     batchFile: c.batchFile ? String(c.batchFile) : join(homedir(), '.dsh', 'mesh-waker', 'batches.json'),
     // Layer-1 task registry retention: rows older than N days or beyond M rows are pruned.
     tasksRetentionDays: clampInterval(c.tasksRetentionDays, 30, 1, 3650),
@@ -784,6 +790,9 @@ export function apply(ctx, config) {
     pendingTasks: 0,
     lastReceipt: null,
     pendingBatches: 0,
+    // Cross-machine task pull (T-388): disabled unless tasksPollEnabled; the fields say what
+    // the loop last did so /mesh/status can answer without guessing.
+    tasksPoll: null,
   }
 
   // Pull loop bookkeeping.
@@ -2732,6 +2741,10 @@ export function apply(ctx, config) {
     // Read-only projection: retention is config-file only, the settings page just shows it.
     tasksRetentionDays: c.tasksRetentionDays,
     tasksMaxRows: c.tasksMaxRows,
+    // Cross-machine task pull (T-388): read-only projection; the enabled switch is in config.
+    tasksPollEnabled: c.tasksPollEnabled,
+    tasksPollIntervalMs: c.tasksPollIntervalMs,
+    taskLeaseMs: c.taskLeaseMs,
   })
 
   /** The settings panel talks to this process over loopback; anything else may only wake. */
@@ -3102,9 +3115,12 @@ export function apply(ctx, config) {
     hubLater(() => void syncHistory(), Math.max(1000, c.catchUpDelayMs) + 2000)
     hubEvery(() => void syncHistory(), Math.max(60_000, c.historySyncIntervalMs ?? 600_000))
     if (effectiveMode !== 'push') schedulePull(1200)
+    // Cross-machine tasks (T-388): opt-in, independent cadence from the message pull.
+    if (c.tasksPollEnabled) hubTasks?.start()
   }
 
   function disposeHubWork() {
+    hubTasks?.stop()
     for (const timer of hubTimers) {
       clearTimeout(timer)
       clearInterval(timer)
@@ -4234,6 +4250,10 @@ export function apply(ctx, config) {
     },
   })
 
+  // Receipt status → hub `result` for cross-machine tasks (T-388). `not-started`/`stalled`
+  // are advisory and never settle the hub row.
+  const HUB_TASK_RESULT = { completed: 'completed', partial: 'partial', error: 'error', failed: 'error', aborted: 'error', blocked: 'error', lost: 'lost' }
+
   // ══ 子系统：任务生命周期与结算 ══════════════════════════════════════════════════
   // 职责：pending 登记、started 认领、not-started 看门狗与 dormant 恢复、settle、turn 事件入口
   // 实现：createTaskLifecycle(deps)（模块级，T-320）；本区只做依赖装配
@@ -4297,7 +4317,113 @@ export function apply(ctx, config) {
     registerBatchTask,
     // 批次聚合的回执更新
     updateBatchTask,
+    // Cross-machine tasks (T-388): a settled receipt also settles the hub row. Declared
+    // (mesh_complete) and observed (turn/end) both land here; whichever settles first wins.
+    onSettled: (taskId, receipt) => {
+      const result = HUB_TASK_RESULT[receipt?.status]
+      if (!result || !hubTaskIds.has(taskId)) return
+      void hubTasks?.settleTask(taskId, {
+        result,
+        summary: receipt.summary ?? '',
+        source: receipt.source === 'declared' ? 'declared' : 'observed',
+      })
+    },
   })
+
+  // ══ 子系统：跨机任务消费（T1 P5，T-388） ══════════════════════════════════════
+  // 职责：拉 pending → 条件认领 → blob 取正文 → 按 intent 投递 → 心跳续租 → settle
+  // 共享闭包：lifecycle, promptWithResume, resolveLocalSession, conversations, workspaces
+  // 对外入口：hubTasks.{start,stop,status,pollOnce,settleTask}；/mesh/status.tasksPoll
+  // 注意：默认关闭；同一任务只 settle 一次，declared 优先于 observed
+
+  const hubTaskIds = new Set()
+  let hubTasks = null
+
+  /** Hub JSON adapter: the consumer wants { ok, status, json } and never sees a token. */
+  async function hubTaskFetch(path, { method = 'GET', body } = {}) {
+    const res = await hubFetch(path, {
+      method,
+      headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(15000),
+    })
+    let json = null
+    try {
+      json = await res.json()
+    } catch {
+      json = null
+    }
+    return { ok: res.ok, status: res.status, json }
+  }
+
+  async function hubTaskInboxSession() {
+    const key = '__hub_tasks_inbox__'
+    const entry = conversations[key] ?? (conversations[key] = { sessionId: null, createdAt: 0, wakes: 0, title: null })
+    if (entry.sessionId) {
+      try {
+        return resolveLocalSession({ session: entry.sessionId })
+      } catch {
+        entry.sessionId = null
+      }
+    }
+    const created = await createDispatchTarget('Mesh 收件箱')
+    entry.sessionId = created.id
+    entry.title = created.title
+    entry.createdAt = Date.now()
+    saveConversations()
+    return created
+  }
+
+  /** Intent decides the target; anything unresolved falls back to the mesh inbox session. */
+  async function deliverHubTask(task) {
+    const intent = String(task.intent ?? 'auto')
+    const targetSession = String(task.target_session ?? task.targetSession ?? '')
+    let session = null
+    if (intent === 'session' && targetSession) {
+      try {
+        session = resolveLocalSession({ session: targetSession })
+      } catch (error) {
+        fileLog(`hub task ${task.taskId}: target_session ${targetSession} unavailable (${error.message}); inbox fallback`)
+      }
+    } else if (intent === 'coordinator') {
+      const ws = String(task.target_ws ?? task.targetWs ?? '')
+      refreshWorkspacesFromDisk()
+      const coordinator = workspaces.workspaces[ws]?.coordinator
+      if (coordinator) {
+        try {
+          session = resolveLocalSession({ session: coordinator })
+        } catch {
+          session = null
+        }
+      }
+    }
+    if (!session) session = await hubTaskInboxSession()
+    const meta = {
+      taskId: task.taskId,
+      ...(task.requester ? { requester: String(task.requester) } : {}),
+      ...(task.subject ? { subject: String(task.subject) } : {}),
+      ...(task.thread ? { thread: String(task.thread) } : {}),
+      ...(task.batch_id ? { batchId: String(task.batch_id) } : {}),
+    }
+    const delivered = c.injectHeader
+      ? withTaskHeader(task.text, { taskId: meta.taskId, batchId: meta.batchId, requester: meta.requester, thread: meta.thread })
+      : task.text
+    hubTaskIds.add(task.taskId)
+    lifecycle.registerPendingTask(session, meta, 'queue', task.text)
+    await promptWithResume(session.id, delivered, 'queue')
+    fileLog(`hub task ${task.taskId} delivered to ${session.id} intent=${intent}`)
+  }
+
+  hubTasks = createHubTaskConsumer({
+    enabled: c.tasksPollEnabled,
+    agent: () => selfName ?? enrollAgentName(c),
+    pollIntervalMs: c.tasksPollIntervalMs,
+    leaseMs: c.taskLeaseMs,
+    fetchJson: hubTaskFetch,
+    deliverTask: deliverHubTask,
+    fileLog,
+  })
+  state.tasksPoll = hubTasks.status()
 
   // ══ 子系统：批次 ══════════════════════════════════════════════════
   // 职责：batches.json、屏障聚合、deadline/告警、取消与恢复
@@ -5903,6 +6029,13 @@ export function apply(ctx, config) {
                 baselineTurn: task.baselineTurn ?? null,
               })),
               pendingBatches: batches.size,
+              // Cross-machine task pull (T-388): enabled/polled/error are self-describing so
+              // an operator can tell "nothing to do" from "the loop never ran".
+              tasksPoll: (() => {
+                const snap = hubTasks?.status() ?? state.tasksPoll
+                state.tasksPoll = snap
+                return snap
+              })(),
               // Queues an operator can act on without reading logs. Local-only status:
               // previews are one-line and bounded, no tokens or paths.
               pendingQuestions: [...questionWaiting.values()],

@@ -172,6 +172,14 @@ export function createTaskLifecycle(deps) {
       deps.fileLog(`receipt ${taskId} delivery crashed: ${error && error.message ? error.message : error}`)
     })
     if (!keepTracking) deps.updateBatchTask(taskId, receipt)
+    // Cross-machine settlement hook (T-388): the hub row mirrors this receipt exactly once.
+    if (typeof deps.onSettled === 'function') {
+      try {
+        deps.onSettled(taskId, receipt, task)
+      } catch (error) {
+        deps.fileLog(`settle hook failed for ${taskId}: ${error?.message ?? error}`)
+      }
+    }
     return receipt
   }
 

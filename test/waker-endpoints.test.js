@@ -437,6 +437,12 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
   const requests = []
   const readIds = []
   const sends = []
+  // Cross-machine tasks (T-388): rows live here, bodies in `blobs` keyed by sha256.
+  const tasks = []
+  const blobs = new Map()
+  const taskClaims = []
+  const taskHeartbeats = []
+  const taskSettles = []
   let unread = messages.map((message) => ({ ...message }))
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://fake-hub')
@@ -492,6 +498,53 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
       if (url.pathname === '/api/conversations') return send(200, { conversations: [] })
       if (url.pathname === '/api/peers') return send(200, { peers: [] })
       if (url.pathname === '/api/register') return send(202, { name: 'dsh-test' })
+      // ---- T-388 hub task contract (fake, per .worklog/docs-internal/t1-hub-tasks.md) ----
+      if (url.pathname === '/api/tasks' && req.method === 'GET') {
+        const agent = url.searchParams.get('agent') ?? ''
+        const status = url.searchParams.get('status') ?? 'pending'
+        return send(200, {
+          ok: true,
+          tasks: tasks.filter((row) => row.target_agent === agent && row.status === status),
+        })
+      }
+      if (url.pathname === '/api/blobs' && req.method === 'GET') {
+        const sha = url.searchParams.get('sha256') ?? ''
+        const text = blobs.get(sha)
+        return send(200, { ok: true, blobs: text === undefined ? [] : [{ id: `blob-${sha.slice(0, 8)}`, sha256: sha, bytes: Buffer.byteLength(text) }] })
+      }
+      if (url.pathname.startsWith('/api/blob/') && req.method === 'GET') {
+        const id = url.pathname.slice('/api/blob/'.length)
+        for (const [sha, text] of blobs) {
+          if (`blob-${sha.slice(0, 8)}` === id) return send(200, { ok: true, text })
+        }
+        return send(404, { ok: false, error: 'no such blob' })
+      }
+      const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/(claim|heartbeat|settle)$/)
+      if (taskMatch) {
+        const [, taskId, action] = taskMatch
+        const row = tasks.find((task) => task.task_id === taskId)
+        if (!row) return send(404, { ok: false, error: 'no such task' })
+        if (action === 'claim') {
+          taskClaims.push({ taskId, body })
+          if (row.status !== 'pending') return send(409, { ok: false, error: 'task is not pending' })
+          if (row.claim_agent) return send(409, { ok: false, error: 'already claimed' })
+          row.status = 'claimed'
+          row.claim_agent = body.agent ?? 'dsh-test'
+          row.lease_until = Date.now() + Number(body.lease_ms ?? 600000)
+          return send(200, { ok: true, task: { ...row } })
+        }
+        if (action === 'heartbeat') {
+          taskHeartbeats.push({ taskId, body })
+          if (row.status !== 'claimed') return send(409, { ok: false, error: 'not claimed' })
+          row.lease_until = Date.now() + Number(body.lease_ms ?? 600000)
+          return send(200, { ok: true, lease_until: row.lease_until })
+        }
+        taskSettles.push({ taskId, body })
+        if (row.status === 'settled') return send(200, { ok: true, receipt: row.receipt ?? null, idempotent: true })
+        row.status = 'settled'
+        row.receipt = { task_id: taskId, status: body.result, source: body.source, summary: body.summary ?? '' }
+        return send(200, { ok: true, receipt: row.receipt })
+      }
       return send(404, { error: 'not found' })
     })
   })
@@ -514,6 +567,44 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
     },
     get unread() {
       return unread
+    },
+    /** Register a hub task row and its body (T-388): text is stored under its sha256. */
+    addTask(row, text = '') {
+      const sha = require('node:crypto').createHash('sha256').update(String(text)).digest('hex')
+      if (text) blobs.set(sha, String(text))
+      const task = {
+        task_id: row.task_id,
+        origin_agent: row.origin_agent ?? 'mesh-a',
+        target_agent: row.target_agent ?? 'dsh-test',
+        intent: row.intent ?? 'auto',
+        target_session: row.target_session ?? null,
+        target_ws: row.target_ws ?? null,
+        subject: row.subject ?? 'task',
+        requester: row.requester ?? 'mesh · 协调',
+        thread: row.thread ?? null,
+        batch_id: row.batch_id ?? null,
+        status: 'pending',
+        claim_agent: null,
+        lease_until: null,
+        text_ref: `sha256:${sha}`,
+      }
+      tasks.push(task)
+      return task
+    },
+    get tasks() {
+      return tasks
+    },
+    get taskClaims() {
+      return taskClaims
+    },
+    get taskHeartbeats() {
+      return taskHeartbeats
+    },
+    get taskSettles() {
+      return taskSettles
+    },
+    get taskListRequests() {
+      return requests.filter((entry) => entry.path === '/api/tasks' && entry.method === 'GET')
     },
     close: () =>
       new Promise((resolveClose) => {
@@ -6751,6 +6842,248 @@ async function main() {
       elapsedMs < 4000
     report('harness: a listener that cannot bind fails fast with the real error', ok, `error=${message.split('\n')[0].slice(0, 220)} ms=${elapsedMs}`)
   }
+
+  // ---- T-388: cross-machine task consumer (pull / claim / heartbeat / settle) ----
+  const hubTasksUrl = pathToFileURL(path.join(REPO, 'plugins', 'mesh-waker', 'lib', 'hub-tasks.mjs')).href
+  const taskRow = (id, overrides = {}) => ({
+    task_id: id,
+    target_agent: 'mesh-b',
+    intent: 'auto',
+    text_ref: 'sha256:' + 'a'.repeat(64),
+    status: 'pending',
+    ...overrides,
+  })
+
+  const taskFetchStub = (rows, { claimStatus = 200, settleStatus = 200, listThrows = false } = {}) => {
+    const calls = []
+    const fetchJson = async (requestPath, { method = 'GET', body } = {}) => {
+      calls.push({ path: requestPath, method, body })
+      if (listThrows) throw new Error('hub unreachable')
+      if (requestPath.startsWith('/api/tasks?')) return { ok: true, status: 200, json: { ok: true, tasks: rows } }
+      if (requestPath.endsWith('/claim')) return claimStatus === 200 ? { ok: true, status: 200, json: { ok: true } } : { ok: false, status: claimStatus, json: null }
+      if (requestPath.endsWith('/heartbeat')) return { ok: true, status: 200, json: { ok: true } }
+      if (requestPath.endsWith('/settle')) return { ok: settleStatus === 200, status: settleStatus, json: { ok: true } }
+      if (requestPath.startsWith('/api/blobs?')) return { ok: true, status: 200, json: { ok: true, blobs: [{ id: 'blob-1' }] } }
+      if (requestPath.startsWith('/api/blob/')) return { ok: true, status: 200, json: { ok: true, text: 'do the thing' } }
+      return { ok: false, status: 404, json: null }
+    }
+    return { calls, fetchJson }
+  }
+
+  await runCase('hub tasks: pull -> claim -> blob -> deliver -> settle observed', async () => {
+    const { createHubTaskConsumer } = await import(hubTasksUrl)
+    const stub = taskFetchStub([taskRow('P-20261108-01')])
+    const delivered = []
+    const consumer = createHubTaskConsumer({
+      enabled: true,
+      agent: 'mesh-b',
+      pollIntervalMs: 600000,
+      leaseMs: 600000,
+      fetchJson: stub.fetchJson,
+      deliverTask: async (task) => delivered.push(task),
+    })
+    try {
+      const round = await consumer.pollOnce()
+      const settle = await consumer.settleTask('P-20261108-01', { result: 'completed', summary: 'ok', source: 'observed' })
+      const claim = stub.calls.find((call) => call.path.endsWith('/claim'))
+      const blobLookup = stub.calls.find((call) => call.path.startsWith('/api/blobs?'))
+      const blobGet = stub.calls.find((call) => call.path.startsWith('/api/blob/'))
+      const settleCall = stub.calls.find((call) => call.path.endsWith('/settle'))
+      const ok =
+        round.polled === 1 &&
+        round.claimed === 1 &&
+        delivered.length === 1 &&
+        delivered[0].text === 'do the thing' &&
+        claim?.body?.lease_ms === 600000 &&
+        Boolean(blobLookup) &&
+        Boolean(blobGet) &&
+        settle.ok === true &&
+        settleCall?.body?.source === 'observed' &&
+        settleCall?.body?.result === 'completed'
+      report('hub tasks: pull -> claim -> blob -> deliver -> settle observed', ok, `polled=${round.polled} claimed=${round.claimed} delivered=${delivered.length} settle=${settle.ok}`)
+    } finally {
+      consumer.stop()
+    }
+  })
+
+  await runCase('hub tasks: a 409 claim is skipped without delivering', async () => {
+    const { createHubTaskConsumer } = await import(hubTasksUrl)
+    const stub = taskFetchStub([taskRow('P-20261108-02')], { claimStatus: 409 })
+    const delivered = []
+    const consumer = createHubTaskConsumer({
+      enabled: true,
+      agent: 'mesh-b',
+      pollIntervalMs: 600000,
+      leaseMs: 600000,
+      fetchJson: stub.fetchJson,
+      deliverTask: async (task) => delivered.push(task),
+    })
+    try {
+      const round = await consumer.pollOnce()
+      const ok = round.polled === 1 && round.claimed === 0 && delivered.length === 0 && !stub.calls.some((call) => call.path.startsWith('/api/blob'))
+      report('hub tasks: a 409 claim is skipped without delivering', ok, `polled=${round.polled} claimed=${round.claimed} delivered=${delivered.length}`)
+    } finally {
+      consumer.stop()
+    }
+  })
+
+  await runCase('hub tasks: declared and observed settle exactly once', async () => {
+    const { createHubTaskConsumer } = await import(hubTasksUrl)
+    const stub = taskFetchStub([taskRow('P-20261108-03')])
+    const consumer = createHubTaskConsumer({
+      enabled: true,
+      agent: 'mesh-b',
+      pollIntervalMs: 600000,
+      leaseMs: 600000,
+      fetchJson: stub.fetchJson,
+      deliverTask: async () => {},
+    })
+    try {
+      await consumer.pollOnce()
+      const first = await consumer.settleTask('P-20261108-03', { result: 'completed', summary: 'declared', source: 'declared' })
+      const second = await consumer.settleTask('P-20261108-03', { result: 'completed', summary: 'observed', source: 'observed' })
+      const settles = stub.calls.filter((call) => call.path.endsWith('/settle'))
+      const ok = first.ok === true && second.skipped === true && settles.length === 1 && settles[0].body.source === 'declared'
+      report('hub tasks: declared and observed settle exactly once', ok, `settles=${settles.length} source=${settles[0]?.body?.source ?? '-'} second=${second.skipped ? 'skipped' : 'sent'}`)
+    } finally {
+      consumer.stop()
+    }
+  })
+
+  await runCase('hub tasks: a heartbeat renews the lease while the task runs', async () => {
+    const { createHubTaskConsumer } = await import(hubTasksUrl)
+    const stub = taskFetchStub([taskRow('P-20261108-04')])
+    const consumer = createHubTaskConsumer({
+      enabled: true,
+      agent: 'mesh-b',
+      pollIntervalMs: 600000,
+      leaseMs: 2000,
+      fetchJson: stub.fetchJson,
+      deliverTask: async () => {},
+    })
+    try {
+      await consumer.pollOnce()
+      const beat = await waitFor(() => (stub.calls.some((call) => call.path.endsWith('/heartbeat')) ? true : null), 3000)
+      const ok = beat === true && stub.calls.some((call) => call.path.endsWith('/heartbeat') && call.body?.lease_ms === 2000)
+      report('hub tasks: a heartbeat renews the lease while the task runs', ok, `heartbeat=${beat === true}`)
+    } finally {
+      consumer.stop()
+    }
+  })
+
+  await runCase('hub tasks: disabled means zero requests, and a failing list is retried next tick', async () => {
+    const { createHubTaskConsumer } = await import(hubTasksUrl)
+    const disabledStub = taskFetchStub([taskRow('P-20261108-05')])
+    const disabled = createHubTaskConsumer({
+      enabled: false,
+      agent: 'mesh-b',
+      fetchJson: disabledStub.fetchJson,
+      deliverTask: async () => {},
+    })
+    const disabledRound = await disabled.pollOnce()
+    disabled.stop()
+    const failingStub = taskFetchStub([], { listThrows: true })
+    const failing = createHubTaskConsumer({
+      enabled: true,
+      agent: 'mesh-b',
+      pollIntervalMs: 600000,
+      fetchJson: failingStub.fetchJson,
+      deliverTask: async () => {},
+    })
+    const failingRound = await failing.pollOnce()
+    const snap = failing.status()
+    failing.stop()
+    const ok =
+      disabledStub.calls.length === 0 &&
+      disabledRound.polled === 0 &&
+      failingRound.polled === 0 &&
+      /tasks poll failed/.test(snap.lastError ?? '') &&
+      snap.isRunning === false &&
+      typeof snap.lastPollAt === 'number'
+    report('hub tasks: disabled means zero requests, and a failing list is retried next tick', ok, `disabledCalls=${disabledStub.calls.length} lastError=${snap.lastError ? 'set' : 'none'}`)
+  })
+
+  await runCase('hub tasks: the plugin delivers a claimed task and settles it on turn/end', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      fake.addTask({ task_id: 'P-20261108-06', target_agent: 'dsh-test', intent: 'inbox', subject: 'cross-machine' }, 'do the cross thing')
+      h = await boot({
+        config: {
+          hubUrl: fake.url,
+          pollIntervalMs: 5000,
+          pollIdleIntervalMs: 5000,
+          tasksPollEnabled: true,
+          tasksPollIntervalMs: 1000,
+        },
+      })
+      const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
+      const settleBeforeTurnEnd = fake.taskSettles.length
+      h.emit('session/event', { id: delivered?.sessionId }, { type: 'turn/start', turn: 3 })
+      h.emit('session/event', { id: delivered?.sessionId }, { type: 'turn/end', turn: 3, reason: { kind: 'completed' } })
+      const settled = await waitFor(() => (fake.taskSettles.length ? fake.taskSettles[0] : null), 5000)
+      const status = await request(h.base, '/mesh/status')
+      const claim = fake.taskClaims[0]
+      const ok =
+        Boolean(delivered) &&
+        fake.tasks[0]?.status === 'settled' &&
+        claim?.body?.lease_ms === 600000 &&
+        settleBeforeTurnEnd === 0 &&
+        settled?.body?.source === 'observed' &&
+        settled?.body?.result === 'completed' &&
+        status.json?.tasksPoll?.enabled === true &&
+        typeof status.json?.tasksPoll?.lastPollAt === 'number'
+      report('hub tasks: the plugin delivers a claimed task and settles it on turn/end', ok, `delivered=${delivered?.sessionId ?? '-'} settles=${fake.taskSettles.length} source=${settled?.body?.source ?? '-'}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('hub tasks: mesh_complete settles with source=declared', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      fake.addTask({ task_id: 'P-20261108-07', target_agent: 'dsh-test', intent: 'inbox' }, 'declared thing')
+      h = await boot({
+        config: { hubUrl: fake.url, pollIntervalMs: 5000, pollIdleIntervalMs: 5000, tasksPollEnabled: true, tasksPollIntervalMs: 1000 },
+      })
+      const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
+      const completed = await request(h.base, '/mesh/tasks/complete', {
+        method: 'POST',
+        body: { sessionId: delivered?.sessionId, taskId: 'P-20261108-07', status: 'done', summary: 'all done' },
+      })
+      const settled = await waitFor(() => (fake.taskSettles.length ? fake.taskSettles[0] : null), 5000)
+      const ok =
+        completed.json?.ok === true &&
+        settled?.body?.source === 'declared' &&
+        settled?.body?.summary === 'all done' &&
+        fake.tasks[0]?.status === 'settled'
+      report('hub tasks: mesh_complete settles with source=declared', ok, `source=${settled?.body?.source ?? '-'} summary=${settled?.body?.summary ?? '-'}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('hub tasks: tasksPollEnabled=false sends no task requests', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      fake.addTask({ task_id: 'P-20261108-08', target_agent: 'dsh-test' }, 'should stay untouched')
+      h = await boot({ config: { hubUrl: fake.url, pollIntervalMs: 5000, pollIdleIntervalMs: 5000 } })
+      await new Promise((resolveWait) => setTimeout(resolveWait, 2000))
+      const status = await request(h.base, '/mesh/status')
+      const ok =
+        fake.taskListRequests.length === 0 &&
+        status.json?.tasksPoll?.enabled === false &&
+        (await Promise.resolve(fake.tasks[0]?.status)) === 'pending'
+      report('hub tasks: tasksPollEnabled=false sends no task requests', ok, `listRequests=${fake.taskListRequests.length} enabled=${status.json?.tasksPoll?.enabled}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
 
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)

@@ -176,6 +176,9 @@ dsh plugin --profile web add dsh-mesh-waker
 | `injectHeader` | `true` | 注入正文前加一行 `[TASK …]` 表头；设 `false` 退回逐字投递 |
 | `tasksRetentionDays` | `30` | 任务库保留天数（启动时裁掉更旧的记录） |
 | `tasksMaxRows` | `5000` | 任务库最多保留条数（超量裁最旧） |
+| `tasksPollEnabled` | `false` | 跨机任务消费（T1 P5）：开启后按 `tasksPollIntervalMs` 拉 `GET /api/tasks?agent=<自己>&status=pending`，认领 → 取 blob 正文 → 投递 → 心跳续租 → 结算；hub 未升级到 0.8.1 前保持关闭 |
+| `tasksPollIntervalMs` | 同 `pollIntervalMs` | 跨机任务拉取间隔（毫秒，1000–86400000） |
+| `taskLeaseMs` | `600000` | 任务租约（毫秒，60000–3600000）；执行期间按 `lease/2` 心跳续租 |
 | `compactTaskText` | `true` | 启动时把仍内嵌正文的任务行迁移为 `textRef`（内容寻址存 `texts/<sha256>.txt`）；迁移失败不改写任务库 |
 | `storageTiers` | `true` | 任务/回执按工作区分层存放（区内 `ws/<slug>/`、跨区 `local/`）；首次启动把旧单文件拆分并保留 `*.legacy.jsonl` |
 | `requireNamespacedIds` | `false` | 跨区任务（落 `local/`）的单号建议带命名空间（如 `dsh-mesh/T-123`）；默认只 WARN，设 `true` 时拒绝裸 `T-…` 单号 |
