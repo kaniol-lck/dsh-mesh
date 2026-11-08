@@ -394,6 +394,20 @@ dsh-mesh-dispatch --target "<session-title>" --file task.txt --task --batch B-20
 tail -n 2 ~/.dsh/mesh-waker/receipts.jsonl
 ```
 
+**跨机派活（`--transport hub`，需要 hub 0.8.1 及以上）**：正文不再内联，而是作为 blob 上传到 hub，任务行只带 `sha256` 引用；本机只留一行 `scope:"hub"` 的引用（不含正文、不建会话、不注入），由对端 waker 拉取执行。
+
+```bash
+# 前缀式 taskId 必须满足 <PREFIX>-<YYYYMMDD>-<SEQ>（hub 拒绝裸 T-NNN）
+dsh-mesh-dispatch --transport hub --to dsh-peer-b \
+  --text "在 matebook 上跑一次构建" --task DMSH-20261108-01 --expect "构建日志里出现 BUILD OK"
+# → dispatched transport=hub to=dsh-peer-b task=DMSH-20261108-01 sha256=sha256:… bytes=… originWs=dsh-mesh blob=<id>
+
+# 先看计划、零网络（不传 --to 之外任何东西也不会发请求）
+dsh-mesh-dispatch --transport hub --to dsh-peer-b --text "…" --dry-run
+```
+
+前提：本机 waker 已连上 hub（`hubUrl` + token）；CLI 只与本机 waker 的 loopback 端点通信（`/mesh/hub/blob`、`/mesh/hub/tasks`、`/mesh/tasks/hub-ref`），**不持有 token**。hub 不可达 / 409 / 400 时退出码非 0，且**不会**写本地引用行（避免同一个任务被本地也执行一次）。
+
 模型入口（工具）参数与 CLI 一一对应：
 
 | 工具参数 | CLI | 说明 |

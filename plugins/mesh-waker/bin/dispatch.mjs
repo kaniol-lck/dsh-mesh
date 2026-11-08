@@ -12,6 +12,7 @@
  *   dsh-mesh-dispatch --thread TH-1 --text "follow-up"   (target comes from the thread binding)
  */
 import { readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
 
@@ -26,6 +27,14 @@ Usage:
 
 Options:
   --target <s>       session id, full title, or a unique title substring
+  --transport <t>    local (default) = inject into a local session; hub = create the task on
+                     the cross-machine hub and keep only a reference row locally.
+  --to <agent>       --transport hub: hub peer name of the target machine
+                     (e.g. dsh-peer-b)
+  --origin-ws <s>    --transport hub: origin workspace slug (default derived from the current
+                     directory basename; required shape <PREFIX>-<YYYYMMDD>-<SEQ> for task ids)
+  --expect <s>       --transport hub: acceptance sentence carried with the task (not a check)
+  --task-prefix <p>  --transport hub: prefix for auto-generated ids (default DMSH)
   --role <role>      dispatch to the worker registered for that role in the workspace that
                      owns the current directory (workers come from /mesh/workspaces).
                      Exits 2 with candidates when the role is missing or its session is
@@ -45,6 +54,8 @@ Options:
                      waker infers the target workspace's coordinator, then falls back to
                      its receiptTo (queue/wake); file mode only writes receipts.jsonl
   --task [id]        receipt task id; "--task" alone generates T-<base36 timestamp>
+                     (--transport hub: must be <PREFIX>-<YYYYMMDD>-<SEQ>; a bare T-NNN is
+                     rejected because the hub refuses it and would silently duplicate)
   --batch [id]       batch barrier id; "--batch" alone generates B-<base36 timestamp>
   --receipt <m>      file | queue | wake (waker default when omitted)
   --deadline <d>     batch deadline such as 30m / 2h / 600s
@@ -68,6 +79,145 @@ function addressFail(message) {
   const error = new Error(message)
   error.exitCode = 2
   throw error
+}
+
+/** Transport failures (hub rejected or unreachable): exit 1, never a fake success (T-389). */
+function transportFail(message) {
+  const error = new Error(message)
+  error.exitCode = 1
+  throw error
+}
+
+/** Task id shape the hub accepts (T1 §三): <PREFIX>-<YYYYMMDD>-<SEQ>. */
+export const HUB_TASK_ID_RE = /^[A-Z][A-Z0-9]{1,11}-\d{8}-\d{1,6}$/
+
+function hubTaskId(prefix) {
+  const now = new Date()
+  const day = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
+  // Seconds since local midnight: ordered within a day, always 1..6 digits, no counter file.
+  const seq = String(now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds())
+  return `${prefix}-${day}-${seq}`
+}
+
+/** Origin workspace slug: basename, or the parent for generic dirs (same rule as the plugin). */
+export function defaultOriginWs(cwd = process.cwd()) {
+  const parts = String(cwd).replace(/[\\/]+$/, '').split(/[\\/]/)
+  const base = parts[parts.length - 1] ?? ''
+  const generic = new Set(['public', 'src', 'dist', 'app', 'main', 'build'])
+  const raw = generic.has(base.toLowerCase()) ? parts[parts.length - 2] ?? base : base
+  return String(raw)
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'unknown'
+}
+
+async function readJsonSafe(response) {
+  try {
+    return await response.json()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Cross-machine dispatch (T-389): the body becomes a blob on the hub, the task row carries its
+ * sha256, and the local ledger keeps one reference row. Any failure aborts before the local
+ * row is written — a hub failure must never look like a local task, or it runs twice.
+ */
+export async function runHubDispatch(options, base, text, fetchImpl = fetch) {
+  const taskId = options.task === undefined || options.task === '' ? hubTaskId(options.taskPrefix ?? 'DMSH') : String(options.task).trim()
+  if (!HUB_TASK_ID_RE.test(taskId)) {
+    transportFail(
+      `task id "${taskId}" is not <PREFIX>-<YYYYMMDD>-<SEQ>; the hub rejects bare ids (e.g. T-123) because they collide across machines — pass --task <PREFIX>-<YYYYMMDD>-<NN> or omit --task to generate one`,
+    )
+  }
+  if (!options.to) transportFail('--transport hub needs --to <agent>')
+  const originWs = String(options.originWs ?? defaultOriginWs()).trim()
+  if (!originWs) transportFail('--origin-ws must not be empty')
+  const subject = String(options.subject ?? text.trim().split('\n')[0] ?? '').trim().slice(0, 120) || taskId
+  const bytes = Buffer.byteLength(text, 'utf8')
+  const sha256 = createHash('sha256').update(text, 'utf8').digest('hex')
+  const textRef = `sha256:${sha256}`
+  const payload = {
+    task_id: taskId,
+    target_agent: options.to,
+    origin_ws: originWs,
+    subject,
+    intent: 'auto',
+    requester: options.requester === undefined ? null : String(options.requester),
+    thread: options.thread === undefined ? null : String(options.thread),
+    batch_id: options.batch === undefined ? null : String(options.batch),
+    text_ref: textRef,
+    text_bytes: bytes,
+    ...(options.deadlineMs ? { deadline_ms: Date.now() + options.deadlineMs } : {}),
+    ...(options.expect === undefined ? {} : { expect: String(options.expect) }),
+  }
+  const localRow = { scope: 'hub', taskId, textRef, textBytes: bytes, hasInlineText: false }
+  if (options.dryRun) {
+    return {
+      dryRun: true,
+      transport: 'hub',
+      url: `${base}/mesh/hub/tasks`,
+      target: options.to,
+      taskId,
+      textRef,
+      textBytes: bytes,
+      originWs,
+      subject,
+      localRow,
+      payload,
+    }
+  }
+  const blobRes = await fetchImpl(`${base}/mesh/hub/blob?name=${encodeURIComponent(`task-${taskId}.txt`)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'text/plain; charset=utf-8' },
+    body: text,
+  })
+  const blob = await readJsonSafe(blobRes)
+  if (!blobRes.ok) transportFail(`blob upload failed: HTTP ${blobRes.status} ${blob?.error ?? ''}`.trim())
+  if (blob?.sha256 !== sha256) transportFail(`blob sha256 mismatch: sent ${sha256.slice(0, 12)}…, hub stored ${String(blob?.sha256 ?? '-').slice(0, 12)}…`)
+  const taskRes = await fetchImpl(`${base}/mesh/hub/tasks`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const taskJson = await readJsonSafe(taskRes)
+  if (taskRes.status === 409) transportFail(`hub already has task ${taskId}; pick another id with --task (nothing was written locally)`)
+  if (!taskRes.ok) transportFail(`hub rejected the task: HTTP ${taskRes.status} ${taskJson?.error ?? ''}`.trim())
+  const refRes = await fetchImpl(`${base}/mesh/tasks/hub-ref`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      taskId,
+      textRef,
+      textBytes: bytes,
+      targetAgent: options.to,
+      originWs,
+      subject,
+      expect: options.expect,
+      requester: options.requester,
+      thread: options.thread,
+      batchId: options.batch,
+    }),
+  })
+  const refJson = await readJsonSafe(refRes)
+  if (!refRes.ok) {
+    transportFail(
+      `task ${taskId} exists on the hub but the local reference row failed: HTTP ${refRes.status} ${refJson?.error ?? ''}; record it manually (scope=hub) or the receipt will never be matched`.trim(),
+    )
+  }
+  return {
+    dryRun: false,
+    transport: 'hub',
+    target: options.to,
+    taskId,
+    textRef,
+    textBytes: bytes,
+    originWs,
+    subject,
+    blobId: blob.id ?? null,
+    localRow,
+  }
 }
 
 /** "30m" / "2h" / "600s" / "500ms" -> milliseconds. */
@@ -98,6 +248,11 @@ export function parseArgs(argv) {
     target: undefined,
     coordinator: undefined,
     role: undefined,
+    transport: 'local',
+    to: undefined,
+    originWs: undefined,
+    expect: undefined,
+    taskPrefix: 'DMSH',
     text: undefined,
     file: undefined,
     mode: 'queue',
@@ -134,6 +289,34 @@ export function parseArgs(argv) {
         const value = String(takeValue()).trim()
         if (!value) fail('--role requires a non-empty role')
         options.role = value.toLowerCase()
+        break
+      }
+      case '--transport': {
+        const value = String(takeValue()).trim().toLowerCase()
+        if (!['local', 'hub'].includes(value)) fail('--transport must be local or hub')
+        options.transport = value
+        break
+      }
+      case '--to': {
+        const value = String(takeValue()).trim()
+        if (!value) fail('--to requires a hub peer name')
+        options.to = value
+        break
+      }
+      case '--origin-ws': {
+        const value = String(takeValue()).trim()
+        if (!value) fail('--origin-ws requires a workspace slug')
+        options.originWs = value
+        break
+      }
+      case '--expect': {
+        options.expect = String(takeValue())
+        break
+      }
+      case '--task-prefix': {
+        const value = String(takeValue()).trim().toUpperCase()
+        if (!/^[A-Z][A-Z0-9]{1,11}$/.test(value)) fail('--task-prefix must look like DMSH (A-Z, 2-12 chars)')
+        options.taskPrefix = value
         break
       }
       case '--text': options.text = takeValue(); break
@@ -175,6 +358,15 @@ export function parseArgs(argv) {
   if (options.help) return options
   if (options.thread !== undefined) options.thread = normalizeCliThread(options.thread)
   // Two addressing modes at once would be ambiguous: refuse instead of guessing.
+  if (options.transport === 'hub') {
+    if (!options.to) fail('--transport hub needs --to <agent>')
+    if (options.target !== undefined || options.role !== undefined || options.coordinator !== undefined) {
+      fail('--transport hub cannot be combined with --target / --role / --coordinator (the remote side picks the session)')
+    }
+    if (options.create) fail('--create is local-only')
+  } else if (options.to !== undefined || options.expect !== undefined) {
+    fail('--to / --expect only apply with --transport hub')
+  }
   if (options.coordinator !== undefined && (options.target !== undefined || options.thread !== undefined)) {
     fail('--coordinator cannot be combined with --target or --thread')
   }
@@ -182,7 +374,13 @@ export function parseArgs(argv) {
     fail('--role cannot be combined with --target, --thread or --coordinator')
   }
   // A known thread resolves the target server-side, so --target may be omitted (T-296).
-  if (!options.target && options.coordinator === undefined && options.role === undefined && options.thread === undefined) {
+  if (
+    options.transport !== 'hub' &&
+    !options.target &&
+    options.coordinator === undefined &&
+    options.role === undefined &&
+    options.thread === undefined
+  ) {
     fail('pass --target, --coordinator, --role or --thread for a known thread')
   }
   if (options.create && !options.target) fail('--create needs --target')
@@ -319,6 +517,13 @@ export async function resolveRoleTarget(base, role, fetchImpl = fetch) {
 /** Dispatch one task; returns the waker's result (plus created flag when it made a session). */
 export async function run(options, fetchImpl = fetch) {
   const base = String(options.waker ?? DEFAULT_WAKER).replace(/\/+$/, '')
+  // Cross-machine transport (T-389) is a different pipeline entirely: blob + hub row + one
+  // local reference. Nothing below (session resolution / inject) runs for it.
+  if (options.transport === 'hub') {
+    const text = options.file !== undefined ? await readFile(String(options.file), 'utf8') : String(options.text ?? '')
+    if (!text.trim()) fail('task text is empty')
+    return runHubDispatch(options, base, text, fetchImpl)
+  }
   let resolvedCoordinator = null
   if (options.coordinator !== undefined) {
     // Resolve before sending anything: a wrong address must never inject.
@@ -426,6 +631,25 @@ async function main(argv = process.argv.slice(2)) {
   }
   if (result.resolvedRole?.dormant) {
     console.error(`warn: 工作区 ${result.resolvedRole.slug} 的 "${result.resolvedRole.role}" worker 会话 ${result.resolvedRole.sessionId} 当前未加载（stale=true, dispatch will wake it）`)
+  }
+  if (result.transport === 'hub') {
+    // Cross-machine dispatch (T-389): plan on --dry-run, result otherwise. The local side
+    // only ever keeps a reference row, so there is no session to print.
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2))
+      return
+    }
+    const parts = [options.dryRun ? 'dry-run' : 'dispatched', 'transport=hub']
+    parts.push(`to=${result.target}`)
+    parts.push(`task=${result.taskId}`)
+    parts.push(`subject=${result.subject}`)
+    parts.push(`sha256=${result.textRef}`)
+    parts.push(`bytes=${result.textBytes}`)
+    parts.push(`originWs=${result.originWs}`)
+    if (options.dryRun) parts.push('local=scope:hub row only (no body, no session)')
+    else parts.push(`blob=${result.blobId ?? '-'}`)
+    console.log(parts.join(' '))
+    return
   }
   if (options.dryRun) {
     const plan = result.payload ?? {}

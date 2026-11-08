@@ -263,6 +263,9 @@ export const inject = ['sessionController', 'agents', 'workspaceRegistry', 'conf
 
 const WINDOW_MS = 120_000
 const MAX_BODY = 16 * 1024
+// Hub-side task id rule (T1 §三, hub 0.8.1): <PREFIX>-<YYYYMMDD>-<SEQ>; bare ids are rejected
+// by the hub, so the local reference endpoint enforces the same shape (T-389).
+const HUB_TASK_ID_RE = /^[A-Z][A-Z0-9]{1,11}-\d{8}-\d{1,6}$/
 const LOG_FILE = process.env.MESH_WAKER_LOG || join(tmpdir(), 'mesh-waker.log')
 // The file logger is configured from the plugin config in apply(); before that it keeps the
 // historical tmp default so early start-up lines are never lost.
@@ -3805,6 +3808,9 @@ export function apply(ctx, config) {
   function dirForRow(row) {
     if (row.scope === 'workspace' && row.workspace && workspaces.workspaces[row.workspace]) return wsDirFor(row.workspace)
     if (row.scope === 'machine') return localDir
+    // Cross-machine reference rows (T-389) live with the machine-wide ledger: the body is on
+    // the hub, so there is no workspace tier to route them into.
+    if (row.scope === 'hub') return localDir
     return routeForRow(row).dir
   }
 
@@ -5448,6 +5454,146 @@ export function apply(ctx, config) {
         saveWorkspaces()
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: true, slug, role, workers: entry.workers }))
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
+      return
+    }
+
+    // ---- T-389: cross-machine dispatch helpers (loopback only) ----
+    // The CLI never holds a hub token: it asks this process, which already has one, to upload
+    // the body as a blob, create the task row, and record the local reference. All three are
+    // single-writer (this process owns the task registry) and echo the hub's status verbatim.
+    const readRequestBuffer = async () => {
+      const chunks = []
+      let size = 0
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size > MAX_BODY) return null
+        chunks.push(chunk)
+      }
+      return Buffer.concat(chunks)
+    }
+
+    if (path === '/mesh/hub/blob' && req.method === 'POST') {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const raw = await readRequestBuffer()
+      if (!raw) {
+        res.writeHead(413).end()
+        return
+      }
+      if (!raw.length) {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end('{"ok":false,"error":"empty body"}')
+        return
+      }
+      try {
+        const query = new URL(req.url ?? '/', 'http://localhost').searchParams
+        const name = String(query.get('name') || `task-${Date.now()}.txt`).slice(0, 200)
+        const sha = sha256Hex(raw.toString('utf8'))
+        const upstream = await hubFetch(`/api/blob?name=${encodeURIComponent(name)}&sha256=${sha}`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${c.token}`, 'content-type': 'text/plain; charset=utf-8' },
+          body: raw,
+          signal: AbortSignal.timeout(30000),
+        })
+        let json = null
+        try {
+          json = await upstream.json()
+        } catch {
+          json = null
+        }
+        res.writeHead(upstream.status, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ status: upstream.status, ...(json ?? {}) }))
+      } catch (error) {
+        res.writeHead(502, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: `hub unreachable: ${error.message}` }))
+      }
+      return
+    }
+
+    if (path === '/mesh/hub/tasks' && req.method === 'POST') {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const raw = await readRequestBuffer()
+      if (!raw) {
+        res.writeHead(413).end()
+        return
+      }
+      try {
+        const draft = JSON.parse(raw.toString('utf8') || '{}')
+        const upstream = await hubFetch('/api/tasks', {
+          method: 'POST',
+          headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
+          body: JSON.stringify(draft),
+          signal: AbortSignal.timeout(20000),
+        })
+        let json = null
+        try {
+          json = await upstream.json()
+        } catch {
+          json = null
+        }
+        res.writeHead(upstream.status, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ status: upstream.status, ...(json ?? {}) }))
+      } catch (error) {
+        res.writeHead(502, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: `hub unreachable: ${error.message}` }))
+      }
+      return
+    }
+
+    if (path === '/mesh/tasks/hub-ref' && req.method === 'POST') {
+      // The only local trace of a cross-machine task: a reference row, never the body.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const raw = await readRequestBuffer()
+      if (!raw) {
+        res.writeHead(413).end()
+        return
+      }
+      try {
+        const draft = JSON.parse(raw.toString('utf8') || '{}')
+        const taskId = String(draft.taskId ?? '').trim()
+        if (!HUB_TASK_ID_RE.test(taskId)) throw new Error(`taskId must be <PREFIX>-<YYYYMMDD>-<SEQ>, got "${taskId}"`)
+        const textRef = String(draft.textRef ?? '').trim()
+        if (!/^sha256:[0-9a-f]{64}$/.test(textRef)) throw new Error('textRef must be sha256:<64 hex>')
+        if (taskRows.has(taskId)) throw new Error(`task ${taskId} is already recorded locally`)
+        const write = Date.now()
+        const row = {
+          taskId,
+          status: 'pending',
+          scope: 'hub',
+          targetAgent: String(draft.targetAgent ?? ''),
+          originWs: String(draft.originWs ?? ''),
+          textRef,
+          textBytes: Number.isFinite(Number(draft.textBytes)) ? Number(draft.textBytes) : null,
+          subject: String(draft.subject ?? '').slice(0, 200),
+          ...(draft.expect ? { expect: String(draft.expect).slice(0, 2048) } : {}),
+          ...(draft.requester ? { requester: String(draft.requester).slice(0, 120) } : {}),
+          ...(draft.thread ? { thread: String(draft.thread).slice(0, 120) } : {}),
+          ...(draft.batchId ? { batchId: String(draft.batchId).slice(0, 120) } : {}),
+          createdAt: write,
+          updatedAt: write,
+        }
+        const written = taskRegistry.appendTaskRow(row)
+        if (!written) throw new Error('local task registry write failed')
+        taskRows.set(taskId, row)
+        state.pendingTasks = pendingTasks.size
+        fileLog(`hub task ${taskId} recorded locally as a reference (scope=hub, no body)`)
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: true, taskId, scope: 'hub', textRef, hasInlineText: false }))
       } catch (error) {
         res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: false, error: error.message }))

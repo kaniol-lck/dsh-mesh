@@ -433,16 +433,18 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
  * Minimal hub for bootstrap + pull: /api/bootstrap, /api/enroll, /api/inbox, /api/read,
  * /api/conversations, /api/peers. Messages stay unread until /api/read, like the real hub.
  */
-async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDelayMs = 0, sendStatus = 201, onSend = null } = {}) {
+async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDelayMs = 0, sendStatus = 201, onSend = null, failTaskStatus = 0 } = {}) {
   const requests = []
   const readIds = []
   const sends = []
-  // Cross-machine tasks (T-388): rows live here, bodies in `blobs` keyed by sha256.
+  // Cross-machine tasks (T-388/T-389): rows live here, bodies in `blobs` keyed by sha256.
   const tasks = []
   const blobs = new Map()
   const taskClaims = []
   const taskHeartbeats = []
   const taskSettles = []
+  const blobUploads = []
+  const taskCreates = []
   let unread = messages.map((message) => ({ ...message }))
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://fake-hub')
@@ -498,6 +500,26 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
       if (url.pathname === '/api/conversations') return send(200, { conversations: [] })
       if (url.pathname === '/api/peers') return send(200, { peers: [] })
       if (url.pathname === '/api/register') return send(202, { name: 'dsh-test' })
+      // ---- T-389 upload side (what the waker proxy forwards to the real hub) ----
+      if (url.pathname === '/api/blob' && req.method === 'POST') {
+        const raw = Buffer.concat(chunks)
+        const sha = require('node:crypto').createHash('sha256').update(raw).digest('hex')
+        const name = url.searchParams.get('name') ?? 'blob.bin'
+        const expected = url.searchParams.get('sha256') ?? ''
+        if (expected && expected !== sha) return send(400, { error: 'sha256 mismatch', expected, actual: sha })
+        blobUploads.push({ name, sha256: sha, bytes: raw.length, text: raw.toString('utf8') })
+        blobs.set(sha, raw.toString('utf8'))
+        return send(201, { id: `blob-${sha.slice(0, 8)}`, name, bytes: raw.length, sha256: sha })
+      }
+      if (url.pathname === '/api/tasks' && req.method === 'POST') {
+        taskCreates.push(body)
+        if (failTaskStatus) return send(failTaskStatus, { error: 'hub exploded' })
+        if (!/^[A-Z][A-Z0-9]{1,11}-\d{8}-\d{1,6}$/.test(String(body.task_id ?? ''))) return send(400, { error: 'task_id must be <PREFIX>-<YYYYMMDD>-<SEQ>' })
+        if (tasks.some((row) => row.task_id === body.task_id)) return send(409, { error: 'task already exists' })
+        const row = { ...body, status: 'pending', claim_agent: null, lease_until: null }
+        tasks.push(row)
+        return send(201, { task: row })
+      }
       // ---- T-388 hub task contract (fake, per .worklog/docs-internal/t1-hub-tasks.md) ----
       if (url.pathname === '/api/tasks' && req.method === 'GET') {
         const agent = url.searchParams.get('agent') ?? ''
@@ -605,6 +627,12 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
     },
     get taskListRequests() {
       return requests.filter((entry) => entry.path === '/api/tasks' && entry.method === 'GET')
+    },
+    get blobUploads() {
+      return blobUploads
+    },
+    get taskCreates() {
+      return taskCreates
     },
     close: () =>
       new Promise((resolveClose) => {
@@ -7079,6 +7107,105 @@ async function main() {
         status.json?.tasksPoll?.enabled === false &&
         (await Promise.resolve(fake.tasks[0]?.status)) === 'pending'
       report('hub tasks: tasksPollEnabled=false sends no task requests', ok, `listRequests=${fake.taskListRequests.length} enabled=${status.json?.tasksPoll?.enabled}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  // ---- T-389: cross-machine dispatch (blob + hub task row + one local reference) ----
+  await runCase('CLI hub: --dry-run prints the plan and sends nothing', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--transport', 'hub', '--to', 'dsh-mate', '--text', 'cross thing', '--dry-run', '--task', 'DMSH-20261108-01'])
+    let calls = 0
+    const result = await run(options, async () => {
+      calls += 1
+      throw new Error('network used')
+    })
+    const ok =
+      result.dryRun === true &&
+      result.transport === 'hub' &&
+      result.taskId === 'DMSH-20261108-01' &&
+      result.payload.target_agent === 'dsh-mate' &&
+      /^sha256:[0-9a-f]{64}$/.test(result.payload.text_ref) &&
+      result.payload.text_bytes === Buffer.byteLength('cross thing') &&
+      result.localRow.scope === 'hub' &&
+      result.localRow.hasInlineText === false &&
+      calls === 0
+    report('CLI hub: --dry-run prints the plan and sends nothing', ok, `task=${result.taskId} calls=${calls} bytes=${result.payload.text_bytes}`)
+  })
+
+  await runCase('CLI hub: bare task ids are rejected before any request', async () => {
+    const { parseArgs, run } = await import(cliUrl)
+    const options = parseArgs(['--transport', 'hub', '--to', 'dsh-mate', '--text', 'x', '--task', 'T-123'])
+    let calls = 0
+    let error = null
+    try {
+      await run(options, async () => {
+        calls += 1
+        throw new Error('network used')
+      })
+    } catch (caught) {
+      error = caught
+    }
+    const ok = error?.exitCode === 1 && /not <PREFIX>-<YYYYMMDD>-<SEQ>/.test(error.message) && calls === 0
+    report('CLI hub: bare task ids are rejected before any request', ok, `exit=${error?.exitCode ?? '-'} calls=${calls}`)
+  })
+
+  await runCase('CLI hub: blob + task on the hub, one reference row locally', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await boot({ config: { hubUrl: fake.url, pollIntervalMs: 5000, pollIdleIntervalMs: 5000 } })
+      const { parseArgs, run } = await import(cliUrl)
+      const options = parseArgs([
+        '--transport', 'hub', '--to', 'dsh-mate', '--text', 'cross machine payload',
+        '--task', 'DMSH-20261108-02', '--origin-ws', 'dsh-mesh', '--waker', h.base,
+      ])
+      const result = await run(options)
+      const blobRequests = fake.requests.filter((entry) => entry.path === '/api/blob')
+      const taskRequests = fake.requests.filter((entry) => entry.path === '/api/tasks' && entry.method === 'POST')
+      const localFile = path.join(h.home, '.dsh', 'mesh-waker', 'local', 'tasks.jsonl')
+      const rows = fs.existsSync(localFile) ? fs.readFileSync(localFile, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : []
+      const row = rows.find((item) => item.taskId === 'DMSH-20261108-02')
+      const ok =
+        result.transport === 'hub' &&
+        blobRequests.length === 1 &&
+        taskRequests.length === 1 &&
+        fake.blobUploads[0]?.text === 'cross machine payload' &&
+        fake.taskCreates[0]?.text_ref === result.textRef &&
+        fake.taskCreates[0]?.target_agent === 'dsh-mate' &&
+        fake.taskCreates[0]?.origin_ws === 'dsh-mesh' &&
+        row?.scope === 'hub' &&
+        row?.text === undefined &&
+        row?.textRef === result.textRef &&
+        rows.length === 1 &&
+        h.state.created.length === 0 &&
+        h.state.prompts.length === 0
+      report('CLI hub: blob + task on the hub, one reference row locally', ok, `blob=${blobRequests.length} task=${taskRequests.length} rows=${rows.length} bodyInRow=${row?.text !== undefined}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('CLI hub: a hub failure exits non-zero and writes no reference row', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest', failTaskStatus: 500 })
+    let h = null
+    try {
+      h = await boot({ config: { hubUrl: fake.url, pollIntervalMs: 5000, pollIdleIntervalMs: 5000 } })
+      const { parseArgs, run } = await import(cliUrl)
+      const options = parseArgs(['--transport', 'hub', '--to', 'dsh-mate', '--text', 'will fail', '--task', 'DMSH-20261108-03', '--waker', h.base])
+      let error = null
+      try {
+        await run(options)
+      } catch (caught) {
+        error = caught
+      }
+      const localFile = path.join(h.home, '.dsh', 'mesh-waker', 'local', 'tasks.jsonl')
+      const rows = fs.existsSync(localFile) ? fs.readFileSync(localFile, 'utf8').split('\n').filter(Boolean) : []
+      const ok = error?.exitCode === 1 && /HTTP 500/.test(error.message) && rows.length === 0 && fake.taskCreates.length === 1
+      report('CLI hub: a hub failure exits non-zero and writes no reference row', ok, `exit=${error?.exitCode ?? '-'} rows=${rows.length}`)
     } finally {
       if (h) h.close()
       await fake.close()
