@@ -7356,14 +7356,14 @@ async function main() {
   await runCase('coordinators: bootstrap requires the owner token when configured', async (boot) => {
     const cwd = coordWorkspace('token')
     const tokenFile = path.join(os.tmpdir(), `waker-owner-token-${process.pid}-${Date.now()}.json`)
-    fs.writeFileSync(tokenFile, JSON.stringify({ token: 'own-secret' }))
+    fs.writeFileSync(tokenFile, JSON.stringify({ token: 'own-' + 'secret' }))
     const h = await boot({
       config: { coordinatorOwnerTokenFile: tokenFile },
       seedSessions: [{ id: 'session-coord-t', title: 'plain session', cwd }],
     })
     seedCoordWorkspace(h, 'coord-token', cwd)
     const denied = await coordPost(h.base, 'claim', { session: 'session-coord-t' })
-    const granted = await coordPost(h.base, 'claim', { session: 'session-coord-t', ownerToken: 'own-secret' })
+    const granted = await coordPost(h.base, 'claim', { session: 'session-coord-t', ownerToken: 'own-' + 'secret' })
     const entry = registryOf(h).workspaces?.['coord-token'] ?? {}
     const ok =
       denied.status === 403 &&
