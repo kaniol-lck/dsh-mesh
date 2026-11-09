@@ -189,7 +189,10 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
       const dir = path.join(sessionsRoot, workspace, id)
       fs.mkdirSync(dir, { recursive: true })
       const log = path.join(dir, 'session.v4.jsonl.zstd')
-      fs.writeFileSync(log, '')
+      // Mirror the host: a new session log carries the cwd, which the identity lookup reads
+      // back (T-394). An empty log would make a created session unidentifiable.
+      const meta = { type: 'session/open', data: { cwd: request.cwd ?? request.workspacePath ?? null } }
+      fs.writeFileSync(log, zstdCompressSync(Buffer.from(JSON.stringify(meta) + '\n')))
       state.created.push({ id, request, log })
       return { sessionId: id }
     },
@@ -7242,6 +7245,81 @@ async function main() {
       if (h) h.close()
       await fake.close()
     }
+  })
+
+  // ---- T-394: authoritative session identity (registry only, never titles) ----
+  await runCase('identity: the registry decides who the coordinator is', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'ident-repo', 'public')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-ident-coord', title: 'mesh · 协调', cwd },
+        { id: 'session-ident-waker', title: 'ident-repo · waker', cwd },
+        { id: 'session-ident-plain', title: 'just a session', cwd },
+      ],
+      prepareHome: (home) => {
+        const dir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(
+          path.join(dir, 'workspaces.json'),
+          `${JSON.stringify({ machine: 'm', workspaces: { 'ident-repo': { cwd, coordinator: 'session-ident-coord' } } }, null, 2)}\n`,
+        )
+      },
+    })
+    const coord = await request(h.base, '/mesh/session/identity?session=session-ident-coord')
+    const worker = await request(h.base, '/mesh/session/identity?session=session-ident-waker')
+    const plain = await request(h.base, '/mesh/session/identity?session=session-ident-plain')
+    const unknown = await request(h.base, '/mesh/session/identity?session=session-nope')
+    const ok =
+      coord.json?.ok === true &&
+      coord.json?.isCoordinator === true &&
+      coord.json?.workspace === 'ident-repo' &&
+      coord.json?.sessionId === 'session-ident-coord' &&
+      worker.json?.isCoordinator === false &&
+      worker.json?.role === 'waker' &&
+      worker.json?.coordinatorSessionId === 'session-ident-coord' &&
+      plain.json?.isCoordinator === false &&
+      plain.json?.role === null &&
+      unknown.json?.ok === false &&
+      /session not found/.test(unknown.json?.reason ?? '')
+    report(
+      'identity: the registry decides who the coordinator is',
+      ok,
+      `coord=${coord.json?.isCoordinator} worker=${worker.json?.isCoordinator}/${worker.json?.role ?? '-'} plain=${plain.json?.isCoordinator} unknown=${unknown.json?.ok}`,
+    )
+  })
+
+  await runCase('identity: a created session gets the identity line on its first prompt only', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'ident-create', 'public')
+    const h = await boot({
+      seedSessions: [{ id: 'session-ident-boss', title: 'mesh · 协调', cwd }],
+      prepareHome: (home) => {
+        const dir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(
+          path.join(dir, 'workspaces.json'),
+          `${JSON.stringify({ machine: 'm', workspaces: { 'ident-create': { cwd, coordinator: 'session-ident-boss' } } }, null, 2)}\n`,
+        )
+      },
+    })
+    const created = await request(h.base, '/mesh/sessions/create', {
+      method: 'POST',
+      body: { title: 'ident-create · docs', prompt: 'write the docs', workspacePath: cwd },
+    })
+    const sessionId = created.json?.sessionId
+    const first = h.state.prompts.find((prompt) => prompt.sessionId === sessionId)
+    const firstText = JSON.stringify(first?.content ?? '')
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { session: sessionId, text: 'second message' } })
+    const all = h.state.prompts.filter((prompt) => prompt.sessionId === sessionId)
+    const secondText = JSON.stringify(all[1]?.content ?? '')
+    const ok =
+      created.status === 201 &&
+      /\[身份\] sessionId=/.test(firstText) &&
+      /workspace=ident-create/.test(firstText) &&
+      /isCoordinator=false/.test(firstText) &&
+      /coordinatorSessionId=session-ident-boss/.test(firstText) &&
+      all.length === 2 &&
+      !secondText.includes('[身份]')
+    report('identity: a created session gets the identity line on its first prompt only', ok, `first=${/\[身份\]/.test(firstText)} second=${/\[身份\]/.test(secondText)} prompts=${all.length} snippet=${firstText.slice(0, 220)}`)
   })
 
   const failed = results.filter((result) => !result.ok)

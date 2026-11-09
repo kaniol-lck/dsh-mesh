@@ -204,6 +204,25 @@ dsh plugin --profile web add dsh-mesh-waker
 
 CA 只记 sha256 前 16 位，token 只记 `fp=<前6位>… len=<n>`；任何日志都不打印密钥。
 
+## 会话身份：任何会话都能自查（0.8.1）
+
+**一个会话是不是本工作区的协调，只认 `~/.dsh/mesh-waker/workspaces.json` 里该工作区的 `coordinator` 字段是否等于自己的 sessionId。** 会话标题、DSH 的 `workspace.json` 标题、`mesh_whoami`（机器身份）**都不是**判据——已有默认会话因工作区标题「mesh · 协调」误判自己是协调。
+
+自查方式（loopback）：
+
+```bash
+curl.exe -s "http://127.0.0.1:8795/mesh/session/identity?session=<自己的 sessionId>"
+# 协调会话：  {"ok":true,"sessionId":"session-…","cwd":"D:\\…\\public","workspace":"dsh-mesh","isCoordinator":true,"coordinatorSessionId":"session-…","role":null}
+# worker 会话：{"ok":true,…,"isCoordinator":false,"coordinatorSessionId":"session-…","role":"waker"}
+# 普通会话：  {"ok":true,…,"isCoordinator":false,"coordinatorSessionId":"session-…","role":null}
+# 查不到时：  {"ok":false,"sessionId":"…","reason":"session not found on this machine"}   ← 不猜、不给默认值
+```
+
+- **默认新建的会话不是协调**，除非注册表显式登记；`role` 从标题 `<项目> · <角色>` 解析，解析不出为 `null`。
+- waker 自己创建的会话（`/mesh/sessions/create`、`mesh_dispatch --create`、收件箱会话等）会在**首个 prompt** 前带一行身份头，之后不再重复：
+  `[身份] sessionId=<id> workspace=<slug> isCoordinator=true|false coordinatorSessionId=<id|none>`
+- 不经过 waker 的普通用户会话无法自动注入，**请调上面的端点自查**。
+
 ## 信任与权限
 
 **信任档只在本机设置，中枢与对端都不能提升它**（代码注释原话：a remote message can never turn this machine into an unapproved execution surface）。远端能做的只有：在本机允许的档位内发消息。

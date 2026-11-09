@@ -2115,13 +2115,76 @@ export function apply(ctx, config) {
     return { parts, trust }
   }
 
+  // T-394: sessions this process created, so their FIRST prompt can carry the authoritative
+  // identity line (a default user session never passes through here and must ask the endpoint).
+  // sessionId -> { cwd } hint captured at creation (a just-created log may not carry it yet).
+  const identityPending = new Map()
+
+  /** The one thing a session may not infer: which workspace it belongs to and whether it leads it. */
+  function identityFor(sessionId, cwdHint = null) {
+    const session = listLocalSessions().find((item) => item.id === sessionId) ?? null
+    if (!session) return { ok: false, sessionId, reason: 'session not found on this machine' }
+    // A session created moments ago may not have its cwd in the log yet; use the hint.
+    const cwd = session.cwd ?? cwdHint ?? null
+    refreshWorkspacesFromDisk()
+    const matches = cwd
+      ? Object.entries(workspaces.workspaces)
+          .filter(([, entry]) => entry.cwd && workspaceKeyPath(entry.cwd) === workspaceKeyPath(cwd))
+          .map(([slug]) => slug)
+      : []
+    if (matches.length === 0) return { ok: false, sessionId, cwd, reason: `no registered workspace matches cwd ${cwd ?? '(none)'}` }
+    if (matches.length > 1) return { ok: false, sessionId, cwd, reason: `cwd matches several workspaces: ${matches.join(', ')}` }
+    const slug = matches[0]
+    const entry = workspaces.workspaces[slug]
+    // Coordinator is a registry fact and nothing else: not the session title, not the DSH
+    // workspace title (both have produced false positives).
+    const isCoordinator = entry.coordinator === sessionId
+    const role = (() => {
+      try {
+        return classifyRoleCandidates([session.title]).roles[0] ?? null
+      } catch {
+        return null
+      }
+    })()
+    return {
+      ok: true,
+      sessionId,
+      cwd,
+      workspace: slug,
+      isCoordinator,
+      coordinatorSessionId: entry.coordinator ?? null,
+      role,
+    }
+  }
+
+  function identityLine(sessionId, cwdHint = null) {
+    const identity = identityFor(sessionId, cwdHint)
+    if (!identity.ok) {
+      return `[身份] sessionId=${sessionId} workspace=unknown isCoordinator=false coordinatorSessionId=none（${identity.reason}；调 GET /mesh/session/identity?session=${sessionId} 复核）`
+    }
+    return `[身份] sessionId=${identity.sessionId} workspace=${identity.workspace} isCoordinator=${identity.isCoordinator} coordinatorSessionId=${identity.coordinatorSessionId ?? 'none'}`
+  }
+
   async function promptWithResume(sid, content, mode = 'queue') {
     // The controller's second parameter is the caller's AbortSignal and its internals
     // call signal.throwIfAborted(); omitting it throws a TypeError instead of a prompt.
     // mode 'steer' calls agent.steer() — the composer's 插队 action — while 'queue' turns
     // into followup() and waits for the running turn to finish.
     const controller = new AbortController()
-    const parts = typeof content === 'string' ? [{ type: 'text', text: content }] : content
+    const rawParts = typeof content === 'string' ? [{ type: 'text', text: content }] : content
+    // T-394: the first prompt of a session we created carries the authoritative identity line,
+    // exactly once; later messages are untouched.
+    const parts = (() => {
+      if (!identityPending.has(sid)) return rawParts
+      const hint = identityPending.get(sid)
+      identityPending.delete(sid)
+      const line = identityLine(sid, hint?.cwd ?? null)
+      const index = rawParts.findIndex((part) => part?.type === 'text')
+      if (index < 0) return [{ type: 'text', text: `${line}\n` }, ...rawParts]
+      const copy = rawParts.slice()
+      copy[index] = { ...copy[index], text: `${line}\n${copy[index].text}` }
+      return copy
+    })()
     const send = (payload) =>
       ctx.sessionController.prompt(
         {
@@ -2418,6 +2481,7 @@ export function apply(ctx, config) {
       )
       const sessionId = created?.sessionId ?? created?.id
       if (!sessionId) throw new Error('create returned no sessionId')
+      identityPending.set(sessionId, { cwd: workspacePath ?? null })
       const echoed = created?.workspacePath ?? created?.cwd ?? null
       if (workspacePath && echoed && String(echoed) !== String(workspacePath)) {
         fileLog(`WARN replacement session ${sessionId} workspace echo ${echoed} != ${workspacePath}`)
@@ -2590,6 +2654,7 @@ export function apply(ctx, config) {
       entry.createdAt = current
       entry.wakes = 0
       entry.title = titleFor(meta)
+      identityPending.set(entry.sessionId, { cwd: null })
       try {
         await ctx.sessionController.rename({ sessionId: entry.sessionId, title: entry.title })
       } catch (error) {
@@ -4859,6 +4924,7 @@ export function apply(ctx, config) {
     )
     const sessionId = created?.sessionId
     if (!sessionId) throw new Error('sessionController.create returned no sessionId')
+    identityPending.set(sessionId, { cwd: null })
     try {
       await ctx.sessionController.rename({ sessionId, title: name })
     } catch (error) {
@@ -5942,6 +6008,32 @@ export function apply(ctx, config) {
       return
     }
 
+    if (path === '/mesh/session/identity' && req.method === 'GET') {
+      // T-394: the authoritative answer to "am I this workspace's coordinator?" — the answer
+      // comes from workspaces.json only; titles are never consulted. Loopback because the
+      // reply includes a local cwd. ok:false + reason means "cannot tell", never a default.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      let sessionId = ''
+      try {
+        sessionId = String(new URL(req.url ?? '/', 'http://localhost').searchParams.get('session') ?? '').trim()
+      } catch {
+        sessionId = ''
+      }
+      if (!sessionId) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, reason: 'session query parameter is required' }))
+        return
+      }
+      const identity = identityFor(sessionId)
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(JSON.stringify(identity))
+      return
+    }
+
     if (path === '/mesh/sessions/create' && req.method === 'POST') {
       // Same mechanics the wake path uses (create + rename + prompt), exposed so a
       // coordinator session can spawn project workers without touching the UI.
@@ -5989,6 +6081,8 @@ export function apply(ctx, config) {
         )
         const sessionId = created?.sessionId
         if (!sessionId) throw new Error('sessionController.create returned no sessionId')
+        // T-394: the first prompt may be absent; keep the flag so the next one still gets it.
+        identityPending.set(sessionId, { cwd: workspacePath ?? null })
         try {
           await ctx.sessionController.rename({ sessionId, title })
         } catch (error) {
