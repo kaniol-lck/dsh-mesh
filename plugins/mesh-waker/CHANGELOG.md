@@ -11,6 +11,7 @@
 - 跨机任务消费（默认关闭）：开启后按自己的节奏拉取、认领、续租并结算对端派来的任务，正文按内容哈希取回，不落本地副本；`/mesh/status` 的 `tasksPoll` 报告开关、最近拉取时间与错误。
 - 跨机派活（`dsh-mesh-dispatch --transport hub --to <agent>`）：正文上传为 blob、任务落到 hub，本机只留一行引用（不含正文、不建会话）；`--dry-run` 零网络，hub 失败时退出码非 0 且不留引用行。
 - 会话身份端点 `GET /mesh/session/identity?session=<id>`：以工作区注册表为准回答「是不是本区协调」（不看标题），waker 自建会话的首个 prompt 带一行 `[身份]` 头。
+- 多协调认领协议：`POST /mesh/coordinator/{claim,approve,reject,release,heartbeat}`，`coordinators[]` 支持多协调同时在线（上限可配）、待批准 TTL、租约与 primary 顺位；空工作区首任按 bootstrap 规则批准（配置 owner token 时必须带）。
 
 ### Fixed
 

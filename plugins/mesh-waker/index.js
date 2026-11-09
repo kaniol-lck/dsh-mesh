@@ -38,6 +38,7 @@ import { createThreads } from './lib/threads.mjs'
 import { createTaskRegistry } from './lib/task-registry.mjs'
 import { createTaskLifecycle } from './lib/task-lifecycle.mjs'
 import { createHubTaskConsumer } from './lib/hub-tasks.mjs'
+import { normalizeCoordinators, coordinatorsView, expireCoordinators, syncPrimary, primaryOf, isOwnerTokenValid, recordAudit } from './lib/coordinators.mjs'
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
 export { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
@@ -605,6 +606,13 @@ function normalizeBase(config) {
     tasksPollEnabled: c.tasksPollEnabled === true,
     tasksPollIntervalMs: clampInterval(c.tasksPollIntervalMs, clampInterval(c.pollIntervalMs, 60000, 1000, 86_400_000), 1000, 86_400_000),
     taskLeaseMs: clampInterval(c.taskLeaseMs, 600000, 60000, 3_600_000),
+    // Multi-coordinator claim protocol (T-395): bounded online coordinators, a lease per
+    // member, and a pending TTL. The owner token file (when configured) is required for the
+    // first claim in an empty workspace and for approve/reject/release by the owner.
+    maxCoordinatorsPerWorkspace: clampInterval(c.maxCoordinatorsPerWorkspace, 3, 1, 20),
+    coordinatorLeaseMs: clampInterval(c.coordinatorLeaseMs, 600000, 60000, 3_600_000),
+    coordinatorPendingTtlMs: clampInterval(c.coordinatorPendingTtlMs, 1_800_000, 60_000, 86_400_000),
+    coordinatorOwnerTokenFile: c.coordinatorOwnerTokenFile ? String(c.coordinatorOwnerTokenFile) : '',
     batchFile: c.batchFile ? String(c.batchFile) : join(homedir(), '.dsh', 'mesh-waker', 'batches.json'),
     // Layer-1 task registry retention: rows older than N days or beyond M rows are pruned.
     tasksRetentionDays: clampInterval(c.tasksRetentionDays, 30, 1, 3650),
@@ -2137,8 +2145,26 @@ export function apply(ctx, config) {
     const slug = matches[0]
     const entry = workspaces.workspaces[slug]
     // Coordinator is a registry fact and nothing else: not the session title, not the DSH
-    // workspace title (both have produced false positives).
-    const isCoordinator = entry.coordinator === sessionId
+    // workspace title (both have produced false positives). T-395: being *approved* in
+    // coordinators[] is what counts; legacy entries without the array still compare the field.
+    const members = normalizeCoordinators(entry.coordinators ?? [])
+    // Expire on a copy: an expired lease or TTL means "not a coordinator" without writing
+    // during a read (the mutation endpoints persist the cleanup).
+    expireCoordinators(members, { now: Date.now(), pendingTtlMs: c.coordinatorPendingTtlMs })
+    const member = members.find((item) => item.sessionId === sessionId) ?? null
+    // The scalar field is only a legacy fallback for entries that never used coordinators[]
+    // (an expired array must read as "no coordinator", not fall back to the stale scalar).
+    const legacyPrimary = !Array.isArray(entry.coordinators) && entry.coordinator === sessionId
+    const coordinatorStatus = member ? member.status : legacyPrimary ? 'approved' : 'none'
+    const isCoordinator = coordinatorStatus === 'approved'
+    const isPrimary = member ? member.isPrimary === true && isCoordinator : legacyPrimary
+    // Report the *current* primary, not the stale scalar left in the file after an expiry.
+    const primaryMember = primaryOf(members)
+    const coordinatorSessionId = primaryMember
+      ? primaryMember.sessionId
+      : !Array.isArray(entry.coordinators)
+        ? (entry.coordinator ?? null)
+        : null
     const role = (() => {
       try {
         return classifyRoleCandidates([session.title]).roles[0] ?? null
@@ -2152,7 +2178,9 @@ export function apply(ctx, config) {
       cwd,
       workspace: slug,
       isCoordinator,
-      coordinatorSessionId: entry.coordinator ?? null,
+      coordinatorStatus,
+      isPrimary,
+      coordinatorSessionId,
       role,
     }
   }
@@ -3334,6 +3362,11 @@ export function apply(ctx, config) {
         ? { rolesUnrecognized: value.rolesUnrecognized.map(String).slice(0, ROLE_UNRECOGNIZED_MAX) }
         : {}),
       ...(Object.keys(workers).length ? { workers } : {}),
+      // Multi-coordinator claim protocol (T-395): the array is the truth, `coordinator`
+      // remains the primary's sessionId for legacy readers.
+      ...(Array.isArray(value.coordinators) && value.coordinators.length
+        ? { coordinators: normalizeCoordinators(value.coordinators) }
+        : {}),
       ...(typeof value.slug === 'string' && value.slug ? { slug: String(value.slug) } : {}),
       ...(value.ephemeral === true ? { ephemeral: true } : {}),
     }
@@ -3693,36 +3726,48 @@ export function apply(ctx, config) {
     for (const [slug, list] of sessionsBySlug) {
       const entry = workspaces.workspaces[slug]
       if (!entry) continue
-      // T-376: an archived session must never be derived as the coordinator. A just-archived
-      // test session can still be live and have the newest last_active, and DSH refuses to
-      // delete live sessions — derivation is the only place that can exclude it.
-      const coordinators = list.filter((session) => isCoordinatorTitle(session.title) && session.archived !== true)
-      coordinators.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
-      const coordinator = coordinators[0] ?? null
-      const nextCoordinator = coordinator ? coordinator.id : null
-      const previousCoordinator = entry.coordinator ?? null
-      if (previousCoordinator !== nextCoordinator) {
-        if (nextCoordinator) entry.coordinator = nextCoordinator
-        else delete entry.coordinator
-        changed = true
-        // Correction of a retired/pointless binding must be visible in the log (T-287).
-        fileLog(`workspace ${slug} coordinator ${previousCoordinator ?? '(none)'} -> ${nextCoordinator ?? '(none)'}`)
-        changed = true
-      }
-      if (nextCoordinator) {
-        const idleMs = Date.now() - Number(coordinator.last_active ?? 0)
-        const stale = idleMs > 7 * 24 * 60 * 60 * 1000
-        if (stale && entry.coordinatorStale !== true) {
-          entry.coordinatorStale = true
+      // T-395: an explicit claim list is the truth. Only legacy entries (no coordinators[])
+      // fall back to deriving a coordinator from session titles.
+      const claimedMembers = Array.isArray(entry.coordinators) ? entry.coordinators : []
+      if (claimedMembers.length) {
+        const expired = expireCoordinators(claimedMembers, { now: Date.now(), pendingTtlMs: c.coordinatorPendingTtlMs })
+        entry.coordinators = claimedMembers
+        const beforeCoordinator = entry.coordinator ?? null
+        const { primary } = syncPrimary(entry)
+        if (expired || beforeCoordinator !== (entry.coordinator ?? null)) changed = true
+        if (expired) fileLog(`workspace ${slug} coordinators expired (primary=${primary?.sessionId ?? 'none'})`)
+      } else {
+        // T-376: an archived session must never be derived as the coordinator. A just-archived
+        // test session can still be live and have the newest last_active, and DSH refuses to
+        // delete live sessions — derivation is the only place that can exclude it.
+        const coordinators = list.filter((session) => isCoordinatorTitle(session.title) && session.archived !== true)
+        coordinators.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
+        const coordinator = coordinators[0] ?? null
+        const nextCoordinator = coordinator ? coordinator.id : null
+        const previousCoordinator = entry.coordinator ?? null
+        if (previousCoordinator !== nextCoordinator) {
+          if (nextCoordinator) entry.coordinator = nextCoordinator
+          else delete entry.coordinator
           changed = true
-          fileLog(`WARN workspace ${slug} coordinator idle for ${Math.round(idleMs / 86400000)}d: ${nextCoordinator}`)
-        } else if (!stale && entry.coordinatorStale === true) {
+          // Correction of a retired/pointless binding must be visible in the log (T-287).
+          fileLog(`workspace ${slug} coordinator ${previousCoordinator ?? '(none)'} -> ${nextCoordinator ?? '(none)'}`)
+          changed = true
+        }
+        if (nextCoordinator) {
+          const idleMs = Date.now() - Number(coordinator.last_active ?? 0)
+          const stale = idleMs > 7 * 24 * 60 * 60 * 1000
+          if (stale && entry.coordinatorStale !== true) {
+            entry.coordinatorStale = true
+            changed = true
+            fileLog(`WARN workspace ${slug} coordinator idle for ${Math.round(idleMs / 86400000)}d: ${nextCoordinator}`)
+          } else if (!stale && entry.coordinatorStale === true) {
+            delete entry.coordinatorStale
+            changed = true
+          }
+        } else if (entry.coordinatorStale === true) {
           delete entry.coordinatorStale
           changed = true
         }
-      } else if (entry.coordinatorStale === true) {
-        delete entry.coordinatorStale
-        changed = true
       }
       // Roles come only from the whitelist (T-295). A `·` suffix that is not a known role is
       // a title fragment: it is parked in rolesUnrecognized instead of roles. Roles a human
@@ -5447,6 +5492,31 @@ export function apply(ctx, config) {
       }
       const view = {}
       for (const [slug, entry] of Object.entries(workspaces.workspaces)) {
+        // T-395: the claim list is computed for the response (expiry without writing on read).
+        const members = normalizeCoordinators(entry.coordinators ?? [])
+        if (members.length) {
+          expireCoordinators(members, { now: Date.now(), pendingTtlMs: c.coordinatorPendingTtlMs })
+          const copy = { ...entry, coordinators: members }
+          syncPrimary(copy)
+          const coordinatorFields = {
+            coordinators: coordinatorsView(members),
+            ...(copy.coordinator ? { coordinator: copy.coordinator } : { coordinator: null }),
+          }
+          if (!entry.workers || typeof entry.workers !== 'object') {
+            view[slug] = { ...entry, ...coordinatorFields }
+            continue
+          }
+          const workers = {}
+          for (const [role, worker] of Object.entries(entry.workers)) {
+            const session = sessionsById.get(worker.sessionId)
+            const missing = !session
+            const archived = missing ? false : session.archived === true
+            const dormant = !missing && !archived && session.live !== true
+            workers[role] = { ...worker, missing, archived, dormant, stale: missing || archived }
+          }
+          view[slug] = { ...entry, ...coordinatorFields, workers }
+          continue
+        }
         if (!entry.workers || typeof entry.workers !== 'object') {
           view[slug] = entry
           continue
@@ -6031,6 +6101,288 @@ export function apply(ctx, config) {
       const identity = identityFor(sessionId)
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
       res.end(JSON.stringify(identity))
+      return
+    }
+
+    // ---- T-395: multi-coordinator claim protocol (loopback; the registry is the truth) ----
+    // All mutations refresh from disk first, then write through the T-370 dirty-merge path, so
+    // an external edit is never silently overwritten and two claims cannot both "win".
+    const mutateCoordinatorRegistry = (slug, mutate) => {
+      refreshWorkspacesFromDisk()
+      const entry = workspaces.workspaces[slug]
+      if (!entry) return { ok: false, status: 404, body: { ok: false, error: `workspace ${slug} is not registered` } }
+      const members = normalizeCoordinators(entry.coordinators ?? [])
+      // Legacy entry (only the scalar coordinator field): seed it as approved so the first
+      // claim cannot silently take over a running workspace.
+      if (!members.length && entry.coordinator) {
+        members.push({
+          sessionId: String(entry.coordinator),
+          isPrimary: true,
+          status: 'approved',
+          claimedAt: 0,
+          leaseUntil: null,
+          approvedBy: 'legacy',
+          requestedAt: 0,
+        })
+      }
+      const expired = expireCoordinators(members, { now: Date.now(), pendingTtlMs: c.coordinatorPendingTtlMs })
+      const result = mutate(members, entry)
+      if (!result.ok) return result
+      entry.coordinators = members
+      const before = entry.coordinator ?? null
+      syncPrimary(entry)
+      const after = entry.coordinator ?? null
+      dirtyWorkspaces.add(slug)
+      saveWorkspaces()
+      if (expired) recordAudit(fileLog, 'coordinators.expired', { slug })
+      if (before !== after) recordAudit(fileLog, 'primary.changed', { slug, from: before ?? 'none', to: after ?? 'none' })
+      return { ok: true, slug, entry, primary: after, members }
+    }
+
+    const readCoordinatorBody = async () => {
+      const raw = await readRequestBuffer()
+      if (!raw) return null
+      try {
+        return JSON.parse(raw.toString('utf8') || '{}')
+      } catch {
+        return { __parseError: true }
+      }
+    }
+    const sendCoordinator = (res, status, body) => {
+      res.writeHead(status, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(JSON.stringify(body))
+    }
+
+    if (path === '/mesh/coordinator/claim' && req.method === 'POST') {
+      if (!fromLoopback(req)) {
+        sendCoordinator(res, 403, { ok: false, error: 'loopback only' })
+        return
+      }
+      const draft = await readCoordinatorBody()
+      if (!draft || draft.__parseError) {
+        sendCoordinator(res, 400, { ok: false, error: 'invalid JSON body' })
+        return
+      }
+      const sessionId = String(draft.session ?? '').trim()
+      if (!sessionId) {
+        sendCoordinator(res, 400, { ok: false, error: 'session is required' })
+        return
+      }
+      let slug = String(draft.slug ?? '').trim()
+      if (!slug) {
+        const identity = identityFor(sessionId)
+        if (!identity.ok) {
+          sendCoordinator(res, 400, { ok: false, error: identity.reason })
+          return
+        }
+        slug = identity.workspace
+      }
+      const ownerOk = isOwnerTokenValid(c.coordinatorOwnerTokenFile, draft.ownerToken, readFileSync)
+      const outcome = mutateCoordinatorRegistry(slug, (members) => {
+        if (members.some((member) => member.sessionId === sessionId)) {
+          return { ok: false, status: 409, body: { ok: false, error: 'session already claimed this workspace', coordinators: coordinatorsView(members) } }
+        }
+        const approvedCount = members.filter((member) => member.status === 'approved').length
+        if (approvedCount >= c.maxCoordinatorsPerWorkspace) {
+          return {
+            ok: false,
+            status: 409,
+            body: {
+              ok: false,
+              error: `workspace already has ${approvedCount} coordinators (limit ${c.maxCoordinatorsPerWorkspace})`,
+              coordinators: coordinatorsView(members),
+            },
+          }
+        }
+        const bootstrap = approvedCount === 0
+        if (bootstrap && c.coordinatorOwnerTokenFile && !ownerOk) {
+          return { ok: false, status: 403, body: { ok: false, error: 'empty workspace bootstrap requires ownerToken' } }
+        }
+        const autoApprove = bootstrap && !c.coordinatorOwnerTokenFile
+        const approved = autoApprove || ownerOk
+        const now = Date.now()
+        const member = {
+          sessionId,
+          ...(draft.channel ? { channel: String(draft.channel).slice(0, 40) } : {}),
+          isPrimary: false,
+          status: approved ? 'approved' : 'pending',
+          claimedAt: approved ? now : null,
+          leaseUntil: approved ? now + c.coordinatorLeaseMs : null,
+          ...(autoApprove ? { approvedBy: 'bootstrap' } : approved ? { approvedBy: 'owner' } : {}),
+          requestedAt: now,
+        }
+        members.push(member)
+        if (autoApprove) {
+          fileLog(`WARN workspace ${slug} bootstrap auto-approved coordinator ${sessionId} (no coordinatorOwnerTokenFile configured; v0 limitation)`)
+        }
+        recordAudit(fileLog, 'coordinator.claim', { slug, session: sessionId, status: member.status, channel: draft.channel ?? '-' })
+        return { ok: true }
+      })
+      if (!outcome.ok) {
+        sendCoordinator(res, outcome.status, outcome.body)
+        return
+      }
+      sendCoordinator(res, 201, {
+        ok: true,
+        slug,
+        sessionId,
+        status: outcome.entry.coordinators.find((member) => member.sessionId === sessionId)?.status ?? null,
+        primary: outcome.primary,
+        coordinators: coordinatorsView(outcome.entry.coordinators),
+      })
+      return
+    }
+
+    if ((path === '/mesh/coordinator/approve' || path === '/mesh/coordinator/reject') && req.method === 'POST') {
+      if (!fromLoopback(req)) {
+        sendCoordinator(res, 403, { ok: false, error: 'loopback only' })
+        return
+      }
+      const draft = await readCoordinatorBody()
+      if (!draft || draft.__parseError) {
+        sendCoordinator(res, 400, { ok: false, error: 'invalid JSON body' })
+        return
+      }
+      const sessionId = String(draft.session ?? '').trim()
+      const slug = String(draft.slug ?? '').trim()
+      if (!sessionId || !slug) {
+        sendCoordinator(res, 400, { ok: false, error: 'session and slug are required' })
+        return
+      }
+      const by = String(draft.by ?? '').trim()
+      const ownerOk = isOwnerTokenValid(c.coordinatorOwnerTokenFile, draft.ownerToken, readFileSync)
+      const approving = path.endsWith('/approve')
+      const outcome = mutateCoordinatorRegistry(slug, (members) => {
+        const target = members.find((member) => member.sessionId === sessionId)
+        if (!target) {
+          return { ok: false, status: 404, body: { ok: false, error: 'no claim for that session', coordinators: coordinatorsView(members) } }
+        }
+        const byApproved = Boolean(by) && members.some((member) => member.sessionId === by && member.status === 'approved')
+        if (!byApproved && !ownerOk) {
+          return {
+            ok: false,
+            status: 403,
+            body: { ok: false, error: 'approval requires an approved coordinator (by) or ownerToken' },
+          }
+        }
+        if (approving) {
+          if (target.status === 'approved') {
+            return { ok: false, status: 409, body: { ok: false, error: 'already approved', coordinators: coordinatorsView(members) } }
+          }
+          const approvedCount = members.filter((member) => member.status === 'approved').length
+          if (approvedCount >= c.maxCoordinatorsPerWorkspace) {
+            return {
+              ok: false,
+              status: 409,
+              body: {
+                ok: false,
+                error: `workspace already has ${approvedCount} coordinators (limit ${c.maxCoordinatorsPerWorkspace})`,
+                coordinators: coordinatorsView(members),
+              },
+            }
+          }
+          const now = Date.now()
+          target.status = 'approved'
+          target.claimedAt = now
+          target.leaseUntil = now + c.coordinatorLeaseMs
+          target.approvedBy = byApproved ? by : 'owner'
+          recordAudit(fileLog, 'coordinator.approve', { slug, session: sessionId, by: target.approvedBy })
+          return { ok: true }
+        }
+        const index = members.indexOf(target)
+        members.splice(index, 1)
+        recordAudit(fileLog, 'coordinator.reject', { slug, session: sessionId, by: byApproved ? by : 'owner' })
+        return { ok: true }
+      })
+      if (!outcome.ok) {
+        sendCoordinator(res, outcome.status, outcome.body)
+        return
+      }
+      sendCoordinator(res, 200, {
+        ok: true,
+        slug,
+        action: approving ? 'approve' : 'reject',
+        sessionId,
+        primary: outcome.primary,
+        coordinators: coordinatorsView(outcome.entry.coordinators),
+      })
+      return
+    }
+
+    if (path === '/mesh/coordinator/release' && req.method === 'POST') {
+      if (!fromLoopback(req)) {
+        sendCoordinator(res, 403, { ok: false, error: 'loopback only' })
+        return
+      }
+      const draft = await readCoordinatorBody()
+      if (!draft || draft.__parseError) {
+        sendCoordinator(res, 400, { ok: false, error: 'invalid JSON body' })
+        return
+      }
+      const sessionId = String(draft.session ?? '').trim()
+      const slug = String(draft.slug ?? '').trim()
+      if (!sessionId || !slug) {
+        sendCoordinator(res, 400, { ok: false, error: 'session and slug are required' })
+        return
+      }
+      const ownerOk = isOwnerTokenValid(c.coordinatorOwnerTokenFile, draft.ownerToken, readFileSync)
+      const outcome = mutateCoordinatorRegistry(slug, (members) => {
+        const target = members.find((member) => member.sessionId === sessionId)
+        if (!target) {
+          return { ok: false, status: 404, body: { ok: false, error: 'session is not a coordinator of that workspace', coordinators: coordinatorsView(members) } }
+        }
+        // Releasing yourself needs no token; releasing someone else does.
+        const self = String(draft.session) === sessionId
+        if (!self && !ownerOk) {
+          return { ok: false, status: 403, body: { ok: false, error: 'releasing another session requires ownerToken' } }
+        }
+        members.splice(members.indexOf(target), 1)
+        recordAudit(fileLog, 'coordinator.release', { slug, session: sessionId, by: self ? sessionId : 'owner' })
+        return { ok: true }
+      })
+      if (!outcome.ok) {
+        sendCoordinator(res, outcome.status, outcome.body)
+        return
+      }
+      sendCoordinator(res, 200, {
+        ok: true,
+        slug,
+        sessionId,
+        primary: outcome.primary,
+        coordinators: coordinatorsView(outcome.entry.coordinators),
+      })
+      return
+    }
+
+    if (path === '/mesh/coordinator/heartbeat' && req.method === 'POST') {
+      if (!fromLoopback(req)) {
+        sendCoordinator(res, 403, { ok: false, error: 'loopback only' })
+        return
+      }
+      const draft = await readCoordinatorBody()
+      if (!draft || draft.__parseError) {
+        sendCoordinator(res, 400, { ok: false, error: 'invalid JSON body' })
+        return
+      }
+      const sessionId = String(draft.session ?? '').trim()
+      const slug = String(draft.slug ?? '').trim()
+      if (!sessionId || !slug) {
+        sendCoordinator(res, 400, { ok: false, error: 'session and slug are required' })
+        return
+      }
+      const outcome = mutateCoordinatorRegistry(slug, (members) => {
+        const target = members.find((member) => member.sessionId === sessionId)
+        if (!target || target.status !== 'approved') {
+          return { ok: false, status: 404, body: { ok: false, error: 'not an approved coordinator of that workspace' } }
+        }
+        target.leaseUntil = Date.now() + c.coordinatorLeaseMs
+        return { ok: true }
+      })
+      if (!outcome.ok) {
+        sendCoordinator(res, outcome.status, outcome.body)
+        return
+      }
+      sendCoordinator(res, 200, { ok: true, slug, sessionId, leaseUntil: Date.now() + c.coordinatorLeaseMs })
       return
     }
 

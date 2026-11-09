@@ -179,6 +179,10 @@ dsh plugin --profile web add dsh-mesh-waker
 | `tasksPollEnabled` | `false` | 跨机任务消费（T1 P5）：开启后按 `tasksPollIntervalMs` 拉 `GET /api/tasks?agent=<自己>&status=pending`，认领 → 取 blob 正文（hub 以 `application/octet-stream` 原始流返回，不是 JSON）→ 投递 → 心跳续租 → 结算；hub 未升级到 0.8.1 前保持关闭 |
 | `tasksPollIntervalMs` | 同 `pollIntervalMs` | 跨机任务拉取间隔（毫秒，1000–86400000） |
 | `taskLeaseMs` | `600000` | 任务租约（毫秒，60000–3600000）；执行期间按 `lease/2` 心跳续租 |
+| `maxCoordinatorsPerWorkspace` | `3` | 同一工作区允许同时在线的协调数量上限（1–20）；超过后 claim 返回 409 + 现有列表 |
+| `coordinatorLeaseMs` | `600000` | 协调租约（毫秒，60000–3600000）；执行期间按 `/mesh/coordinator/heartbeat` 续期，过期转 stale |
+| `coordinatorPendingTtlMs` | `1800000` | 待批准认领的存活时间（毫秒，60000–86400000），过期自动失效 |
+| `coordinatorOwnerTokenFile` | 空 | owner 批准令牌文件路径（JSON `{token}` 或纯文本）；配置后空工作区首次 claim 必须带 `ownerToken`，否则首任自动批准（v0 限制，README 有说明） |
 | `compactTaskText` | `true` | 启动时把仍内嵌正文的任务行迁移为 `textRef`（内容寻址存 `texts/<sha256>.txt`）；迁移失败不改写任务库 |
 | `storageTiers` | `true` | 任务/回执按工作区分层存放（区内 `ws/<slug>/`、跨区 `local/`）；首次启动把旧单文件拆分并保留 `*.legacy.jsonl` |
 | `requireNamespacedIds` | `false` | 跨区任务（落 `local/`）的单号建议带命名空间（如 `dsh-mesh/T-123`）；默认只 WARN，设 `true` 时拒绝裸 `T-…` 单号 |
@@ -222,6 +226,29 @@ curl.exe -s "http://127.0.0.1:8795/mesh/session/identity?session=<自己的 sess
 - waker 自己创建的会话（`/mesh/sessions/create`、`mesh_dispatch --create`、收件箱会话等）会在**首个 prompt** 前带一行身份头，之后不再重复：
   `[身份] sessionId=<id> workspace=<slug> isCoordinator=true|false coordinatorSessionId=<id|none>`
 - 不经过 waker 的普通用户会话无法自动注入，**请调上面的端点自查**。
+
+### 协调认领（多协调在线，2026-11-10）
+
+默认新建的会话**不会自动**成为协调；必须显式认领并获批：
+
+```bash
+# 1) 认领（body: session / slug / channel / ownerToken?）
+curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/claim -d '{"session":"<自己的 id>","channel":"chat"}'
+#    → {"ok":true,"slug":"dsh-mesh","status":"pending","coordinators":[…]}
+
+# 2) 批准（已批准的协调用 by，或 owner 用 ownerToken）
+curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/approve -d '{"session":"<被批准者>","slug":"dsh-mesh","by":"<已批准的协调 id>"}'
+# 3) 拒绝 / 交回 / 续租
+curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/reject  -d '{"session":"<id>","slug":"dsh-mesh","by":"<协调 id>"}'
+curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/release -d '{"session":"<id>","slug":"dsh-mesh"}'
+curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/heartbeat -d '{"session":"<id>","slug":"dsh-mesh"}'
+```
+
+- 数据模型：`workspaces.json.<slug>.coordinators[]`（`sessionId / channel / isPrimary / status / claimedAt / leaseUntil / approvedBy / requestedAt`），`coordinator` 字段始终等于 primary；
+- 同一工作区**允许多个协调同时在线**，上限 `maxCoordinatorsPerWorkspace`（默认 3），超出 claim 返回 409 + 现有列表；
+- **空工作区 bootstrap**：配置了 `coordinatorOwnerTokenFile` 时必须带 `ownerToken`；未配置时首任自动批准并标记 `approvedBy:"bootstrap"` + 写 WARN 日志（**v0 限制**，后续接 owner 审批）；
+- 待批准项 30 分钟 TTL（`coordinatorPendingTtlMs`）；租约过期转 `stale` 并可再次认领；primary 失效时按 `claimedAt` 最早顺位；
+- 身份端点据此回答：`isCoordinator` = 在 **approved** 的 `coordinators[]` 中，另返回 `coordinatorStatus` 与 `isPrimary`。
 
 ## 信任与权限
 

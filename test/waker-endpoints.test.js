@@ -7322,6 +7322,150 @@ async function main() {
     report('identity: a created session gets the identity line on its first prompt only', ok, `first=${/\[身份\]/.test(firstText)} second=${/\[身份\]/.test(secondText)} prompts=${all.length} snippet=${firstText.slice(0, 220)}`)
   })
 
+  // ---- T-395: multi-coordinator claim protocol ----
+  const coordPost = (base, action, body) => request(base, `/mesh/coordinator/${action}`, { method: 'POST', body })
+  const coordWorkspace = (id) => path.join(os.tmpdir(), 'Projects', `coord-${id}`, 'public')
+  const seedCoordWorkspace = (h, slug, cwd) => {
+    const registry = registryOf(h)
+    registry.workspaces[slug] = { cwd }
+    fs.writeFileSync(workspacesFileOf(h), `${JSON.stringify(registry, null, 2)}\n`)
+  }
+
+  await runCase('coordinators: an empty workspace bootstraps its first coordinator', async (boot) => {
+    const cwd = coordWorkspace('boot')
+    const logFile = path.join(os.tmpdir(), `waker-coord-boot-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile },
+      seedSessions: [{ id: 'session-coord-a', title: 'plain session', cwd }],
+    })
+    seedCoordWorkspace(h, 'coord-boot', cwd)
+    const claimed = await coordPost(h.base, 'claim', { session: 'session-coord-a', channel: 'chat' })
+    const entry = registryOf(h).workspaces?.['coord-boot'] ?? {}
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok =
+      claimed.status === 201 &&
+      claimed.json?.status === 'approved' &&
+      entry.coordinator === 'session-coord-a' &&
+      entry.coordinators?.length === 1 &&
+      entry.coordinators[0].approvedBy === 'bootstrap' &&
+      entry.coordinators[0].isPrimary === true &&
+      /WARN .*bootstrap auto-approved/.test(log)
+    report('coordinators: an empty workspace bootstraps its first coordinator', ok, `status=${claimed.json?.status} approvedBy=${entry.coordinators?.[0]?.approvedBy ?? '-'} primary=${entry.coordinator ?? '-'}`)
+  })
+
+  await runCase('coordinators: bootstrap requires the owner token when configured', async (boot) => {
+    const cwd = coordWorkspace('token')
+    const tokenFile = path.join(os.tmpdir(), `waker-owner-token-${process.pid}-${Date.now()}.json`)
+    fs.writeFileSync(tokenFile, JSON.stringify({ token: 'own-secret' }))
+    const h = await boot({
+      config: { coordinatorOwnerTokenFile: tokenFile },
+      seedSessions: [{ id: 'session-coord-t', title: 'plain session', cwd }],
+    })
+    seedCoordWorkspace(h, 'coord-token', cwd)
+    const denied = await coordPost(h.base, 'claim', { session: 'session-coord-t' })
+    const granted = await coordPost(h.base, 'claim', { session: 'session-coord-t', ownerToken: 'own-secret' })
+    const entry = registryOf(h).workspaces?.['coord-token'] ?? {}
+    const ok =
+      denied.status === 403 &&
+      /ownerToken/.test(denied.json?.error ?? '') &&
+      granted.status === 201 &&
+      granted.json?.status === 'approved' &&
+      entry.coordinators?.[0]?.approvedBy === 'owner'
+    report('coordinators: bootstrap requires the owner token when configured', ok, `denied=${denied.status} granted=${granted.status}/${entry.coordinators?.[0]?.approvedBy ?? '-'}`)
+  })
+
+  await runCase('coordinators: a second coordinator is approved and both stay online', async (boot) => {
+    const cwd = coordWorkspace('two')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-coord-1', title: 'plain one', cwd },
+        { id: 'session-coord-2', title: 'plain two', cwd },
+      ],
+    })
+    seedCoordWorkspace(h, 'coord-two', cwd)
+    const first = await coordPost(h.base, 'claim', { session: 'session-coord-1' })
+    const second = await coordPost(h.base, 'claim', { session: 'session-coord-2' })
+    const identityPending = await request(h.base, '/mesh/session/identity?session=session-coord-2')
+    const approved = await coordPost(h.base, 'approve', { session: 'session-coord-2', slug: 'coord-two', by: 'session-coord-1' })
+    const identityApproved = await request(h.base, '/mesh/session/identity?session=session-coord-2')
+    const identityPrimary = await request(h.base, '/mesh/session/identity?session=session-coord-1')
+    const entry = registryOf(h).workspaces?.['coord-two'] ?? {}
+    const ok =
+      first.json?.status === 'approved' &&
+      second.json?.status === 'pending' &&
+      identityPending.json?.isCoordinator === false &&
+      identityPending.json?.coordinatorStatus === 'pending' &&
+      approved.status === 200 &&
+      entry.coordinators?.length === 2 &&
+      identityApproved.json?.isCoordinator === true &&
+      identityApproved.json?.isPrimary === false &&
+      identityPrimary.json?.isPrimary === true
+    report('coordinators: a second coordinator is approved and both stay online', ok, `coordinators=${entry.coordinators?.length} identityApproved=${identityApproved.json?.isCoordinator} isPrimary(first)=${identityPrimary.json?.isPrimary}`)
+  })
+
+  await runCase('coordinators: the limit, reject, release and primary promotion', async (boot) => {
+    const cwd = coordWorkspace('limit')
+    const h = await boot({
+      config: { maxCoordinatorsPerWorkspace: 2 },
+      seedSessions: [
+        { id: 'session-c-limit-1', title: 'plain 1', cwd },
+        { id: 'session-c-limit-2', title: 'plain 2', cwd },
+        { id: 'session-c-limit-3', title: 'plain 3', cwd },
+      ],
+    })
+    seedCoordWorkspace(h, 'coord-limit', cwd)
+    await coordPost(h.base, 'claim', { session: 'session-c-limit-1' })
+    await coordPost(h.base, 'claim', { session: 'session-c-limit-2' })
+    await coordPost(h.base, 'approve', { session: 'session-c-limit-2', slug: 'coord-limit', by: 'session-c-limit-1' })
+    const overLimit = await coordPost(h.base, 'claim', { session: 'session-c-limit-3' })
+    const released = await coordPost(h.base, 'release', { session: 'session-c-limit-1', slug: 'coord-limit' })
+    const afterRelease = registryOf(h).workspaces?.['coord-limit'] ?? {}
+    const identityPromoted = await request(h.base, '/mesh/session/identity?session=session-c-limit-2')
+    const rejected = await coordPost(h.base, 'reject', { session: 'session-c-limit-2', slug: 'coord-limit', by: 'session-nobody' })
+    const ok =
+      overLimit.status === 409 &&
+      /limit 2/.test(overLimit.json?.error ?? '') &&
+      (overLimit.json?.coordinators?.length ?? 0) === 2 &&
+      released.status === 200 &&
+      afterRelease.coordinator === 'session-c-limit-2' &&
+      identityPromoted.json?.isPrimary === true &&
+      rejected.status === 403
+    report(
+      'coordinators: the limit, reject, release and primary promotion',
+      ok,
+      `limit=${overLimit.status} primaryAfterRelease=${afterRelease.coordinator ?? '-'} promotedPrimary=${identityPromoted.json?.isPrimary}`,
+    )
+  })
+
+  await runCase('coordinators: an expired lease is not a coordinator and can be claimed again', async (boot) => {
+    const cwd = coordWorkspace('lease')
+    const h = await boot({ seedSessions: [{ id: 'session-c-lease', title: 'plain lease', cwd }] })
+    seedCoordWorkspace(h, 'coord-lease', cwd)
+    await coordPost(h.base, 'claim', { session: 'session-c-lease' })
+    const registry = registryOf(h)
+    registry.workspaces['coord-lease'].coordinators[0].leaseUntil = Date.now() - 1000
+    fs.writeFileSync(workspacesFileOf(h), `${JSON.stringify(registry, null, 2)}\n`)
+    const identity = await request(h.base, '/mesh/session/identity?session=session-c-lease')
+    const workspacesView = await request(h.base, '/mesh/workspaces')
+    const reclaimed = await coordPost(h.base, 'claim', { session: 'session-c-lease' })
+    const ok =
+      identity.json?.isCoordinator === false &&
+      identity.json?.coordinatorStatus === 'none' &&
+      (workspacesView.json?.workspaces?.['coord-lease']?.coordinators?.length ?? 0) === 0 &&
+      reclaimed.status === 201
+    report('coordinators: an expired lease is not a coordinator and can be claimed again', ok, `identity=${identity.json?.coordinatorStatus} view=${workspacesView.json?.workspaces?.['coord-lease']?.coordinators?.length ?? 0} reclaim=${reclaimed.status}`)
+  })
+
+  await runCase('coordinators: a duplicate claim is refused with the current list', async (boot) => {
+    const cwd = coordWorkspace('dup')
+    const h = await boot({ seedSessions: [{ id: 'session-c-dup', title: 'plain dup', cwd }] })
+    seedCoordWorkspace(h, 'coord-dup', cwd)
+    await coordPost(h.base, 'claim', { session: 'session-c-dup' })
+    const again = await coordPost(h.base, 'claim', { session: 'session-c-dup' })
+    const ok = again.status === 409 && /already claimed/.test(again.json?.error ?? '') && (again.json?.coordinators?.length ?? 0) === 1
+    report('coordinators: a duplicate claim is refused with the current list', ok, `status=${again.status} list=${again.json?.coordinators?.length ?? 0}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
