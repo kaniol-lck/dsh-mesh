@@ -4353,13 +4353,22 @@ export function apply(ctx, config) {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(15000),
     })
+    // Blob downloads are the raw file stream (application/octet-stream), not JSON (T-392):
+    // read the body as text first, then try to parse it. JSON endpoints look identical to
+    // before; the blob body is available on `.text`.
+    let text = ''
+    try {
+      text = await res.text()
+    } catch {
+      text = ''
+    }
     let json = null
     try {
-      json = await res.json()
+      json = text ? JSON.parse(text) : null
     } catch {
       json = null
     }
-    return { ok: res.ok, status: res.status, json }
+    return { ok: res.ok, status: res.status, json, text }
   }
 
   async function hubTaskInboxSession() {

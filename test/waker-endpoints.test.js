@@ -537,7 +537,12 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
       if (url.pathname.startsWith('/api/blob/') && req.method === 'GET') {
         const id = url.pathname.slice('/api/blob/'.length)
         for (const [sha, text] of blobs) {
-          if (`blob-${sha.slice(0, 8)}` === id) return send(200, { ok: true, text })
+          if (`blob-${sha.slice(0, 8)}` === id) {
+            // Mirror the real hub (T-392): blobs are served as the raw file stream, NOT JSON.
+            res.writeHead(200, { 'content-type': 'application/octet-stream' })
+            res.end(text)
+            return
+          }
         }
         return send(404, { ok: false, error: 'no such blob' })
       }
@@ -6892,7 +6897,8 @@ async function main() {
       if (requestPath.endsWith('/heartbeat')) return { ok: true, status: 200, json: { ok: true } }
       if (requestPath.endsWith('/settle')) return { ok: settleStatus === 200, status: settleStatus, json: { ok: true } }
       if (requestPath.startsWith('/api/blobs?')) return { ok: true, status: 200, json: { ok: true, blobs: [{ id: 'blob-1' }] } }
-      if (requestPath.startsWith('/api/blob/')) return { ok: true, status: 200, json: { ok: true, text: 'do the thing' } }
+      // The real hub streams the blob as text, so the stub returns `text` with no JSON (T-392).
+      if (requestPath.startsWith('/api/blob/')) return { ok: true, status: 200, json: null, text: 'do the thing' }
       return { ok: false, status: 404, json: null }
     }
     return { calls, fetchJson }
@@ -7206,6 +7212,32 @@ async function main() {
       const rows = fs.existsSync(localFile) ? fs.readFileSync(localFile, 'utf8').split('\n').filter(Boolean) : []
       const ok = error?.exitCode === 1 && /HTTP 500/.test(error.message) && rows.length === 0 && fake.taskCreates.length === 1
       report('CLI hub: a hub failure exits non-zero and writes no reference row', ok, `exit=${error?.exitCode ?? '-'} rows=${rows.length}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('hub tasks: a raw octet-stream blob is parsed, delivered and settled', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      fake.addTask({ task_id: 'P-20261110-01', target_agent: 'dsh-test', intent: 'inbox', subject: 'raw blob' }, 'raw stream body')
+      h = await boot({
+        config: { hubUrl: fake.url, pollIntervalMs: 5000, pollIdleIntervalMs: 5000, tasksPollEnabled: true, tasksPollIntervalMs: 1000 },
+      })
+      const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
+      const status = await request(h.base, '/mesh/status')
+      h.emit('session/event', { id: delivered?.sessionId }, { type: 'turn/start', turn: 2 })
+      h.emit('session/event', { id: delivered?.sessionId }, { type: 'turn/end', turn: 2, reason: { kind: 'completed' } })
+      const settled = await waitFor(() => (fake.taskSettles.length ? fake.taskSettles[0] : null), 5000)
+      const bodyDelivered = h.state.prompts.some((prompt) => JSON.stringify(prompt.content ?? '').includes('raw stream body'))
+      const ok =
+        Boolean(delivered) &&
+        status.json?.tasksPoll?.lastError === null &&
+        settled?.body?.source === 'observed' &&
+        fake.tasks[0]?.status === 'settled'
+      report('hub tasks: a raw octet-stream blob is parsed, delivered and settled', ok, `delivered=${delivered?.sessionId ?? '-'} body=${bodyDelivered} settle=${settled?.body?.source ?? '-'}`)
     } finally {
       if (h) h.close()
       await fake.close()

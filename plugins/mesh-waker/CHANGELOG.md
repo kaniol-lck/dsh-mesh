@@ -11,6 +11,10 @@
 - 跨机任务消费（默认关闭）：开启后按自己的节奏拉取、认领、续租并结算对端派来的任务，正文按内容哈希取回，不落本地副本；`/mesh/status` 的 `tasksPoll` 报告开关、最近拉取时间与错误。
 - 跨机派活（`dsh-mesh-dispatch --transport hub --to <agent>`）：正文上传为 blob、任务落到 hub，本机只留一行引用（不含正文、不建会话）；`--dry-run` 零网络，hub 失败时退出码非 0 且不留引用行。
 
+### Fixed
+
+- 跨机任务正文按 hub 的真实契约解析（/api/blob/<id> 是原始文件流而非 JSON）；失败信息改为粘性并在 /mesh/status.tasksPoll 暴露 lastErrorAt，不再被下一轮成功清空。
+
 ## [0.8.0] - 2026-11-02
 
 ### Added

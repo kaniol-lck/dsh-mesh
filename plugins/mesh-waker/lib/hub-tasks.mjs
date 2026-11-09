@@ -34,9 +34,19 @@ export function createHubTaskConsumer({
   let timer = null
   let running = false
   let lastPollAt = null
+  // Sticky (T-392): a later successful poll must not erase the previous failure. The E2E bug
+  // was invisible exactly because the next poll cleared lastError and nothing was logged.
   let lastError = null
+  let lastErrorAt = null
+  let lastSuccessAt = null
   let lastPollTaskCount = 0
   let stopped = false
+
+  function recordError(message) {
+    lastError = message
+    lastErrorAt = now()
+    fileLog(message)
+  }
 
   function status() {
     return {
@@ -46,6 +56,8 @@ export function createHubTaskConsumer({
       leaseMs,
       lastPollAt,
       lastError,
+      lastErrorAt,
+      lastSuccessAt,
       lastPollTaskCount,
       activeTaskCount: active.size,
       isRunning: running,
@@ -79,9 +91,11 @@ export function createHubTaskConsumer({
     if (!blobId) throw new Error(`no blob for ${ref}`)
     const got = await fetchJson(`/api/blob/${encodeURIComponent(blobId)}`, { method: 'GET' })
     if (!got.ok) throw new Error(`blob fetch failed: HTTP ${got.status}`)
-    const text = got.json?.text ?? got.json?.body ?? got.json?.blob?.text ?? null
-    if (typeof text !== 'string') throw new Error(`blob ${blobId} has no text`)
-    return text
+    // The hub serves blobs as a raw stream (octet-stream), so the body arrives as plain text
+    // (T-392). Older/fake hubs that answered JSON still work through the json fallbacks.
+    const body = got.text ?? got.json?.text ?? got.json?.body ?? got.json?.blob?.text ?? null
+    if (typeof body !== 'string') throw new Error(`blob ${blobId} has no text`)
+    return body
   }
 
   function startHeartbeat(taskId) {
@@ -144,25 +158,25 @@ export function createHubTaskConsumer({
           continue
         }
         claimed += 1
-        const text = await resolveTaskText(row)
-        if (!text.trim()) {
-          fileLog(`hub task ${taskId} has no body; leaving it claimed for the lease to recycle`)
-          continue
-        }
-        active.set(taskId, { timers: [], claimedAt: now() })
-        startHeartbeat(taskId)
         try {
+          const text = await resolveTaskText(row)
+          if (!text.trim()) {
+            recordError(`hub task ${taskId} has no body; leaving it claimed for the lease to recycle`)
+            continue
+          }
+          active.set(taskId, { timers: [], claimedAt: now() })
+          startHeartbeat(taskId)
           await deliverTask({ ...row, taskId, text })
         } catch (error) {
           // Delivery failure keeps the claim: the lease recycles it, never a silent drop.
-          fileLog(`hub task ${taskId} delivery failed: ${error.message}`)
+          // One bad task must not stop the rest of the round (T-392).
+          recordError(`hub task ${taskId} delivery failed: ${error.message}`)
         }
       }
       lastPollTaskCount = polled
-      lastError = null
+      lastSuccessAt = now()
     } catch (error) {
-      lastError = `tasks poll failed: ${error.message}`
-      fileLog(lastError)
+      recordError(`tasks poll failed: ${error.message}`)
     } finally {
       running = false
       lastPollAt = now()
@@ -193,8 +207,7 @@ export function createHubTaskConsumer({
     } catch (error) {
       // Allow a later attempt (e.g. declared after a failed observed settle).
       settled.delete(id)
-      lastError = `settle ${id} failed: ${error.message}`
-      fileLog(lastError)
+      recordError(`settle ${id} failed: ${error.message}`)
       return { ok: false, error: error.message }
     }
   }
