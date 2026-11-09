@@ -7466,6 +7466,94 @@ async function main() {
     report('coordinators: a duplicate claim is refused with the current list', ok, `status=${again.status} list=${again.json?.coordinators?.length ?? 0}`)
   })
 
+  // T-398: historical workspaces only carry the scalar coordinator. Reading them must migrate
+  // that session into an approved member, otherwise they look empty and a claim auto-approves.
+  await runCase('coordinators: a legacy scalar coordinator is migrated into the array', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'coord-legacy', 'public')
+    const h = await boot({
+      seedSessions: [{ id: 'session-legacy', title: 'mesh · 协调', cwd }],
+      prepareHome: (home) => {
+        const dir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(
+          path.join(dir, 'workspaces.json'),
+          `${JSON.stringify({ machine: 'm', workspaces: { 'coord-legacy': { cwd, coordinator: 'session-legacy' } } }, null, 2)}\n`,
+        )
+      },
+    })
+    const identity = await request(h.base, '/mesh/session/identity?session=session-legacy')
+    const first = await request(h.base, '/mesh/workspaces')
+    const second = await request(h.base, '/mesh/workspaces')
+    const entry = first.json?.workspaces?.['coord-legacy']?.coordinators ?? []
+    const ok =
+      identity.json?.isCoordinator === true &&
+      entry.length === 1 &&
+      entry[0].sessionId === 'session-legacy' &&
+      entry[0].status === 'approved' &&
+      entry[0].isPrimary === true &&
+      entry[0].approvedBy === 'legacy' &&
+      JSON.stringify(second.json?.workspaces?.['coord-legacy']?.coordinators) === JSON.stringify(entry)
+    report(
+      'coordinators: a legacy scalar coordinator is migrated into the array',
+      ok,
+      `legacyViewApproved=${entry[0]?.status === 'approved'} legacyApprovedBy=${entry[0]?.approvedBy ?? '-'} count=${entry.length}`,
+    )
+  })
+
+  await runCase('coordinators: claiming a migrated legacy workspace needs approval (no bootstrap)', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'coord-legacy-claim', 'public')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-legacy-owner', title: 'mesh · 协调', cwd },
+        { id: 'session-legacy-new', title: 'plain new', cwd },
+      ],
+      prepareHome: (home) => {
+        const dir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(
+          path.join(dir, 'workspaces.json'),
+          `${JSON.stringify({ machine: 'm', workspaces: { 'coord-legacy-claim': { cwd, coordinator: 'session-legacy-owner' } } }, null, 2)}\n`,
+        )
+      },
+    })
+    const claimed = await coordPost(h.base, 'claim', { session: 'session-legacy-new' })
+    const approved = await coordPost(h.base, 'approve', { session: 'session-legacy-new', slug: 'coord-legacy-claim', by: 'session-legacy-owner' })
+    const members = registryOf(h).workspaces?.['coord-legacy-claim']?.coordinators ?? []
+    const legacyCopies = members.filter((member) => member.sessionId === 'session-legacy-owner').length
+    const ok =
+      claimed.status === 201 &&
+      claimed.json?.status === 'pending' &&
+      approved.status === 200 &&
+      members.length === 2 &&
+      legacyCopies === 1 &&
+      members.find((member) => member.sessionId === 'session-legacy-owner')?.approvedBy === 'legacy' &&
+      members.find((member) => member.sessionId === 'session-legacy-new')?.approvedBy === 'session-legacy-owner'
+    report(
+      'coordinators: claiming a migrated legacy workspace needs approval (no bootstrap)',
+      ok,
+      `legacyClaimStatus=${claimed.json?.status ?? '-'} legacyApprovedBy=${members.find((m) => m.sessionId === 'session-legacy-owner')?.approvedBy ?? '-'} noDuplicate=${legacyCopies === 1}`,
+    )
+  })
+
+  await runCase('coordinators: a workspace with no legacy coordinator still bootstraps', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'coord-empty-new', 'public')
+    const h = await boot({
+      seedSessions: [{ id: 'session-empty-new', title: 'plain empty', cwd }],
+      prepareHome: (home) => {
+        const dir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(
+          path.join(dir, 'workspaces.json'),
+          `${JSON.stringify({ machine: 'm', workspaces: { 'coord-empty-new': { cwd } } }, null, 2)}\n`,
+        )
+      },
+    })
+    const claimed = await coordPost(h.base, 'claim', { session: 'session-empty-new' })
+    const members = registryOf(h).workspaces?.['coord-empty-new']?.coordinators ?? []
+    const ok = claimed.status === 201 && claimed.json?.status === 'approved' && members.length === 1 && members[0].approvedBy === 'bootstrap'
+    report('coordinators: a workspace with no legacy coordinator still bootstraps', ok, `status=${claimed.json?.status ?? '-'} approvedBy=${members[0]?.approvedBy ?? '-'}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

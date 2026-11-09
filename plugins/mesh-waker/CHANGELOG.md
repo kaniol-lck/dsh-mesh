@@ -15,6 +15,10 @@
 
 ### Fixed
 
+- 旧工作区（只有 `coordinator` 字段）读取时自动迁移成一条已批准的 legacy 成员，不再被当成空工作区而让任意会话 claim 后自动批准。
+
+### Fixed
+
 - 跨机任务正文按 hub 的真实契约解析（/api/blob/<id> 是原始文件流而非 JSON）；失败信息改为粘性并在 /mesh/status.tasksPoll 暴露 lastErrorAt，不再被下一轮成功清空。
 
 ## [0.8.0] - 2026-11-02

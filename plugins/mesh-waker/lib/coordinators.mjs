@@ -34,6 +34,12 @@ export function isOwnerTokenValid(configTokenFile, provided, readFile) {
 export function normalizeCoordinators(value) {
   if (!Array.isArray(value)) return []
   const out = []
+  const timeOrNull = (input) => {
+    // `null` must stay null (a legacy member never expires); Number(null) is 0 and would look
+    // like an ancient lease that claims the member is stale (T-398).
+    if (input === null || input === undefined || input === '') return null
+    return Number.isFinite(Number(input)) ? Number(input) : null
+  }
   for (const item of value) {
     if (!item || typeof item !== 'object') continue
     const sessionId = String(item.sessionId ?? '').trim()
@@ -43,10 +49,10 @@ export function normalizeCoordinators(value) {
       ...(item.channel ? { channel: String(item.channel).slice(0, 40) } : {}),
       isPrimary: item.isPrimary === true,
       status: COORDINATOR_STATUSES.has(item.status) ? item.status : 'pending',
-      claimedAt: Number.isFinite(Number(item.claimedAt)) ? Number(item.claimedAt) : null,
-      leaseUntil: Number.isFinite(Number(item.leaseUntil)) ? Number(item.leaseUntil) : null,
+      claimedAt: timeOrNull(item.claimedAt),
+      leaseUntil: timeOrNull(item.leaseUntil),
       ...(item.approvedBy ? { approvedBy: String(item.approvedBy).slice(0, 80) } : {}),
-      requestedAt: Number.isFinite(Number(item.requestedAt)) ? Number(item.requestedAt) : null,
+      requestedAt: timeOrNull(item.requestedAt),
     })
   }
   return out

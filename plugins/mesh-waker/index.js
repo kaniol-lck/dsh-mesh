@@ -3353,6 +3353,22 @@ export function apply(ctx, config) {
         }
       }
     }
+    // T-398: migrate the legacy scalar `coordinator` into a synthesized approved member. Without
+    // this every historical workspace looks empty, so a claim would auto-approve through the
+    // bootstrap path and bypass "a claim needs approval". Idempotent: once written, the array is
+    // used as-is and claimedAt stays put.
+    const coordinators = normalizeCoordinators(value.coordinators ?? [])
+    if (!coordinators.length && value.coordinator) {
+      coordinators.push({
+        sessionId: String(value.coordinator),
+        isPrimary: true,
+        status: 'approved',
+        claimedAt: Number.isFinite(Number(value.createdAt)) ? Number(value.createdAt) : 0,
+        leaseUntil: null,
+        approvedBy: 'legacy',
+        requestedAt: 0,
+      })
+    }
     return {
       cwd: String(value.cwd ?? ''),
       ...(value.coordinator ? { coordinator: String(value.coordinator) } : {}),
@@ -3364,9 +3380,7 @@ export function apply(ctx, config) {
       ...(Object.keys(workers).length ? { workers } : {}),
       // Multi-coordinator claim protocol (T-395): the array is the truth, `coordinator`
       // remains the primary's sessionId for legacy readers.
-      ...(Array.isArray(value.coordinators) && value.coordinators.length
-        ? { coordinators: normalizeCoordinators(value.coordinators) }
-        : {}),
+      ...(coordinators.length ? { coordinators } : {}),
       ...(typeof value.slug === 'string' && value.slug ? { slug: String(value.slug) } : {}),
       ...(value.ephemeral === true ? { ephemeral: true } : {}),
     }
@@ -3729,7 +3743,10 @@ export function apply(ctx, config) {
       // T-395: an explicit claim list is the truth. Only legacy entries (no coordinators[])
       // fall back to deriving a coordinator from session titles.
       const claimedMembers = Array.isArray(entry.coordinators) ? entry.coordinators : []
-      if (claimedMembers.length) {
+      // Legacy-only members are a projection of the scalar field; title derivation (T-287)
+      // still owns that field, so the projection is dropped and re-synthesized on next read.
+      const onlyLegacy = claimedMembers.length > 0 && claimedMembers.every((member) => member.approvedBy === 'legacy')
+      if (claimedMembers.length && !onlyLegacy) {
         const expired = expireCoordinators(claimedMembers, { now: Date.now(), pendingTtlMs: c.coordinatorPendingTtlMs })
         entry.coordinators = claimedMembers
         const beforeCoordinator = entry.coordinator ?? null
@@ -3737,6 +3754,10 @@ export function apply(ctx, config) {
         if (expired || beforeCoordinator !== (entry.coordinator ?? null)) changed = true
         if (expired) fileLog(`workspace ${slug} coordinators expired (primary=${primary?.sessionId ?? 'none'})`)
       } else {
+        if (onlyLegacy) {
+          delete entry.coordinators
+          changed = true
+        }
         // T-376: an archived session must never be derived as the coordinator. A just-archived
         // test session can still be live and have the newest last_active, and DSH refuses to
         // delete live sessions — derivation is the only place that can exclude it.
