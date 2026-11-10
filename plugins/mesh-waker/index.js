@@ -4358,7 +4358,8 @@ export function apply(ctx, config) {
 
 
   function receiptBody(receipt) {
-    return receiptNoticeText(receipt, { includeSummary: c.receiptNoticeSummary === true })
+    // Global config or the dispatch's own opt-in (T-404); default stays status-only.
+    return receiptNoticeText(receipt, { includeSummary: c.receiptNoticeSummary === true || receipt?.noticeSummary === true })
   }
 
   /** Store a body once under texts/<sha256>.txt and return its ref, or null on failure. */
@@ -4811,12 +4812,19 @@ export function apply(ctx, config) {
         rows.push({ taskId, status: derived.state, durationMs: null, summary: '', detail: derived.detail || null, settled: false, workspace: row.workspace ?? null })
       }
     }
+    const anyMemberOptIn = rows.some(
+      (row) => pendingTasks.get(row.taskId)?.noticeSummary === true || taskRows.get(row.taskId)?.noticeSummary === true,
+    )
     const { record, body } = buildBatchReceipt({
       batchId,
       tasks: rows,
       startedAt: batch.createdAt,
       endedAt: now,
       summaryChars: c.receiptSummaryChars,
+      // T-404: summaries are opt-in (global config or any member's per-dispatch request) and
+      // capped at min(maxInlineBytes, 8 KiB) so a big batch cannot flood the chat again.
+      includeSummaries: c.receiptNoticeSummary === true || anyMemberOptIn,
+      maxBytes: Math.min(8192, Math.max(1024, Number(c.maxInlineBytes) || 4096)),
     })
     writeReceiptFile(record, receiptDirFor(record))
     lastReceipt = { taskId: batchId, status: partial ? 'partial' : 'completed', at: now, deliveredTo: null }
@@ -5250,6 +5258,7 @@ export function apply(ctx, config) {
       ...(thread ? { thread } : {}),
       ...(resolved.batchId ? { batchId: resolved.batchId } : {}),
       ...(args.receipt ? { receipt: String(args.receipt) } : {}),
+      ...(args.receiptSummary === true ? { receiptSummary: true } : {}),
       ...(resolved.deadlineMs ? { deadlineMs: resolved.deadlineMs } : {}),
     }
     const deliveredText = c.injectHeader

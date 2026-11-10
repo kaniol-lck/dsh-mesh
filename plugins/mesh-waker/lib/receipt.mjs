@@ -75,6 +75,7 @@ export function buildReceipt({
   injectedDuringTurn = false,
   source = 'observed',
   routedTo = null,
+  noticeSummary = false,
 } = {}) {
   const at = endedAt ?? Date.now()
   return {
@@ -97,6 +98,9 @@ export function buildReceipt({
     injectedDuringTurn: injectedDuringTurn === true,
     // How the dispatcher addressed this task (T-355): workspace:<slug> | session:<id> | thread:<id>.
     routedTo: routedTo ? String(routedTo).slice(0, 120) : null,
+    // Per-task opt-in (T-404): render the summary in the injected notice too. Off by default
+    // because 0.7.28/T-269 deliberately reduced notices to status lines after a reply storm.
+    noticeSummary: noticeSummary === true,
   }
 }
 
@@ -159,7 +163,7 @@ export function deriveLivenessState(ledger, { hasPending = false, lost = false, 
  * Build the aggregate batch receipt: the JSONL record and the chat body share the tasks.
  * `tasks` entries carry {taskId, status, durationMs, summary, detail}.
  */
-export function buildBatchReceipt({ batchId, tasks = [], startedAt = 0, endedAt = Date.now(), summaryChars = 300 } = {}) {
+export function buildBatchReceipt({ batchId, tasks = [], startedAt = 0, endedAt = Date.now(), summaryChars = 300, includeSummaries = false, maxBytes = 8192 } = {}) {
   const normalized = tasks.map((task) => ({
     taskId: task.taskId,
     status: task.status ?? 'pending',
@@ -196,5 +200,37 @@ export function buildBatchReceipt({ batchId, tasks = [], startedAt = 0, endedAt 
     const ws = workspace ? `  ${workspace}${failed ? '  ← 失败' : ''}` : ''
     return `${icon} ${id}  ${took}  ${status}${ws}`.replace(/\s+$/, '')
   })
-  return { record, body: [header, ...lines].join('\n') }
+  const baseBody = [header, ...lines].join('\n')
+  // Default stays byte-identical to 0.7.28 (status lines only). Summaries are opt-in per batch
+  // (T-404) and capped, because injecting all of them is what caused the earlier reply storm.
+  if (!includeSummaries) return { record, body: baseBody }
+  const limit = Math.max(1024, Number(maxBytes) || 8192)
+  if (Buffer.byteLength(baseBody, 'utf8') >= limit) return { record, body: baseBody }
+  const summaries = normalized.map((task) => truncateText(String(task.summary ?? '').replace(/\s+/g, ' ').trim(), summaryChars))
+  const hint = '…（摘要已截断，详见 GET /mesh/tasks/<id>）'
+  const render = (count) => {
+    const out = [header]
+    normalized.forEach((task, index) => {
+      out.push(lines[index])
+      if (index < count && summaries[index]) out.push(`  ${summaries[index]}`)
+    })
+    return out.join('\n')
+  }
+  const available = summaries.filter(Boolean).length
+  let count = available
+  let body = render(count)
+  while (Buffer.byteLength(body, 'utf8') > limit && count > 0) {
+    count -= 1
+    body = render(count)
+  }
+  if (count < available) {
+    // Reserve room for the truncation hint itself, then keep dropping summaries until it fits.
+    let withHint = `${render(count)}\n${hint}`
+    while (Buffer.byteLength(withHint, 'utf8') > limit && count > 0) {
+      count -= 1
+      withHint = `${render(count)}\n${hint}`
+    }
+    body = Buffer.byteLength(withHint, 'utf8') <= limit ? withHint : render(count)
+  }
+  return { record, body }
 }

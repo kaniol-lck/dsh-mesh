@@ -7815,6 +7815,114 @@ async function main() {
     report('cancel: the mesh_cancel tool is registered and requires a target', ok, `registered=${Boolean(tool)} rejected=${error ? 'yes' : 'no'}`)
   })
 
+  // ---- T-404: receipt summaries are opt-in; the default notice stays a status line ----
+  const receiptLibUrl = pathToFileURL(path.join(REPO, 'plugins', 'mesh-waker', 'lib', 'receipt.mjs')).href
+
+  await runCase('receipt summary: default notices stay status-only', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-sum-work', title: 'sum worker' },
+        { id: 'session-sum-notify', title: 'sum notify' },
+      ],
+      config: { receiptTo: 'session-sum-notify', receiptMode: 'wake' },
+    })
+    const { buildBatchReceipt } = await import(receiptLibUrl)
+    const batch = buildBatchReceipt({ batchId: 'B-sum-default', tasks: [{ taskId: 'T-sum-0', status: 'completed', durationMs: 5, summary: 'SECRET SUMMARY' }] })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-sum-work', text: 'work', meta: { taskId: 'T-sum-0', receipt: 'wake' } } })
+    h.emit('session/event', { id: 'session-sum-work' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-sum-work' }, { type: 'assistant/message', turn: 1, message: { content: [{ type: 'text', text: 'SECRET SUMMARY' }] } })
+    h.emit('session/event', { id: 'session-sum-work' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const notice = await waitFor(() => h.state.prompts.find((prompt) => JSON.stringify(prompt).includes('[RECEIPT] T-sum-0')), 5000)
+    const noticeText = JSON.stringify(notice ?? '')
+    const ok = Boolean(notice) && !noticeText.includes('SECRET SUMMARY') && !batch.body.includes('SECRET SUMMARY') && /status|completed/.test(noticeText)
+    report('receipt summary: default notices stay status-only', ok, `notice=${noticeText.slice(0, 90)} batchHasSummary=${batch.body.includes('SECRET SUMMARY')}`)
+  })
+
+  await runCase('receipt summary: a single dispatch can opt in', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-sum-optin', title: 'sum worker' },
+        { id: 'session-sum-optin-notify', title: 'sum notify' },
+      ],
+      config: { receiptTo: 'session-sum-optin-notify', receiptMode: 'wake' },
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { session: 'session-sum-optin', text: 'work', meta: { taskId: 'T-sum-1', receipt: 'wake', receiptSummary: true } },
+    })
+    h.emit('session/event', { id: 'session-sum-optin' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-sum-optin' }, { type: 'assistant/message', turn: 1, message: { content: [{ type: 'text', text: 'BRANCH AND COMMIT SUMMARY' }] } })
+    h.emit('session/event', { id: 'session-sum-optin' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const notice = await waitFor(() => h.state.prompts.find((prompt) => JSON.stringify(prompt).includes('[RECEIPT] T-sum-1')), 5000)
+    const ok = Boolean(notice) && JSON.stringify(notice).includes('BRANCH AND COMMIT SUMMARY')
+    report('receipt summary: a single dispatch can opt in', ok, `containsSummary=${JSON.stringify(notice ?? '').includes('BRANCH AND COMMIT SUMMARY')}`)
+  })
+
+  await runCase('receipt summary: a batch member opt-in renders summaries in the aggregate', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-batch-sum', title: 'batch sum worker' },
+        { id: 'session-batch-sum-notify', title: 'batch sum notify' },
+      ],
+      config: { receiptTo: 'session-batch-sum-notify', barrierMode: 'wake' },
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { session: 'session-batch-sum', text: 'a', meta: { taskId: 'T-bsum-a', batchId: 'B-sum-1', receiptSummary: true } },
+    })
+    h.emit('session/event', { id: 'session-batch-sum' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-batch-sum' }, { type: 'assistant/message', turn: 1, message: { content: [{ type: 'text', text: 'ALPHA CONCLUSION' }] } })
+    h.emit('session/event', { id: 'session-batch-sum' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { session: 'session-batch-sum', text: 'b', meta: { taskId: 'T-bsum-b', batchId: 'B-sum-1', receiptSummary: true } },
+    })
+    h.emit('session/event', { id: 'session-batch-sum' }, { type: 'turn/start', turn: 2 })
+    h.emit('session/event', { id: 'session-batch-sum' }, { type: 'assistant/message', turn: 2, message: { content: [{ type: 'text', text: 'BETA CONCLUSION' }] } })
+    h.emit('session/event', { id: 'session-batch-sum' }, { type: 'turn/end', turn: 2, reason: { kind: 'completed' } })
+    const notice = await waitFor(
+      () => h.state.prompts.find((prompt) => JSON.stringify(prompt).includes('[BATCH] B-sum-1') && JSON.stringify(prompt).includes('ALPHA')),
+      6000,
+    )
+    const text = JSON.stringify(notice ?? '')
+    const ok = Boolean(notice) && text.includes('ALPHA CONCLUSION') && text.includes('BETA CONCLUSION')
+    report('receipt summary: a batch member opt-in renders summaries in the aggregate', ok, `aggregate=${Boolean(notice)} hasAlpha=${text.includes('ALPHA CONCLUSION')} hasBeta=${text.includes('BETA CONCLUSION')}`)
+  })
+
+  await runCase('receipt summary: summaries are truncated and the record keeps them', async () => {
+    const { buildReceipt, receiptNoticeText, buildBatchReceipt } = await import(receiptLibUrl)
+    const long = 'x'.repeat(500)
+    const receipt = buildReceipt({ taskId: 'T-trunc', status: 'completed', summary: long, summaryChars: 300, noticeSummary: true })
+    const rendered = receiptNoticeText(receipt, { includeSummary: true })
+    const batch = buildBatchReceipt({
+      batchId: 'B-trunc',
+      tasks: [{ taskId: 'T-trunc', status: 'completed', durationMs: 5, summary: long }],
+      includeSummaries: true,
+      summaryChars: 300,
+    })
+    const ok =
+      receipt.summary.length === 301 &&
+      receipt.summary.endsWith('…') &&
+      rendered.includes(receipt.summary) &&
+      batch.body.includes(receipt.summary) &&
+      batch.record.tasks[0].summary === receipt.summary
+    report('receipt summary: summaries are truncated and the record keeps them', ok, `recordLen=${receipt.summary.length} renderedTruncated=${rendered.includes(receipt.summary)}`)
+  })
+
+  await runCase('receipt summary: the batch body is capped and says it was truncated', async () => {
+    const { buildBatchReceipt } = await import(receiptLibUrl)
+    const tasks = Array.from({ length: 12 }, (_, index) => ({
+      taskId: `T-cap-${index}`,
+      status: 'completed',
+      durationMs: 1000,
+      summary: 'y'.repeat(300),
+    }))
+    const batch = buildBatchReceipt({ batchId: 'B-cap', tasks, includeSummaries: true, summaryChars: 300, maxBytes: 1500 })
+    const bytes = Buffer.byteLength(batch.body, 'utf8')
+    const ok = bytes <= 1500 && batch.body.includes('摘要已截断') && batch.body.split('\n').length > 3
+    report('receipt summary: the batch body is capped and says it was truncated', ok, `bytes=${bytes} hint=${batch.body.includes('摘要已截断')}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

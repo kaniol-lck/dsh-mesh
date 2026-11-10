@@ -149,6 +149,8 @@ export function createTaskRegistry(deps) {
       receiptRef: null,
       // Addressing mode (T-355): workspace:<slug> | session:<id> | thread:<id>.
       routedTo: extra.routedTo ?? null,
+      // Per-dispatch summary opt-in (T-404); persists so the batch can honour it after settle.
+      ...(extra.noticeSummary === true ? { noticeSummary: true } : {}),
       ...deps.scopeFields(route),
       ...(reusedId ? { reusedId: true } : {}),
       refs: Array.isArray(meta?.refs)

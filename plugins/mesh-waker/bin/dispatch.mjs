@@ -58,6 +58,9 @@ Options:
                      rejected because the hub refuses it and would silently duplicate)
   --batch [id]       batch barrier id; "--batch" alone generates B-<base36 timestamp>
   --receipt <m>      file | queue | wake (waker default when omitted)
+  --receipt-summary  include the worker's summary in the receipt notice (default off: the notice
+                     is a status line only; error/lost also carry one reason line). The summary is
+                     always stored in receipts.jsonl and GET /mesh/tasks/<id> either way.
   --deadline <d>     batch deadline such as 30m / 2h / 600s
   --create           create the session (titled with --target) when it does not resolve
   --dry-run          print the request that would be sent; send nothing
@@ -261,6 +264,7 @@ export function parseArgs(argv) {
     task: undefined,
     batch: undefined,
     receipt: undefined,
+    receiptSummary: false,
     deadline: undefined,
     deadlineMs: undefined,
     create: false,
@@ -342,6 +346,7 @@ export function parseArgs(argv) {
         break
       }
       case '--receipt': options.receipt = takeValue(); break
+      case '--receipt-summary': options.receiptSummary = true; break
       case '--deadline': options.deadline = takeValue(); break
       case '--create': options.create = true; break
       case '--dry-run': options.dryRun = true; break
@@ -552,6 +557,7 @@ export async function run(options, fetchImpl = fetch) {
     ? {
         taskId,
         ...(options.receipt ? { receipt: options.receipt } : {}),
+        ...(options.receiptSummary ? { receiptSummary: true } : {}),
         ...(batchId ? { batchId } : {}),
         ...(options.deadlineMs ? { deadlineMs: options.deadlineMs } : {}),
       }

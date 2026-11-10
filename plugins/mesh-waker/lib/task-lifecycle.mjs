@@ -150,6 +150,7 @@ export function createTaskLifecycle(deps) {
       injectedDuringTurn: task.injectedDuringTurn === true,
       source: details.source ?? task.source ?? 'observed',
       routedTo: task.routedTo ?? null,
+      noticeSummary: task.noticeSummary === true,
     })
     deps.writeReceiptFile(receipt, task.recordDir ?? deps.receiptDirForTask(taskId) ?? deps.receiptDirFor(receipt))
     // Registry status mirrors the receipt: not-started is the stall path, everything else
@@ -299,6 +300,8 @@ export function createTaskLifecycle(deps) {
       routedTo: meta?.routedTo ? String(meta.routedTo).slice(0, 120) : null,
       settled: false,
       stallTimer: null,
+      // Per-dispatch opt-in (T-404): render the summary in the notice too.
+      noticeSummary: meta?.receiptSummary === true,
       ...(idWarning ? { idWarning } : {}),
     }
     deps.pendingTasks.set(taskId, task)
@@ -314,6 +317,7 @@ export function createTaskLifecycle(deps) {
       routedTo: task.routedTo ?? null,
       // Persist the actual mode so a restart can still notify the dispatcher (T-273).
       receiptMode,
+      noticeSummary: task.noticeSummary === true,
     })
     const timer = armStallTimer(taskId, task)
     task.stallTimer = timer

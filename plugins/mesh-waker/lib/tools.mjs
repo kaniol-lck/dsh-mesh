@@ -49,6 +49,11 @@ export const MESH_DISPATCH_TOOL = {
     taskId: { type: 'string', description: 'Receipt task id; a T-<base36 timestamp> is generated when omitted.' },
     batchId: { type: 'string', description: 'Batch barrier id: one aggregate receipt after every task ends.' },
     receipt: { type: 'string', enum: ['file', 'queue', 'wake'], description: 'Override the plugin receipt mode.' },
+    receiptSummary: {
+      type: 'boolean',
+      description:
+        'Include the worker\u2019s summary in the receipt notice (default false: the notice is a status line only; error/lost add one reason line). The summary is always stored in receipts.jsonl and readable from GET /mesh/tasks/<id>. For a batch this opts the whole batch into summaries.',
+    },
     deadline: { type: 'string', description: 'Batch deadline such as 30m / 2h / 600s.' },
   },
   required: ['text'],
