@@ -21,6 +21,7 @@
  * Exit codes: 0 ok (also when the waker is unreachable — the board is marked offline), 1 read/write error.
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
@@ -31,6 +32,9 @@ const TODO_DIR = path.join(WORKLOG, 'todo')
 const QUEUE_FILE = path.join(WORKLOG, 'dispatch', 'queue.md')
 const TRIAGE_DIR = path.join(WORKLOG, 'ops', 'triage')
 const DEFAULT_WAKER = process.env.MESH_WAKER_URL ?? 'http://127.0.0.1:8795'
+const DEFAULT_MESH_HOME = process.env.MESH_HOME ?? path.join(os.homedir(), '.dsh', 'mesh-waker')
+const DEFAULT_QUEUE_THRESHOLD = 10
+const DEFAULT_WAIT_THRESHOLD_MIN = 30
 
 const USAGE = `gen-board.mjs — read-only task board generated from the workspace ledgers
 
@@ -39,6 +43,9 @@ Usage:
   node scripts/gen-board.mjs --out <file>       write the self-contained HTML board
   node scripts/gen-board.mjs --offline          skip waker fetches (ledgers only)
   node scripts/gen-board.mjs --waker-url <url>  waker base URL (default ${DEFAULT_WAKER})
+  node scripts/gen-board.mjs --mesh-home <dir>  waker home for tasks.jsonl (default ${DEFAULT_MESH_HOME})
+  node scripts/gen-board.mjs --queue-threshold <n>   red row when pending+started > n (default 10)
+  node scripts/gen-board.mjs --wait-threshold <min>  red row when oldest wait > min (default 30)
 
 Inputs (relative to this repo): .worklog/todo/*.md, .worklog/dispatch/queue.md,
 .worklog/ops/triage/*.json. With a reachable waker it also reads /mesh/status,
@@ -47,10 +54,21 @@ still generated (sessions tab shows 离线) and marked offline.
 
 Tabs: 路线图 (grouped by 功能), 会话列表 (claimed by DSH session; archived/stopped/
 unregistered hidden by default), 派单列表 (all queue rows with status/role filters).
+The queue columns come from <mesh-home>/ws/*/tasks.jsonl: one line per state change,
+so counts use the LAST line per taskId (pending+started = queued, oldest wait =
+now-createdAt, ETA = median settled durationMs x queue length).
 --help prints this text and writes nothing.`
 
 function parseArgs(argv) {
-  const options = { out: null, offline: false, wakerUrl: DEFAULT_WAKER, help: false }
+  const options = {
+    out: null,
+    offline: false,
+    wakerUrl: DEFAULT_WAKER,
+    meshHome: DEFAULT_MESH_HOME,
+    queueThreshold: DEFAULT_QUEUE_THRESHOLD,
+    waitThreshold: DEFAULT_WAIT_THRESHOLD_MIN,
+    help: false,
+  }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     const value = () => {
@@ -62,6 +80,9 @@ function parseArgs(argv) {
     else if (arg === '--offline') options.offline = true
     else if (arg === '--out') options.out = value()
     else if (arg === '--waker-url') options.wakerUrl = value().replace(/\/+$/, '')
+    else if (arg === '--mesh-home') options.meshHome = value()
+    else if (arg === '--queue-threshold') options.queueThreshold = Number(value())
+    else if (arg === '--wait-threshold') options.waitThreshold = Number(value())
     else throw new Error(`unknown argument: ${arg}`)
   }
   return options
@@ -134,6 +155,118 @@ function readTriage() {
     }
   }
   return triage
+}
+
+/**
+ * Queue depth from <mesh-home>/ws/<workspace>/tasks.jsonl.
+ *
+ * The file is an append-only log of STATE CHANGES (one taskId can appear as
+ * pending -> started -> settled), so every count below uses the LAST line per
+ * taskId; counting lines would overstate the queue (e.g. 22 lines ~= 11 tasks).
+ * ETA = median durationMs of the last 20 settled tasks for that target x queue length.
+ */
+function readQueueState(meshHome) {
+  const empty = {
+    available: false,
+    tasks: 0,
+    pending: 0,
+    started: 0,
+    queued: 0,
+    oldestWaitMin: null,
+    sessions: {},
+    unknownTargets: {},
+  }
+  if (!meshHome || !existsSync(meshHome)) return empty
+  const wsRoot = path.join(meshHome, 'ws')
+  if (!existsSync(wsRoot)) return empty
+  const lastByTask = new Map()
+  for (const workspace of readdirSync(wsRoot)) {
+    const file = path.join(wsRoot, workspace, 'tasks.jsonl')
+    if (!existsSync(file)) continue
+    for (const line of readFileSync(file, 'utf8').split(/\r?\n/)) {
+      if (!line.trim()) continue
+      try {
+        const entry = JSON.parse(line)
+        if (entry?.taskId) lastByTask.set(entry.taskId, entry)
+      } catch {
+        /* a torn line must not hide the rest */
+      }
+    }
+  }
+  const now = Date.now()
+  const byTarget = new Map()
+  const unknown = { pending: 0, started: 0, queued: 0, oldestWaitMin: null }
+  const settledDurations = new Map()
+  let pending = 0
+  let started = 0
+  let oldestWaitMin = null
+  for (const entry of lastByTask.values()) {
+    const target = entry.targetSessionId ?? entry.targetTitle ?? null
+    if (entry.status === 'pending' || entry.status === 'started') {
+      const waitMin = entry.createdAt ? (now - Number(entry.createdAt)) / 60000 : 0
+      if (!target) {
+        unknown[entry.status] += 1
+        unknown.queued += 1
+        unknown.oldestWaitMin = Math.max(unknown.oldestWaitMin ?? 0, waitMin)
+      } else {
+        if (!byTarget.has(target)) byTarget.set(target, { pending: 0, started: 0, queued: 0, oldestWaitMin: 0 })
+        const bucket = byTarget.get(target)
+        bucket[entry.status] += 1
+        bucket.queued += 1
+        bucket.oldestWaitMin = Math.max(bucket.oldestWaitMin, waitMin)
+      }
+      if (entry.status === 'pending') pending += 1
+      else started += 1
+      oldestWaitMin = Math.max(oldestWaitMin ?? 0, waitMin)
+    } else if (entry.status === 'settled' && target && Number.isFinite(Number(entry.durationMs))) {
+      if (!settledDurations.has(target)) settledDurations.set(target, [])
+      settledDurations.get(target).push(Number(entry.durationMs))
+    }
+  }
+  const median = (values) => {
+    const sorted = [...values].sort((left, right) => left - right)
+    if (!sorted.length) return null
+    const middle = Math.floor(sorted.length / 2)
+    return sorted.length % 2 ? sorted[middle] : Math.round((sorted[middle - 1] + sorted[middle]) / 2)
+  }
+  const sessions = {}
+  for (const [target, bucket] of byTarget) {
+    const durations = (settledDurations.get(target) ?? []).slice(-20)
+    const medianDuration = median(durations)
+    sessions[target] = {
+      ...bucket,
+      oldestWaitMin: Math.round(bucket.oldestWaitMin * 10) / 10,
+      etaMin: medianDuration === null ? null : Math.round((medianDuration * bucket.queued) / 60000),
+      sampleCount: durations.length,
+    }
+  }
+  return {
+    available: true,
+    tasks: lastByTask.size,
+    pending,
+    started,
+    queued: pending + started,
+    oldestWaitMin: oldestWaitMin === null ? null : Math.round(oldestWaitMin * 10) / 10,
+    sessions,
+    unknownTargets: unknown,
+  }
+}
+
+function attachQueue(waker, queueState) {
+  for (const session of waker.sessions) {
+    const bucket = queueState.sessions[session.id] ?? null
+    session.queue = bucket
+      ? { queued: bucket.queued, pending: bucket.pending, started: bucket.started, oldestWaitMin: bucket.oldestWaitMin, etaMin: bucket.etaMin }
+      : { queued: 0, pending: 0, started: 0, oldestWaitMin: null, etaMin: null }
+  }
+  waker.queue = {
+    available: queueState.available,
+    tasks: queueState.tasks,
+    queued: queueState.queued,
+    oldestWaitMin: queueState.oldestWaitMin,
+    unknownTargets: queueState.unknownTargets,
+  }
+  return waker
 }
 
 async function fetchJson(base, route) {
@@ -230,6 +363,9 @@ function summarize(todos, queue, triage, waker) {
     onlineSessionCount: waker.sessions.filter((session) => session.live && !session.archived).length,
     coordinatorCount: waker.coordinators.length,
     hiddenSessionCount: waker.hiddenSessionCount,
+    queuePendingStarted: waker.queue?.queued ?? null,
+    queueOldestWaitMin: waker.queue?.oldestWaitMin ?? null,
+    queueAvailable: Boolean(waker.queue?.available),
     triageCount: Object.keys(triage).length,
     pendingTasks: waker.pendingTasks,
     wakerOnline: waker.online,
@@ -241,8 +377,8 @@ function escapeHtml(value) {
 }
 
 function renderHtml(model) {
-  const { generatedAt, stats, todos, queue, triage, waker } = model
-  const payload = JSON.stringify({ todos, queue, triage, waker, stats }).replace(/</g, '\\u003c')
+  const { generatedAt, stats, todos, queue, triage, waker, thresholds } = model
+  const payload = JSON.stringify({ todos, queue, triage, waker, stats, thresholds }).replace(/</g, '\\u003c')
   const roles = [...new Set(todos.map((todo) => todo.role))].sort()
 
   return `<!doctype html>
@@ -290,6 +426,7 @@ function renderHtml(model) {
   .feature span { color:var(--muted); font-weight:400; font-size:12px; }
   .session-row { cursor:pointer; }
   .session-row:hover { background:#fafafa; }
+  .session-row.hot td { background:#fef2f2; }
   .history { background:#fafafa; }
   .history ul { list-style:none; margin:6px 0; padding:0 0 0 12px; border-left:2px solid var(--line); }
   .history li { padding:3px 0; font-size:12px; }
@@ -308,6 +445,8 @@ function renderHtml(model) {
     <div class="stat"><b>${stats.onlineSessionCount}</b><span>在线会话</span></div>
     <div class="stat"><b>${stats.coordinatorCount}</b><span>协调</span></div>
     <div class="stat"><b>${stats.hiddenSessionCount}</b><span>隐藏会话</span></div>
+    <div class="stat"><b>${stats.queuePendingStarted ?? '—'}</b><span>排队 pending+started</span></div>
+    <div class="stat"><b>${stats.queueOldestWaitMin === null || stats.queueOldestWaitMin === undefined ? '—' : stats.queueOldestWaitMin + 'm'}</b><span>最老等待</span></div>
   </section>
 
   <nav class="tabs">
@@ -421,19 +560,28 @@ function renderSessions() {
     .sort((left, right) => Number(right.live) - Number(left.live) || Number(right.lastActive ?? 0) - Number(left.lastActive ?? 0));
   document.getElementById('sessionsBody').innerHTML = rows.length === 0
     ? '<div class="empty">waker 离线或没有会话数据</div>'
-    : '<table><thead><tr><th>会话</th><th>角色</th><th>状态</th><th>最近活跃</th><th>cwd</th></tr></thead><tbody>' +
+    : '<table><thead><tr><th>会话</th><th>角色</th><th>状态</th><th>最近活跃</th><th>排队</th><th>最老等待</th><th>ETA</th><th>cwd</th></tr></thead><tbody>' +
       rows.map((session) => {
         const history = queueHistoryFor(session);
-        const historyHtml = '<tr class="history" hidden><td colspan="5"><ul>' +
+        const queue = session.queue || {};
+        const queued = Number(queue.queued || 0);
+        const waitMin = queue.oldestWaitMin === null || queue.oldestWaitMin === undefined ? null : Number(queue.oldestWaitMin);
+        const etaMin = queue.etaMin === null || queue.etaMin === undefined ? null : Number(queue.etaMin);
+        const hot = queued > DATA.thresholds.queueThreshold || (waitMin !== null && waitMin > DATA.thresholds.waitThreshold);
+        const queueCell = queued ? String(queued) : '—';
+        const waitCell = waitMin === null ? '—' : waitMin + 'm';
+        const etaCell = etaMin === null ? '—' : '~' + etaMin + 'm';
+        const historyHtml = '<tr class="history" hidden><td colspan="8"><ul>' +
           (history.length ? history.map((row) => '<li><span class="muted">' + esc(row.taskId) + '</span> ' + esc(row.subject) +
             ' <span class="' + chipClass(row.status) + '">' + esc(row.status) + '</span></li>').join('')
             : '<li class="muted">无关联派单记录</li>') +
           '</ul></td></tr>';
-        return '<tr class="session-row" data-session="' + esc(session.id) + '">' +
+        return '<tr class="session-row' + (hot ? ' hot' : '') + '" data-session="' + esc(session.id) + '">' +
           '<td>' + esc(session.title) + ' <span class="muted">' + esc(session.id.replace(/^session-/, '').slice(0, 8)) + '</span></td>' +
           '<td>' + esc(session.role) + '</td>' +
           '<td>' + (session.live ? 'live' : 'idle') + (session.archived ? ' · archived' : '') + (session.registered ? '' : ' · 未登记') + '</td>' +
           '<td>' + relTime(session.lastActive) + '</td>' +
+          '<td>' + queueCell + '</td><td>' + waitCell + '</td><td>' + etaCell + '</td>' +
           '<td class="muted">' + esc(cwdTail(session.cwd)) + '</td></tr>' + historyHtml;
       }).join('') + '</tbody></table>';
   document.querySelectorAll('.session-row').forEach((row) => row.addEventListener('click', () => {
@@ -510,13 +658,15 @@ function main() {
   const triage = readTriage()
   return (async () => {
     const waker = options.offline ? EMPTY_WAKER : await readWaker(options.wakerUrl)
+    attachQueue(waker, options.offline ? readQueueState(null) : readQueueState(options.meshHome))
     const stats = summarize(todos, queue, triage, waker)
-    const summary = `todo=${stats.todoCount} doing=${stats.doingCount} done=${stats.doneCount} queue=${stats.queueCount} sessions=${waker.sessions.length} hiddenSessions=${stats.hiddenSessionCount} coordinators=${stats.coordinatorCount} waker=${stats.wakerOnline ? 'online' : 'offline'}`
+    const thresholds = { queueThreshold: options.queueThreshold, waitThreshold: options.waitThreshold }
+    const summary = `todo=${stats.todoCount} doing=${stats.doingCount} done=${stats.doneCount} queue=${stats.queueCount} sessions=${waker.sessions.length} hiddenSessions=${stats.hiddenSessionCount} coordinators=${stats.coordinatorCount} pendingStarted=${stats.queuePendingStarted ?? '—'} oldestWaitMin=${stats.queueOldestWaitMin ?? '—'} waker=${stats.wakerOnline ? 'online' : 'offline'}`
     if (!options.out) {
       console.log(summary)
       return 0
     }
-    const model = { generatedAt: new Date().toISOString(), stats, todos, queue, triage, waker }
+    const model = { generatedAt: new Date().toISOString(), stats, todos, queue, triage, waker, thresholds }
     const out = path.resolve(options.out)
     mkdirSync(path.dirname(out), { recursive: true })
     writeFileSync(out, renderHtml(model), 'utf8')
