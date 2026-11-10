@@ -8015,6 +8015,31 @@ async function main() {
     }
   })
 
+  // T-413: a thread bound before anything was dispatched has lastTaskId: null; the host
+  // rejected that under `type: string` for mesh_thread list.
+  await runCase('tools: mesh_thread list satisfies THREAD_OUTPUT with a null lastTaskId', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-thread-null', title: 'thread null target' }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const subscribed = await request(h.base, '/mesh/threads/subscribe', { method: 'POST', body: { thread: 'TH-null-1', sessionId: 'session-thread-null' } })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_thread')
+    const listed = await tool.execute({ action: 'list', scope: 'all' }, { sessionId: 'session-thread-null' })
+    const { THREAD_OUTPUT } = await import(pathToFileURL(ENTRY).href)
+    const issues = validateHostSubset(THREAD_OUTPUT.schema, listed)
+    const row = (listed.threads ?? []).find((entry) => entry.thread === 'TH-null-1')
+    const status = await request(h.base, '/mesh/status')
+    const ok =
+      subscribed.status === 200 &&
+      row?.lastTaskId === null &&
+      issues.length === 0 &&
+      status.json?.tools?.cancel === true &&
+      (status.json?.toolsError ?? null) === null
+    report(
+      'tools: mesh_thread list satisfies THREAD_OUTPUT with a null lastTaskId',
+      ok,
+      `lastTaskId=${row?.lastTaskId === null ? 'null' : String(row?.lastTaskId)} threadIssues=${issues.length} tools.cancel=${status.json?.tools?.cancel} toolsError=${status.json?.toolsError ?? 'null'}`,
+    )
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

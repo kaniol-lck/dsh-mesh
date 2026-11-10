@@ -6956,9 +6956,15 @@ export function apply(ctx, config) {
                 ask: toolState.ask.ok,
                 thread: toolState.thread.ok,
                 complete: toolState.complete.ok,
+                cancel: toolState.cancel.ok,
               },
               toolsError:
-                toolState.dispatch.error ?? toolState.ask.error ?? toolState.thread.error ?? toolState.complete.error ?? null,
+                toolState.dispatch.error ??
+                toolState.ask.error ??
+                toolState.thread.error ??
+                toolState.complete.error ??
+                toolState.cancel.error ??
+                null,
               // Effective limits and optional-seam state, so operators never have to guess.
               limits: { maxInlineBytes: c.maxInlineBytes },
               seams: { approval: seams.approval, questions: seams.questions },

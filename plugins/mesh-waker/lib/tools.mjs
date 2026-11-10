@@ -191,11 +191,13 @@ export const THREAD_OUTPUT = {
           type: 'object',
           properties: {
             thread: { type: 'string' },
-            targetSessionId: { type: 'string' },
-            targetTitle: { type: 'string' },
+            // A thread may be bound before anything is dispatched and its binding row may
+            // predate a field: the host rejects null under `type: string` (T-413).
+            targetSessionId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            targetTitle: { oneOf: [{ type: 'string' }, { type: 'null' }] },
             count: { type: 'number' },
-            lastTaskId: { type: 'string' },
-            updatedAt: { type: 'number' },
+            lastTaskId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            updatedAt: { oneOf: [{ type: 'number' }, { type: 'null' }] },
             subscribedBy: { type: 'string' },
             taskIds: { type: 'array', items: { type: 'string' } },
           },
