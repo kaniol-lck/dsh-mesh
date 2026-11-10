@@ -478,7 +478,7 @@ dsh-mesh-dispatch --transport hub --to dsh-peer-b --text "…" --dry-run
 | `thread` | `--thread` | 线索 id（≤128 字节，如 `TH-1`）：已知 thread 可省略 `target`，后续补丁续派到同一会话；显式 target 会改绑 |
 | `requester` | `--requester` | 回执收件人：会话 id 或标题，服务端解析（CLI 原样透传，不自己解析）。不传时 waker 先按**目标会话的 cwd** 推断同工作区协调会话（唯一或明显最新者），推断不出才回退 `receiptTo`；`receipt` 为 `file`（默认）时只写 `receipts.jsonl`，不注入任何会话 |
 
-**新建会话的工作区归属（0.8.1 起）**：createIfMissing 新会话默认继承**调用方会话的 cwd/工作区**；需要指定时用 workspacePath（别名 cwd，绝对路径）。拿不到调用方 cwd 又没传 workspacePath → 直接拒绝（不回退收件箱）；workspacePath 与调用方工作区不同 → 也直接拒绝，并给出三条出路（改派该区已有会话 	arget:<id> / 去掉 workspacePath 继承本区 / 到目标工作区的会话里发起）。返回体带 workspacePath 与实际 workspace slug，便于确认落在哪里。
+**新建会话的工作区归属（未发布版起）**：createIfMissing 新会话默认继承**调用方会话的 cwd/工作区**；需要指定时用 workspacePath（别名 cwd，绝对路径）。拿不到调用方 cwd 又没传 workspacePath → 直接拒绝（不回退收件箱）；workspacePath 与调用方工作区不同 → 也直接拒绝，并给出三条出路（改派该区已有会话 target:<id> / 去掉 workspacePath 继承本区 / 到目标工作区的会话里发起）。返回体带 workspacePath 与实际 workspace slug，便于确认落在哪里。
 
 工具描述里明确写了：投递后**不要轮询等待**，插件会在回合结束时写回执；要「全部完成再叫我」就用同一个 `batchId`。
 
