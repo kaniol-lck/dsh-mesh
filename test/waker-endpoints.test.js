@@ -569,10 +569,21 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
           row.lease_until = Date.now() + Number(body.lease_ms ?? 600000)
           return send(200, { ok: true, lease_until: row.lease_until })
         }
-        taskSettles.push({ taskId, body })
+        // Mirror the real hub (T-399): settle validates `status` and `source`, and rejects a
+        // body that only carries `result` — that mismatch is what the fake used to hide.
+        const SETTLE_STATUSES = new Set(['completed', 'error', 'lost', 'partial'])
+        const settleStatus = String(body.status ?? '')
+        const settleSource = body.source === undefined ? 'declared' : String(body.source)
+        if (!SETTLE_STATUSES.has(settleStatus)) {
+          return send(400, { error: 'status must be completed|error|lost|partial' })
+        }
+        if (!['observed', 'declared'].includes(settleSource)) {
+          return send(400, { error: 'source must be observed|declared' })
+        }
+        taskSettles.push({ taskId, body: { ...body, status: settleStatus, source: settleSource } })
         if (row.status === 'settled') return send(200, { ok: true, receipt: row.receipt ?? null, idempotent: true })
         row.status = 'settled'
-        row.receipt = { task_id: taskId, status: body.result, source: body.source, summary: body.summary ?? '' }
+        row.receipt = { task_id: taskId, status: settleStatus, source: settleSource, summary: body.summary ?? '' }
         return send(200, { ok: true, receipt: row.receipt })
       }
       return send(404, { error: 'not found' })
@@ -6898,7 +6909,12 @@ async function main() {
       if (requestPath.startsWith('/api/tasks?')) return { ok: true, status: 200, json: { ok: true, tasks: rows } }
       if (requestPath.endsWith('/claim')) return claimStatus === 200 ? { ok: true, status: 200, json: { ok: true } } : { ok: false, status: claimStatus, json: null }
       if (requestPath.endsWith('/heartbeat')) return { ok: true, status: 200, json: { ok: true } }
-      if (requestPath.endsWith('/settle')) return { ok: settleStatus === 200, status: settleStatus, json: { ok: true } }
+      // The real hub validates the settle body (T-399): status must be one of the four, so a
+      // client that sends `result` gets a 400 instead of a silent success.
+      if (requestPath.endsWith('/settle')) {
+        const ok = ['completed', 'error', 'lost', 'partial'].includes(String(body?.status ?? ''))
+        return { ok, status: ok ? settleStatus : 400, json: ok ? { ok: true } : { error: 'status must be completed|error|lost|partial' } }
+      }
       if (requestPath.startsWith('/api/blobs?')) return { ok: true, status: 200, json: { ok: true, blobs: [{ id: 'blob-1' }] } }
       // The real hub streams the blob as text, so the stub returns `text` with no JSON (T-392).
       if (requestPath.startsWith('/api/blob/')) return { ok: true, status: 200, json: null, text: 'do the thing' }
@@ -6936,7 +6952,7 @@ async function main() {
         Boolean(blobGet) &&
         settle.ok === true &&
         settleCall?.body?.source === 'observed' &&
-        settleCall?.body?.result === 'completed'
+        settleCall?.body?.status === 'completed'
       report('hub tasks: pull -> claim -> blob -> deliver -> settle observed', ok, `polled=${round.polled} claimed=${round.claimed} delivered=${delivered.length} settle=${settle.ok}`)
     } finally {
       consumer.stop()
@@ -7067,7 +7083,7 @@ async function main() {
         claim?.body?.lease_ms === 600000 &&
         settleBeforeTurnEnd === 0 &&
         settled?.body?.source === 'observed' &&
-        settled?.body?.result === 'completed' &&
+        settled?.body?.status === 'completed' &&
         status.json?.tasksPoll?.enabled === true &&
         typeof status.json?.tasksPoll?.lastPollAt === 'number'
       report('hub tasks: the plugin delivers a claimed task and settles it on turn/end', ok, `delivered=${delivered?.sessionId ?? '-'} settles=${fake.taskSettles.length} source=${settled?.body?.source ?? '-'}`)
@@ -7552,6 +7568,74 @@ async function main() {
     const members = registryOf(h).workspaces?.['coord-empty-new']?.coordinators ?? []
     const ok = claimed.status === 201 && claimed.json?.status === 'approved' && members.length === 1 && members[0].approvedBy === 'bootstrap'
     report('coordinators: a workspace with no legacy coordinator still bootstraps', ok, `status=${claimed.json?.status ?? '-'} approvedBy=${members[0]?.approvedBy ?? '-'}`)
+  })
+
+  // T-399: the hub settle field is `status`, not `result`. The fake hub now validates it, so a
+  // regression would fail here instead of silently passing.
+  await runCase('hub tasks: settle sends the status key and the fake hub rejects a result-only body', async () => {
+    const { createHubTaskConsumer } = await import(hubTasksUrl)
+    const stub = taskFetchStub([taskRow('P-20261110-01')])
+    const consumer = createHubTaskConsumer({
+      enabled: true,
+      agent: 'mesh-b',
+      pollIntervalMs: 600000,
+      leaseMs: 600000,
+      fetchJson: stub.fetchJson,
+      deliverTask: async () => {},
+    })
+    let clientSettle = null
+    let settleCall = null
+    try {
+      await consumer.pollOnce()
+      clientSettle = await consumer.settleTask('P-20261110-01', { result: 'completed', summary: 'ok', source: 'observed' })
+      settleCall = stub.calls.find((call) => call.path.endsWith('/settle'))
+    } finally {
+      consumer.stop()
+    }
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    try {
+      fake.addTask({ task_id: 'P-20261110-02', target_agent: 'dsh-test' }, 'x')
+      const rejected = await request(fake.url, '/api/tasks/P-20261110-02/settle', { method: 'POST', body: { result: 'completed', source: 'observed' } })
+      const accepted = await request(fake.url, '/api/tasks/P-20261110-02/settle', { method: 'POST', body: { status: 'completed', source: 'observed' } })
+      const ok =
+        clientSettle?.ok === true &&
+        settleCall?.body?.status === 'completed' &&
+        settleCall?.body?.result === undefined &&
+        rejected.status === 400 &&
+        /status must be completed\|error\|lost\|partial/.test(rejected.json?.error ?? '') &&
+        accepted.status === 200
+      report('hub tasks: settle sends the status key and the fake hub rejects a result-only body', ok, `settleStatusKey=${settleCall?.body?.status ?? '-'} fakeHubRejectsResultOnly=${rejected.status} accepted=${accepted.status}`)
+    } finally {
+      await fake.close()
+    }
+  })
+
+  await runCase('hub tasks: a rejected settle is surfaced in lastError', async () => {
+    const { createHubTaskConsumer } = await import(hubTasksUrl)
+    const stub = taskFetchStub([taskRow('P-20261110-03')], {})
+    // Override settle to mimic the hub's 400 for a bad body.
+    const rejecting = async (requestPath, options) => {
+      const res = await stub.fetchJson(requestPath, options)
+      if (requestPath.endsWith('/settle')) return { ok: false, status: 400, json: { error: 'status must be completed|error|lost|partial' } }
+      return res
+    }
+    const consumer = createHubTaskConsumer({
+      enabled: true,
+      agent: 'mesh-b',
+      pollIntervalMs: 600000,
+      leaseMs: 600000,
+      fetchJson: rejecting,
+      deliverTask: async () => {},
+    })
+    try {
+      await consumer.pollOnce()
+      const settled = await consumer.settleTask('P-20261110-03', { result: 'completed', source: 'observed' })
+      const snap = consumer.status()
+      const ok = settled.ok === false && /settle P-20261110-03 failed: HTTP 400/.test(snap.lastError ?? '')
+      report('hub tasks: a rejected settle is surfaced in lastError', ok, `ok=${settled.ok} lastError=${snap.lastError ?? '-'}`)
+    } finally {
+      consumer.stop()
+    }
   })
 
   const failed = results.filter((result) => !result.ok)

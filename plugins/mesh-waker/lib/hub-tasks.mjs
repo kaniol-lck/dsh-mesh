@@ -195,7 +195,9 @@ export function createHubTaskConsumer({
       const res = await fetchJson(`/api/tasks/${encodeURIComponent(id)}/settle`, {
         method: 'POST',
         body: {
-          result,
+          // The hub contract names this field `status` (completed|error|lost|partial), not
+          // `result` (T-399); sending `result` gets a 400 and the settlement is lost.
+          status: result,
           source,
           summary: String(summary ?? '').slice(0, 300),
           ...(Array.isArray(artifacts) && artifacts.length ? { artifacts } : {}),
