@@ -21,6 +21,7 @@
 - 跨机任务正文按 hub 的真实契约解析（`/api/blob/<id>` 是原始文件流而非 JSON）；失败信息改为粘性并在 `/mesh/status.tasksPoll` 暴露 `lastErrorAt`，不再被下一轮成功清空。
 - 结算请求改用 hub 契约的 `status` 字段（此前误发 `result`，真实 hub 一律 400、任务永远结算不了）；测试的 fake hub 同步校验字段，避免同类偏差再被掩盖。
 - `mesh_dispatch` 的 `createIfMissing` 不再把新会话建到收件箱工作区：默认继承调用方工作区，显式 `workspacePath` 跨区时直接拒绝，拿不到工作区时拒绝并给出路。
+- 注入类消息的 `FROM` 不再裸 `unknown`：`/mesh/inject` 按 `callerSession/origin/workspace` 回退来源，CLI 未传 `--requester` 时默认用 `DSH_SESSION_ID`；`TASK` 表头改为注册后渲染，始终是真实 id。
 
 ## [0.8.0] - 2026-11-02
 

@@ -6794,13 +6794,28 @@ export function apply(ctx, config) {
           target = resolveLocalSession(draft)
         }
         const batchId = meta.batchId ? String(meta.batchId).trim() : null
-        const deliveredText = c.injectHeader
-          ? withTaskHeader(text, { taskId: meta.taskId ? String(meta.taskId) : '-', batchId, requester, thread })
-          : text
-        // Register before prompting: a very fast turn can end before this request returns.
+        // T-415: register before rendering the header so TASK carries a real id (not '-'), and
+        // fall back to the sender's own session/workspace for FROM instead of a bare `unknown`.
+        const sourceLabel =
+          requester ||
+          String(draft.callerSession ?? '').trim() ||
+          String(draft.origin ?? '').trim() ||
+          String(draft.workspace ?? '').trim()
         let taskId = null
+        let deliveredText = text
         try {
-          if (meta.taskId) taskId = lifecycle.registerPendingTask(target, meta, mode, text)
+          if (!meta.taskId) meta.taskId = `T-${Date.now().toString(36)}`
+          // Register before prompting: a very fast turn can end before this request returns.
+          taskId = lifecycle.registerPendingTask(target, meta, mode, text)
+          deliveredText = c.injectHeader
+            ? withTaskHeader(text, {
+                taskId,
+                batchId,
+                requester,
+                origin: requester ? undefined : sourceLabel || undefined,
+                thread,
+              })
+            : text
           await promptWithResume(target.id, deliveredText, mode)
         } catch (error) {
           if (taskId) lifecycle.cancelPendingTask(taskId)

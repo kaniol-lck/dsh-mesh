@@ -55,7 +55,7 @@ export function normalizeThread(value) {
  * knows which task/batch it is running without guessing from prose. The body after the blank
  * line stays byte-for-byte unchanged.
  */
-export function withTaskHeader(text, { taskId, batchId, requester, thread, now = new Date() } = {}) {
+export function withTaskHeader(text, { taskId, batchId, requester, thread, origin, now = new Date() } = {}) {
   const pad = (value) => String(value).padStart(2, '0')
   const offset = -now.getTimezoneOffset()
   const sign = offset >= 0 ? '+' : '-'
@@ -64,7 +64,9 @@ export function withTaskHeader(text, { taskId, batchId, requester, thread, now =
   const task = taskId || '-'
   const threadLabel = thread || '-'
   const batch = batchId || '-'
-  const from = requester || 'unknown'
+  // `requester` is who should receive the receipt. A caller that has none (plain /mesh/inject,
+  // CLI, curl) still knows where it came from: show that instead of a bare `unknown` (T-415).
+  const from = requester || (origin ? `unknown(${origin})` : 'unknown')
   return `[TASK ${task} · THREAD ${threadLabel} · BATCH ${batch} · FROM ${from}] ${stamp}\n\n${text}`
 }
 

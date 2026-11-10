@@ -50,9 +50,11 @@ Options:
   --mode <m>         queue (default) or steer
   --thread <id>      follow-up thread id (at most 128 UTF-8 bytes); a known thread lets
                      you omit --target and keeps the binding on the same session
-  --requester <s>    session id or title that should receive the receipt; when omitted the
-                     waker infers the target workspace's coordinator, then falls back to
-                     its receiptTo (queue/wake); file mode only writes receipts.jsonl
+  --requester <s>    session id or title that should receive the receipt; an explicit value
+                     wins, otherwise DSH_SESSION_ID is used when set (a session-invoked CLI
+                     names itself instead of showing FROM unknown), then the waker infers the
+                     target workspace's coordinator, then falls back to its receiptTo
+                     (queue/wake); file mode only writes receipts.jsonl
   --task [id]        receipt task id; "--task" alone generates T-<base36 timestamp>
                      (--transport hub: must be <PREFIX>-<YYYYMMDD>-<SEQ>; a bare T-NNN is
                      rejected because the hub refuses it and would silently duplicate)
@@ -522,6 +524,16 @@ export async function resolveRoleTarget(base, role, fetchImpl = fetch) {
 /** Dispatch one task; returns the waker's result (plus created flag when it made a session). */
 export async function run(options, fetchImpl = fetch) {
   const base = String(options.waker ?? DEFAULT_WAKER).replace(/\/+$/, '')
+  // T-415: a CLI invoked from inside a session knows which session that is, so it can name
+  // itself instead of dispatching with no source metadata (which renders `FROM unknown`).
+  // An explicit --requester always wins; the fallback is announced on stderr so --json stays clean.
+  if (!options.requester) {
+    const envSession = String(process.env.DSH_SESSION_ID ?? '').trim()
+    if (envSession) {
+      options = { ...options, requester: envSession }
+      console.error(`[dsh-mesh-dispatch] requester=${envSession} (from DSH_SESSION_ID; pass --requester to override)`)
+    }
+  }
   // Cross-machine transport (T-389) is a different pipeline entirely: blob + hub row + one
   // local reference. Nothing below (session resolution / inject) runs for it.
   if (options.transport === 'hub') {
@@ -683,6 +695,7 @@ async function main(argv = process.argv.slice(2)) {
     return
   }
   const parts = [`sent session=${result.sessionId}`, `task=${result.taskId ?? '-'}`]
+  if (options.requester) parts.push(`requester=${options.requester}`)
   if (result.batchId) parts.push(`batch=${result.batchId}`)
   if (result.created) parts.push('created=yes')
   console.log(parts.join(' '))

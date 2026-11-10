@@ -1612,12 +1612,20 @@ async function main() {
     report('CLI: --requester accepts a title verbatim', ok, `requester=${plan.payload?.requester ?? '-'}`)
   })
 
-  await runCase('CLI: without --requester the body keeps no requester field', async () => {
+  await runCase('CLI: without --requester or DSH_SESSION_ID the body keeps no requester field', async () => {
     const { parseArgs, run } = await import(cliUrl)
-    const options = parseArgs(['--target', 'mesh · hub', '--text', 'hi'])
-    const plan = await run({ ...options, dryRun: true }, noFetch)
-    const ok = !('requester' in (plan.payload ?? {}))
-    report('CLI: without --requester the body keeps no requester field', ok, `keys=${Object.keys(plan.payload ?? {}).join(',')}`)
+    // T-415: the CLI now defaults the requester from DSH_SESSION_ID, so this legacy guarantee
+    // is about "neither the flag nor the environment names a session".
+    const saved = process.env.DSH_SESSION_ID
+    delete process.env.DSH_SESSION_ID
+    try {
+      const options = parseArgs(['--target', 'mesh · hub', '--text', 'hi'])
+      const plan = await run({ ...options, dryRun: true }, noFetch)
+      const ok = !('requester' in (plan.payload ?? {}))
+      report('CLI: without --requester or DSH_SESSION_ID the body keeps no requester field', ok, `keys=${Object.keys(plan.payload ?? {}).join(',')}`)
+    } finally {
+      if (saved !== undefined) process.env.DSH_SESSION_ID = saved
+    }
   })
 
   await runCase('CLI: --requester and --thread coexist', async () => {
@@ -1798,10 +1806,11 @@ async function main() {
 
   // Async spawn: spawnSync would block this process's event loop, so the registry stub above
   // could never answer the child and every case would look like a connection failure.
-  const runCliProcess = (args) =>
+  const runCliProcess = (args, options = {}) =>
     new Promise((resolve) => {
       const { spawn } = require('node:child_process')
-      const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+      const env = options.env ? { ...process.env, ...options.env } : process.env
+      const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'], env })
       let stdout = ''
       let stderr = ''
       child.stdout.on('data', (chunk) => {
@@ -8038,6 +8047,68 @@ async function main() {
       ok,
       `lastTaskId=${row?.lastTaskId === null ? 'null' : String(row?.lastTaskId)} threadIssues=${issues.length} tools.cancel=${status.json?.tools?.cancel} toolsError=${status.json?.toolsError ?? 'null'}`,
     )
+  })
+
+  // ---- T-415: the injected header names its source instead of a bare `unknown` ----
+  const headerLineOf = (h, index = 0) => String(h.state.prompts[index]?.content?.[0]?.text ?? '').split('\n')[0]
+  const headerBodyOf = (h, index = 0) => String(h.state.prompts[index]?.content?.[0]?.text ?? '').split('\n\n').slice(1).join('\n\n')
+  const STAMP_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+-]\d{2}:\d{2}$/
+
+  await runCase('inject: a header falls back to the sender origin', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-hdr-origin', title: 'hdr origin' }] })
+    const sent = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { session: 'session-hdr-origin', text: 'origin body', origin: 'dsh-peer-b/xiajiang' },
+    })
+    const header = headerLineOf(h)
+    const taskMatch = header.match(/^\[TASK ([^ ]+) · THREAD - · BATCH - · FROM unknown\(dsh-peer-b\/xiajiang\)\] /)
+    const ok =
+      sent.status === 200 &&
+      Boolean(taskMatch) &&
+      /^T-[0-9a-z]+$/.test(taskMatch?.[1] ?? '') &&
+      sent.json?.taskId === taskMatch?.[1] &&
+      STAMP_RE.test(header) &&
+      headerBodyOf(h) === 'origin body'
+    report('inject: a header falls back to the sender origin', ok, `injectFrom=unknown(dsh-peer-b/xiajiang) injectTaskId=${sent.json?.taskId} header=${header}`)
+  })
+
+  await runCase('inject: a header with no source keeps the bare unknown', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-hdr-plain', title: 'hdr plain' }] })
+    const sent = await request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-hdr-plain', text: 'plain body' } })
+    const header = headerLineOf(h)
+    const ok = sent.status === 200 && / · FROM unknown\] /.test(header) && headerBodyOf(h) === 'plain body'
+    report('inject: a header with no source keeps the bare unknown', ok, `header=${header}`)
+  })
+
+  await runCase('inject: a header with a requester is unchanged', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-hdr-legacy', title: 'hdr legacy' }] })
+    const sent = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { session: 'session-hdr-legacy', text: 'legacy body', requester: 'session-req-x', origin: 'ignored/origin' },
+    })
+    const header = headerLineOf(h)
+    const taskId = sent.json?.taskId
+    const stamp = header.slice(header.lastIndexOf('] ') + 2)
+    const expected = `[TASK ${taskId} · THREAD - · BATCH - · FROM session-req-x] ${stamp}`
+    const legacyHeaderByteIdentical = header === expected && STAMP_RE.test(stamp)
+    const ok = sent.status === 200 && legacyHeaderByteIdentical && !header.includes('ignored/origin') && headerBodyOf(h) === 'legacy body'
+    report('inject: a header with a requester is unchanged', ok, `legacyHeaderByteIdentical=${legacyHeaderByteIdentical} header=${header}`)
+  })
+
+  await runCase('CLI: DSH_SESSION_ID becomes the default requester', async () => {
+    const cliPath = path.join(REPO, 'plugins', 'mesh-waker', 'bin', 'dispatch.mjs')
+    const args = [cliPath, '--target', 'some-session', '--text', 'hi', '--dry-run', '--json']
+    const withEnv = await runCliProcess(args, { env: { DSH_SESSION_ID: 'session-cli-env' } })
+    const withoutEnv = await runCliProcess(args, { env: { DSH_SESSION_ID: '' } })
+    const withJson = JSON.parse(withEnv.stdout || '{}')
+    const withoutJson = JSON.parse(withoutEnv.stdout || '{}')
+    const cliRequester = withJson.payload?.requester ?? null
+    const ok =
+      withEnv.status === 0 &&
+      cliRequester === 'session-cli-env' &&
+      withoutJson.payload?.requester === undefined &&
+      /requester=session-cli-env/.test(withEnv.stderr)
+    report('CLI: DSH_SESSION_ID becomes the default requester', ok, `cliRequester=${cliRequester ?? '-'} noEnv=${withoutJson.payload?.requester ?? '-'} stderrNoted=${/requester=session-cli-env/.test(withEnv.stderr)}`)
   })
 
   const failed = results.filter((result) => !result.ok)
