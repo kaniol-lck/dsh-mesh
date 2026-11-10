@@ -1385,16 +1385,105 @@ async function main() {
   })
 
   await runCase('mesh_dispatch: createIfMissing=true creates the session and injects', async (boot) => {
+    const wsPath = path.join(os.tmpdir(), 'Projects', 'create-missing-ws')
     const h = await boot({})
     await waitFor(() => h.state.tools.length > 0, 5000)
-    const result = await h.state.tools[0].execute({ target: 'brand new worker', text: 'bootstrap it', createIfMissing: true })
+    const result = await h.state.tools[0].execute({ target: 'brand new worker', text: 'bootstrap it', createIfMissing: true, workspacePath: wsPath })
     const ok =
       result.ok === true &&
       result.created === true &&
       Boolean(result.sessionId) &&
+      result.workspacePath === wsPath &&
       h.state.created.length === 1 &&
       h.state.prompts.length === 1
-    report('mesh_dispatch: createIfMissing=true creates the session and injects', ok, `created=${result.created} session=${result.sessionId} createCalls=${h.state.created.length} prompts=${h.state.prompts.length}`)
+    report('mesh_dispatch: createIfMissing=true creates the session and injects', ok, `created=${result.created} session=${result.sessionId} workspacePath=${result.workspacePath ?? '-'} createCalls=${h.state.created.length} prompts=${h.state.prompts.length}`)
+  })
+
+  // T-402: createIfMissing used to place every new session in the inbox workspace.
+  await runCase('mesh_dispatch: createIfMissing inherits the caller workspace', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'caller-repo', 'public')
+    const h = await boot({ seedSessions: [{ id: 'session-caller-ws', title: 'caller', cwd }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const result = await h.state.tools[0].execute({ target: 'inherited worker', text: 'do it', createIfMissing: true }, { sessionId: 'session-caller-ws' })
+    const request = h.state.created[0]?.request ?? {}
+    const ok =
+      result.created === true &&
+      result.workspacePath === cwd &&
+      request.workspaceId === h.state.workspace?.id &&
+      h.state.workspace?.path === cwd
+    report('mesh_dispatch: createIfMissing inherits the caller workspace', ok, `workspacePath=${result.workspacePath ?? '-'} createdAt=${h.state.workspace?.path ?? '-'} byId=${Boolean(request.workspaceId)}`)
+  })
+
+  await runCase('mesh_dispatch: createIfMissing honours an explicit workspacePath', async (boot) => {
+    const wsPath = path.join(os.tmpdir(), 'Projects', 'explicit-ws')
+    const h = await boot({})
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const result = await h.state.tools[0].execute({ target: 'explicit worker', text: 'do it', createIfMissing: true, workspacePath: wsPath })
+    const request = h.state.created[0]?.request ?? {}
+    const ok =
+      result.created === true &&
+      result.workspacePath === wsPath &&
+      h.state.workspace?.path === wsPath &&
+      request.workspaceId === h.state.workspace?.id
+    report('mesh_dispatch: createIfMissing honours an explicit workspacePath', ok, `workspacePath=${result.workspacePath ?? '-'} workspace=${result.workspace ?? '-'}`)
+  })
+
+  await runCase('mesh_dispatch: a cross-workspace create is refused with options', async (boot) => {
+    const callerCwd = path.join(os.tmpdir(), 'Projects', 'xiajiang')
+    const otherCwd = path.join(os.tmpdir(), 'Projects', 'other-repo')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-caller-x', title: 'caller', cwd: callerCwd },
+        { id: 'session-other-y', title: 'other worker', cwd: otherCwd },
+      ],
+    })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    let error = null
+    try {
+      await h.state.tools[0].execute({ target: 'cross worker', text: 'do it', createIfMissing: true, workspacePath: otherCwd }, { sessionId: 'session-caller-x' })
+    } catch (caught) {
+      error = caught
+    }
+    const message = String(error?.message ?? '')
+    const ok =
+      h.state.created.length === 0 &&
+      message.includes(callerCwd) &&
+      message.includes(otherCwd) &&
+      message.includes('xiajiang') &&
+      message.includes('other-repo') &&
+      message.includes('target:') &&
+      /inherit/.test(message)
+    report('mesh_dispatch: a cross-workspace create is refused with options', ok, `created=${h.state.created.length} bothPaths=${message.includes(callerCwd) && message.includes(otherCwd)} options=${/target:/.test(message) && /inherit/.test(message)}`)
+  })
+
+  await runCase('mesh_dispatch: createIfMissing without a caller workspace is refused', async (boot) => {
+    const h = await boot({})
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    let error = null
+    try {
+      await h.state.tools[0].execute({ target: 'nowhere worker', text: 'do it', createIfMissing: true })
+    } catch (caught) {
+      error = caught
+    }
+    const message = String(error?.message ?? '')
+    const ok = h.state.created.length === 0 && /workspacePath/.test(message) && /target:/.test(message)
+    report('mesh_dispatch: createIfMissing without a caller workspace is refused', ok, `created=${h.state.created.length} mentionsWorkspacePath=${/workspacePath/.test(message)}`)
+  })
+
+  await runCase('mesh_dispatch: the cross-workspace id warning names a real prefix', async (boot) => {
+    const callerCwd = path.join(os.tmpdir(), 'Projects', 'xiajiang')
+    const targetCwd = path.join(os.tmpdir(), 'Projects', 'other-repo')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-warn-caller', title: 'caller', cwd: callerCwd },
+        { id: 'session-warn-target', title: 'remote worker', cwd: targetCwd },
+      ],
+    })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const result = await h.state.tools[0].execute({ target: 'session-warn-target', text: 'do it', taskId: 'T-bare-2' }, { sessionId: 'session-warn-caller' })
+    const warning = String(result.warning ?? '')
+    const ok = warning.includes('other-repo/T-bare-2') && warning.includes('<PREFIX>-<YYYYMMDD>-<SEQ>') && !warning.includes('dsh-mesh/T-123')
+    report('mesh_dispatch: the cross-workspace id warning names a real prefix', ok, `warning=${warning.slice(0, 120)}`)
   })
 
   await runCase('mesh_dispatch: taskId auto-generates and explicit ids pass through', async (boot) => {

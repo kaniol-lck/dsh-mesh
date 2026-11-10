@@ -261,13 +261,23 @@ export function createTaskLifecycle(deps) {
     // requireNamespacedIds is on (opt-in so historical ids stay addressable).
     let idWarning = null
     if (route.scope === 'machine' && /^T-/i.test(taskId)) {
+      // T-402: the example must be executable — use the real workspace slug of the target
+      // session's cwd (the old hardcoded `dsh-mesh/T-123` belonged to no real workspace).
+      let slug = null
+      try {
+        slug = deps.workspaceSlugForCwd?.(deps.sessionCwdOf?.(target.id)) ?? null
+      } catch {
+        slug = null
+      }
+      const namespaced = slug ? `${slug}/${taskId}` : `<workspace-slug>/${taskId}`
+      const example = `${namespaced} (or <PREFIX>-<YYYYMMDD>-<SEQ>, e.g. DMSH-20261111-01)`
       if (deps.config.requireNamespacedIds === true) {
         deps.fileLog(`task id rejected (not namespaced): ${taskId}`)
         throw new Error(
-          `cross-workspace task id ${taskId} must be namespaced (e.g. dsh-mesh/${taskId}); set requireNamespacedIds:false to allow bare ids`,
+          `cross-workspace task id ${taskId} must be namespaced: ${example}; set requireNamespacedIds:false to allow bare ids`,
         )
       }
-      idWarning = 'cross-workspace task ids should be namespaced (e.g. dsh-mesh/T-123)'
+      idWarning = `cross-workspace task ids should be namespaced: ${example}`
       deps.fileLog(`WARN cross-workspace task id ${taskId} is not namespaced`)
     }
     const task = {

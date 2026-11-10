@@ -17,11 +17,17 @@ export const MESH_DISPATCH_TOOL = {
     'Returns immediately with taskId; do NOT poll or wait for the result — the waker writes a receipt when that turn ends (file by default). ' +
     'Pass the same batchId for several tasks to get exactly one aggregate notice after all of them finish (batch barrier). ' +
     'Pass a thread id to group follow-ups: once bound, a later dispatch may omit target and goes to the same session. ' +
-    'Set createIfMissing:true to create the session when target does not resolve. ' +
+    'Set createIfMissing:true to create the session when target does not resolve. A created session always lives in a workspace: it inherits the caller session\u2019s cwd by default, or the absolute path you pass as workspacePath; a cross-workspace create is refused. ' +
     'requester names the session that should receive the receipt (usually passed by the CLI; models may omit it).',
   parameters: {
     target: { type: 'string', description: 'Session id, full title, or a unique title substring. Required unless a known `thread` is given.' },
     text: { type: 'string', required: true, description: 'Task text, delivered verbatim after a one-line [TASK …] header (max 64 KiB).' },
+    workspacePath: {
+      type: 'string',
+      description:
+        'Absolute workspace path for a session created by createIfMissing (e.g. D:\\projects\\proj). Omit to inherit the caller session\u2019s workspace. Refused when it points at a different workspace than the caller\u2019s.',
+    },
+    cwd: { type: 'string', description: 'Alias of workspacePath (absolute path).' },
     thread: {
       type: 'string',
       description: 'Optional follow-up thread id (≤128 bytes, e.g. TH-1). A known thread lets you omit target and keeps binding follow-ups to the same session.',

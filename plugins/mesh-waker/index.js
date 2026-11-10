@@ -2128,6 +2128,19 @@ export function apply(ctx, config) {
   // sessionId -> { cwd } hint captured at creation (a just-created log may not carry it yet).
   const identityPending = new Map()
 
+  /**
+   * Workspace slug that owns an absolute path, or null when the path is not registered.
+   * `createIfMissing` uses this to tell "same workspace" from "cross workspace" (T-402).
+   */
+  function workspaceSlugForPath(path) {
+    const raw = String(path ?? '').trim()
+    if (!raw) return null
+    refreshWorkspacesFromDisk()
+    const key = workspaceKeyPath(raw)
+    const hit = Object.entries(workspaces.workspaces).find(([, entry]) => entry.cwd && workspaceKeyPath(entry.cwd) === key)
+    return hit ? hit[0] : null
+  }
+
   /** The one thing a session may not infer: which workspace it belongs to and whether it leads it. */
   function identityFor(sessionId, cwdHint = null) {
     const session = listLocalSessions().find((item) => item.id === sessionId) ?? null
@@ -4440,6 +4453,8 @@ export function apply(ctx, config) {
     maxTurnFor,
     // 会话 id → cwd（路由用）
     sessionCwdOf,
+    // cwd → 工作区 slug（跨区单号提示用真实前缀，T-402）
+    workspaceSlugForCwd: (path) => workspaceSlugForPath(path),
     // LCA 路由
     routeForCwds,
     // 路由 → scope 字段
@@ -4512,7 +4527,10 @@ export function apply(ctx, config) {
         entry.sessionId = null
       }
     }
-    const created = await createDispatchTarget('Mesh 收件箱')
+    // The mesh inbox is a system-created session: it belongs to the inbox workspace, not to
+    // the caller's workspace (T-402 only forbids using the inbox as a caller fallback).
+    const inboxPath = c.workspacePath || c.sessionCwd
+    const created = await createDispatchTarget('Mesh 收件箱', inboxPath)
     entry.sessionId = created.id
     entry.title = created.title
     entry.createdAt = Date.now()
@@ -4976,28 +4994,65 @@ export function apply(ctx, config) {
   // @deepseek-ai/dsh-tools is a host peer dependency that a linked install may not resolve,
   // in which case the same definition is registered with a plain JSON Schema.
 
-  async function createDispatchTarget(title) {
+  /**
+   * Create a dispatch target inside an explicit workspace (T-402). `c.workspacePath` is NOT
+   * consulted: a task created from another project used to land in the inbox workspace, which
+   * gave the new session the wrong cwd, relative paths and task tier. The host's echo is
+   * checked so a silent misplacement turns into an error instead of a wrong turn.
+   */
+  async function createDispatchTarget(title, workspacePath) {
     const name = String(title ?? '').trim().slice(0, 60)
     if (!name) throw new Error('createIfMissing needs a non-empty target to use as the title')
-    let workspaceId
+    const path = String(workspacePath ?? '').trim()
+    if (!path) throw new Error('createIfMissing needs an explicit workspacePath (no inbox fallback)')
     try {
-      workspaceId = await ensureWorkspaceId()
-    } catch {
-      workspaceId = undefined
+      mkdirSync(path, { recursive: true })
+    } catch (error) {
+      fileLog(`dispatch workspace mkdir failed: ${error.message}`)
+    }
+    let workspaceId = null
+    try {
+      const resolved = await ctx.workspaceRegistry?.resolveByPath?.(path)
+      workspaceId = resolved?.id ?? null
+      if (!workspaceId) {
+        const createdWorkspace = await ctx.workspaceRegistry?.create?.(path, name)
+        workspaceId = createdWorkspace?.id ?? null
+      }
+    } catch (error) {
+      fileLog(`dispatch workspace resolve/create failed (${error.message})`)
     }
     const created = await ctx.sessionController.create(
-      workspaceId ? { workspaceId, agentPreset: c.agentPreset } : { cwd: c.sessionCwd, agentPreset: c.agentPreset },
+      workspaceId ? { workspaceId, agentPreset: c.agentPreset } : { cwd: path, agentPreset: c.agentPreset },
     )
     const sessionId = created?.sessionId
     if (!sessionId) throw new Error('sessionController.create returned no sessionId')
-    identityPending.set(sessionId, { cwd: null })
+    // Never inject into a session the host placed somewhere else than requested.
+    const echoed = created?.workspacePath ?? created?.cwd ?? null
+    if (echoed && workspaceKeyPath(echoed) !== workspaceKeyPath(path)) {
+      throw new Error(
+        `session ${sessionId} was created at ${echoed}, not the requested workspace ${path}; refusing to inject into the wrong workspace (pass the right workspacePath or reuse an existing session with target:<id>)`,
+      )
+    }
+    identityPending.set(sessionId, { cwd: path })
     try {
       await ctx.sessionController.rename({ sessionId, title: name })
     } catch (error) {
       fileLog(`renaming dispatch-created session failed: ${error.message}`)
     }
-    fileLog(`created session ${sessionId} for mesh_dispatch target "${name}"`)
-    return { id: sessionId, title: name }
+    fileLog(`created session ${sessionId} for mesh_dispatch target "${name}" workspace=${path}`)
+    return { id: sessionId, title: name, workspaceId, workspacePath: path }
+  }
+
+  /** Refuse cross-workspace creation with the two workspaces and three executable options. */
+  function crossWorkspaceCreateError(callerCwd, requestedPath) {
+    const fromSlug = workspaceSlugForPath(callerCwd) ?? '<unknown>'
+    const toSlug = workspaceSlugForPath(requestedPath) ?? '<unregistered>'
+    return new Error(
+      `refusing to create a session in another workspace: caller workspace ${fromSlug} (${callerCwd}) != requested ${toSlug} (${requestedPath}). ` +
+        `Options: (1) dispatch into an existing session of that workspace with target:"<session id>"; ` +
+        `(2) drop workspacePath so the new session inherits ${callerCwd}; ` +
+        `(3) run this dispatch from a session that already lives in ${toSlug}.`,
+    )
   }
 
   let toolExtraLogged = false
@@ -5045,6 +5100,7 @@ export function apply(ctx, config) {
     if (text.length > 64 * 1024) throw new Error('text is too large (max 64 KiB)')
     let session = null
     let createdSession = false
+    let createdWorkspacePath = null
     try {
       session = resolveLocalSession({ session: target, title: target })
     } catch (error) {
@@ -5056,8 +5112,26 @@ export function apply(ctx, config) {
           `找不到会话 "${target}"；可用 list_local_sessions 查看，或设 createIfMissing:true 新建（${error.message}）`,
         )
       }
-      session = await createDispatchTarget(target)
+      // T-402: a new session belongs to the caller's workspace. The inbox workspace
+      // (c.workspacePath) is never a fallback: that used to put workers in the wrong cwd.
+      const requestedPath = String(args.workspacePath ?? args.cwd ?? '').trim()
+      const callerCwd = sessionCwdOf(callerSession) ?? sessionCwdOf(requester) ?? null
+      if (requestedPath && callerCwd && workspaceKeyPath(requestedPath) !== workspaceKeyPath(callerCwd)) {
+        throw crossWorkspaceCreateError(callerCwd, requestedPath)
+      }
+      if (!requestedPath && !callerCwd) {
+        throw new Error(
+          'createIfMissing needs a workspace for the new session, but the caller cwd is unknown: ' +
+            'pass workspacePath:"<absolute path, e.g. D:\\\\projects\\\\proj>" (alias cwd:"…"), ' +
+            'or dispatch to an existing session with target:"<session id>", ' +
+            'or start a session in that workspace first and dispatch from there.',
+        )
+      }
+      const targetPath = requestedPath || callerCwd
+      const dispatchTarget = await createDispatchTarget(target, targetPath)
+      session = { id: dispatchTarget.id, title: dispatchTarget.title }
       createdSession = true
+      createdWorkspacePath = dispatchTarget.workspacePath
     }
     const resolved = buildDispatchMeta(args)
     const meta = {
@@ -5084,6 +5158,7 @@ export function apply(ctx, config) {
     fileLog(
       `mesh_dispatch: ${text.length} chars (delivered ${deliveredText.length}) -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''}${thread ? ` thread=${thread}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession} header=${c.injectHeader}${explicitTarget ? ' explicit-target' : thread ? ' via-thread' : ''}`,
     )
+    const effectiveWorkspacePath = createdWorkspacePath ?? sessionCwdOf(session.id) ?? null
     return {
       ok: true,
       sessionId: session.id,
@@ -5094,6 +5169,10 @@ export function apply(ctx, config) {
       requester: requester || null,
       mode: args.mode === 'steer' ? 'steer' : 'queue',
       created: createdSession,
+      // Where the session actually lives (created or reused): callers no longer have to guess
+      // whether a new worker landed in the right workspace (T-402).
+      workspacePath: effectiveWorkspacePath,
+      workspace: workspaceSlugForPath(effectiveWorkspacePath),
       ...(taskId && pendingTasks.get(taskId)?.idWarning ? { warning: pendingTasks.get(taskId).idWarning } : {}),
     }
   }

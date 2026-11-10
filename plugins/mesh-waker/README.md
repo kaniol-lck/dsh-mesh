@@ -460,7 +460,9 @@ dsh-mesh-dispatch --transport hub --to dsh-peer-b --text "…" --dry-run
 |---|---|---|
 | `target`（必填） | `--target` | 会话 id、完整标题或唯一标题子串 |
 | `text`（必填） | `--text` / `--file` | 原文投递，≤64 KiB；注入时正文前会加一行 `[TASK <id> · THREAD <id|-> · BATCH <id|-> · FROM <requester>] <时间>` 表头（`injectHeader:false` 可关），账本里可直接引用该 taskId |
-| `createIfMissing` | `--create` | 解析不到时按 `target` 当标题**新建会话**再投递（新会话用 `sessionCwd`/默认工作区） |
+| `createIfMissing` | `--create` | 解析不到时按 `target` 当标题**新建会话**再投递；新会话默认落在**调用方会话所在工作区**（不再用收件箱/`sessionCwd`），拿不到调用方 cwd 且未传 `workspacePath` 时**直接拒绝**并给三条出路 |
+| `workspacePath` | （CLI 用 `--create` + 自身 `cwd`） | 新建会话要落在哪个工作区（绝对路径）；省略时继承调用方会话 cwd。与调用方工作区不同 → **拒绝创建**（报出两边 slug/路径 + 改派/继承/换会话发起三条指引），不做静默跨区新建 |
+| `cwd` | — | `workspacePath` 的别名 |
 | `mode` | `--mode` | `queue`（默认，等当前回合）或 `steer`（打断） |
 | `taskId` | `--task [id]` | 不传自动 `T-<base36>`；不带值也自动生成 |
 | `batchId` | `--batch [id]` | 同批次 barrier：全部结束只回执一次 |
@@ -469,6 +471,8 @@ dsh-mesh-dispatch --transport hub --to dsh-peer-b --text "…" --dry-run
 | `subject` | （CLI 暂缺） | 任务库/面板显示的可读标题（≤120 字）；省略时由正文首行清洗（优先加粗片段、去掉 `任务（…）：`/`【…】` 前缀与 `**`）。目前只有工具参数支持 |
 | `thread` | `--thread` | 线索 id（≤128 字节，如 `TH-1`）：已知 thread 可省略 `target`，后续补丁续派到同一会话；显式 target 会改绑 |
 | `requester` | `--requester` | 回执收件人：会话 id 或标题，服务端解析（CLI 原样透传，不自己解析）。不传时 waker 先按**目标会话的 cwd** 推断同工作区协调会话（唯一或明显最新者），推断不出才回退 `receiptTo`；`receipt` 为 `file`（默认）时只写 `receipts.jsonl`，不注入任何会话 |
+
+**新建会话的工作区归属（0.8.1 起）**：createIfMissing 新会话默认继承**调用方会话的 cwd/工作区**；需要指定时用 workspacePath（别名 cwd，绝对路径）。拿不到调用方 cwd 又没传 workspacePath → 直接拒绝（不回退收件箱）；workspacePath 与调用方工作区不同 → 也直接拒绝，并给出三条出路（改派该区已有会话 	arget:<id> / 去掉 workspacePath 继承本区 / 到目标工作区的会话里发起）。返回体带 workspacePath 与实际 workspace slug，便于确认落在哪里。
 
 工具描述里明确写了：投递后**不要轮询等待**，插件会在回合结束时写回执；要「全部完成再叫我」就用同一个 `batchId`。
 
