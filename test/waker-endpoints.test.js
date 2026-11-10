@@ -3716,18 +3716,82 @@ async function main() {
 
   // 124-125. Host schema subset guard (T-236): type arrays silently block registration.
   await runCase('tools: both output schemas pass the host JSON Schema subset', async () => {
-    const { DISPATCH_OUTPUT, ASK_OUTPUT, THREAD_OUTPUT, COMPLETE_OUTPUT, validateToolSchema } = await import(pathToFileURL(ENTRY).href)
+    const { DISPATCH_OUTPUT, ASK_OUTPUT, THREAD_OUTPUT, COMPLETE_OUTPUT, CANCEL_OUTPUT, validateToolSchema } = await import(pathToFileURL(ENTRY).href)
     const dispatch = validateToolSchema(DISPATCH_OUTPUT)
     const ask = validateToolSchema(ASK_OUTPUT)
     const thread = validateToolSchema(THREAD_OUTPUT)
     const complete = validateToolSchema(COMPLETE_OUTPUT)
-    const schemas = { dispatch: dispatch.ok, ask: ask.ok, thread: thread.ok, complete: complete.ok }
+    const cancel = validateToolSchema(CANCEL_OUTPUT)
+    const schemas = { dispatch: dispatch.ok, ask: ask.ok, thread: thread.ok, complete: complete.ok, cancel: cancel.ok }
     const ok = Object.values(schemas).every(Boolean)
     report(
       'tools: both output schemas pass the host JSON Schema subset',
       ok,
-      `dispatch=${dispatch.ok ? 'ok' : dispatch.issues.join('; ')} ask=${ask.ok ? 'ok' : ask.issues.join('; ')} thread=${thread.ok ? 'ok' : thread.issues.join('; ')} complete=${complete.ok ? 'ok' : complete.issues.join('; ')}`,
+      `dispatch=${dispatch.ok ? 'ok' : dispatch.issues.join('; ')} ask=${ask.ok ? 'ok' : ask.issues.join('; ')} thread=${thread.ok ? 'ok' : thread.issues.join('; ')} complete=${complete.ok ? 'ok' : complete.issues.join('; ')} cancel=${cancel.ok ? 'ok' : cancel.issues.join('; ')}`,
     )
+  })
+
+  // T-408: the host validates a tool's returned value against its output schema. A null under
+  // `type: string` throws ToolOutputError *after* the side effect (the turn already stopped).
+  const validateHostSubset = (schema, value) => {
+    const issues = []
+    const walk = (node, val, at) => {
+      if (!node || typeof node !== 'object') return
+      if (node.oneOf) {
+        let matched = false
+        for (const child of node.oneOf) {
+          const mark = issues.length
+          walk(child, val, at)
+          const branchIssues = issues.length - mark
+          issues.length = mark
+          if (branchIssues === 0) {
+            matched = true
+            break
+          }
+        }
+        if (!matched) issues.push(`${at} matches no oneOf branch`)
+        return
+      }
+      if (node.type === 'object') {
+        if (!val || typeof val !== 'object' || Array.isArray(val)) {
+          issues.push(`${at} must be object`)
+          return
+        }
+        for (const key of node.required ?? []) if (!(key in val)) issues.push(`${at}.${key} is required`)
+        for (const [key, child] of Object.entries(node.properties ?? {})) if (key in val) walk(child, val[key], `${at}.${key}`)
+        return
+      }
+      if (node.type === 'array') {
+        if (!Array.isArray(val)) issues.push(`${at} must be array`)
+        else if (node.items) val.forEach((item, index) => walk(node.items, item, `${at}[${index}]`))
+        return
+      }
+      if (node.type === 'string' && typeof val !== 'string') issues.push(`${at} must be string`)
+      if (node.type === 'number' && typeof val !== 'number') issues.push(`${at} must be number`)
+      if (node.type === 'boolean' && typeof val !== 'boolean') issues.push(`${at} must be boolean`)
+      if (node.type === 'null' && val !== null) issues.push(`${at} must be null`)
+    }
+    walk(schema, value, 'value')
+    return issues
+  }
+
+  await runCase('tools: runtime outputs satisfy their declared schemas (no null under string)', async (boot) => {
+    const h = await boot({ config: { cancelWaitMs: 150 }, seedSessions: [{ id: 'session-out-a', title: 'out a' }, { id: 'session-out-b', title: 'out b' }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const { DISPATCH_OUTPUT, CANCEL_OUTPUT } = await import(pathToFileURL(ENTRY).href)
+    const dispatchTool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const dispatch = await dispatchTool.execute({ target: 'session-out-a', text: 'no task id' }, { sessionId: 'session-out-b' })
+    h.emit('session/event', { id: 'session-out-b' }, { type: 'turn/start', turn: 1 })
+    const cancelTool = h.state.tools.find((entry) => entry.name === 'mesh_cancel')
+    const cancelled = await cancelTool.execute({ session: 'session-out-b' }, { sessionId: 'session-out-a' })
+    const dispatchIssues = validateHostSubset(DISPATCH_OUTPUT.schema, dispatch)
+    const cancelIssues = validateHostSubset(CANCEL_OUTPUT.schema, cancelled)
+    const ok =
+      dispatchIssues.length === 0 &&
+      cancelIssues.length === 0 &&
+      (cancelled.taskId === undefined || typeof cancelled.taskId === 'string') &&
+      (cancelled.taskStatus === undefined || typeof cancelled.taskStatus === 'string')
+    report('tools: runtime outputs satisfy their declared schemas (no null under string)', ok, `dispatchIssues=${dispatchIssues.length} cancelIssues=${cancelIssues.length} cancelTaskId=${typeof cancelled.taskId} cancelTaskStatus=${typeof cancelled.taskStatus}`)
   })
 
   await runCase('tools: validateToolSchema rejects a type array with the host wording', async () => {

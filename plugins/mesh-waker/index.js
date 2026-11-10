@@ -1974,6 +1974,8 @@ export function apply(ctx, config) {
       taskStatus = taskRows.get(taskId)?.status ?? row?.status ?? null
     }
     fileLog(`cancel task=${taskId || '-'} session=${targetSessionId} by=${by} cancelCalled=${cancelCalled} turnStopped=${turnStopped}${reason ? ` reason=${reason}` : ''}`)
+    // HTTP keeps the historical shape (taskId/taskStatus may be null); the tool wrapper strips
+    // nulls because the host validates tool values against CANCEL_OUTPUT (T-408).
     return {
       ok: true,
       action: 'cancel',
@@ -1997,7 +1999,15 @@ export function apply(ctx, config) {
     const task = String(args.task ?? '').trim()
     const session = String(args.session ?? '').trim()
     if (!task && !session) throw new Error('pass task (task id) or session (session id / title)')
-    return await cancelTaskOrSession({ task, session, reason: String(args.reason ?? '').trim() || null, by: caller })
+    const result = await cancelTaskOrSession({ task, session, reason: String(args.reason ?? '').trim() || null, by: caller })
+    // The host validates this value against CANCEL_OUTPUT: a null under `type: string` throws
+    // ToolOutputError after the turn was already stopped, so omit absent fields (T-408).
+    const { taskId: resultTaskId, taskStatus: resultTaskStatus, ...rest } = result
+    return {
+      ...rest,
+      ...(resultTaskId ? { taskId: resultTaskId } : {}),
+      ...(resultTaskStatus ? { taskStatus: resultTaskStatus } : {}),
+    }
   }
 
   function throttleSummary() {

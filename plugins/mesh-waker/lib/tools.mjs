@@ -90,11 +90,17 @@ export const DISPATCH_OUTPUT = {
       ok: { type: 'boolean' },
       sessionId: { type: 'string' },
       title: { oneOf: [{ type: 'string' }, { type: 'null' }] },
-      taskId: { type: 'string' },
+      // Always present, null when the dispatch carried no taskId (host validates the value,
+      // not just presence: a null under `type: string` throws ToolOutputError).
+      taskId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
       batchId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
       mode: { type: 'string' },
       created: { type: 'boolean' },
       warning: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      requester: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      // T-402 fields: always present, null when unknown (declared so the contract is explicit).
+      workspacePath: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      workspace: { oneOf: [{ type: 'string' }, { type: 'null' }] },
     },
     required: ['ok', 'sessionId', 'taskId', 'mode', 'created'],
   },
