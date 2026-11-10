@@ -1411,8 +1411,21 @@ try {
 
       const cancelTask = async (taskId) => {
         try {
-          await json(BASE + '/mesh/tasks/' + encodeURIComponent(taskId), { method: 'DELETE' })
-          setNote('已取消任务 ' + taskId)
+          // T-403: stop the turn, not just the row. "已取消" used to be shown while the
+          // session kept running.
+          const result = await json(BASE + '/mesh/cancel', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ task: taskId }),
+          })
+          const detail = result.turnWasOpen
+            ? result.turnStopped
+              ? result.sessionLive
+                ? 'turn 已停，会话仍在'
+                : 'turn 已停，会话已不在线'
+              : '已请求停止，turn 未在 5s 内关闭'
+            : '没有在跑的 turn（任务已结算）'
+          setNote('已取消任务 ' + taskId + '：' + detail)
           setSelectedId(null)
           await load(filter)
         } catch (error) {

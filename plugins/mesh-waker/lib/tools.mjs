@@ -197,6 +197,52 @@ export const THREAD_OUTPUT = {
 }
 
 /**
+ * Stop the turn behind a dispatched task (T-403). This is NOT session deletion: the session
+ * stays alive so it can receive the next task. Deleting a session remains /mesh/sessions/delete.
+ */
+export const MESH_CANCEL_TOOL = {
+  name: 'mesh_cancel',
+  description:
+    'Stop the running turn of a dispatched task (or of an explicit session) and settle its receipt as aborted. ' +
+    'Pass task (task id) or session (session id / exact title / unique title substring); at least one is required, and both must resolve to the same session. ' +
+    'This stops the turn only: the session stays alive and is NOT deleted or archived — use /mesh/sessions/delete to remove a session. ' +
+    'Returns turnWasOpen/turnStopped/sessionLive and the receipt status; 404 for an unknown task, 409 when there is nothing to cancel.',
+  parameters: {
+    task: { type: 'string', description: 'Task id whose target session should be stopped (e.g. T-mwasu2ot).' },
+    session: { type: 'string', description: 'Session id, exact title, or a unique title substring to stop.' },
+    reason: { type: 'string', description: 'Short reason recorded in the receipt (reasonDetail: "cancelled by <caller>: <reason>").' },
+  },
+  required: [],
+}
+
+export const CANCEL_OUTPUT = {
+  schema: {
+    type: 'object',
+    properties: {
+      ok: { type: 'boolean' },
+      action: { type: 'string' },
+      taskId: { type: 'string' },
+      sessionId: { type: 'string' },
+      by: { type: 'string' },
+      turnWasOpen: { type: 'boolean' },
+      turnStopped: { type: 'boolean' },
+      sessionLive: { type: 'boolean' },
+      taskStatus: { type: 'string' },
+      receipt: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string' },
+          status: { type: 'string' },
+        },
+        required: ['taskId', 'status'],
+      },
+    },
+    required: ['ok', 'action'],
+  },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+}
+
+/**
  * Validate a tool output definition against the host's enforced JSON Schema subset.
  * Returns `{ ok, issues }`; this is the guard test that would have caught T-236
  * (`type: ['string','null']` is rejected by the host, not by JSON Schema).

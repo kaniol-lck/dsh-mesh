@@ -28,7 +28,7 @@ import { zstdDecompressSync } from 'node:zlib'
 // ── Pure helpers moved to lib/ (T-292); re-exported below so external imports are stable.
 import { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
 import { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, buildBatchReceipt } from './lib/receipt.mjs'
-import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
+import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
 import { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, classifyRoleCandidates, ROLE_UNRECOGNIZED_MAX } from './lib/session.mjs'
 import { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settings.mjs'
@@ -43,7 +43,7 @@ import { normalizeCoordinators, coordinatorsView, expireCoordinators, syncPrimar
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
 export { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
 export { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, buildBatchReceipt } from './lib/receipt.mjs'
-export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
+export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
 export { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, ROLE_NAMES, ROLE_UNRECOGNIZED_MAX, titleRoleCandidate, classifyRoleCandidates } from './lib/session.mjs'
 export { createReceiptFlow } from './lib/receipt-flow.mjs'
 export { createThreads } from './lib/threads.mjs'
@@ -606,6 +606,8 @@ function normalizeBase(config) {
     tasksPollEnabled: c.tasksPollEnabled === true,
     tasksPollIntervalMs: clampInterval(c.tasksPollIntervalMs, clampInterval(c.pollIntervalMs, 60000, 1000, 86_400_000), 1000, 86_400_000),
     taskLeaseMs: clampInterval(c.taskLeaseMs, 600000, 60000, 3_600_000),
+    // Bounded wait for a cancelled turn to close (T-403): never hang a cancel call forever.
+    cancelWaitMs: clampInterval(c.cancelWaitMs, 5000, 0, 10000),
     // Multi-coordinator claim protocol (T-395): bounded online coordinators, a lease per
     // member, and a pending TTL. The owner token file (when configured) is required for the
     // first claim in an empty workspace and for approve/reject/release by the owner.
@@ -1889,6 +1891,113 @@ export function apply(ctx, config) {
     const deadline = Date.now() + 2000
     while (Date.now() < deadline && isLive(sessionId)) await sleep(100)
     return { live: isLive(sessionId), stopped: !isLive(sessionId), via }
+  }
+
+  /**
+   * Stop the turn behind a task or session (T-403) without deleting or archiving the session.
+   * "Cancelled" without a stopped turn was a lie: the panel said cancelled while the wrong
+   * workspace kept working. Liveness (`openTurn`) decides whether a turn is really gone; a
+   * still-pending task is then settled as aborted so the requester always gets a receipt.
+   */
+  async function cancelTaskOrSession({ task, session, reason, by }) {
+    const httpError = (status, message) => Object.assign(new Error(message), { httpStatus: status })
+    const taskId = String(task ?? '').trim()
+    const sessionArg = String(session ?? '').trim()
+    if (!taskId && !sessionArg) throw httpError(400, 'task or session is required')
+    let row = null
+    let pending = null
+    let targetSessionId = null
+    if (taskId) {
+      pending = pendingTasks.get(taskId) ?? null
+      row = taskRows.get(taskId) ?? null
+      if (!pending && !row) throw httpError(404, `task "${taskId}" not found`)
+      targetSessionId = pending?.sessionId ?? row?.targetSessionId ?? null
+      if (!targetSessionId) throw httpError(409, `task "${taskId}" has no target session`)
+      // A started row is cancellable too: that is the case the DELETE endpoint used to fake.
+      if (!pending && row && ['settled', 'stalled', 'cancelled'].includes(String(row.status))) {
+        throw httpError(409, `only pending tasks can be cancelled (status=${row.status})`)
+      }
+    }
+    if (sessionArg) {
+      let resolved = null
+      try {
+        resolved = resolveLocalSession({ session: sessionArg, title: sessionArg })
+      } catch (error) {
+        throw httpError(/找不到会话/.test(error.message) ? 404 : 400, error.message)
+      }
+      if (targetSessionId && resolved.id !== targetSessionId) {
+        throw httpError(400, `task "${taskId}" targets ${targetSessionId}, but "${sessionArg}" resolves to ${resolved.id}; pass only one of them`)
+      }
+      targetSessionId = resolved.id
+    }
+    const openTurn = liveness.get(targetSessionId)?.openTurn ?? null
+    const turnWasOpen = openTurn !== null && openTurn !== undefined
+    if (!turnWasOpen && !pending && !(row && row.status === 'pending')) throw httpError(409, 'nothing to cancel')
+    let cancelCalled = false
+    try {
+      if (typeof ctx.sessionController?.cancel === 'function') {
+        await ctx.sessionController.cancel({ sessionId: targetSessionId })
+        cancelCalled = true
+      }
+    } catch (error) {
+      fileLog(`cancel ${targetSessionId} failed: ${error.message}`)
+    }
+    const deadline = Date.now() + c.cancelWaitMs
+    while (Date.now() < deadline) {
+      const open = liveness.get(targetSessionId)?.openTurn ?? null
+      if (open === null || open === undefined) break
+      await sleep(100)
+    }
+    const after = liveness.get(targetSessionId)?.openTurn ?? null
+    const turnStopped = after === null || after === undefined
+    let receipt = null
+    let taskStatus = null
+    if (taskId && pendingTasks.has(taskId)) {
+      const detail = `cancelled by ${by}${reason ? `: ${reason}` : ''}`
+      receipt = lifecycle.settleTask(taskId, pendingTasks.get(taskId), {
+        turn: null,
+        status: 'aborted',
+        reasonKind: 'cancelled',
+        reasonDetail: detail,
+        source: 'declared',
+      })
+      taskStatus = receipt?.status ?? 'aborted'
+      // The registry row says "cancelled" (what an operator did) while the receipt keeps the
+      // factual status "aborted" (what the turn became); both are visible, neither is a lie.
+      taskRegistry.updateTaskRow(taskId, { status: 'cancelled', settledAt: Date.now() })
+      taskStatus = 'cancelled'
+    } else if (taskId && row && row.status === 'pending') {
+      // A restored row with no in-flight entry: mark it cancelled so it stops showing pending.
+      taskRegistry.updateTaskRow(taskId, { status: 'cancelled', settledAt: Date.now() })
+      taskStatus = 'cancelled'
+    } else if (taskId) {
+      taskStatus = taskRows.get(taskId)?.status ?? row?.status ?? null
+    }
+    fileLog(`cancel task=${taskId || '-'} session=${targetSessionId} by=${by} cancelCalled=${cancelCalled} turnStopped=${turnStopped}${reason ? ` reason=${reason}` : ''}`)
+    return {
+      ok: true,
+      action: 'cancel',
+      taskId: taskId || null,
+      sessionId: targetSessionId,
+      by,
+      turnWasOpen,
+      turnStopped,
+      sessionLive: isLive(targetSessionId),
+      taskStatus,
+      ...(receipt ? { receipt: { taskId: receipt.taskId, status: receipt.status } } : {}),
+    }
+  }
+
+  /** Model tool wrapper: the caller session identifies who cancelled (never guessed). */
+  async function meshCancel(args = {}, extra = null) {
+    const caller = callerSessionFrom(extra)
+    if (!caller) {
+      throw new Error('mesh_cancel needs the calling session; the host did not pass one (no default session is guessed)')
+    }
+    const task = String(args.task ?? '').trim()
+    const session = String(args.session ?? '').trim()
+    if (!task && !session) throw new Error('pass task (task id) or session (session id / title)')
+    return await cancelTaskOrSession({ task, session, reason: String(args.reason ?? '').trim() || null, by: caller })
   }
 
   function throttleSummary() {
@@ -5266,6 +5375,7 @@ export function apply(ctx, config) {
     ask: { ok: false, error: null },
     thread: { ok: false, error: null },
     complete: { ok: false, error: null },
+    cancel: { ok: false, error: null },
   }
 
   // ══ 子系统：工具注册与代码自检 ══════════════════════════════════════════════════
@@ -5373,6 +5483,16 @@ export function apply(ctx, config) {
       execute: (args, extra) => meshThreadAction(args, extra),
     })
     installModelTool(threadDefinition, 'thread')
+
+    const cancelDefinition = await buildToolDefinition({
+      name: MESH_CANCEL_TOOL.name,
+      description: MESH_CANCEL_TOOL.description,
+      parameters: MESH_CANCEL_TOOL.parameters,
+      required: MESH_CANCEL_TOOL.required,
+      output: CANCEL_OUTPUT,
+      execute: (args, extra) => meshCancel(args, extra),
+    })
+    installModelTool(cancelDefinition, 'cancel')
 
     const completeDefinition = await buildToolDefinition({
       name: MESH_COMPLETE_TOOL.name,
@@ -6017,15 +6137,21 @@ export function apply(ctx, config) {
         return
       }
       // DELETE only cancels a task that has not settled yet (settled history is immutable).
-      if (row.status !== 'pending') {
+      if (['settled', 'stalled', 'cancelled'].includes(String(row.status))) {
         res.writeHead(409, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: false, error: 'only pending tasks can be cancelled', status: row.status }))
         return
       }
-      lifecycle.cancelPendingTask(taskId)
-      fileLog(`task ${taskId} cancelled via DELETE`)
-      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
-      res.end(JSON.stringify({ ok: true, taskId, status: 'cancelled' }))
+      // Same cancel path as POST /mesh/cancel (T-403): stop the turn, then settle the task as
+      // aborted. Settled history stays immutable.
+      try {
+        const result = await cancelTaskOrSession({ task: taskId, reason: 'DELETE /mesh/tasks/:id', by: 'loopback' })
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify(result))
+      } catch (error) {
+        res.writeHead(error.httpStatus ?? 500, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
       return
     }
 
@@ -6483,6 +6609,39 @@ export function apply(ctx, config) {
         return
       }
       sendCoordinator(res, 200, { ok: true, slug, sessionId, leaseUntil: Date.now() + c.coordinatorLeaseMs })
+      return
+    }
+
+    if (path === '/mesh/cancel' && req.method === 'POST') {
+      // T-403: stop the turn behind a task/session (never delete the session). Loopback only:
+      // the caller is a local script, so `by` is 'loopback' (the tool records the session id).
+      if (!fromLoopback(req)) {
+        sendCoordinator(res, 403, { ok: false, error: 'loopback only' })
+        return
+      }
+      const raw = await readRequestBuffer()
+      if (!raw) {
+        res.writeHead(413).end()
+        return
+      }
+      let draft = {}
+      try {
+        draft = JSON.parse(raw.toString('utf8') || '{}')
+      } catch {
+        sendCoordinator(res, 400, { ok: false, error: 'invalid JSON body' })
+        return
+      }
+      try {
+        const result = await cancelTaskOrSession({
+          task: draft.task,
+          session: draft.session,
+          reason: draft.reason ? String(draft.reason).slice(0, 200) : null,
+          by: 'loopback',
+        })
+        sendCoordinator(res, 200, result)
+      } catch (error) {
+        sendCoordinator(res, error.httpStatus ?? 500, { ok: false, error: error.message })
+      }
       return
     }
 

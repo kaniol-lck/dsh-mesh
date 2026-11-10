@@ -7727,6 +7727,94 @@ async function main() {
     }
   })
 
+  // ---- T-403: cancel stops the turn (not just the row) ----
+  const injectAndStart = async (h, { taskId, sessionId, turn = 1 }) => {
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { session: sessionId, text: 'work', meta: { taskId } } })
+    h.emit('session/event', { id: sessionId }, { type: 'turn/start', turn })
+  }
+
+  await runCase('cancel: a started task stops the turn and settles aborted', async (boot) => {
+    const h = await boot({ config: { cancelWaitMs: 150 }, seedSessions: [{ id: 'session-cancel-a', title: 'cancel target' }] })
+    h.state.agents.set('session-cancel-a', {})
+    await injectAndStart(h, { taskId: 'T-cancel-a', sessionId: 'session-cancel-a' })
+    const result = await request(h.base, '/mesh/cancel', { method: 'POST', body: { task: 'T-cancel-a', reason: 'wrong workspace' } })
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-cancel-a'), 4000)
+    const ok =
+      result.status === 200 &&
+      result.json?.turnWasOpen === true &&
+      result.json?.sessionLive === true &&
+      result.json?.taskStatus === 'cancelled' &&
+      h.state.cancels.includes('session-cancel-a') &&
+      receipt?.status === 'aborted' &&
+      /cancelled by loopback: wrong workspace/.test(receipt?.reasonDetail ?? '')
+    report('cancel: a started task stops the turn and settles aborted', ok, `turnWasOpen=${result.json?.turnWasOpen} sessionLive=${result.json?.sessionLive} cancels=${h.state.cancels.length} receipt=${receipt?.status}`)
+  })
+
+  await runCase('cancel: a task that never started still gets an aborted receipt', async (boot) => {
+    const h = await boot({ config: { cancelWaitMs: 150 }, seedSessions: [{ id: 'session-cancel-b', title: 'idle target' }] })
+    await request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-cancel-b', text: 'work', meta: { taskId: 'T-cancel-b' } } })
+    const result = await request(h.base, '/mesh/cancel', { method: 'POST', body: { task: 'T-cancel-b' } })
+    const status = await request(h.base, '/mesh/status')
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-cancel-b'), 4000)
+    const ok = result.status === 200 && result.json?.turnWasOpen === false && status.json?.pendingTasks === 0 && receipt?.status === 'aborted'
+    report('cancel: a task that never started still gets an aborted receipt', ok, `turnWasOpen=${result.json?.turnWasOpen} pending=${status.json?.pendingTasks} receipt=${receipt?.status}`)
+  })
+
+  await runCase('cancel: a settled task is refused without touching the session', async (boot) => {
+    const h = await boot({ config: { cancelWaitMs: 150 }, seedSessions: [{ id: 'session-cancel-c', title: 'settled target' }] })
+    await injectAndStart(h, { taskId: 'T-cancel-c', sessionId: 'session-cancel-c' })
+    h.emit('session/event', { id: 'session-cancel-c' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-cancel-c'), 4000)
+    const result = await request(h.base, '/mesh/cancel', { method: 'POST', body: { task: 'T-cancel-c' } })
+    const ok = result.status === 409 && h.state.cancels.length === 0
+    report('cancel: a settled task is refused without touching the session', ok, `status=${result.status} cancels=${h.state.cancels.length}`)
+  })
+
+  await runCase('cancel: session-only cancel stops the turn and leaves tasks alone', async (boot) => {
+    const h = await boot({ config: { cancelWaitMs: 150 }, seedSessions: [{ id: 'session-cancel-d', title: 'session only' }] })
+    h.emit('session/event', { id: 'session-cancel-d' }, { type: 'turn/start', turn: 2 })
+    const result = await request(h.base, '/mesh/cancel', { method: 'POST', body: { session: 'session-cancel-d' } })
+    const status = await request(h.base, '/mesh/status')
+    const ok =
+      result.status === 200 &&
+      result.json?.turnWasOpen === true &&
+      result.json?.taskId === null &&
+      h.state.cancels.includes('session-cancel-d') &&
+      status.json?.pendingTasks === 0 &&
+      readReceipts(h.receiptsPath).length === 0
+    report('cancel: session-only cancel stops the turn and leaves tasks alone', ok, `turnWasOpen=${result.json?.turnWasOpen} cancels=${h.state.cancels.length} receipts=${readReceipts(h.receiptsPath).length}`)
+  })
+
+  await runCase('cancel: nothing running is a 409', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-cancel-e', title: 'idle session' }] })
+    const result = await request(h.base, '/mesh/cancel', { method: 'POST', body: { session: 'session-cancel-e' } })
+    const ok = result.status === 409 && /nothing to cancel/.test(result.json?.error ?? '')
+    report('cancel: nothing running is a 409', ok, `status=${result.status} error=${result.json?.error ?? '-'}`)
+  })
+
+  await runCase('cancel: DELETE /mesh/tasks/:id really stops the turn', async (boot) => {
+    const h = await boot({ config: { cancelWaitMs: 150 }, seedSessions: [{ id: 'session-cancel-f', title: 'delete target' }] })
+    await injectAndStart(h, { taskId: 'T-cancel-f', sessionId: 'session-cancel-f' })
+    const result = await request(h.base, '/mesh/tasks/T-cancel-f', { method: 'DELETE' })
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-cancel-f'), 4000)
+    const ok = result.status === 200 && h.state.cancels.includes('session-cancel-f') && receipt?.status === 'aborted'
+    report('cancel: DELETE /mesh/tasks/:id really stops the turn', ok, `status=${result.status} cancels=${h.state.cancels.length} receipt=${receipt?.status ?? '-'}`)
+  })
+
+  await runCase('cancel: the mesh_cancel tool is registered and requires a target', async (boot) => {
+    const h = await boot({})
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_cancel')
+    let error = null
+    try {
+      await tool.execute({}, { sessionId: 'session-tool-cancel' })
+    } catch (caught) {
+      error = caught
+    }
+    const ok = Boolean(tool) && Boolean(tool.parameters?.properties?.task) && Boolean(tool.parameters?.properties?.session) && /task|session/.test(error?.message ?? '')
+    report('cancel: the mesh_cancel tool is registered and requires a target', ok, `registered=${Boolean(tool)} rejected=${error ? 'yes' : 'no'}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

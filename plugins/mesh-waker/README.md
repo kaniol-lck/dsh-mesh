@@ -179,6 +179,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `tasksPollEnabled` | `false` | 跨机任务消费（T1 P5）：开启后按 `tasksPollIntervalMs` 拉 `GET /api/tasks?agent=<自己>&status=pending`，认领 → 取 blob 正文（hub 以 `application/octet-stream` 原始流返回，不是 JSON）→ 投递 → 心跳续租 → 结算；hub 未升级到 0.8.1 前保持关闭 |
 | `tasksPollIntervalMs` | 同 `pollIntervalMs` | 跨机任务拉取间隔（毫秒，1000–86400000） |
 | `taskLeaseMs` | `600000` | 任务租约（毫秒，60000–3600000）；执行期间按 `lease/2` 心跳续租 |
+| `cancelWaitMs` | `5000` | `/mesh/cancel` 等待被取消的 turn 真正关闭的上限（毫秒，0–10000）；超时不阻塞调用，仍会结算 aborted 回执 |
 | `maxCoordinatorsPerWorkspace` | `3` | 同一工作区允许同时在线的协调数量上限（1–20）；超过后 claim 返回 409 + 现有列表 |
 | `coordinatorLeaseMs` | `600000` | 协调租约（毫秒，60000–3600000）；执行期间按 `/mesh/coordinator/heartbeat` 续期，过期转 stale |
 | `coordinatorPendingTtlMs` | `1800000` | 待批准认领的存活时间（毫秒，60000–86400000），过期自动失效 |
@@ -321,9 +322,13 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 |---|---|
 | `GET /mesh/tasks?status=&session=&batch=&limit=&offset=&include=text` | 列表（跨层聚合，默认不含正文；`include=text` 时每条附 `text`（经 `textRef`/旧 `text` 解析）；默认 `limit=50`、`createdAt` 倒序、返回 `total`；`session` 同时匹配目标会话与 requester） |
 | `GET /mesh/tasks/:id` | 详情：全文 + 回执摘要（`receiptSummary`/`receiptRef`）+ 目标会话 `{sessionId, title, live}` |
-| `DELETE /mesh/tasks/:id` | 仅 `pending` 可取消（→ `cancelled`）；已 settled/stalled 返回 **409**，历史不改写 |
+| `DELETE /mesh/tasks/:id` | 取消：**先停 turn 再结算**（回执 `aborted`，行状态 `cancelled`）；已 settled/stalled 返回 **409**，历史不改写 |
+| `POST /mesh/cancel` | 体 `{task?, session?, reason?}`：按 task 或 session（id/精确标题/唯一子串）取消，**只停 turn、不删会话**；等到 turn 关闭（≤`cancelWaitMs`）后把仍 pending 的任务结算为 `aborted`（`reasonDetail: cancelled by <by>[: reason]`）并投递回执；无 task 且无 open turn → **409 nothing to cancel**；未知 task → **404**；task 与 session 指向不同会话 → **400**。返回 `{ok, action, taskId, sessionId, by, turnWasOpen, turnStopped, sessionLive, taskStatus, receipt?}` |
+| `mesh_cancel`（工具） | 同 `POST /mesh/cancel`，`by` 取调用会话（拿不到报错不猜）；**停 turn 不等于删会话**（删会话用 `/mesh/sessions/delete`） |
 | `GET /mesh/workspaces` | 本机工作区注册表（只读）：`{machine, count, workspaces}` |
 | `GET /mesh/threads` | 线程列表：`{ thread, targetSessionId, targetTitle, count, lastTaskId, updatedAt, taskIds[] }`（`taskIds` 从任务库派生，按 createdAt 升序） |
+
+**取消（0.8.1）：停 turn，不删会话**——`POST /mesh/cancel` 与 `mesh_cancel({task})` 会先调 `sessionController.cancel` 停掉该会话当前 turn，再等 `cancelWaitMs`（默认 5s）确认 turn 关闭；仍未结算的任务立即写 `aborted` 回执（`reasonDetail` 带 `cancelled by <by>`）并投给 requester。面板「取消任务」按钮走同一条路径，note 里显示「turn 已停，会话仍在 / turn 未在 5s 内关闭」这类真实结果，不再无条件「已取消」。**停止 turn ≠ 删除/归档会话**：会话仍在，可以继续接下一单；要删会话请用 `/mesh/sessions/delete`。
 
 **线程（0.7.21）**：派活可带 `thread`（≤128 字节）把后续补丁归到同一线索。绑定写在 `~/.dsh/mesh-waker/threads.json`（0600，只在成功投递后更新）：`{ "TH-1": { targetSessionId, targetTitle, lastTaskId, count, updatedAt } }`。之后 `mesh_dispatch({ thread, text })` **可省略 `target`**，按绑定投递；未知 thread 直接报错并列出已知项（不猜、不回落到默认会话）；显式传 `target` 时以 target 为准并**改绑**该线程（日志 `thread TH-x rebound: old -> new`）。回执仍按 `requester` 返回派活方。
 
