@@ -4640,7 +4640,9 @@ export function apply(ctx, config) {
     // The mesh inbox is a system-created session: it belongs to the inbox workspace, not to
     // the caller's workspace (T-402 only forbids using the inbox as a caller fallback).
     const inboxPath = c.workspacePath || c.sessionCwd
-    const created = await createDispatchTarget('Mesh 收件箱', inboxPath)
+    // T-407: a minimal install has neither path; the inbox session may then use the host
+    // default, exactly like /mesh/sessions/create without workspacePath.
+    const created = await createDispatchTarget('Mesh 收件箱', inboxPath, { requirePath: false })
     entry.sessionId = created.id
     entry.title = created.title
     entry.createdAt = Date.now()
@@ -5117,47 +5119,55 @@ export function apply(ctx, config) {
    * gave the new session the wrong cwd, relative paths and task tier. The host's echo is
    * checked so a silent misplacement turns into an error instead of a wrong turn.
    */
-  async function createDispatchTarget(title, workspacePath) {
+  async function createDispatchTarget(title, workspacePath, { requirePath = true } = {}) {
     const name = String(title ?? '').trim().slice(0, 60)
     if (!name) throw new Error('createIfMissing needs a non-empty target to use as the title')
     const path = String(workspacePath ?? '').trim()
-    if (!path) throw new Error('createIfMissing needs an explicit workspacePath (no inbox fallback)')
-    try {
-      mkdirSync(path, { recursive: true })
-    } catch (error) {
-      fileLog(`dispatch workspace mkdir failed: ${error.message}`)
-    }
+    // The dispatch path (`requirePath`) must never guess a workspace; the system inbox keeps
+    // the old "let the host pick its default" behaviour on a minimal install (T-407).
+    if (!path && requirePath) throw new Error('createIfMissing needs an explicit workspacePath (no inbox fallback)')
     let workspaceId = null
-    try {
-      const resolved = await ctx.workspaceRegistry?.resolveByPath?.(path)
-      workspaceId = resolved?.id ?? null
-      if (!workspaceId) {
-        const createdWorkspace = await ctx.workspaceRegistry?.create?.(path, name)
-        workspaceId = createdWorkspace?.id ?? null
+    if (path) {
+      try {
+        mkdirSync(path, { recursive: true })
+      } catch (error) {
+        fileLog(`dispatch workspace mkdir failed: ${error.message}`)
       }
-    } catch (error) {
-      fileLog(`dispatch workspace resolve/create failed (${error.message})`)
+      try {
+        const resolved = await ctx.workspaceRegistry?.resolveByPath?.(path)
+        workspaceId = resolved?.id ?? null
+        if (!workspaceId) {
+          const createdWorkspace = await ctx.workspaceRegistry?.create?.(path, name)
+          workspaceId = createdWorkspace?.id ?? null
+        }
+      } catch (error) {
+        fileLog(`dispatch workspace resolve/create failed (${error.message})`)
+      }
     }
-    const created = await ctx.sessionController.create(
-      workspaceId ? { workspaceId, agentPreset: c.agentPreset } : { cwd: path, agentPreset: c.agentPreset },
-    )
+    const created = !path
+      ? await ctx.sessionController.create({ agentPreset: c.agentPreset })
+      : workspaceId
+        ? await ctx.sessionController.create({ workspaceId, agentPreset: c.agentPreset })
+        : await ctx.sessionController.create({ cwd: path, agentPreset: c.agentPreset })
     const sessionId = created?.sessionId
     if (!sessionId) throw new Error('sessionController.create returned no sessionId')
     // Never inject into a session the host placed somewhere else than requested.
-    const echoed = created?.workspacePath ?? created?.cwd ?? null
-    if (echoed && workspaceKeyPath(echoed) !== workspaceKeyPath(path)) {
-      throw new Error(
-        `session ${sessionId} was created at ${echoed}, not the requested workspace ${path}; refusing to inject into the wrong workspace (pass the right workspacePath or reuse an existing session with target:<id>)`,
-      )
+    if (path) {
+      const echoed = created?.workspacePath ?? created?.cwd ?? null
+      if (echoed && workspaceKeyPath(echoed) !== workspaceKeyPath(path)) {
+        throw new Error(
+          `session ${sessionId} was created at ${echoed}, not the requested workspace ${path}; refusing to inject into the wrong workspace (pass the right workspacePath or reuse an existing session with target:<id>)`,
+        )
+      }
     }
-    identityPending.set(sessionId, { cwd: path })
+    identityPending.set(sessionId, { cwd: path || null })
     try {
       await ctx.sessionController.rename({ sessionId, title: name })
     } catch (error) {
       fileLog(`renaming dispatch-created session failed: ${error.message}`)
     }
-    fileLog(`created session ${sessionId} for mesh_dispatch target "${name}" workspace=${path}`)
-    return { id: sessionId, title: name, workspaceId, workspacePath: path }
+    fileLog(`created session ${sessionId} for mesh_dispatch target "${name}" workspace=${path || '(host default)'}`)
+    return { id: sessionId, title: name, workspaceId, workspacePath: path || null }
   }
 
   /** Refuse cross-workspace creation with the two workspaces and three executable options. */

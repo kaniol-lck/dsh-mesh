@@ -7923,6 +7923,34 @@ async function main() {
     report('receipt summary: the batch body is capped and says it was truncated', ok, `bytes=${bytes} hint=${batch.body.includes('摘要已截断')}`)
   })
 
+  // T-407: minimal installs (hubUrl + token only) have no workspacePath/sessionCwd; the
+  // system inbox must still be creatable, otherwise a hub task with an inbox fallback dies.
+  await runCase('hub tasks: the inbox fallback works without a configured inbox workspace', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      fake.addTask({ task_id: 'P-20261111-09', target_agent: 'dsh-test', intent: 'inbox', subject: 'minimal install' }, 'inbox body')
+      h = await boot({
+        config: {
+          hubUrl: fake.url,
+          pollIntervalMs: 5000,
+          pollIdleIntervalMs: 5000,
+          tasksPollEnabled: true,
+          tasksPollIntervalMs: 1000,
+          workspacePath: undefined,
+          sessionCwd: undefined,
+        },
+      })
+      const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
+      const status = await request(h.base, '/mesh/status')
+      const ok = h.state.created.length === 1 && Boolean(delivered) && status.json?.tasksPoll?.lastError === null
+      report('hub tasks: the inbox fallback works without a configured inbox workspace', ok, `created=${h.state.created.length} delivered=${Boolean(delivered)} lastError=${status.json?.tasksPoll?.lastError ?? 'none'}`)
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
