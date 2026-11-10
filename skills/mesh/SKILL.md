@@ -310,6 +310,8 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 发起对话时把回信钉在当前会话，别让它落进「Mesh 收件箱」：
 
 - **MCP 发信**：mesh_send 带 session: <本会话 id>（shell 里可用 $DSH_SESSION_ID）；
+- **漏传 `session` 的后果**（2026-11-11 实测）：hub 里该消息 `origin_session=null`，waker 无法把回复绑定回发起会话 → 对方回复只能落 **Mesh 收件箱**，还会唤醒收件箱会话（可能代答）。要等回信的 `mesh_send` 必须先确认本会话 id。
+- **回复方规则**：回复必须沿用**同一 `conversation`**（+ `reply_to`）；跨 agent 的 `Re:` 若不带 conversation 会落到 `default`/收件箱（实测 `Re: C 实施确认` 落错会话）。
 - **CLI / 脚本发信**：自动读环境变量 `DSH_SESSION_ID` 带上 `session` 即可（DSH 会话里已就绪）；
 - 远端回信到达时，waker 看到 origin_session 会把该对话**自动绑定**到发起会话（用户手动绑定优先）；
 - 绑定晚于消息也不丢：POST /mesh/bind {conversation, sessionId, deliver:true, backfill:12} 会把最近消息补投进会话；
