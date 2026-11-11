@@ -213,17 +213,30 @@ export function createTaskLifecycle(deps) {
     // receipt.
     let baselineTurn = injectedDuringTurn ? openTurn : deps.maxTurnFor(target.id)
     let sameTurnInjected = false
-    if (injectedDuringTurn && taskMode === 'queue') {
+    if (taskMode === 'queue' && baselineTurn !== null) {
+      // Queue position, not just same-turn siblings: every unsettled queue task scheduled at
+      // or after the current turn still consumes one turn before this one. Counting only the
+      // same openTurn made a cross-turn backlog invisible, and an earlier turn/end then
+      // settled tasks that had not run yet (T-412: T-407/T-408 completed on turn 53).
       const queuedAhead = [...deps.pendingTasks.values()].filter(
         (pending) =>
           pending.sessionId === target.id &&
           !pending.settled &&
           pending.mode === 'queue' &&
-          pending.injectedDuringTurn === true &&
-          pending.injectedAtTurn === openTurn,
+          Number.isFinite(pending.baselineTurn) &&
+          pending.baselineTurn >= baselineTurn,
       ).length
-      baselineTurn = openTurn + queuedAhead
-      sameTurnInjected = queuedAhead > 0
+      baselineTurn += queuedAhead
+      sameTurnInjected =
+        injectedDuringTurn &&
+        [...deps.pendingTasks.values()].some(
+          (pending) =>
+            pending.sessionId === target.id &&
+            !pending.settled &&
+            pending.mode === 'queue' &&
+            pending.injectedDuringTurn === true &&
+            pending.injectedAtTurn === openTurn,
+        )
     }
     // Receipts go back to whoever dispatched the task; receiptTo is only the fallback.
     const requester = deps.receiptFlow.resolveRequester(meta?.requester, target)
@@ -306,6 +319,12 @@ export function createTaskLifecycle(deps) {
     }
     deps.pendingTasks.set(taskId, task)
     deps.state.pendingTasks = deps.pendingTasks.size
+    // A steer lands inside the turn that is already running: it belongs to that turn's
+    // ownership set, so its turn/end may settle it (T-412).
+    if (taskMode === 'steer' && injectedDuringTurn) {
+      const ledger = deps.liveness.get(target.id)
+      if (ledger && ledger.ownedTurn === openTurn && ledger.ownedTaskIds) ledger.ownedTaskIds.add(taskId)
+    }
     if (batchId) deps.registerBatchTask(taskId, task, meta)
     deps.taskRegistry.recordTaskPending(taskId, target, meta, text, {
       batchId,
@@ -452,6 +471,19 @@ export function createTaskLifecycle(deps) {
           if (task.sessionId !== sessionId || task.settled) continue
           if (task.baselineTurn === null || (turn !== null && turn > task.baselineTurn)) clearPending(task)
         }
+        if (turn !== null) {
+          // Ownership set (T-412): the task ids this turn may settle. Built at start, so a task
+          // injected while the turn runs (other than steer) is not covered by this turn's end.
+          const owned = new Set()
+          for (const [pendingId, pending] of deps.pendingTasks) {
+            if (pending.sessionId !== sessionId || pending.settled) continue
+            if (pending.baselineTurn === null) continue
+            const ownsByOrder = pending.mode === 'steer' ? turn >= pending.baselineTurn : turn > pending.baselineTurn
+            if (ownsByOrder) owned.add(pendingId)
+          }
+          ledger.ownedTurn = turn
+          ledger.ownedTaskIds = owned
+        }
         return
       }
       if (type === 'assistant/message') {
@@ -461,8 +493,15 @@ export function createTaskLifecycle(deps) {
       }
       if (type === 'turn/end') {
         const classified = classifyTurnEnd(d.reason)
+        // A turn only settles the tasks it knew about at start (plus steer tasks inserted into
+        // it). Without a recorded set (plugin restarted mid-turn) fall back to the baseline
+        // rule rather than leaving work pending forever (T-412).
+        const ownedIds = ledger.ownedTurn === turn ? ledger.ownedTaskIds : null
+        ledger.ownedTurn = null
+        ledger.ownedTaskIds = null
         for (const [taskId, task] of [...deps.pendingTasks]) {
           if (task.sessionId !== sessionId || task.settled) continue
+          if (ownedIds && !ownedIds.has(taskId)) continue
           if (task.baselineTurn !== null && turn !== null) {
             // queue: the task only started in a strictly later turn; steer was inserted into
             // the running turn, so that turn's end already covers it.

@@ -8111,6 +8111,41 @@ async function main() {
     report('CLI: DSH_SESSION_ID becomes the default requester', ok, `cliRequester=${cliRequester ?? '-'} noEnv=${withoutJson.payload?.requester ?? '-'} stderrNoted=${/requester=session-cli-env/.test(withEnv.stderr)}`)
   })
 
+  // T-412: the queue baseline under-counted across turn boundaries, so one turn/end settled
+  // several tasks that had not run yet (T-407/T-408 reported completed while turn 53 ran
+  // different work).
+  await runCase('queue: a task behind a cross-turn backlog waits for its own turn', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-q412', title: 'queue 412' }] })
+    const emit = (type, turn, extra = {}) => h.emit('session/event', { id: 'session-q412' }, { type, turn, ...extra })
+    const inject = (taskId, text) => request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-q412', text, meta: { taskId } } })
+    const settled = (taskId) => readReceipts(h.receiptsPath).find((row) => !row.kind && row.taskId === taskId) ?? null
+    emit('turn/start', 1)
+    await inject('T-q412-a', 'a')
+    await inject('T-q412-b', 'b')
+    emit('turn/end', 1, { reason: { kind: 'completed' } })
+    emit('turn/start', 2)
+    await inject('T-q412-c', 'c')
+    emit('turn/end', 2, { reason: { kind: 'completed' } })
+    const afterTurn2 = ['T-q412-a', 'T-q412-b', 'T-q412-c'].filter((taskId) => settled(taskId))
+    emit('turn/start', 3)
+    emit('turn/end', 3, { reason: { kind: 'completed' } })
+    const afterTurn3 = ['T-q412-a', 'T-q412-b', 'T-q412-c'].filter((taskId) => settled(taskId))
+    emit('turn/start', 4)
+    emit('turn/end', 4, { reason: { kind: 'completed' } })
+    const turns = ['T-q412-a', 'T-q412-b', 'T-q412-c'].map((taskId) => settled(taskId)?.turn ?? null)
+    const ok =
+      afterTurn2.join(',') === 'T-q412-a' &&
+      afterTurn3.join(',') === 'T-q412-a,T-q412-b' &&
+      turns.every((turn) => turn !== null) &&
+      new Set(turns).size === 3 &&
+      turns[2] === 4
+    report(
+      'queue: a task behind a cross-turn backlog waits for its own turn',
+      ok,
+      `afterTurn2=[${afterTurn2}] afterTurn3=[${afterTurn3}] receiptTurns=[${turns}]`,
+    )
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
