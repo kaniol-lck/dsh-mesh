@@ -64,6 +64,7 @@ Options:
   --run-checks               run {check} gate requirements (default: yes in --check/--json)
   --no-checks                skip {check} gate requirements
   --fail-on-check            exit 1 when a non-optional check fails
+  --strict                   treat missing 功能： and 未分类 entries as errors (default: warning only)
 
 Exit codes: 0 = OK, 1 = drift or parse error (or failed check with --fail-on-check), 2 = usage / missing markers.`
 
@@ -87,6 +88,7 @@ function parseArgs(argv) {
     noChecks: false,
     runChecks: null,
     failOnCheck: false,
+    strict: false,
   }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -111,6 +113,7 @@ function parseArgs(argv) {
       case '--no-checks': options.noChecks = true; break
       case '--run-checks': options.runChecks = true; break
       case '--fail-on-check': options.failOnCheck = true; break
+      case '--strict': options.strict = true; break
       case '-h':
       case '--help':
         console.log(USAGE)
@@ -209,6 +212,7 @@ function parseEntry(line, sessionName, file, lineNumber, errors, features, warni
       fields.acceptance = fields.acceptance.slice(0, inline.index).replace(/[。；]$/, '').trim()
     }
   }
+  const explicitFeature = fields.feature !== null
   const head = descriptionParts.join('；')
   const splitAt = head.indexOf('——')
   const problems = []
@@ -242,6 +246,7 @@ function parseEntry(line, sessionName, file, lineNumber, errors, features, warni
     explicitOwner: fields.owner !== null,
     progress: fields.progress ?? null,
     feature: resolveFeature(fields.feature, title, description, features, file, lineNumber, warnings),
+    explicitFeature,
     file,
     line: lineNumber,
     source: `${file}:${lineNumber}`,
@@ -249,7 +254,7 @@ function parseEntry(line, sessionName, file, lineNumber, errors, features, warni
   }
 }
 
-async function parseTodos(todoDir, features, warnings) {
+async function parseTodos(todoDir, features, warnings, strict = false) {
   let names
   try {
     names = (await readdir(todoDir)).filter((name) => name.endsWith('.md')).sort()
@@ -268,6 +273,15 @@ async function parseTodos(todoDir, features, warnings) {
       if (!line.startsWith('- ')) continue
       const entry = parseEntry(line, sessionName, file, index + 1, errors, features, warnings)
       if (entry) entries.push(entry)
+    }
+  }
+  if (strict) {
+    for (const entry of entries) {
+      if (!entry.explicitFeature) {
+        errors.push({ file: entry.file, line: entry.line, message: 'missing 功能：' })
+      } else if (entry.feature === UNCLASSIFIED) {
+        errors.push({ file: entry.file, line: entry.line, message: '未分类（strict 要求显式 功能：且能归类）' })
+      }
     }
   }
   return { entries, errors }
@@ -1119,7 +1133,7 @@ async function main() {
   await assertWorklog(worklogDir)
   const features = await loadFeatures(options.featuresFile)
   const warnings = []
-  const { entries, errors } = await parseTodos(todoDir, features, warnings)
+  const { entries, errors } = await parseTodos(todoDir, features, warnings, options.strict)
   for (const warning of warnings) console.log(`WARN: ${warning.file} 行 ${warning.line} ${warning.message}`)
   markDuplicates(entries)
   const gates = await loadGates(gatesPath)
@@ -1163,7 +1177,11 @@ async function main() {
 
   if (errors.length) {
     for (const error of errors) console.error(`${error.file}:${error.line}: ${error.message}`)
-    console.error(`\n${errors.length} parse error(s); fix ${todoDir}/*.md first.`)
+    const productState =
+      options.mode === 'check'
+        ? '✗ 校验失败（未写任何文件）'
+        : '✗ ROADMAP/HTML 均未写入（产物保持旧版本）；先修上面的错误再重跑 --write'
+    console.error(`\n${errors.length} parse error(s); fix ${todoDir}/*.md first.\n${productState}`)
     process.exit(1)
   }
 
