@@ -542,5 +542,60 @@ export function createTaskLifecycle(deps) {
     }
   }
 
-  return { clearPending, settleTask, registerPendingTask, cancelPendingTask, handleSessionEvent }
+  /**
+   * Park a task until a workspace lock frees up (T-418). The stall timer is cleared and no turn
+   * is claimed: waiting for a lock is not progress and must never look like a stall.
+   */
+  function deferForLock(taskId, delivery = {}) {
+    const task = deps.pendingTasks.get(taskId)
+    if (!task) return false
+    clearPending(task)
+    task.waitingLock = { text: String(delivery.text ?? ''), mode: delivery.mode === 'steer' ? 'steer' : 'queue' }
+    deps.taskRegistry.updateTaskRow(taskId, { status: 'waiting-lock' })
+    deps.fileLog(`task ${taskId} waiting-lock on ${task.sessionId} workspace=${delivery.workspace ?? '-'}`)
+    return true
+  }
+
+  /**
+   * Deliver tasks parked by a lock. `shouldWait(task)` is asked per task; `deliver(...)` sends
+   * the prompt. The queue baseline is re-anchored at delivery time so the wait consumes no turn.
+   */
+  async function flushWaitingTasks({ shouldWait, deliver } = {}) {
+    const delivered = []
+    for (const [taskId, task] of [...deps.pendingTasks]) {
+      if (!task.waitingLock || task.settled) continue
+      if (typeof shouldWait === 'function' && shouldWait(task)) continue
+      const { text, mode } = task.waitingLock
+      task.waitingLock = null
+      const openTurn = deps.liveness.get(task.sessionId)?.openTurn ?? null
+      task.injectedDuringTurn = openTurn !== null
+      task.injectedAt = Date.now()
+      const base = openTurn !== null ? openTurn : deps.maxTurnFor(task.sessionId)
+      task.baselineTurn = Number.isFinite(base)
+        ? base +
+          [...deps.pendingTasks.values()].filter(
+            (other) =>
+              other !== task &&
+              other.sessionId === task.sessionId &&
+              !other.settled &&
+              !other.waitingLock &&
+              other.mode === 'queue' &&
+              Number.isFinite(other.baselineTurn) &&
+              other.baselineTurn >= base,
+          ).length
+        : null
+      deps.taskRegistry.updateTaskRow(taskId, { status: 'pending' })
+      try {
+        await deliver(taskId, task, text, mode)
+        task.stallTimer = armStallTimer(taskId, task)
+        delivered.push(taskId)
+        deps.fileLog(`task ${taskId} waiting-lock delivered session=${task.sessionId} baselineTurn=${task.baselineTurn ?? 'unknown'}`)
+      } catch (error) {
+        deps.fileLog(`task ${taskId} waiting-lock delivery failed: ${error?.message ?? error}`)
+      }
+    }
+    return delivered
+  }
+
+  return { clearPending, settleTask, registerPendingTask, cancelPendingTask, handleSessionEvent, deferForLock, flushWaitingTasks }
 }

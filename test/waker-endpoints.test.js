@@ -8253,6 +8253,149 @@ async function main() {
     report('dispatch: unsafe artifact paths are rejected before delivery', ok, `rejected=${errors.length} delivered=${h.state.prompts.length} first=${(errors[0] ?? '-').slice(0, 80)}`)
   })
 
+  // ---- T-418: advisory workspace lock ----
+  await runCase('lock: acquire is idempotent, visible, and 409 to other sessions', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'lock-ws-a')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-lock-holder', title: 'lock holder', cwd },
+        { id: 'session-lock-other', title: 'lock other', cwd },
+      ],
+    })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_lock')
+    const first = await tool.execute({ action: 'acquire', reason: 'build' }, { sessionId: 'session-lock-holder' })
+    const again = await tool.execute({ action: 'acquire' }, { sessionId: 'session-lock-holder' })
+    const status = await tool.execute({ action: 'status' }, { sessionId: 'session-lock-other' })
+    const conflict = await request(h.base, '/mesh/workspace/lock', {
+      method: 'POST',
+      body: { workspace: first.workspace, sessionId: 'session-lock-other' },
+    })
+    const listed = await request(h.base, '/mesh/workspaces')
+    const visible = listed.json?.workspaces?.[first.workspace]?.lock ?? null
+    const released = await tool.execute({ action: 'release' }, { sessionId: 'session-lock-holder' })
+    const after = await tool.execute({ action: 'status' }, { sessionId: 'session-lock-other' })
+    const ok =
+      first.ok === true &&
+      first.renewed === false &&
+      typeof first.lock?.expiresAt === 'number' &&
+      again.renewed === true &&
+      status.lock?.ownerSessionId === 'session-lock-holder' &&
+      conflict.status === 409 &&
+      conflict.json?.holder?.ownerSessionId === 'session-lock-holder' &&
+      typeof conflict.json?.holder?.expiresAt === 'number' &&
+      visible?.ownerSessionId === 'session-lock-holder' &&
+      released.released === true &&
+      after.lock === null
+    report(
+      'lock: acquire is idempotent, visible, and 409 to other sessions',
+      ok,
+      `lock=${JSON.stringify({ workspace: first.workspace, owner: status.lock?.ownerSessionId ?? null })} conflict=${conflict.status} released=${released.released} after=${after.lock ? 'held' : 'free'}`,
+    )
+  })
+
+  await runCase('lock: a locked workspace queues dispatches and delivers after release', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'lock-ws-b')
+    const h = await boot({
+      config: { workspaceLockTtlMs: 60000 },
+      seedSessions: [
+        { id: 'session-lock-holder-b', title: 'holder b', cwd },
+        { id: 'session-lock-worker-b', title: 'worker b', cwd },
+        { id: 'session-lock-dispatcher-b', title: 'dispatcher b', cwd },
+      ],
+    })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const lockTool = h.state.tools.find((entry) => entry.name === 'mesh_lock')
+    const dispatchTool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const acquired = await lockTool.execute({ action: 'acquire' }, { sessionId: 'session-lock-holder-b' })
+    const queued = await dispatchTool.execute(
+      { target: 'session-lock-worker-b', text: 'change the tree', taskId: 'T-lock-queued' },
+      { sessionId: 'session-lock-dispatcher-b' },
+    )
+    const row = await request(h.base, '/mesh/tasks/T-lock-queued')
+    const promptsWhileLocked = h.state.prompts.length
+    await lockTool.execute({ action: 'release' }, { sessionId: 'session-lock-holder-b' })
+    const delivered = await waitFor(() => (h.state.prompts.length === 1 ? h.state.prompts[0] : null), 5000)
+    settleOnTurn(h, 'session-lock-worker-b', 1)
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((entry) => entry.taskId === 'T-lock-queued'), 4000)
+    const ok =
+      acquired.ok === true &&
+      queued.ok === true &&
+      queued.waitingLock?.workspace === acquired.workspace &&
+      promptsWhileLocked === 0 &&
+      row.json?.task?.status === 'waiting-lock' &&
+      Boolean(delivered) &&
+      receipt?.status === 'completed'
+    report(
+      'lock: a locked workspace queues dispatches and delivers after release',
+      ok,
+      `waitingLock=${queued.waitingLock?.workspace ?? '-'} promptsWhileLocked=${promptsWhileLocked} rowStatus=${row.json?.task?.status ?? '-'} receipt=${receipt?.status ?? '-'}`,
+    )
+  })
+
+  await runCase('lock: an expired lock releases the queue automatically', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'lock-ws-c')
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-lock-holder-c', title: 'holder c', cwd },
+        { id: 'session-lock-worker-c', title: 'worker c', cwd },
+        { id: 'session-lock-dispatch-c', title: 'dispatch c', cwd },
+      ],
+    })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const lockTool = h.state.tools.find((entry) => entry.name === 'mesh_lock')
+    const dispatchTool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    await lockTool.execute({ action: 'acquire', ttlMs: 10000, reason: 'short lease' }, { sessionId: 'session-lock-holder-c' })
+    const dispatched = await dispatchTool.execute(
+      { target: 'session-lock-worker-c', text: 'ttl task', taskId: 'T-lock-ttl' },
+      { sessionId: 'session-lock-dispatch-c' },
+    )
+    const promptsBefore = h.state.prompts.length
+    const delivered = await waitFor(() => (h.state.prompts.length > 0 ? h.state.prompts[0] : null), 20000)
+    const ok = Boolean(dispatched.waitingLock) && promptsBefore === 0 && Boolean(delivered)
+    report(
+      'lock: an expired lock releases the queue automatically',
+      ok,
+      `ttlMs=10000 promptsBefore=${promptsBefore} deliveredAfterExpiry=${Boolean(delivered)}`,
+    )
+  })
+
+  await runCase('lock: a restart starts with an empty lock table', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'lock-ws-d')
+    const logFile = fileLogFile()
+    const h = await boot({ config: { logFile }, seedSessions: [{ id: 'session-lock-restart', title: 'restart', cwd }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const listed = await request(h.base, '/mesh/workspaces')
+    const locks = Object.values(listed.json?.workspaces ?? {}).map((entry) => entry.lock ?? null)
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok = locks.every((lock) => lock === null) && /workspace locks: cleared on start/.test(log)
+    report('lock: a restart starts with an empty lock table', ok, `locks=${locks.filter(Boolean).length} logged=${/workspace locks: cleared on start/.test(log)}`)
+  })
+
+  await runCase('lock: the tool validates its action and workspace', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'lock-ws-e')
+    const h = await boot({ seedSessions: [{ id: 'session-lock-e', title: 'lock e', cwd }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_lock')
+    const errors = []
+    for (const args of [{ action: 'bogus' }, { action: 'status', workspace: 'no-such-workspace-xyz' }]) {
+      try {
+        await tool.execute(args, { sessionId: 'session-lock-e' })
+      } catch (error) {
+        errors.push(String(error.message))
+      }
+    }
+    const status = await request(h.base, '/mesh/status')
+    const ok =
+      Boolean(tool) &&
+      errors.length === 2 &&
+      /action must be acquire/.test(errors[0]) &&
+      /unknown workspace/.test(errors[1]) &&
+      status.json?.tools?.lock === true &&
+      typeof status.json?.workspaceLocks?.count === 'number'
+    report('lock: the tool validates its action and workspace', ok, `errors=${errors.length} tools.lock=${status.json?.tools?.lock} lockCount=${status.json?.workspaceLocks?.count}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

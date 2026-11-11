@@ -284,6 +284,55 @@ export const CANCEL_OUTPUT = {
 }
 
 /**
+ * Advisory workspace lock (T-418). Owner decision B+C: lock a workspace so git-changing tasks
+ * run one at a time, without the plugin creating worktrees or switching branches.
+ */
+export const MESH_LOCK_TOOL = {
+  name: 'mesh_lock',
+  description:
+    'Advisory workspace lock. acquire serialises git-changing dispatches in one workspace: new dispatches to a locked workspace queue as waiting-lock instead of racing the worktree (they are not rejected). release frees the lock; status shows the holder and expiry. In-memory per process (a restart drops every lock), never blocks reads, and never creates worktrees or switches branches.',
+  parameters: {
+    action: { type: 'string', required: true, enum: ['acquire', 'release', 'status'], description: 'acquire | release | status' },
+    workspace: { type: 'string', description: 'Workspace slug or cwd; defaults to the calling session\u2019s workspace.' },
+    ttlMs: { type: 'number', description: 'Lock lifetime in ms (default workspaceLockTtlMs, clamped 10s\u20131h).' },
+    reason: { type: 'string', description: 'Why the workspace is locked (visible to waiters).' },
+  },
+  required: ['action'],
+}
+
+export const LOCK_OUTPUT = {
+  schema: {
+    type: 'object',
+    properties: {
+      ok: { type: 'boolean' },
+      action: { type: 'string' },
+      workspace: { type: 'string' },
+      released: { type: 'boolean' },
+      renewed: { type: 'boolean' },
+      lock: {
+        oneOf: [
+          {
+            type: 'object',
+            properties: {
+              workspace: { type: 'string' },
+              ownerSessionId: { type: 'string' },
+              ownerLabel: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+              reason: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+              acquiredAt: { type: 'number' },
+              expiresAt: { type: 'number' },
+            },
+            required: ['workspace', 'ownerSessionId', 'acquiredAt', 'expiresAt'],
+          },
+          { type: 'null' },
+        ],
+      },
+    },
+    required: ['ok', 'action', 'workspace'],
+  },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+}
+
+/**
  * Validate a tool output definition against the host's enforced JSON Schema subset.
  * Returns `{ ok, issues }`; this is the guard test that would have caught T-236
  * (`type: ['string','null']` is rejected by the host, not by JSON Schema).

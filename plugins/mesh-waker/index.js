@@ -28,7 +28,7 @@ import { zstdDecompressSync } from 'node:zlib'
 // ── Pure helpers moved to lib/ (T-292); re-exported below so external imports are stable.
 import { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
 import { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, buildBatchReceipt } from './lib/receipt.mjs'
-import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
+import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
 import { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, classifyRoleCandidates, ROLE_UNRECOGNIZED_MAX } from './lib/session.mjs'
 import { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settings.mjs'
@@ -39,12 +39,13 @@ import { createTaskRegistry } from './lib/task-registry.mjs'
 import { createTaskLifecycle } from './lib/task-lifecycle.mjs'
 import { createHubTaskConsumer } from './lib/hub-tasks.mjs'
 import { readGitContext, describeArtifacts, normalizeArtifacts } from './lib/git-context.mjs'
+import { createWorkspaceLocks } from './lib/workspace-locks.mjs'
 import { normalizeCoordinators, coordinatorsView, expireCoordinators, syncPrimary, primaryOf, isOwnerTokenValid, recordAudit } from './lib/coordinators.mjs'
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
 export { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
 export { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, buildBatchReceipt } from './lib/receipt.mjs'
-export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
+export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
 export { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, ROLE_NAMES, ROLE_UNRECOGNIZED_MAX, titleRoleCandidate, classifyRoleCandidates } from './lib/session.mjs'
 export { createReceiptFlow } from './lib/receipt-flow.mjs'
 export { createThreads } from './lib/threads.mjs'
@@ -609,6 +610,8 @@ function normalizeBase(config) {
     taskLeaseMs: clampInterval(c.taskLeaseMs, 600000, 60000, 3_600_000),
     // Bounded wait for a cancelled turn to close (T-403): never hang a cancel call forever.
     cancelWaitMs: clampInterval(c.cancelWaitMs, 5000, 0, 10000),
+    // Advisory workspace lock TTL (T-418): serialises git-changing dispatches per workspace.
+    workspaceLockTtlMs: clampInterval(c.workspaceLockTtlMs, 600000, 10_000, 3_600_000),
     // Multi-coordinator claim protocol (T-395): bounded online coordinators, a lease per
     // member, and a pending TTL. The owner token file (when configured) is required for the
     // first claim in an empty workspace and for approve/reject/release by the owner.
@@ -2011,6 +2014,47 @@ export function apply(ctx, config) {
     }
   }
 
+  /** Mesh tool for the advisory workspace lock (T-418); `ownerSessionId` is the caller. */
+  function meshLock(args = {}, extra = null) {
+    const caller = callerSessionFrom(extra)
+    if (!caller) {
+      throw new Error('mesh_lock needs the calling session; the host did not pass one (no default session is guessed)')
+    }
+    const action = String(args.action ?? '').trim()
+    if (!['acquire', 'release', 'status'].includes(action)) {
+      throw new Error('action must be acquire | release | status')
+    }
+    const workspace = String(args.workspace ?? '').trim() || workspaceSlugForPath(sessionCwdOf(caller)) || ''
+    if (!workspace) {
+      throw new Error(
+        'workspace is required: pass a slug or cwd, or call from a session whose cwd belongs to a registered workspace',
+      )
+    }
+    if (action === 'status') {
+      const slug = requireWorkspace(workspace)
+      return { ok: true, action, workspace: slug, lock: workspaceLocks.lockFor(slug) }
+    }
+    if (action === 'acquire') {
+      const session = listLocalSessions().find((item) => item.id === caller) ?? null
+      const result = workspaceLocks.acquire({
+        workspace,
+        ownerSessionId: caller,
+        ownerLabel: session?.title ?? null,
+        reason: args.reason === undefined ? null : String(args.reason).slice(0, 200),
+        ttlMs: args.ttlMs,
+      })
+      return { ok: true, action, workspace: result.lock.workspace, lock: result.lock, renewed: result.renewed }
+    }
+    const result = workspaceLocks.release({ workspace, ownerSessionId: caller })
+    return {
+      ok: true,
+      action,
+      workspace: result.workspace,
+      released: result.released,
+      ...(result.lock ? { lock: result.lock } : {}),
+    }
+  }
+
   function throttleSummary() {
     const now = Date.now()
     return Object.entries(throttleLedger.conversations)
@@ -3377,6 +3421,7 @@ export function apply(ctx, config) {
   // Batches: one aggregate receipt when every task settled (or the deadline hits).
   const batches = new Map()
   let batchSweepTimer = null
+  let lockSweepTimer = null
 
   // ══ 子系统：状态账本辅助 ══════════════════════════════════════════════════
   // 职责：liveness ledger 取用与最大 turn 查询
@@ -5067,6 +5112,8 @@ export function apply(ctx, config) {
     }
     if (batchSweepTimer) clearInterval(batchSweepTimer)
     batchSweepTimer = null
+    if (lockSweepTimer) clearInterval(lockSweepTimer)
+    lockSweepTimer = null
     state.pendingTasks = 0
   }
 
@@ -5306,10 +5353,18 @@ export function apply(ctx, config) {
     const deliveredText = c.injectHeader
       ? withTaskHeader(text, { taskId: meta.taskId, batchId: meta.batchId, requester, thread })
       : text
+    const deliveryMode = args.mode === 'steer' ? 'steer' : 'queue'
+    // T-418: a workspace lock from someone else parks the task instead of racing the worktree.
+    const sessionLock = lockForSession(session.id)
+    const waitForLock = Boolean(sessionLock) && !lockExempt(sessionLock.lock, callerSession, requester)
     let taskId = null
     try {
-      taskId = lifecycle.registerPendingTask(session, meta, args.mode === 'steer' ? 'steer' : 'queue', text)
-      await promptWithResume(session.id, deliveredText, args.mode === 'steer' ? 'steer' : 'queue')
+      taskId = lifecycle.registerPendingTask(session, meta, deliveryMode, text)
+      if (waitForLock) {
+        lifecycle.deferForLock(taskId, { text: deliveredText, mode: deliveryMode, workspace: sessionLock.workspace })
+      } else {
+        await promptWithResume(session.id, deliveredText, deliveryMode)
+      }
     } catch (error) {
       if (taskId) lifecycle.cancelPendingTask(taskId)
       throw error
@@ -5321,6 +5376,11 @@ export function apply(ctx, config) {
     const effectiveWorkspacePath = createdWorkspacePath ?? sessionCwdOf(session.id) ?? null
     const warnings = [
       ...dispatchWarnings,
+      ...(waitForLock
+        ? [
+            `workspace ${sessionLock.workspace} is locked by ${sessionLock.lock.ownerSessionId} until ${new Date(sessionLock.lock.expiresAt).toISOString()}; task queued as waiting-lock`,
+          ]
+        : []),
       ...(taskId && pendingTasks.get(taskId)?.idWarning ? [pendingTasks.get(taskId).idWarning] : []),
     ]
     return {
@@ -5340,6 +5400,15 @@ export function apply(ctx, config) {
       // Dispatch-time git snapshot (T-416): null when the cwd is not a git repo or git is
       // unavailable. The receipt carries the settled-time snapshot for comparison.
       git: dispatchGit,
+      ...(waitForLock
+        ? {
+            waitingLock: {
+              workspace: sessionLock.workspace,
+              ownerSessionId: sessionLock.lock.ownerSessionId,
+              expiresAt: sessionLock.lock.expiresAt,
+            },
+          }
+        : {}),
       ...(warnings.length ? { warnings, warning: warnings[0] } : {}),
     }
   }
@@ -5428,12 +5497,67 @@ export function apply(ctx, config) {
   // a race with the host's tools service (ctx.get('tools') is still undefined on the first
   // plugin turn), so it retries a few times instead of failing silently; every outcome goes
   // to the waker log and to /mesh/status.tools.
+  // ---------------------------------------------------------------- workspace locks (T-418)
+  //
+  // Advisory, in-memory, per process: a lock serialises git-changing dispatches to one
+  // workspace and lets other dispatches queue instead of racing. Reads are never blocked and a
+  // restart drops every lock (a lock is a courtesy between live sessions, not a durable fact).
+  const resolveWorkspaceArg = (input) => {
+    const raw = String(input ?? '').trim()
+    if (!raw) return { ok: false, candidates: [] }
+    refreshWorkspacesFromDisk()
+    if (workspaces.workspaces?.[raw]) return { ok: true, workspace: raw }
+    const slug = workspaceSlugForPath(raw)
+    if (slug) return { ok: true, workspace: slug }
+    return { ok: false, candidates: Object.keys(workspaces.workspaces ?? {}) }
+  }
+  const workspaceLocks = createWorkspaceLocks({
+    config: { workspaceLockTtlMs: c.workspaceLockTtlMs },
+    fileLog,
+    resolveWorkspace: resolveWorkspaceArg,
+  })
+  const requireWorkspace = (input) => {
+    const result = resolveWorkspaceArg(input)
+    if (result.ok) return result.workspace
+    const error = new Error(
+      `unknown workspace ${JSON.stringify(String(input ?? ''))}; known workspaces: ${result.candidates.join(', ') || '(none registered)'}`,
+    )
+    error.httpStatus = 404
+    throw error
+  }
+  /** The lock guarding a session's workspace, if any (workspace slug resolved from its cwd). */
+  const lockForSession = (sessionId) => {
+    const slug = workspaceSlugForPath(sessionCwdOf(sessionId))
+    if (!slug) return null
+    const lock = workspaceLocks.lockFor(slug)
+    return lock ? { workspace: slug, lock } : null
+  }
+  const lockExempt = (lock, ...sessionIds) => Boolean(lock) && sessionIds.filter(Boolean).includes(lock.ownerSessionId)
+
+  /** Deliver tasks parked by a lock once it is gone; also expires stale locks. */
+  async function sweepWorkspaceLocks() {
+    workspaceLocks.expire()
+    if (!pendingTasks.size) return
+    await lifecycle.flushWaitingTasks({
+      shouldWait: (task) => {
+        const slug = workspaceSlugForPath(task.cwd)
+        if (!slug) return false
+        const lock = workspaceLocks.lockFor(slug)
+        return Boolean(lock) && lock.ownerSessionId !== task.requesterSessionId
+      },
+      deliver: async (taskId, task, text, mode) => {
+        await promptWithResume(task.sessionId, text, mode)
+      },
+    })
+  }
+
   const toolState = {
     dispatch: { ok: false, error: null },
     ask: { ok: false, error: null },
     thread: { ok: false, error: null },
     complete: { ok: false, error: null },
     cancel: { ok: false, error: null },
+    lock: { ok: false, error: null },
   }
 
   // ══ 子系统：工具注册与代码自检 ══════════════════════════════════════════════════
@@ -5552,6 +5676,16 @@ export function apply(ctx, config) {
     })
     installModelTool(cancelDefinition, 'cancel')
 
+    const lockDefinition = await buildToolDefinition({
+      name: MESH_LOCK_TOOL.name,
+      description: MESH_LOCK_TOOL.description,
+      parameters: MESH_LOCK_TOOL.parameters,
+      required: MESH_LOCK_TOOL.required,
+      output: LOCK_OUTPUT,
+      execute: (args, extra) => meshLock(args, extra),
+    })
+    installModelTool(lockDefinition, 'lock')
+
     const completeDefinition = await buildToolDefinition({
       name: MESH_COMPLETE_TOOL.name,
       description: MESH_COMPLETE_TOOL.description,
@@ -5647,6 +5781,11 @@ export function apply(ctx, config) {
   autoBindTopics()
   batchSweepTimer = setInterval(sweepBatches, Math.max(1000, Math.min(30000, Math.floor(c.waitLongMs / 2))))
   batchSweepTimer.unref?.()
+  // T-418: locks are in-memory, so a restart starts clean; the sweeper expires TTLs and
+  // delivers tasks parked as waiting-lock.
+  workspaceLocks.clearAtStart()
+  lockSweepTimer = setInterval(() => void sweepWorkspaceLocks(), 1000)
+  lockSweepTimer.unref?.()
 
   ctx.effect(() => {
     // Trust anchors must be in place before any request; a bad caFile leaves the plugin
@@ -5818,6 +5957,8 @@ export function apply(ctx, config) {
         }
         view[slug] = { ...entry, workers }
       }
+      // T-418: every workspace reports its advisory lock (null when free); reads stay unblocked.
+      for (const slug of Object.keys(view)) view[slug] = { ...view[slug], lock: workspaceLocks.lockFor(slug) }
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
       res.end(
         JSON.stringify({
@@ -6670,6 +6811,65 @@ export function apply(ctx, config) {
       return
     }
 
+    if (path === '/mesh/workspace/lock' && req.method === 'GET') {
+      // T-418: read one workspace's advisory lock (null when free).
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      try {
+        const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+        const slug = requireWorkspace(String(url.searchParams.get('workspace') ?? '').trim())
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: true, workspace: slug, lock: workspaceLocks.lockFor(slug) }))
+      } catch (error) {
+        res.writeHead(error.httpStatus ?? 400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
+      return
+    }
+
+    if ((path === '/mesh/workspace/lock' || path === '/mesh/workspace/unlock') && req.method === 'POST') {
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const raw = await readRequestBuffer()
+      if (!raw) {
+        res.writeHead(413).end()
+        return
+      }
+      let draft = {}
+      try {
+        draft = JSON.parse(raw.toString('utf8') || '{}')
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end('{"ok":false,"error":"invalid JSON body"}')
+        return
+      }
+      const sessionId = String(draft.sessionId ?? draft.ownerSessionId ?? '').trim()
+      const workspaceArg = String(draft.workspace ?? '').trim() || (sessionId ? workspaceSlugForPath(sessionCwdOf(sessionId)) ?? '' : '')
+      if (!workspaceArg) {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'workspace (slug or cwd) or sessionId is required' }))
+        return
+      }
+      const owner = sessionId || 'loopback'
+      try {
+        const result = path === '/mesh/workspace/unlock'
+          ? { action: 'release', ...workspaceLocks.release({ workspace: workspaceArg, ownerSessionId: owner }) }
+          : { action: 'acquire', ...workspaceLocks.acquire({ workspace: workspaceArg, ownerSessionId: owner, ownerLabel: draft.ownerLabel, reason: draft.reason, ttlMs: draft.ttlMs }) }
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: true, ...result }))
+      } catch (error) {
+        res.writeHead(error.httpStatus ?? 400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message, ...(error.holder ? { holder: error.holder } : {}) }))
+      }
+      return
+    }
+
     if (path === '/mesh/cancel' && req.method === 'POST') {
       // T-403: stop the turn behind a task/session (never delete the session). Loopback only:
       // the caller is a local script, so `by` is 'loopback' (the tool records the session id).
@@ -6832,6 +7032,10 @@ export function apply(ctx, config) {
           String(draft.workspace ?? '').trim()
         let taskId = null
         let deliveredText = text
+        // T-418: a workspace lock held by another session parks the task instead of injecting.
+        const injectLock = lockForSession(target.id)
+        const injectWaitsForLock =
+          Boolean(injectLock) && !lockExempt(injectLock.lock, requester, String(draft.callerSession ?? '').trim())
         try {
           if (!meta.taskId) meta.taskId = `T-${Date.now().toString(36)}`
           // Register before prompting: a very fast turn can end before this request returns.
@@ -6845,7 +7049,11 @@ export function apply(ctx, config) {
                 thread,
               })
             : text
-          await promptWithResume(target.id, deliveredText, mode)
+          if (injectWaitsForLock) {
+            lifecycle.deferForLock(taskId, { text: deliveredText, mode, workspace: injectLock.workspace })
+          } else {
+            await promptWithResume(target.id, deliveredText, mode)
+          }
         } catch (error) {
           if (taskId) lifecycle.cancelPendingTask(taskId)
           throw error
@@ -6862,6 +7070,9 @@ export function apply(ctx, config) {
             taskId,
             batchId: taskId ? batchId : null,
             thread: thread ?? null,
+            ...(injectWaitsForLock
+              ? { waitingLock: { workspace: injectLock.workspace, ownerSessionId: injectLock.lock.ownerSessionId, expiresAt: injectLock.lock.expiresAt } }
+              : {}),
             ...(taskId && pendingTasks.get(taskId)?.idWarning ? { warning: pendingTasks.get(taskId).idWarning } : {}),
           }),
         )
@@ -7001,6 +7212,7 @@ export function apply(ctx, config) {
                 thread: toolState.thread.ok,
                 complete: toolState.complete.ok,
                 cancel: toolState.cancel.ok,
+                lock: toolState.lock.ok,
               },
               toolsError:
                 toolState.dispatch.error ??
@@ -7008,7 +7220,10 @@ export function apply(ctx, config) {
                 toolState.thread.error ??
                 toolState.complete.error ??
                 toolState.cancel.error ??
+                toolState.lock.error ??
                 null,
+              // T-418: advisory workspace locks are in-memory; this is the live view.
+              workspaceLocks: { count: workspaceLocks.count(), locks: workspaceLocks.list() },
               // Effective limits and optional-seam state, so operators never have to guess.
               limits: { maxInlineBytes: c.maxInlineBytes },
               seams: { approval: seams.approval, questions: seams.questions },
