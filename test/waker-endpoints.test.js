@@ -8146,6 +8146,113 @@ async function main() {
     )
   })
 
+  // ---- T-416: dispatch carries git context and artifact expectations ----
+  const gitTestSetup = () => {
+    const { execFileSync } = require('node:child_process')
+    try {
+      execFileSync('git', ['--version'], { stdio: 'ignore' })
+    } catch {
+      return { available: false }
+    }
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-waker-git-'))
+    execFileSync('git', ['init', '-q'], { cwd: repo })
+    execFileSync('git', ['-c', 'user.email=test@example.com', '-c', 'user.name=test', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd: repo })
+    const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim()
+    return { available: true, repo, branch }
+  }
+
+  await runCase('dispatch: the response carries the target git context', async (boot) => {
+    const setup = gitTestSetup()
+    if (!setup.available) {
+      report('dispatch: the response carries the target git context', true, 'skipped: git is not installed')
+      return
+    }
+    const h = await boot({ seedSessions: [{ id: 'session-git-a', title: 'git worker', cwd: setup.repo }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const result = await tool.execute({ target: 'session-git-a', text: 'read the tree' })
+    const git = result.git ?? {}
+    const ok =
+      result.ok === true &&
+      result.git !== null &&
+      git.cwd === setup.repo &&
+      git.branch === setup.branch &&
+      /^[0-9a-f]{4,}$/.test(git.head ?? '') &&
+      git.dirty === false &&
+      h.state.prompts.length === 1
+    report('dispatch: the response carries the target git context', ok, `git=${JSON.stringify(git)}`)
+  })
+
+  await runCase('dispatch: expectBranch warns without blocking the task', async (boot) => {
+    const setup = gitTestSetup()
+    if (!setup.available) {
+      report('dispatch: expectBranch warns without blocking the task', true, 'skipped: git is not installed')
+      return
+    }
+    const h = await boot({ seedSessions: [{ id: 'session-git-b', title: 'git worker', cwd: setup.repo }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const mismatch = await tool.execute({ target: 'session-git-b', text: 'one', expectBranch: 'not-this-branch' })
+    const match = await tool.execute({ target: 'session-git-b', text: 'two', expectBranch: setup.branch })
+    const ok =
+      (mismatch.warnings ?? []).some((line) => /branch mismatch/.test(line) && line.includes('not-this-branch')) &&
+      (match.warnings ?? []).length === 0 &&
+      h.state.prompts.length === 2
+    report('dispatch: expectBranch warns without blocking the task', ok, `mismatchWarning=${JSON.stringify(mismatch.warnings ?? [])} matchWarnings=${(match.warnings ?? []).length} delivered=${h.state.prompts.length}`)
+  })
+
+  await runCase('dispatch: artifacts are listed at settlement, missing ones included', async (boot) => {
+    const setup = gitTestSetup()
+    if (!setup.available) {
+      report('dispatch: artifacts are listed at settlement, missing ones included', true, 'skipped: git is not installed')
+      return
+    }
+    fs.writeFileSync(path.join(setup.repo, 'out.txt'), 'produced\n')
+    const h = await boot({ seedSessions: [{ id: 'session-git-c', title: 'git worker', cwd: setup.repo }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const result = await tool.execute({
+      target: 'session-git-c',
+      text: 'produce it',
+      taskId: 'T-git-artifacts',
+      artifacts: ['out.txt', 'missing.txt'],
+    })
+    settleOnTurn(h, 'session-git-c', 1)
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((row) => row.taskId === 'T-git-artifacts'), 4000)
+    const produced = (receipt?.artifacts ?? []).find((entry) => entry.path === 'out.txt')
+    const missing = (receipt?.artifacts ?? []).find((entry) => entry.path === 'missing.txt')
+    const ok =
+      result.ok === true &&
+      (receipt?.artifacts ?? []).length === 2 &&
+      produced?.exists === true &&
+      typeof produced?.sizeBytes === 'number' &&
+      missing?.exists === false &&
+      missing?.sizeBytes === null &&
+      receipt?.git?.branch === setup.branch
+    report('dispatch: artifacts are listed at settlement, missing ones included', ok, `artifacts=${JSON.stringify(receipt?.artifacts ?? [])} receiptGit=${JSON.stringify(receipt?.git ?? null)}`)
+  })
+
+  await runCase('dispatch: a non-git workspace yields git:null but still delivers', async (boot) => {
+    const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'mesh-waker-nogit-'))
+    const h = await boot({ seedSessions: [{ id: 'session-git-d', title: 'plain worker', cwd: plain }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const result = await tool.execute({ target: 'session-git-d', text: 'no repo here' })
+    const ok = result.ok === true && result.git === null && h.state.prompts.length === 1
+    report('dispatch: a non-git workspace yields git:null but still delivers', ok, `git=${JSON.stringify(result.git)} delivered=${h.state.prompts.length}`)
+  })
+
+  await runCase('dispatch: unsafe artifact paths are rejected before delivery', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-git-e', title: 'plain worker' }] })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const errors = []
+    for (const artifacts of [['C:\\Windows\\win.ini'], ['../outside.txt'], ['ok.txt', 'dir/../../escape']]) {
+      try {
+        await tool.execute({ target: 'session-git-e', text: 'nope', artifacts })
+      } catch (error) {
+        errors.push(String(error.message))
+      }
+    }
+    const ok = errors.length === 3 && errors.every((message) => /relative|\.\./.test(message)) && h.state.prompts.length === 0
+    report('dispatch: unsafe artifact paths are rejected before delivery', ok, `rejected=${errors.length} delivered=${h.state.prompts.length} first=${(errors[0] ?? '-').slice(0, 80)}`)
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {

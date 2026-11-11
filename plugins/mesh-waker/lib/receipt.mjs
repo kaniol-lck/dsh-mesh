@@ -76,6 +76,9 @@ export function buildReceipt({
   source = 'observed',
   routedTo = null,
   noticeSummary = false,
+  git = null,
+  artifacts = null,
+  warnings = [],
 } = {}) {
   const at = endedAt ?? Date.now()
   return {
@@ -101,6 +104,11 @@ export function buildReceipt({
     // Per-task opt-in (T-404): render the summary in the injected notice too. Off by default
     // because 0.7.28/T-269 deliberately reduced notices to status lines after a reply storm.
     noticeSummary: noticeSummary === true,
+    // Settled-time git snapshot and declared artifacts (T-416): both are optional and are only
+    // added when the dispatcher asked for them, so a plain receipt keeps its old shape.
+    ...(git ? { git } : {}),
+    ...(Array.isArray(artifacts) && artifacts.length ? { artifacts } : {}),
+    ...(Array.isArray(warnings) && warnings.length ? { warnings } : {}),
   }
 }
 
@@ -173,6 +181,9 @@ export function buildBatchReceipt({ batchId, tasks = [], startedAt = 0, endedAt 
     settled: task.settled !== false,
     // T-355: every member carries its workspace so a failure names the right one.
     workspace: task.workspace ? String(task.workspace) : null,
+    // T-416: settled-time git snapshot and declared artifacts, per member.
+    git: task.git && typeof task.git === 'object' ? task.git : null,
+    artifacts: Array.isArray(task.artifacts) ? task.artifacts : null,
   }))
   const pendingStates = ['pending', 'not-started', 'stalled', 'working', 'waiting-approval', 'waiting-job', 'waiting-tool']
   // done counts settled tasks (a failed turn still finished); open ones stay out.
@@ -213,6 +224,12 @@ export function buildBatchReceipt({ batchId, tasks = [], startedAt = 0, endedAt 
     normalized.forEach((task, index) => {
       out.push(lines[index])
       if (index < count && summaries[index]) out.push(`  ${summaries[index]}`)
+      // Artifact lines ride with the member's summary so the byte cap above already covers them.
+      if (index < count && Array.isArray(task.artifacts)) {
+        for (const artifact of task.artifacts) {
+          out.push(`    ▸ ${artifact.path} ${artifact.exists ? `${artifact.sizeBytes}B` : '缺失'}`)
+        }
+      }
     })
     return out.join('\n')
   }

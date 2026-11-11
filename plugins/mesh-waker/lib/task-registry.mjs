@@ -151,6 +151,10 @@ export function createTaskRegistry(deps) {
       routedTo: extra.routedTo ?? null,
       // Per-dispatch summary opt-in (T-404); persists so the batch can honour it after settle.
       ...(extra.noticeSummary === true ? { noticeSummary: true } : {}),
+      // Git/artifact context (T-416): persisted so a later reader can audit branch and files.
+      ...(extra.cwd ? { cwd: String(extra.cwd) } : {}),
+      ...(extra.expectBranch ? { expectBranch: String(extra.expectBranch) } : {}),
+      ...(Array.isArray(extra.artifacts) && extra.artifacts.length ? { artifacts: extra.artifacts.slice(0, 10) } : {}),
       ...deps.scopeFields(route),
       ...(reusedId ? { reusedId: true } : {}),
       refs: Array.isArray(meta?.refs)

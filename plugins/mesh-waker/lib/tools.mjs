@@ -54,6 +54,17 @@ export const MESH_DISPATCH_TOOL = {
       description:
         'Include the worker\u2019s summary in the receipt notice (default false: the notice is a status line only; error/lost add one reason line). The summary is always stored in receipts.jsonl and readable from GET /mesh/tasks/<id>. For a batch this opts the whole batch into summaries.',
     },
+    expectBranch: {
+      type: 'string',
+      description:
+        'Optional branch the target workspace is expected to sit on. A mismatch only produces a warning (dispatch response and receipt); it never blocks the task.',
+    },
+    artifacts: {
+      type: 'array',
+      items: { type: 'string' },
+      description:
+        'Up to 10 paths relative to the target workspace that the task should produce. Settlement lists each as {path, exists, sizeBytes, mtimeMs} in the receipt (and the batch record); missing files are listed with exists:false. Absolute paths and .. are rejected. The plugin never creates files.',
+    },
     deadline: { type: 'string', description: 'Batch deadline such as 30m / 2h / 600s.' },
   },
   required: ['text'],
@@ -101,6 +112,23 @@ export const DISPATCH_OUTPUT = {
       // T-402 fields: always present, null when unknown (declared so the contract is explicit).
       workspacePath: { oneOf: [{ type: 'string' }, { type: 'null' }] },
       workspace: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      // Dispatch-time git snapshot (T-416); null when the target cwd is not a git repo.
+      git: {
+        oneOf: [
+          {
+            type: 'object',
+            properties: {
+              cwd: { type: 'string' },
+              branch: { type: 'string' },
+              head: { type: 'string' },
+              dirty: { type: 'boolean' },
+            },
+            required: ['cwd', 'branch', 'head', 'dirty'],
+          },
+          { type: 'null' },
+        ],
+      },
+      warnings: { type: 'array', items: { type: 'string' } },
     },
     required: ['ok', 'sessionId', 'taskId', 'mode', 'created'],
   },

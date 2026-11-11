@@ -14,6 +14,7 @@
 - 多协调认领协议：`POST /mesh/coordinator/{claim,approve,reject,release,heartbeat}`，`coordinators[]` 支持多协调同时在线（上限可配）、待批准 TTL、租约与 primary 顺位；空工作区首任按 bootstrap 规则批准（配置 owner token 时必须带）。
 - 新增任务取消（`POST /mesh/cancel` 与 `mesh_cancel` 工具）：先停掉目标会话的 turn 再结算 `aborted` 回执，面板「取消任务」不再只改状态；停 turn 不删会话。
 - 回执/批次汇总可选带 worker 的末轮摘要：全局 `receiptNoticeSummary` 或单次 `receiptSummary`（工具参数 / `meta.receiptSummary` / CLI `--receipt-summary`），默认仍只发状态行；批次 body 超 min(`maxInlineBytes`, 8 KiB) 时截断并提示。
+- 派活回执带 git 上下文与派生产物清单：`mesh_dispatch` 返回派发时刻的 `git:{cwd,branch,head,dirty}`，回执带结算时刻快照、`artifacts:[{path,exists,sizeBytes,mtimeMs}]`（缺失也列出）与 `warnings`（`expectBranch` 不一致只提示不阻断）；插件不创建 worktree、不切分支、不加树锁。
 
 ### Fixed
 

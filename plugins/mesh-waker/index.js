@@ -38,6 +38,7 @@ import { createThreads } from './lib/threads.mjs'
 import { createTaskRegistry } from './lib/task-registry.mjs'
 import { createTaskLifecycle } from './lib/task-lifecycle.mjs'
 import { createHubTaskConsumer } from './lib/hub-tasks.mjs'
+import { readGitContext, describeArtifacts, normalizeArtifacts } from './lib/git-context.mjs'
 import { normalizeCoordinators, coordinatorsView, expireCoordinators, syncPrimary, primaryOf, isOwnerTokenValid, recordAudit } from './lib/coordinators.mjs'
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
@@ -4573,6 +4574,9 @@ export function apply(ctx, config) {
     maxTurnFor,
     // 会话 id → cwd（路由用）
     sessionCwdOf,
+    // git 快照与派生产物清单（T-416）
+    readGitContext,
+    describeArtifacts,
     // cwd → 工作区 slug（跨区单号提示用真实前缀，T-402）
     workspaceSlugForCwd: (path) => workspaceSlugForPath(path),
     // LCA 路由
@@ -4818,7 +4822,7 @@ export function apply(ctx, config) {
     const rows = []
     for (const [taskId, row] of batch.tasks) {
       if (row.settledAt !== null) {
-        rows.push({ taskId, status: row.status, durationMs: row.durationMs, summary: row.summary, settled: true, workspace: row.workspace ?? null })
+        rows.push({ taskId, status: row.status, durationMs: row.durationMs, summary: row.summary, settled: true, workspace: row.workspace ?? null, git: row.git ?? null, artifacts: row.artifacts ?? null })
       } else {
         const derived = taskLiveness(row.sessionId, taskId)
         rows.push({ taskId, status: derived.state, durationMs: null, summary: '', detail: derived.detail || null, settled: false, workspace: row.workspace ?? null })
@@ -4941,6 +4945,9 @@ export function apply(ctx, config) {
       row.settledAt = receipt.endedAt
       row.durationMs = receipt.durationMs
       row.summary = receipt.summary
+      // T-416: carry the settled-time git snapshot and artifact listing into the aggregate.
+      row.git = receipt.git ?? null
+      row.artifacts = Array.isArray(receipt.artifacts) ? receipt.artifacts : null
     }
     saveBatches()
     if ([...batch.tasks.values()].some((entry) => entry.settledAt === null)) return
@@ -5271,6 +5278,19 @@ export function apply(ctx, config) {
       createdWorkspacePath = dispatchTarget.workspacePath
     }
     const resolved = buildDispatchMeta(args)
+    // T-416: git context and declared artifacts ride on the task so settlement can compare
+    // branches and report what the worker actually produced. Validation happens before any
+    // injection: a bad path must not reach a session.
+    const expectBranch = String(args.expectBranch ?? '').trim() || null
+    const artifacts = normalizeArtifacts(args.artifacts)
+    const targetCwd = sessionCwdOf(session.id) ?? createdWorkspacePath ?? null
+    const dispatchGit = readGitContext(targetCwd)
+    const dispatchWarnings = []
+    if (expectBranch && dispatchGit?.branch !== expectBranch) {
+      dispatchWarnings.push(
+        `branch mismatch: target ${session.id} is on ${dispatchGit?.branch ?? '(no git)'}, expected ${expectBranch}`,
+      )
+    }
     const meta = {
       taskId: resolved.taskId,
       ...(requester ? { requester } : {}),
@@ -5279,6 +5299,8 @@ export function apply(ctx, config) {
       ...(resolved.batchId ? { batchId: resolved.batchId } : {}),
       ...(args.receipt ? { receipt: String(args.receipt) } : {}),
       ...(args.receiptSummary === true ? { receiptSummary: true } : {}),
+      ...(expectBranch ? { expectBranch } : {}),
+      ...(artifacts.length ? { artifacts } : {}),
       ...(resolved.deadlineMs ? { deadlineMs: resolved.deadlineMs } : {}),
     }
     const deliveredText = c.injectHeader
@@ -5297,6 +5319,10 @@ export function apply(ctx, config) {
       `mesh_dispatch: ${text.length} chars (delivered ${deliveredText.length}) -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''}${thread ? ` thread=${thread}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession} header=${c.injectHeader}${explicitTarget ? ' explicit-target' : thread ? ' via-thread' : ''}`,
     )
     const effectiveWorkspacePath = createdWorkspacePath ?? sessionCwdOf(session.id) ?? null
+    const warnings = [
+      ...dispatchWarnings,
+      ...(taskId && pendingTasks.get(taskId)?.idWarning ? [pendingTasks.get(taskId).idWarning] : []),
+    ]
     return {
       ok: true,
       sessionId: session.id,
@@ -5311,7 +5337,10 @@ export function apply(ctx, config) {
       // whether a new worker landed in the right workspace (T-402).
       workspacePath: effectiveWorkspacePath,
       workspace: workspaceSlugForPath(effectiveWorkspacePath),
-      ...(taskId && pendingTasks.get(taskId)?.idWarning ? { warning: pendingTasks.get(taskId).idWarning } : {}),
+      // Dispatch-time git snapshot (T-416): null when the cwd is not a git repo or git is
+      // unavailable. The receipt carries the settled-time snapshot for comparison.
+      git: dispatchGit,
+      ...(warnings.length ? { warnings, warning: warnings[0] } : {}),
     }
   }
 

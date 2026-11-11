@@ -63,6 +63,14 @@ Options:
   --receipt-summary  include the worker's summary in the receipt notice (default off: the notice
                      is a status line only; error/lost also carry one reason line). The summary is
                      always stored in receipts.jsonl and GET /mesh/tasks/<id> either way.
+  --expect-branch <b>  warn when the target workspace is not on this branch (dispatch response and
+                     receipt); never blocks the task. Implying a receipt needs a task, so an id is
+                     generated when --task is omitted.
+  --artifact <path>  up to 10 paths (relative to the target workspace; no absolute paths, no ..)
+                     the task should produce. Settlement lists each in the receipt with
+                     {path, exists, sizeBytes, mtimeMs}; missing files stay visible with
+                     exists:false. Repeat the flag per path. The plugin never creates worktrees,
+                     never switches branches and never moves files back to the main workspace.
   --deadline <d>     batch deadline such as 30m / 2h / 600s
   --create           create the session (titled with --target) when it does not resolve
   --dry-run          print the request that would be sent; send nothing
@@ -267,6 +275,8 @@ export function parseArgs(argv) {
     batch: undefined,
     receipt: undefined,
     receiptSummary: false,
+    expectBranch: undefined,
+    artifacts: [],
     deadline: undefined,
     deadlineMs: undefined,
     create: false,
@@ -349,6 +359,18 @@ export function parseArgs(argv) {
       }
       case '--receipt': options.receipt = takeValue(); break
       case '--receipt-summary': options.receiptSummary = true; break
+      case '--expect-branch': {
+        const value = String(takeValue()).trim()
+        if (!value) fail('--expect-branch requires a branch name')
+        options.expectBranch = value
+        break
+      }
+      case '--artifact': {
+        const value = String(takeValue()).trim()
+        if (!value) fail('--artifact requires a relative path')
+        options.artifacts.push(value)
+        break
+      }
       case '--deadline': options.deadline = takeValue(); break
       case '--create': options.create = true; break
       case '--dry-run': options.dryRun = true; break
@@ -563,13 +585,17 @@ export async function run(options, fetchImpl = fetch) {
           : `session:${options.target}`
   const text = options.file !== undefined ? await readFile(String(options.file), 'utf8') : String(options.text ?? '')
   if (!text.trim()) fail('task text is empty')
-  const taskId = options.task === undefined ? null : options.task || `T-${Date.now().toString(36)}`
+  const needsTrackedTask = Boolean(options.expectBranch) || (options.artifacts?.length ?? 0) > 0
+  const taskId =
+    options.task === undefined ? (needsTrackedTask ? `T-${Date.now().toString(36)}` : null) : options.task || `T-${Date.now().toString(36)}`
   const batchId = options.batch === undefined ? null : options.batch || `B-${Date.now().toString(36)}`
   const meta = taskId
     ? {
         taskId,
         ...(options.receipt ? { receipt: options.receipt } : {}),
         ...(options.receiptSummary ? { receiptSummary: true } : {}),
+        ...(options.expectBranch ? { expectBranch: options.expectBranch } : {}),
+        ...(options.artifacts?.length ? { artifacts: options.artifacts } : {}),
         ...(batchId ? { batchId } : {}),
         ...(options.deadlineMs ? { deadlineMs: options.deadlineMs } : {}),
       }

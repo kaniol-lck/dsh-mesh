@@ -133,6 +133,17 @@ export function createTaskLifecycle(deps) {
     // guarded snapshot (never invent prose the worker did not send).
     const captured = turnMatches && textIsFresh ? shot.text : ''
     const summary = details.summary !== undefined ? String(details.summary) : captured
+    // Settlement-time git snapshot and artifact listing (T-416). Both are advisory: a worker on
+    // a different branch only produces a warning, and a missing file is listed as exists:false.
+    const settleCwd = task.cwd ?? (typeof deps.sessionCwdOf === 'function' ? deps.sessionCwdOf(task.sessionId) : null) ?? null
+    const settleGit = typeof deps.readGitContext === 'function' ? deps.readGitContext(settleCwd) : null
+    const settleArtifacts = typeof deps.describeArtifacts === 'function' ? deps.describeArtifacts(settleCwd, task.artifacts) : null
+    const settleWarnings = []
+    if (task.expectBranch && settleGit?.branch !== task.expectBranch) {
+      settleWarnings.push(
+        `branch mismatch: worker ended on ${settleGit?.branch ?? '(no git)'}, expected ${task.expectBranch}`,
+      )
+    }
     const receipt = buildReceipt({
       taskId,
       sessionId: task.sessionId,
@@ -151,6 +162,9 @@ export function createTaskLifecycle(deps) {
       source: details.source ?? task.source ?? 'observed',
       routedTo: task.routedTo ?? null,
       noticeSummary: task.noticeSummary === true,
+      git: settleGit,
+      artifacts: settleArtifacts,
+      warnings: [...(Array.isArray(details.warnings) ? details.warnings : []), ...settleWarnings],
     })
     deps.writeReceiptFile(receipt, task.recordDir ?? deps.receiptDirForTask(taskId) ?? deps.receiptDirFor(receipt))
     // Registry status mirrors the receipt: not-started is the stall path, everything else
@@ -313,6 +327,15 @@ export function createTaskLifecycle(deps) {
       routedTo: meta?.routedTo ? String(meta.routedTo).slice(0, 120) : null,
       settled: false,
       stallTimer: null,
+      // T-416: settlement compares the branch the worker ended on and stats declared files.
+      cwd: target.cwd ?? deps.sessionCwdOf(target.id) ?? null,
+      expectBranch: meta?.expectBranch ? String(meta.expectBranch).slice(0, 200) : null,
+      artifacts: Array.isArray(meta?.artifacts)
+        ? meta.artifacts
+            .map((path) => String(path))
+            .filter((path) => path && !/^(?:[A-Za-z]:)?[\\/\\\\]/.test(path) && !path.split(/[\\\\/]+/).includes('..'))
+            .slice(0, 10)
+        : [],
       // Per-dispatch opt-in (T-404): render the summary in the notice too.
       noticeSummary: meta?.receiptSummary === true,
       ...(idWarning ? { idWarning } : {}),
@@ -337,6 +360,9 @@ export function createTaskLifecycle(deps) {
       // Persist the actual mode so a restart can still notify the dispatcher (T-273).
       receiptMode,
       noticeSummary: task.noticeSummary === true,
+      cwd: task.cwd ?? null,
+      expectBranch: task.expectBranch ?? null,
+      artifacts: task.artifacts ?? [],
     })
     const timer = armStallTimer(taskId, task)
     task.stallTimer = timer
