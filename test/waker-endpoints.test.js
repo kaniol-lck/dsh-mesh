@@ -671,6 +671,25 @@ async function waitFor(check, timeoutMs = 10000, stepMs = 100) {
   return null
 }
 
+/**
+ * Read conversations.json only after it exists and parses (T-419). The plugin writes the map
+ * while/after delivering the wake prompt, so a fast prompt arrival on a slow CI runner can
+ * precede the write; reading immediately produced a flaky ENOENT (CI run 43064663673).
+ */
+async function readConversationsWhenReady(h, timeoutMs = 5000) {
+  const parsed = await waitFor(() => {
+    try {
+      return JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
+    } catch {
+      return null
+    }
+  }, timeoutMs)
+  if (parsed) return parsed
+  throw new Error(
+    `conversations.json was not readable within ${timeoutMs}ms: path=${h.conversationsPath} prompts=${h.state.prompts.length} created=${h.state.created.length}`,
+  )
+}
+
 /** Evaluate client.js in a VM (no React) and return its opt-in test helpers. */
 function loadClientHelpers() {
   const source = fs.readFileSync(path.join(REPO, 'plugins', 'mesh-waker', 'client.js'), 'utf8')
@@ -838,7 +857,7 @@ async function main() {
     const deleted = await request(h.base, '/mesh/sessions/delete', { method: 'POST', body: { session: id } })
     const listed = await request(h.base, '/mesh/sessions')
     const ids = (listed.json?.sessions ?? []).map((session) => session.id)
-    const conversationsText = fs.readFileSync(h.conversationsPath, 'utf8')
+    const conversationsText = JSON.stringify(await readConversationsWhenReady(h))
     const ok =
       deleted.status === 200 &&
       deleted.json?.ok === true &&
@@ -2078,7 +2097,7 @@ async function main() {
       h.state.agents.set('session-e2e-origin', {})
       e2eOriginLog(h, 'session-e2e-origin', conversation)
       const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
-      const conversations = JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
+      const conversations = await readConversationsWhenReady(h)
       const entry = conversations[conversation] ?? {}
       const ok = delivered?.sessionId === 'session-e2e-origin' && entry.deliverTo === 'session-e2e-origin'
       report('origin routing: a reply is delivered to the live origin session', ok, `deliverTo=${entry.deliverTo ?? '-'} prompt=${delivered?.sessionId ?? '-'}`)
@@ -2103,7 +2122,7 @@ async function main() {
       // Not live: the auto-bound session must be replaced, not used.
       e2eOriginLog(h, 'session-e2e-gone', conversation)
       const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
-      const conversations = JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
+      const conversations = await readConversationsWhenReady(h)
       const entry = conversations[conversation] ?? {}
       const replacement = h.state.created.find((item) => item.id === delivered?.sessionId)
       const ok =
@@ -2127,7 +2146,7 @@ async function main() {
     try {
       h = await boot({ config: { hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 } })
       const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
-      const conversations = JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
+      const conversations = await readConversationsWhenReady(h)
       const entry = conversations[conversation] ?? {}
       // The inbox session is created by the wake path (h.state.created), never bound.
       const ok = Boolean(delivered) && !entry.deliverTo && h.state.created.some((item) => item.id === delivered.sessionId)
