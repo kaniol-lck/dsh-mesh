@@ -85,3 +85,8 @@ node .worklog/bin/roadmap.mjs --check    # 0 一致 / 1 漂移
 node .worklog/bin/defects.mjs --scan     # 缺陷台账
 node .worklog/bin/dispatch.mjs --title "<项目> · <角色>" --file dispatch/task.txt
 ```
+
+## 延伸阅读
+
+- 多主线并行（一树一分支、账本共享、合并锁）→ `docs/multi-track-worktrees.md`
+- 分支模型（`main` 发布 / `dev` 开发 / `feature/*` / `release/*` / `hotfix/*`）→ `docs/team-repo-governance.md`
