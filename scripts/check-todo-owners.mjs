@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 /**
- * check-todo-owners.mjs — every `归属：` in .worklog/todo/*.md must be a role slug.
+ * check-todo-owners.mjs — every owner FIELD in .worklog/todo/*.md must be a role slug.
+ *
+ * A field is "归属：" at the start of a line or right after a "；"/";" separator.
+ * Mentions inside prose, quotes or backticks are not fields and are ignored.
  *
  * The owner field is filtered by in ROADMAP.html, so free-form values (session
  * titles like "mesh · waker", or a sentence accidentally swallowed into the
@@ -24,10 +27,12 @@ Usage:
   node check-todo-owners.mjs [--todo-dir <dir>] [--roles <file>] [--json] [--help]
 
 Rule:
-  Every "归属：<value>" in .worklog/todo/*.md must be one of the slugs listed in
-  .worklog/roles.json (default: waker | docs | hub | ops | 协调). Session titles
-  such as "mesh · waker" and sentences are rejected: they split ROADMAP.html's
-  owner filter.
+  Only real fields count: "归属：" at the start of a line or right after "；"/";"
+  (spaces allowed). Mentions inside prose, quotes or backticks are not fields.
+  Each field value must be one of the slugs listed in .worklog/roles.json
+  (default: waker | docs | hub | ops | 协调). Session titles such as
+  "mesh · waker" and sentences are rejected: they split ROADMAP.html's owner
+  filter. --json "checked" is the number of owner FIELD occurrences.
 
 Options:
   --todo-dir <dir>   directory with todo markdown (default: .worklog/todo)
@@ -75,7 +80,7 @@ export function scanOwners(linesByFile, allowed) {
   let checked = 0
   for (const [file, lines] of Object.entries(linesByFile)) {
     lines.forEach((line, index) => {
-      for (const match of line.matchAll(/归属：([^；\n]+)/g)) {
+      for (const match of line.matchAll(/(?:^|[；;])\s*归属：([^；\n]+)/g)) {
         checked += 1
         const value = match[1].trim()
         if (!allowedSet.has(value)) violations.push({ file, line: index + 1, value })
