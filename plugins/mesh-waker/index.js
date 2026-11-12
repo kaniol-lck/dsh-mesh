@@ -41,6 +41,7 @@ import { createHubTaskConsumer } from './lib/hub-tasks.mjs'
 import { readGitContext, describeArtifacts, normalizeArtifacts } from './lib/git-context.mjs'
 import { createWorkspaceLocks } from './lib/workspace-locks.mjs'
 import { createDshTitleReader, applyDshTitles } from './lib/session-titles.mjs'
+import { createSettleHook } from './lib/settle-hook.mjs'
 import { normalizeCoordinators, coordinatorsView, expireCoordinators, syncPrimary, primaryOf, isOwnerTokenValid, recordAudit } from './lib/coordinators.mjs'
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
@@ -615,6 +616,17 @@ function normalizeBase(config) {
     cancelWaitMs: clampInterval(c.cancelWaitMs, 5000, 0, 10000),
     // Advisory workspace lock TTL (T-418): serialises git-changing dispatches per workspace.
     workspaceLockTtlMs: clampInterval(c.workspaceLockTtlMs, 600000, 10_000, 3_600_000),
+    // Settle hook (T-452): off by default. When a command is set, a settled task runs it once
+    // after a coalescing window; argv array only, never a shell string.
+    settleHookCommand: c.settleHookCommand ? String(c.settleHookCommand).trim() : '',
+    settleHookArgs: Array.isArray(c.settleHookArgs)
+      ? c.settleHookArgs
+          .map((value) => String(value))
+          .filter((value) => value !== '')
+          .slice(0, 20)
+      : [],
+    settleHookTimeoutMs: clampInterval(c.settleHookTimeoutMs, 60000, 5000, 300000),
+    settleHookDebounceMs: clampInterval(c.settleHookDebounceMs, 300000, 0, 600000),
     // Multi-coordinator claim protocol (T-395): bounded online coordinators, a lease per
     // member, and a pending TTL. The owner token file (when configured) is required for the
     // first claim in an empty workspace and for approve/reject/release by the owner.
@@ -4582,6 +4594,17 @@ export function apply(ctx, config) {
   // 实现：createTaskLifecycle(deps)（模块级，T-320）；本区只做依赖装配
   // 对外入口：lifecycle.registerPendingTask / settleTask / handleSessionEvent / cancelPendingTask / clearPending
   // 注意：排队 re-arm 与 dormant 恢复不能删（T-279）；结算后回执交给「回执投递」
+  // Settle hook (T-452): an opt-in local script that scans when tasks settle. Off when no
+  // command is configured — then the factory holds no timer and notify() is inert.
+  const SETTLE_HOOK_STATUSES = new Set(['completed', 'partial', 'error', 'lost', 'aborted', 'blocked', 'failed'])
+  const settleHook = createSettleHook({
+    command: c.settleHookCommand,
+    args: c.settleHookArgs,
+    timeoutMs: c.settleHookTimeoutMs,
+    debounceMs: c.settleHookDebounceMs,
+    fileLog,
+  })
+
   const lifecycle = createTaskLifecycle({
     // 在飞任务（taskId → task）
     pendingTasks,
@@ -4648,6 +4671,13 @@ export function apply(ctx, config) {
     // Cross-machine tasks (T-388): a settled receipt also settles the hub row. Declared
     // (mesh_complete) and observed (turn/end) both land here; whichever settles first wins.
     onSettled: (taskId, receipt) => {
+      // T-452: the local hook fires first so its spawn never waits on hub I/O. Only the
+      // terminal statuses that the hub settle path also understands trigger a scan.
+      try {
+        if (SETTLE_HOOK_STATUSES.has(String(receipt?.status ?? ''))) settleHook.notify(taskId, receipt)
+      } catch (error) {
+        fileLog(`settle hook notify failed for ${taskId}: ${error?.message ?? error}`)
+      }
       const result = HUB_TASK_RESULT[receipt?.status]
       if (!result || !hubTaskIds.has(taskId)) return
       void hubTasks?.settleTask(taskId, {
@@ -5121,6 +5151,7 @@ export function apply(ctx, config) {
     batchSweepTimer = null
     if (lockSweepTimer) clearInterval(lockSweepTimer)
     lockSweepTimer = null
+    settleHook.dispose()
     state.pendingTasks = 0
   }
 

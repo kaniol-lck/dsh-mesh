@@ -181,6 +181,10 @@ dsh plugin --profile web add dsh-mesh-waker
 | `taskLeaseMs` | `600000` | 任务租约（毫秒，60000–3600000）；执行期间按 `lease/2` 心跳续租 |
 | `cancelWaitMs` | `5000` | `/mesh/cancel` 等待被取消的 turn 真正关闭的上限（毫秒，0–10000）；超时不阻塞调用，仍会结算 aborted 回执 |
 | `workspaceLockTtlMs` | `600000` | 工作区 advisory 锁的默认 TTL（毫秒，10s–1h）；过期自动释放并自动投递排队任务。锁只存在于进程内，重启即清空 |
+| `settleHookCommand` | `''` | 任务结算后要跑一次的本地命令（argv[0]，**默认空 = 完全关闭**，不建定时器、不 spawn）；只执行配置的命令，不拼 shell、不 eval |
+| `settleHookArgs` | `[]` | 传给 `settleHookCommand` 的固定参数（字符串数组，非字符串丢弃）；实际 argv 为 `[...settleHookArgs, '--settle-tasks', '<id1>,<id2>']` |
+| `settleHookTimeoutMs` | `60000` | 钩子子进程超时（夹取 5000–300000ms）；超时 `SIGKILL` 并记日志，定时器与子进程都 unref，不拖住宿主退出 |
+| `settleHookDebounceMs` | `300000` | 合并窗口（0–600000ms）：窗口内多次结算只跑一次，`--settle-tasks` 带去重后的逗号分隔 id；`0` 表示尽快跑 |
 | `maxCoordinatorsPerWorkspace` | `3` | 同一工作区允许同时在线的协调数量上限（1–20）；超过后 claim 返回 409 + 现有列表 |
 | `coordinatorLeaseMs` | `600000` | 协调租约（毫秒，60000–3600000）；执行期间按 `/mesh/coordinator/heartbeat` 续期，过期转 stale |
 | `coordinatorPendingTtlMs` | `1800000` | 待批准认领的存活时间（毫秒，60000–86400000），过期自动失效 |
