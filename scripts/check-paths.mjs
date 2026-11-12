@@ -23,7 +23,11 @@ const PLACEHOLDER_FILES = new Set([
 // Changelogs quote historical defects verbatim; they are history, not a leak.
 const HISTORICAL_FILES = new Set(['hub/CHANGES.md'])
 // Author/repo metadata is allowed by name; usernames are part of the upstream identity.
-const MARKER_ALLOWLIST = new Set(['LICENSE', 'plugins/mesh-waker/package.json'])
+const MARKER_ALLOWLIST = new Set([
+  'LICENSE',
+  'plugins/mesh-waker/package.json',
+  'skills/package.json',
+])
 // Fake-but-consistent example ranges (docs examples and the hub default allowlist).
 const ALLOWED_LAN = new Set(['192.168.0.0/16', '192.168.1.0/24', '192.168.1.50', '192.168.1.10'])
 
