@@ -40,5 +40,6 @@ dsh-mesh-skills install --dest ./skills # 自定义目录
 ## 发布说明
 
 - 版本见 `CHANGELOG.md`；当前 `0.1.0`（MVP，**尚未 `npm publish`**，发布需 owner 明确批准）。
+- 发布包**不包含** `__pycache__`/`.pyc`/`.pyo`（`.npmignore` 排除；`files` 白名单里也加了对应 `!` 规则——npm 在有 `files` 时只看白名单，单靠 `.npmignore` 不会生效）。
 - 本包暂未纳入仓库根的门禁（`check-changelog` / `check-version-sync` 目前只覆盖三个插件/hub）；
   TODO：发布前把 `skills/package.json` 的版本与 `CHANGELOG.md` 接入门禁。

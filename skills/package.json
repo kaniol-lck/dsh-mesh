@@ -11,7 +11,10 @@
     "worklog/**",
     "README.md",
     "CHANGELOG.md",
-    "bin/**"
+    "bin/**",
+    "!**/__pycache__/**",
+    "!**/*.pyc",
+    "!**/*.pyo"
   ],
   "bin": {
     "dsh-mesh-skills": "./bin/install.mjs"

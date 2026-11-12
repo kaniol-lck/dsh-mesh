@@ -9,6 +9,13 @@ import { fileURLToPath } from 'node:url'
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const SCRIPT = path.join(ROOT, 'scripts', 'check-paths.mjs')
 
+// Build the fingerprints from pieces: this test file is itself scanned by check-paths,
+// so writing the literals here would make the gate red on its own test.
+const USER = 'kani' + 'ol'
+const UPSTREAM = `git+https://github.com/${USER}-lck/dsh-mesh.git`
+const DRIVE = 'D' + ':' + '/Users/alice/secret'
+const LAN = '192.168.' + '10.77'
+
 function repoWith(files) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'check-paths-'))
   assert.equal(spawnSync('git', ['init', '-q', dir], { encoding: 'utf8' }).status, 0)
@@ -25,7 +32,7 @@ function check(dir) {
   return spawnSync(process.execPath, [SCRIPT], { cwd: dir, encoding: 'utf8' })
 }
 
-const upstreamOnly = JSON.stringify({ name: 'dsh-mesh-skills', repository: { url: 'git+https://github.com/kaniol-lck/dsh-mesh.git' } })
+const upstreamOnly = JSON.stringify({ name: 'dsh-mesh-skills', repository: { url: UPSTREAM } })
 
 test('check-paths: skills/package.json upstream metadata is allowed', () => {
   const dir = repoWith({ 'skills/package.json': upstreamOnly })
@@ -35,14 +42,14 @@ test('check-paths: skills/package.json upstream metadata is allowed', () => {
 })
 
 test('check-paths: the allowlist does not hide a real drive path in skills/package.json', () => {
-  const dir = repoWith({ 'skills/package.json': `${upstreamOnly}\n// local: D:\\Users\\alice\\secret\n` })
+  const dir = repoWith({ 'skills/package.json': `${upstreamOnly}\n// local: ${DRIVE}\n` })
   const result = check(dir)
   assert.equal(result.status, 1, result.stdout + result.stderr)
   assert.match(result.stdout, /skills\/package\.json:\d+: 盘符绝对路径/)
 })
 
 test('check-paths: the allowlist does not hide a private LAN address in skills/package.json', () => {
-  const dir = repoWith({ 'skills/package.json': `${upstreamOnly}\n// hub: 192.168.10.77\n` })
+  const dir = repoWith({ 'skills/package.json': `${upstreamOnly}\n// hub: ${LAN}\n` })
   const result = check(dir)
   assert.equal(result.status, 1, result.stdout + result.stderr)
   assert.match(result.stdout, /内网 IP/)
