@@ -410,8 +410,8 @@ HTTP（loopback）：`GET /mesh/batches`、`GET /mesh/batches/<id>`（含每个�
 
 | 端点 | 作用 |
 |---|---|
-| `GET /mesh/sessions` | 列出本机会话（按最后活动排序）：`id` / `title` / `cwd` / `workspace` / `last_active` / `live` / `archived`。分页参数 `limit`（默认 80，夹取到 1–500）、`offset`（默认 0）、`archived`（`1`/`0`/省略）、`cwd`（精确匹配）、`q`（标题子串，大小写不敏感）；响应含 `{ ok, total, limit, offset, sessions }`，`total` 是过滤后总数。`?live=1` 仍只返回未归档会话 |
-| `POST /mesh/inject` | 向已有会话投一轮任务：按 `session`（完整 id）→ 精确标题 → 标题唯一子串寻址；歧义或找不到返回 400。`mode` 为 `queue`（默认，等当前回合）或 `steer`（打断当前回合） |
+| `GET /mesh/sessions` | 列出本机会话（按最后活动排序）：`id` / `title` / `titleSource` / `cwd` / `workspace` / `last_active` / `live` / `archived`。**`title` 以 DSH 实际标题为准**（`titleSource: "dsh"`，读 `~/.dsh/storages/session_projcache/sessions/<id>.json` 的 `record.rows.title.val`），读不到才退回本地索引快照（`titleSource: "cached"`）；两者不一致时该条另带 `titleStale: true`。分页参数 `limit`（默认 80，夹取到 1–500）、`offset`（默认 0）、`archived`（`1`/`0`/省略）、`cwd`（精确匹配）、`q`（标题子串，大小写不敏感）；响应含 `{ ok, total, limit, offset, sessions }`，`total` 是过滤后总数。`?live=1` 仍只返回未归档会话 |
+| `POST /mesh/inject` | 向已有会话投一轮任务：按 `session`（完整 id）→ 精确标题 → 标题唯一子串寻址；歧义或找不到返回 400。**标题已过期（`titleStale`）的会话拒绝按标题投递**：返回 400 并列出对应 session id，请改用 id。`mode` 为 `queue`（默认，等当前回合）或 `steer`（打断当前回合） |
 | `POST /mesh/sessions/create` | 新建会话并绑定工作区，可选首轮 `prompt`；返回 `sessionId` / `workspaceId` / `workspacePath` / `prompted` |
 | `POST /mesh/sessions/archive` | 归档会话：日志保留、侧栏隐藏；存活的会话会被宿主拒绝（`workspace/session-active`） |
 | `POST /mesh/sessions/delete` | 删除会话：支持 `session`（id，可省略 `session-` 前缀）或 `title`（精确/唯一子串）寻址，标题歧义返回 400 并列出候选；先停掉在跑的 agent（`sessionController.cancel` + 宿主 dispose 钩子），摘掉 `conversations.json` 里指向它的绑定，再删会话目录；停不下来的返回 **409**，不会假报成功 |
@@ -625,6 +625,13 @@ mesh_ask({
 grep -c "pull failed" ~/.dsh/mesh-waker/waker.log     # 同类错误出现次数
 tail -n 50 ~/.dsh/mesh-waker/waker.log                # 最近上下文
 ```
+
+## 会话标题来源（未发布）
+
+`title` 是 DSH 实际标题（`titleSource: "dsh"`），不是 waker 索引里的创建时快照：DSH UI 改名后索引不会更新，按旧标题选目标会**投错会话**（实测把 `xiajiang/audit` 投给了 `虾酱 · worker` 而非 `虾酱 · 协调`）。因此：
+
+- `GET /mesh/sessions` 每条带 `titleSource`（`dsh`/`cached`），索引与 DSH 不一致时带 `titleStale: true`，并在 `waker.log` 记一行 `title stale <sessionId> index=<a> dsh=<b>`；
+- 按标题投递（`/mesh/inject`、`mesh_dispatch` 的标题目标、topic 的 `titlePattern`）遇到 `titleStale` **拒绝**并提示改用 session id；按 id 投递不受影响。
 
 ## 面板操作（0.7.6）
 
