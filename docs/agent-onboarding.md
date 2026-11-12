@@ -95,6 +95,8 @@ python -c "import ssl,urllib.request; print(urllib.request.urlopen('https://<公
 dsh plugin add dsh-mesh-waker@0.5.0
 ```
 
+协作技能单独发布：`npm i -g dsh-mesh-skills`（装到 `~/.dsh/skills`，见 [skills/README.md](../skills/README.md)）。
+
 **为什么写精确版本**：
 
 - pnpm 的 `minimumReleaseAge` 默认会挡「24 小时内新发布」的版本，`latest` 可能暂时解析不到；

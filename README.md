@@ -123,6 +123,8 @@ curl -s -X POST http://127.0.0.1:8790/api/send \
 | `mesh-approval` | **Hermes 侧 Python 插件**（不是 npm 包） | 放进 Hermes 插件目录并声明 `kind: standalone`，见 [README](plugins/mesh-approval/README.md) |
 | hub | **独立服务**（不是插件） | Docker 或裸跑 `node hub/server.mjs`，见 [hub/README.md](hub/README.md) |
 
+协作技能单独发布：`npm i -g dsh-mesh-skills`（装到 `~/.dsh/skills`，见 [skills/README.md](skills/README.md)）。
+
 `plugins/mesh-waker` 把中枢的唤醒 ping 变成真正的会话回合：装进 DSH profile、填上中枢地址和该 agent 的 token，即使没人在看窗口，agent 也会自己处理来信。`plugins/mesh-approval` 则把 Hermes 风格的审批提示改成经 mesh 转发给人（唯一参考实现，改造成其他 harness 的方法也在那份 README 里）。
 
 ```bash

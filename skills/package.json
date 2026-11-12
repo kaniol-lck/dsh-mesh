@@ -1,0 +1,34 @@
+{
+  "name": "dsh-mesh-skills",
+  "version": "0.1.0",
+  "description": "DSH 技能包：mesh 协作约定、handoff 工作区交接、worklog 多会话台账——安装到 ~/.dsh/skills，与 dsh-mesh-waker 插件分开发布",
+  "license": "MIT",
+  "private": false,
+  "type": "module",
+  "files": [
+    "mesh/**",
+    "handoff/**",
+    "worklog/**",
+    "README.md",
+    "CHANGELOG.md",
+    "bin/**"
+  ],
+  "bin": {
+    "dsh-mesh-skills": "./bin/install.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "dsh",
+    "skills",
+    "mesh",
+    "handoff",
+    "worklog"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaniol-lck/dsh-mesh.git",
+    "directory": "public/skills"
+  }
+}
