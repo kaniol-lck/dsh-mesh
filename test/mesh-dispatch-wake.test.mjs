@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import os from 'node:os'
@@ -190,4 +190,13 @@ test('wake: no target with --create makes <slug> · 协调 <n>, verifies workspa
     },
     { workspaces: { 'demo-ws': { cwd: dir } }, createdTitle, workspacePath: dir },
   )
+})
+
+test('--help documents --expect-branch with dev and warning semantics', () => {
+  const result = spawnSync(process.execPath, [SCRIPT, '--help'], { encoding: 'utf8' })
+  assert.equal(result.status, 0, result.stderr)
+  for (const needle of ['--expect-branch', 'dev', 'warning']) {
+    assert.ok(result.stdout.includes(needle), `--help is missing ${needle}`)
+  }
+  assert.match(result.stdout, /no default/i)
 })

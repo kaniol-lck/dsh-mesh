@@ -43,6 +43,12 @@ Local extensions (not part of the plugin CLI):
   --wake             send directly to the waker inject API; text must start with "[WAKE]"
   --dry-run          with --wake: print target + dedupe key + 未投递, send nothing
   --repo <path>      workspace used by --title/--coordinator and the wake dedupe file (default: cwd)
+  --expect-branch <b>  expected branch of the target workspace (forwarded as meta.expectBranch).
+                     Dispatch with "dev" in this repo by default — main only takes release merges.
+                     The script sets no default: omitted means nothing is sent (assign.mjs adds dev
+                     by convention). Responses/receipts carry git.branch (settlement snapshot);
+                     a mismatch only adds a "branch mismatch: ..." warning in warnings and never
+                     blocks delivery; workers must not "git switch" on their own.
 
 Wake target: explicit --session/--target/--thread/--coordinator/--role/--title is used as-is.
 With no target, --wake no longer falls back to the recorded coordinator: --create makes a new
