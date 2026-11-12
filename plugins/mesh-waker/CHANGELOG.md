@@ -25,6 +25,7 @@
 - `mesh_dispatch` 的 `createIfMissing` 不再把新会话建到收件箱工作区：默认继承调用方工作区，显式 `workspacePath` 跨区时直接拒绝，拿不到工作区时拒绝并给出路。
 - 注入类消息的 `FROM` 不再裸 `unknown`：`/mesh/inject` 按 `callerSession/origin/workspace` 回退来源，CLI 未传 `--requester` 时默认用 `DSH_SESSION_ID`；`TASK` 表头改为注册后渲染，始终是真实 id。
 - 队列任务不再被无关回合误结算成 completed：一个 `turn/end` 只结算该回合开始时已排队、或 steer 插入本回合的任务，跨回合积压按队列位置计算。
+- 未绑定 conversation 的跨机消息不再自动新建「Mesh 收件箱」会话并消费：消息保持 unread 等人工 `/mesh/bind`，已有绑定/面板绑定继续投递且不会被覆盖；投递失败保留绑定并延后，不再静默改投入收件箱。
 
 ## [0.8.0] - 2026-11-02
 

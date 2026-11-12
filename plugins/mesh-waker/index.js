@@ -305,7 +305,9 @@ function configureLog(file, maxBytes) {
   logWorkspaceDirFor = null
   logScopeResolver = null
   logHeartbeatState.clear()
-  if (file) logTarget = String(file)
+  // No explicit file means "the configured/default target", not "whatever the previous boot
+  // set": leaking the previous test's file silently sent later logs to the wrong place.
+  logTarget = file ? String(file) : LOG_FILE
   if (Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0) logMaxBytes = Number(maxBytes)
   try {
     logBytes = statSync(logTarget).size
@@ -2747,6 +2749,7 @@ export function apply(ctx, config) {
       messages = fresh
     }
     let entry = conversations[conversation]
+    const hadEntry = Boolean(entry)
     if (!entry) {
       entry = { sessionId: null, createdAt: 0, wakes: 0, title: null }
       conversations[conversation] = entry
@@ -2794,11 +2797,12 @@ export function apply(ctx, config) {
         saveConversations()
       }
     }
-    // Delivery target: a session the user bound this conversation to. Try it first — the
-    // prompt goes in with mode 'queue', so it behaves like the user typing while the agent
-    // is busy rather than replacing its turn. A dead binding falls back to the inbox session.
-    if (entry.deliverTo) {
-      const target = entry.deliverTo
+    // Delivery target (T-426): only an explicit binding may receive a conversation. deliverTo is
+    // the delivery binding; panelSessionId is what /mesh/bind records for the panel. An unbound
+    // conversation is never given a new inbox session and its messages stay unread.
+    const boundTarget = entry.deliverTo || entry.panelSessionId || null
+    if (boundTarget) {
+      const target = boundTarget
       try {
         const built = await buildContent(meta, messages)
         applyTrustPolicy(target, trustFor(meta.sender))
@@ -2817,6 +2821,7 @@ export function apply(ctx, config) {
           state.conversations = Object.keys(conversations).length
           recordTopicDelivery(conversation)
           fileLog(`delivered ${messages.length} msg into branch session ${branch} (${conversation}) mode=branch`)
+          fileLog(`conversation=${conversation} target=${branch} reason=bound messages=${messages.length} mode=branch`)
           return
         }
         await promptWithResume(target, built.parts, mode)
@@ -2828,64 +2833,24 @@ export function apply(ctx, config) {
         state.conversations = Object.keys(conversations).length
         recordTopicDelivery(conversation)
         fileLog(`delivered ${messages.length} msg into bound session ${target} (${conversation}) mode=${mode}`)
+        fileLog(`conversation=${conversation} target=${target} reason=bound messages=${messages.length} mode=${mode}`)
         return
       } catch (error) {
-        fileLog(`delivery to bound session ${target} failed (${error.message}); falling back to inbox session`)
-        entry.deliverTo = null
-        saveConversations()
+        // Keep the binding: clearing it here is what let an unbound conversation fall through to
+        // a freshly created inbox session (T-426). The messages stay unread for a retry/bind.
+        state.lastError = `delivery to bound session ${target} failed: ${error.message}`
+        fileLog(`conversation=${conversation} target=deferred reason=delivery-failed session=${target} error=${error.message}`)
+        return
       }
     }
-    const current = Date.now()
-    const ageHours = entry.createdAt ? (current - entry.createdAt) / 3_600_000 : 0
-    if (entry.sessionId && (ageHours >= c.resetAfterHours || entry.wakes >= c.maxWakes)) {
-      fileLog(`rotating conversation session ${entry.sessionId} (${conversation}, age=${ageHours.toFixed(1)}h, wakes=${entry.wakes})`)
-      try {
-        await ctx.workspaceRegistry.archiveSession(entry.sessionId)
-      } catch (error) {
-        fileLog(`archiving ${entry.sessionId} failed: ${error.message}`)
-      }
-      entry.sessionId = null
-      entry.createdAt = 0
-      entry.wakes = 0
-    }
-    if (!entry.sessionId) {
-      const workspaceId = await ensureWorkspaceId()
-      const created = await ctx.sessionController.create(
-        workspaceId
-          ? { workspaceId, agentPreset: c.agentPreset }
-          : { cwd: c.sessionCwd, agentPreset: c.agentPreset },
-      )
-      entry.sessionId = created.sessionId
-      entry.createdAt = current
-      entry.wakes = 0
-      entry.title = titleFor(meta)
-      identityPending.set(entry.sessionId, { cwd: null })
-      try {
-        await ctx.sessionController.rename({ sessionId: entry.sessionId, title: entry.title })
-      } catch (error) {
-        fileLog(`rename failed: ${error.message}`)
-      }
-      fileLog(`created conversation session ${entry.sessionId} conv=${conversation} title="${entry.title}"`)
-      log.info(`[mesh-waker] conversation ${conversation} -> session ${entry.sessionId}`)
-    }
-    applyTrustPolicy(entry.sessionId, trustFor(meta.sender))
-    try {
-      const built = await buildContent(meta, messages)
-      await promptWithResume(entry.sessionId, built.parts)
-    } catch (error) {
-      // A bound session may have been deleted or archived; forget the binding so the next
-      // wake builds a fresh one instead of failing forever.
-      fileLog(`conversation ${conversation} session ${entry.sessionId} failed: ${error.message}; resetting`)
-      entry.sessionId = null
-      saveConversations()
-      throw error
-    }
-    await markRead(messages)
-    entry.wakes += 1
-    saveConversations()
-    state.sessionId = entry.sessionId
-    state.conversations = Object.keys(conversations).length
-    recordTopicDelivery(conversation)
+    // T-426: no binding means no target. Do not create an inbox session, do not mark the
+    // messages read: they stay unread until a human binds the conversation (/mesh.bind),
+    // which is what keeps an unbound conversation visible instead of silently consumed.
+    if (!hadEntry) delete conversations[conversation]
+    state.lastDeferredAt = Date.now()
+    state.lastDeferredConversation = conversation
+    state.lastDeferredReason = 'unbound'
+    fileLog(`conversation=${conversation} target=deferred reason=unbound messages=${messages.length}`)
   }
 
   async function wake(meta = {}) {

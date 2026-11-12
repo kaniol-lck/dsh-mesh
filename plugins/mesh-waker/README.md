@@ -652,7 +652,7 @@ MIT
 
 ## 跨机消息绑定（`/mesh/bind`）
 
-这条路径**只服务跨机来件**：hub 把消息 ping 给 waker，若该 `conversation` 有 `deliverTo`，waker 直接把 wake prompt 投进那个会话（默认 `mode: 'queue'`，像用户打字一样排队），而不是另起/复用「Mesh 收件箱」会话。
+这条路径**只服务跨机来件**：hub 把消息 ping 给 waker，若该 `conversation` 有 `deliverTo`（或面板绑定 `panelSessionId`），waker 直接把 wake prompt 投进那个会话（默认 `mode: 'queue'`，像用户打字一样排队）。**未绑定的 conversation 不再自动新建「Mesh 收件箱」会话、也不消费消息**：消息保持 unread 等人工 `/mesh/bind`，日志写 `conversation=<c> target=deferred reason=unbound`；已有绑定则写 `target=<sessionId> reason=bound`。这保证「开机后 4 条消息各建一个 inbox 会话并被标记已读」不会再发生。
 
 > **本机会话之间不要用这套。** 同机派活走 `/mesh/inject`（命令行：`npx dsh-mesh-dispatch --title "<session-title>" --file task.txt`，需要唤醒时加 `--wake`）——毫秒级、离线可用，不必让消息绕中枢一圈。
 
@@ -671,7 +671,7 @@ MIT
 
 响应：`{ "ok": true, "conversation": "conv/wake-verify", "sessionId": "session-…", "deliverTo": "session-…", "backfilled": 0 }`
 
-投递失败（会话已删除/归档、prompt 被拒）会**自动清掉 `deliverTo`** 并回退到「Mesh 收件箱」会话，邮件不会丢；此时 `POST /mesh/admin/bindings` 里该条的 `deliverTo` 会变成 `null`，这是排查的第一现场。
+投递到绑定会话失败（会话已删除/归档、prompt 被拒）**不再清掉 `deliverTo`，也不回退到收件箱**：绑定保留、消息保持 unread，日志写 `conversation=<c> target=deferred reason=delivery-failed session=<id>`，等会话恢复或人工重新 `/mesh/bind` 后重投。`/mesh/bind` 的 `backfill` 补投只是把历史当上下文送进会话，**不会**把消息标成已读。
 
 ### `GET /mesh/admin/bindings`
 

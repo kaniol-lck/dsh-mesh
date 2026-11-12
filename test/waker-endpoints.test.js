@@ -449,6 +449,9 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
   const blobUploads = []
   const taskCreates = []
   let unread = messages.map((message) => ({ ...message }))
+  // Every message ever seen in this fake hub (read or not): /api/conversation serves the
+  // history for /mesh/bind backfill, exactly like the real hub (T-426).
+  const allMessages = messages.map((message) => ({ ...message }))
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://fake-hub')
     const chunks = []
@@ -481,6 +484,10 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
         return send(201, { name: body.name ?? 'dsh-test', token })
       }
       if (url.pathname === '/api/inbox') return send(200, { messages: unread })
+      if (url.pathname === '/api/conversation') {
+        const wanted = url.searchParams.get('conversation') ?? ''
+        return send(200, { messages: allMessages.filter((message) => message.conversation === wanted) })
+      }
       if (url.pathname === '/api/send') {
         sends.push(body)
         if (typeof onSend === 'function') onSend(body)
@@ -599,6 +606,7 @@ async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDe
     requests,
     push(message) {
       unread.push({ ...message })
+      allMessages.push({ ...message })
     },
     get readIds() {
       return readIds
@@ -962,7 +970,14 @@ async function main() {
     })
     let h = null
     try {
-      h = await boot({ writeToken: false, config: { hubUrl: fake.url, joinCode: 'JOIN-123' } })
+      h = await boot({
+        writeToken: false,
+        // T-426: an unbound conversation is deferred now, so this case binds it first — the
+        // point here is that the pull loop drains a *bound* conversation.
+        seedSessions: [{ id: 'session-pull-target', title: 'pull target' }],
+        conversations: { 'conv/pull': { sessionId: null, createdAt: 1, wakes: 0, title: null, deliverTo: 'session-pull-target' } },
+        config: { hubUrl: fake.url, joinCode: 'JOIN-123' },
+      })
       const booted = await waitFor(async () => {
         const status = await request(h.base, '/mesh/status')
         return status.json?.mode && status.json.mode !== 'standalone' ? status.json : null
@@ -2136,21 +2151,34 @@ async function main() {
     }
   })
 
-  await runCase('origin routing: an unresolvable reply still lands in the inbox session', async (boot) => {
+  // T-426: an unbound conversation must not get an inbox session, and its messages stay
+  // unread so a human can bind it (/mesh.bind).
+  await runCase('origin routing: an unresolvable reply is deferred, not consumed by an inbox session', async (boot) => {
     const conversation = `test-reply-unknown-${Date.now()}`
+    const logFile = path.join(os.tmpdir(), `waker-defer-${process.pid}-${Date.now()}.log`)
     const fake = await startFakeHub({
       token: 'tok-' + 'selftest',
       messages: [{ id: 'm-e2e-unknown', sender: 'peer-b', conversation, reply_to: 'm-out-unknown', subject: 're', body: 'a reply' }],
     })
     let h = null
     try {
-      h = await boot({ config: { hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 } })
-      const delivered = await waitFor(() => (h.state.prompts.length ? h.state.prompts[0] : null), 15000)
-      const conversations = await readConversationsWhenReady(h)
-      const entry = conversations[conversation] ?? {}
-      // The inbox session is created by the wake path (h.state.created), never bound.
-      const ok = Boolean(delivered) && !entry.deliverTo && h.state.created.some((item) => item.id === delivered.sessionId)
-      report('origin routing: an unresolvable reply still lands in the inbox session', ok, `deliverTo=${entry.deliverTo ?? '(none)'} inbox=${delivered?.sessionId ?? '-'}`)
+      h = await boot({ config: { logFile, hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 } })
+      const decision = await waitFor(() => {
+        if (!fs.existsSync(logFile)) return null
+        const text = fs.readFileSync(logFile, 'utf8')
+        return /target=deferred reason=unbound/.test(text) ? text : null
+      }, 15000)
+      const logText = decision ?? ''
+      const ok =
+        /conversation=\S+ target=deferred reason=unbound messages=1/.test(logText) &&
+        h.state.created.length === 0 &&
+        h.state.prompts.length === 0 &&
+        !fake.readIds.includes('m-e2e-unknown')
+      report(
+        'origin routing: an unresolvable reply is deferred, not consumed by an inbox session',
+        ok,
+        `deferred=${/reason=unbound/.test(logText)} created=${h.state.created.length} prompts=${h.state.prompts.length} read=${fake.readIds.length}`,
+      )
     } finally {
       if (h) h.close()
       await fake.close()
@@ -8413,6 +8441,141 @@ async function main() {
       status.json?.tools?.lock === true &&
       typeof status.json?.workspaceLocks?.count === 'number'
     report('lock: the tool validates its action and workspace', ok, `errors=${errors.length} tools.lock=${status.json?.tools?.lock} lockCount=${status.json?.workspaceLocks?.count}`)
+  })
+
+  // T-426: a restart must keep an existing binding and deliver into it, not create an inbox.
+  await runCase('delivery: an existing binding survives a restart and receives the message', async (boot) => {
+    const conversation = `conv-restart-bound-${Date.now()}`
+    const logFile = path.join(os.tmpdir(), `waker-bound-${process.pid}-${Date.now()}.log`)
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-bound-1', sender: 'peer-b', conversation, body: 'deliver to the bound session' }],
+    })
+    let h = null
+    try {
+      h = await boot({
+        seedSessions: [
+          { id: 'session-bound-target', title: 'bound target' },
+          { id: 'session-legacy-inbox', title: 'legacy inbox' },
+        ],
+        conversations: {
+          [conversation]: { sessionId: 'session-legacy-inbox', createdAt: 123, wakes: 2, title: 'old inbox', deliverTo: 'session-bound-target' },
+        },
+        config: { logFile, hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 },
+      })
+      const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-bound-target'), 15000)
+      const conversations = await waitFor(() => {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
+          return parsed[conversation]?.wakes > 2 ? parsed : null
+        } catch {
+          return null
+        }
+      }, 5000)
+      const entry = conversations?.[conversation] ?? {}
+      const logText = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+      const ok =
+        Boolean(delivered) &&
+        entry.deliverTo === 'session-bound-target' &&
+        entry.sessionId === 'session-legacy-inbox' &&
+        entry.createdAt === 123 &&
+        /conversation=\S+ target=session-bound-target reason=bound/.test(logText) &&
+        h.state.created.length === 0
+      report(
+        'delivery: an existing binding survives a restart and receives the message',
+        ok,
+        `target=${delivered?.sessionId ?? '-'} deliverTo=${entry.deliverTo ?? '-'} sessionId=${entry.sessionId ?? '-'} createdAt=${entry.createdAt ?? '-'} created=${h.state.created.length}`,
+      )
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('delivery: an unbound conversation with a legacy inbox session stays deferred', async (boot) => {
+    const conversation = `conv-restart-unbound-${Date.now()}`
+    const logFile = path.join(os.tmpdir(), `waker-unbound-${process.pid}-${Date.now()}.log`)
+    const createdAt = Date.now() - 60_000
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-unbound-1', sender: 'peer-b', conversation, body: 'nobody bound me' }],
+    })
+    let h = null
+    try {
+      h = await boot({
+        seedSessions: [{ id: 'session-legacy-inbox-2', title: 'legacy inbox 2' }],
+        conversations: { [conversation]: { sessionId: 'session-legacy-inbox-2', createdAt, wakes: 3, title: 'old inbox' } },
+        config: { logFile, hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 },
+      })
+      const decision = await waitFor(() => {
+        if (!fs.existsSync(logFile)) return null
+        const text = fs.readFileSync(logFile, 'utf8')
+        return /target=deferred reason=unbound/.test(text) ? text : null
+      }, 15000)
+      const conversations = JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
+      const entry = conversations[conversation] ?? {}
+      const ok =
+        Boolean(decision) &&
+        h.state.created.length === 0 &&
+        h.state.prompts.length === 0 &&
+        fake.unread.length === 1 &&
+        fake.readIds.length === 0 &&
+        entry.sessionId === 'session-legacy-inbox-2' &&
+        entry.createdAt === createdAt
+      report(
+        'delivery: an unbound conversation with a legacy inbox session stays deferred',
+        ok,
+        `created=${h.state.created.length} prompts=${h.state.prompts.length} unread=${fake.unread.length} read=${fake.readIds.length} sessionId=${entry.sessionId ?? '-'} createdAt=${entry.createdAt ?? '-'}`,
+      )
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
+  })
+
+  await runCase('delivery: binding after a deferred message backfills it into the session', async (boot) => {
+    const conversation = `conv-bind-backfill-${Date.now()}`
+    const logFile = path.join(os.tmpdir(), `waker-bind-${process.pid}-${Date.now()}.log`)
+    const fake = await startFakeHub({
+      token: 'tok-' + 'selftest',
+      messages: [{ id: 'm-bind-1', sender: 'peer-b', conversation, body: 'backfill me' }],
+    })
+    let h = null
+    try {
+      h = await boot({
+        seedSessions: [{ id: 'session-bind-target', title: 'bind target' }],
+        config: { logFile, hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 },
+      })
+      const deferred = await waitFor(() => {
+        if (!fs.existsSync(logFile)) return null
+        const text = fs.readFileSync(logFile, 'utf8')
+        return /target=deferred reason=unbound/.test(text) ? text : null
+      }, 15000)
+      const bound = await request(h.base, '/mesh/bind', {
+        method: 'POST',
+        body: { conversation, sessionId: 'session-bind-target', deliver: true, backfill: 5 },
+      })
+      const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-bind-target'), 8000)
+      const conversations = JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
+      const ok =
+        Boolean(deferred) &&
+        bound.status === 200 &&
+        bound.json?.backfilled === 1 &&
+        bound.json?.deliverTo === 'session-bind-target' &&
+        Boolean(delivered) &&
+        conversations[conversation]?.deliverTo === 'session-bind-target' &&
+        // Backfill replays history as context; it is not a read (the message stays unread).
+        fake.unread.length === 1 &&
+        fake.readIds.length === 0
+      report(
+        'delivery: binding after a deferred message backfills it into the session',
+        ok,
+        `backfilled=${bound.json?.backfilled ?? '-'} deliverTo=${bound.json?.deliverTo ?? '-'} prompted=${Boolean(delivered)} read=${fake.readIds.length}`,
+      )
+    } finally {
+      if (h) h.close()
+      await fake.close()
+    }
   })
 
   const failed = results.filter((result) => !result.ok)
