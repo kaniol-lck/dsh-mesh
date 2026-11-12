@@ -40,6 +40,7 @@ import { createTaskLifecycle } from './lib/task-lifecycle.mjs'
 import { createHubTaskConsumer } from './lib/hub-tasks.mjs'
 import { readGitContext, describeArtifacts, normalizeArtifacts } from './lib/git-context.mjs'
 import { createWorkspaceLocks } from './lib/workspace-locks.mjs'
+import { createDshTitleReader, applyDshTitles } from './lib/session-titles.mjs'
 import { normalizeCoordinators, coordinatorsView, expireCoordinators, syncPrimary, primaryOf, isOwnerTokenValid, recordAudit } from './lib/coordinators.mjs'
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
@@ -1256,9 +1257,13 @@ export function apply(ctx, config) {
     saveArchivedTombstones()
   }
 
+  // T-429: DSH owns the title. The index entry is only a fallback, and a disagreement is
+  // logged once per (session, index-title, dsh-title) so operators see why routing skipped it.
+  const readDshTitle = createDshTitleReader({ dshBase: dirname(sessionsRoot()), fileLog })
+  const staleTitleReported = new Set()
   function listLocalSessions() {
     const archived = archivedSessionIds()
-    return discoverSessions().map((entry) => {
+    return applyDshTitles(discoverSessions().map((entry) => {
       const meta = sessionMeta(entry)
       return {
         id: entry.id,
@@ -1277,6 +1282,13 @@ export function apply(ctx, config) {
           }
         })(),
       }
+    }), readDshTitle, {
+      onStale: (sessionId, indexTitle, dshTitle) => {
+        const key = `${sessionId}|${indexTitle}|${dshTitle}`
+        if (staleTitleReported.has(key)) return
+        staleTitleReported.add(key)
+        fileLog(`title stale ${sessionId} index=${indexTitle} dsh=${dshTitle}`)
+      },
     })
   }
 
@@ -1304,19 +1316,36 @@ export function apply(ctx, config) {
       if (hit) return hit
     }
     if (title) {
-      const exact = sessions.filter((session) => session.title === title)
+      // T-429: a title whose index value disagrees with DSH is not trustworthy — refuse to
+      // route by it and name the session so the caller can switch to its id.
+      const eligible = sessions.filter((session) => !session.titleStale)
+      const blocked = sessions.filter((session) => {
+        if (!session.titleStale) return false
+        const names = [session.title, session.titleIndex].filter(Boolean)
+        return names.some((name) => name === title || name.includes(title))
+      })
+      const exact = eligible.filter((session) => session.title === title)
       const activeExact = exact.filter((session) => !session.archived)
       if (activeExact.length === 1) return activeExact[0]
       if (activeExact.length > 1) throw ambiguityError(activeExact)
       if (exact.length === 1) return exact[0]
       if (exact.length > 1) throw ambiguityError(exact)
 
-      const fuzzy = sessions.filter((session) => session.title && session.title.includes(title))
+      const fuzzy = eligible.filter((session) => session.title && session.title.includes(title))
       const activeFuzzy = fuzzy.filter((session) => !session.archived)
       if (activeFuzzy.length === 1) return activeFuzzy[0]
       if (activeFuzzy.length > 1) throw ambiguityError(activeFuzzy)
       if (fuzzy.length === 1) return fuzzy[0]
       if (fuzzy.length > 1) throw ambiguityError(fuzzy)
+      if (blocked.length) {
+        const ids = blocked
+          .slice(0, 5)
+          .map((session) => session.id)
+          .join(', ')
+        throw new Error(
+          `会话标题已过期（DSH 已改名），拒绝按标题投递：${ids}；请改用 session id（GET /mesh/sessions 查看 titleSource/titleStale）`,
+        )
+      }
     }
     throw new Error(
       '找不到会话；可用 GET /mesh/sessions 查看本机会话列表（含 archived 字段），或用完整 session id 寻址',
@@ -1406,14 +1435,27 @@ export function apply(ctx, config) {
    */
   function ensureTopicBinding(topic) {
     const entry = conversations[topic.label] ?? (conversations[topic.label] = { sessionId: null, createdAt: 0, wakes: 0, title: null })
-    const active = listLocalSessions().filter((session) => !session.archived)
+    const sessions = listLocalSessions().filter((session) => !session.archived)
+    // T-429: a title the index and DSH disagree on cannot pick a target; skip it and say why.
+    const active = sessions.filter((session) => !session.titleStale)
     if (entry.deliverTo && active.some((session) => session.id === entry.deliverTo)) {
       topic.boundSessionId = entry.deliverTo
       return entry.deliverTo
     }
     const match = matchTopicSession(topic, active)
     if (!match) {
-      fileLog(`topic unresolved label=${topic.label} pattern=${topic.titlePattern}`)
+      const stale = matchTopicSession(topic, sessions.filter((session) => session.titleStale))
+      if (stale) {
+        fileLog(
+          `topic deferred label=${topic.label} reason=title-stale sessions=${sessions
+            .filter((session) => session.titleStale)
+            .map((session) => session.id)
+            .slice(0, 5)
+            .join(',')}`,
+        )
+      } else {
+        fileLog(`topic unresolved label=${topic.label} pattern=${topic.titlePattern}`)
+      }
       return null
     }
     entry.deliverTo = match.id

@@ -8578,6 +8578,63 @@ async function main() {
     }
   })
 
+  // ---- T-429: DSH owns the session title; the index is only a creation-time snapshot ----
+  const writeProjcacheTitle = (home, sessionId, title) => {
+    // The plugin derives the DSH base from MESH_WAKER_SESSIONS_ROOT's parent (production:
+    // ~/.dsh); in the harness sessions root is <tmp>/sessions, so the base is <tmp>.
+    const base = path.dirname(home)
+    const dir = path.join(base, 'storages', 'session_projcache', 'sessions')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ record: { rows: { title: { val: title } } } }))
+  }
+
+  await runCase('titles: the DSH projcache title wins over the sessions index', async (boot) => {
+    const sessionId = 'session-title-dsh'
+    const h = await boot({
+      seedSessions: [{ id: sessionId, title: '虾酱 · 协调' }],
+      prepareHome: (home) => writeProjcacheTitle(home, sessionId, '虾酱 · worker'),
+    })
+    const listed = await request(h.base, '/mesh/sessions')
+    const entry = (listed.json?.sessions ?? []).find((session) => session.id === sessionId)
+    const ok = entry?.title === '虾酱 · worker' && entry?.titleSource === 'dsh' && entry?.titleStale === true
+    report('titles: the DSH projcache title wins over the sessions index', ok, `title=${entry?.title ?? '-'} source=${entry?.titleSource ?? '-'} stale=${entry?.titleStale ?? false}`)
+  })
+
+  await runCase('titles: a missing projcache row falls back to the cached title', async (boot) => {
+    const sessionId = 'session-title-cached'
+    const h = await boot({ seedSessions: [{ id: sessionId, title: 'only in index' }] })
+    const listed = await request(h.base, '/mesh/sessions')
+    const entry = (listed.json?.sessions ?? []).find((session) => session.id === sessionId)
+    const ok = entry?.title === 'only in index' && entry?.titleSource === 'cached' && entry?.titleStale === undefined
+    report('titles: a missing projcache row falls back to the cached title', ok, `title=${entry?.title ?? '-'} source=${entry?.titleSource ?? '-'} stale=${entry?.titleStale ?? false}`)
+  })
+
+  await runCase('titles: a stale title refuses title routing and names the session id', async (boot) => {
+    const sessionId = 'session-title-stale'
+    const logFile = path.join(os.tmpdir(), `waker-titles-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      seedSessions: [{ id: sessionId, title: 'old name' }],
+      prepareHome: (home) => writeProjcacheTitle(home, sessionId, 'new name'),
+      config: { logFile },
+    })
+    const byTitle = await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'old name', text: 'should be refused' } })
+    const byId = await request(h.base, '/mesh/inject', { method: 'POST', body: { session: sessionId, text: 'by id is fine' } })
+    const logText = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+    const error = String(byTitle.json?.error ?? '')
+    const ok =
+      byTitle.status >= 400 &&
+      /已过期/.test(error) &&
+      error.includes(sessionId) &&
+      byId.status === 200 &&
+      h.state.prompts.length === 1 &&
+      new RegExp(`title stale ${sessionId} index=old name dsh=new name`).test(logText)
+    report(
+      'titles: a stale title refuses title routing and names the session id',
+      ok,
+      `byTitle=${byTitle.status} byId=${byId.status} prompts=${h.state.prompts.length} logStale=${/title stale/.test(logText)}`,
+    )
+  })
+
   const failed = results.filter((result) => !result.ok)
   console.log(`\n${results.length - failed.length}/${results.length} passed`)
   if (failed.length) {
