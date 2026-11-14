@@ -518,7 +518,7 @@ export async function resolveRoleTarget(base, role, fetchImpl = fetch) {
   const worker = workers[want]
   if (!worker || !worker.sessionId) {
     const known = Object.keys(workers).join(', ') || '无'
-    addressFail(`工作区 ${slug} 没有 "${want}" worker（已登记角色：${known}）；先让该角色会话启动，或登记 worker，或改用 --coordinator / --target`)
+    addressFail(`工作区 ${slug} 没有 "${want}" worker（已登记角色：${known}）；先显式登记 worker（POST /mesh/workspaces/workers 或 rotate-session --role），或改用 --coordinator / --target`)
   }
   // T-374: a dormant worker (exists, not archived, not currently loaded) is still
   // deliverable — the wake path loads it. Only a missing or archived session is fatal.

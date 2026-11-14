@@ -189,7 +189,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `digestIdleDebounceMs` | `3000` | 空闲会话的 digest 触发防抖（clamp 500–60000ms）：任务落板后起一个 unref 定时器，到点若该会话 `openTurn == null` 就注入 digest（多条合并成一条），忙则等 `turn/end`；同会话只留一个定时器，dispose 时清空 |
 | `digestNotifyWarnMs` | `90000` | digest 任务「首通知」看门狗（1000–600000ms）：落板后超过该窗口仍 `notifiedAt=null` 时记 WARN `digest not-notified session=… tasks=…` 并重排一次 idle 触发（T-470；正常路径不该看到） |
 | `receiptDigest` | `'off'` | `'on'` = **回执不再逐条排队**（owner 2026-11-14 要的能力）：`receiptMode='queue'` 的回执照旧写 `receipts.jsonl`，但注入改成 `turn/end` 或空闲（沿用 `digestIdleDebounceMs`）后合并成一条 `[RECEIPT-DIGEST]`；同一 requester 退避 10/30 分钟、最多 2 次，`mesh_ack({ids})` 签收后不再提醒（板标记，不产生新回执）。`file`/`wake` 语义不变，默认 `'off'` |
-| `roleInstructions` | `{}` | B 档角色注入：`{ "<role>": "<文件路径或文本>" }`（role ∈ `waker\|docs\|hub\|ops`）。目标会话标题匹配 `^(.+?) · (role)$` 时，在注入文本**末尾**追加 `## 角色卡（自动注入 · <role>）` + 内容；值为路径时相对**目标会话 cwd** 解析（读不到只记 `role-card missing` 日志，不报错、不阻断）。默认空对象 = 零行为变化 |
+| `roleInstructions` | `{}` | B 档角色注入：`{ "<role>": "<文件路径或文本>" }`（role ∈ `waker\|docs\|hub\|ops`）。目标会话 id 命中注册表 `workers[<role>].sessionId` 时，在注入文本**末尾**追加 `## 角色卡（自动注入 · <role>）` + 内容；值为路径时相对**目标会话 cwd** 解析（读不到只记 `role-card missing` 日志，不报错、不阻断）。默认空对象 = 零行为变化 |
 | `maxCoordinatorsPerWorkspace` | `3` | 同一工作区允许同时在线的协调数量上限（1–20）；超过后 claim 返回 409 + 现有列表 |
 | `coordinatorLeaseMs` | `600000` | 协调租约（毫秒，60000–3600000）；执行期间按 `/mesh/coordinator/heartbeat` 续期，过期转 stale |
 | `coordinatorPendingTtlMs` | `1800000` | 待批准认领的存活时间（毫秒，60000–86400000），过期自动失效 |
@@ -264,7 +264,7 @@ curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/heartbeat -d '{"session"
 
 ### 角色卡自动注入（B 档，未发布）
 
-派活正文首行的「角色卡：先读 `.worklog/roles/<role>.md`」靠人写，漏写就失效。配置 `roleInstructions` 后，waker 在 `/mesh/inject`、`mesh_dispatch` 与 `/mesh/sessions/create` 构建 prompt 时，按**目标会话标题** `^(.+?) · (waker|docs|hub|ops)$` 解析 role，并把对应角色卡**追加到末尾**：
+派活正文首行的「角色卡：先读 `.worklog/roles/<role>.md`」靠人写，漏写就失效。配置 `roleInstructions` 后，waker 在 `/mesh/inject`、`mesh_dispatch` 与 `/mesh/sessions/create` 构建 prompt 时，按**工作区注册表** `workers[<role>].sessionId` 反查目标会话的 role（**不看标题**；标题可被用户改名），并把对应角色卡**追加到末尾**：
 
 ```text
 …原任务正文…
@@ -274,7 +274,7 @@ curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/heartbeat -d '{"session"
 ```
 
 - 值为路径时相对**目标会话 cwd** 解析（worker 的 cwd 就是仓库，`.worklog/roles/docs.md` 直接命中）；读不到记 `role-card missing role=… path=…`，**不报错、不阻断投递**。
-- 成功记 `role-card injected role=… session=… chars=…`；未配置、标题不匹配或内容为空时 prompt **逐字不变**（默认 `{}` 零行为变化）。
+- 成功记 `role-card injected role=… session=… source=registry slug=… chars=…`；未配置、目标未登记为 worker、或内容为空时 prompt **逐字不变**（默认 `{}` 零行为变化）。
 
 ### digest 投递的可观测性（未发布）
 

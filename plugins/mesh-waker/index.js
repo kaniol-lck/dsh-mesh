@@ -2567,19 +2567,31 @@ export function apply(ctx, config) {
 
   // ---------------------------------------------------------------- role card (T-469)
   //
-  // A target session titled `<project> · <role>` gets `.worklog/roles/<role>.md` appended to
-  // the injected task text. The config is empty by default: no role, no config, or a missing
-  // file all leave the prompt byte-for-byte unchanged.
-  const ROLE_TITLE_RE = /^(.+?)\s*·\s*(waker|docs|hub|ops)$/
-
-  function roleFromTitle(title) {
-    const match = ROLE_TITLE_RE.exec(String(title ?? '').trim())
-    return match ? match[2] : null
+  // A **registered worker** gets `.worklog/roles/<role>.md` appended to the injected task
+  // text. The role comes from the workspace registry's `workers[role].sessionId` — never
+  // from the session title, which the user can rename at any time. The config is empty by
+  // default: no role, no config, or a missing file all leave the prompt byte-for-byte unchanged.
+  function roleForSession(sessionId) {
+    if (!sessionId) return null
+    refreshWorkspacesFromDisk()
+    const hits = []
+    for (const [slug, entry] of Object.entries(workspaces.workspaces ?? {})) {
+      const workers = entry?.workers && typeof entry.workers === 'object' ? entry.workers : {}
+      for (const [role, worker] of Object.entries(workers)) {
+        if (worker?.sessionId === sessionId) hits.push({ role, slug })
+      }
+    }
+    if (hits.length > 1) {
+      fileLog(`role-card ambiguous session=${sessionId} hits=${hits.map((hit) => `${hit.slug}:${hit.role}`).join(',')}`)
+      return null
+    }
+    return hits[0] ?? null
   }
 
   function roleCardText(session) {
-    const role = roleFromTitle(session?.title)
-    if (!role) return ''
+    const hit = roleForSession(session?.id)
+    if (!hit) return ''
+    const role = hit.role
     const configured = c.roleInstructions?.[role]
     if (typeof configured !== 'string' || !configured.trim()) return ''
     const source = configured.trim()
@@ -2598,7 +2610,7 @@ export function apply(ctx, config) {
       }
     }
     if (!content.trim()) return ''
-    fileLog(`role-card injected role=${role} session=${session?.id ?? '-'} chars=${content.length}`)
+    fileLog(`role-card injected role=${role} session=${session?.id ?? '-'} source=registry slug=${hit.slug} chars=${content.length}`)
     return `\n\n## 角色卡（自动注入 · ${role}）\n${content.trimEnd()}\n`
   }
 
@@ -4186,44 +4198,9 @@ export function apply(ctx, config) {
         else delete entry.rolesUnrecognized
         changed = true
       }
-      // Workers (T-372): the most recently active session per role, so a dispatch can address
-      // a role instead of a session id. A coordinator title contributes no role.
-      const derivedWorkers = {}
-      for (const session of list) {
-        if (!session.id || !session.title) continue
-        // T-376: an archived session is not a worker candidate either.
-        if (session.archived === true) continue
-        let sessionRoles = []
-        try {
-          sessionRoles = classifyRoleCandidates([session.title]).roles
-        } catch {
-          sessionRoles = []
-        }
-        for (const role of sessionRoles) {
-          const candidate = {
-            sessionId: session.id,
-            ...(session.cwd ? { cwd: session.cwd } : {}),
-            updatedAt: Number(session.last_active ?? 0),
-          }
-          const previous = derivedWorkers[role]
-          if (!previous || candidate.updatedAt > previous.updatedAt) derivedWorkers[role] = candidate
-        }
-      }
-      const previousWorkers = entry.workers && typeof entry.workers === 'object' ? entry.workers : {}
-      const nextWorkers = { ...previousWorkers, ...derivedWorkers }
-      // Keep updatedAt stable when the role already points at the same session: a restart
-      // must not rewrite the registry just because the session log was touched.
-      for (const [role, worker] of Object.entries(nextWorkers)) {
-        const previous = previousWorkers[role]
-        if (previous && previous.sessionId === worker.sessionId && Number.isFinite(Number(previous.updatedAt))) {
-          nextWorkers[role] = { ...worker, updatedAt: Number(previous.updatedAt) }
-        }
-      }
-      if (JSON.stringify(nextWorkers) !== JSON.stringify(previousWorkers)) {
-        if (Object.keys(nextWorkers).length) entry.workers = nextWorkers
-        else delete entry.workers
-        changed = true
-      }
+      // Workers are explicit (T-372 registration): the registry never binds a worker from a
+      // session title. Titles are user-renamable and must not decide identity; register via
+      // POST /mesh/workspaces/workers or rotate-session --role. Existing entries are kept.
     }
     if (changed) {
       // Only the slugs this pass actually rewrote may override the file (T-370).

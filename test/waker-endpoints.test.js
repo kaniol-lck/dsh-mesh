@@ -5995,7 +5995,7 @@ async function main() {
     report('workspaces: only archived coordinators leave the field empty', ok, `coordinator=${entry?.coordinator ?? '(none)'}`)
   })
 
-  await runCase('workspaces: an archived session is never derived as a worker', async (boot) => {
+  await runCase('workspaces: workers are explicit, never derived from titles', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'archived-worker-repo')
     const now = Date.now()
     const h = await boot({
@@ -6006,8 +6006,8 @@ async function main() {
       archivedIds: ['session-docs-archived'],
     })
     const entry = registryOf(h).workspaces?.['archived-worker-repo']
-    const ok = entry?.workers?.docs?.sessionId === 'session-docs-live'
-    report('workspaces: an archived session is never derived as a worker', ok, `docs=${entry?.workers?.docs?.sessionId ?? '-'}`)
+    const ok = !entry?.workers?.docs
+    report('workspaces: workers are explicit, never derived from titles', ok, `docs=${entry?.workers?.docs?.sessionId ?? '-'}`)
   })
 
   await runCase('workspaces: a human slug and roles survive restarts', async (boot) => {
@@ -7569,14 +7569,24 @@ async function main() {
     return cwd
   }
 
+  const seedWorker = (h, slug, cwd, role, sessionId) => {
+    const registry = registryOf(h)
+    const entry = registry.workspaces[slug] ?? { cwd }
+    entry.cwd = entry.cwd ?? cwd
+    entry.workers = { ...(entry.workers ?? {}), [role]: { sessionId, cwd } }
+    registry.workspaces[slug] = entry
+    fs.writeFileSync(workspacesFileOf(h), `${JSON.stringify(registry, null, 2)}\n`)
+  }
+
   await runCase('role card: a configured role file is appended to the injected task', async (boot) => {
     const cwd = roleCwd('inject')
     const logFile = path.join(os.tmpdir(), `waker-role-inject-${process.pid}-${Date.now()}.log`)
     try {
       const h = await boot({
         config: { roleInstructions: { docs: '.worklog/roles/docs.md' }, logFile },
-        seedSessions: [{ id: 'session-role-docs', title: 'mesh · docs', cwd }],
+        seedSessions: [{ id: 'session-role-docs', title: 'renamed title', cwd }],
       })
+      seedWorker(h, 'role-inject', cwd, 'docs', 'session-role-docs')
       const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-role-docs', text: 'do the thing' } })
       const text = JSON.stringify(h.state.prompts[0]?.content ?? '')
       const log = fs.readFileSync(logFile, 'utf8')
@@ -7613,8 +7623,9 @@ async function main() {
     try {
       const h = await boot({
         config: { roleInstructions: { docs: '.worklog/roles/docs.md' }, logFile, injectHeader: false },
-        seedSessions: [{ id: 'session-role-missing', title: 'mesh · docs', cwd }],
+        seedSessions: [{ id: 'session-role-missing', title: 'whatever', cwd }],
       })
+      seedWorker(h, 'role-missing', cwd, 'docs', 'session-role-missing')
       const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-role-missing', text: 'still delivered' } })
       const text = h.state.prompts[0]?.content?.[0]?.text ?? ''
       const log = fs.readFileSync(logFile, 'utf8')
@@ -7629,23 +7640,23 @@ async function main() {
     }
   })
 
-  await runCase('role card: a non-role title gets no injection', async (boot) => {
+  await runCase('role card: an unregistered title gets no injection', async (boot) => {
     const cwd = roleCwd('nonrole')
     try {
       const h = await boot({
         config: { roleInstructions: { docs: '.worklog/roles/docs.md' } },
-        seedSessions: [{ id: 'session-role-none', title: 'plain session', cwd }],
+        seedSessions: [{ id: 'session-role-none', title: 'mesh · docs', cwd }],
       })
       const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-role-none', text: 'no card here' } })
       const text = h.state.prompts[0]?.content?.[0]?.text ?? ''
       const ok = res.status === 200 && !/角色卡（自动注入/.test(text)
-      report('role card: a non-role title gets no injection', ok, `status=${res.status} card=${/角色卡/.test(text)}`)
+      report('role card: an unregistered title gets no injection', ok, `status=${res.status} card=${/角色卡/.test(text)}`)
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true })
     }
   })
 
-  await runCase('role card: a created session is greeted with its role card', async (boot) => {
+  await runCase('role card: a created session without registration gets no card', async (boot) => {
     const cwd = roleCwd('create')
     try {
       const h = await boot({
@@ -7661,9 +7672,8 @@ async function main() {
       const ok =
         created.status === 201 &&
         /start work/.test(text) &&
-        text.includes('## 角色卡（自动注入 · docs）') &&
-        text.includes('只改 docs 范围。')
-      report('role card: a created session is greeted with its role card', ok, `status=${created.status} card=${/角色卡/.test(text)}`)
+        !/角色卡（自动注入/.test(text)
+      report('role card: a created session without registration gets no card', ok, `status=${created.status} card=${/角色卡/.test(text)}`)
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true })
     }

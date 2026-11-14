@@ -36,6 +36,10 @@
 - 空闲会话不再漏收任务通知：开启 digest 后，任务落板会在 `digestIdleDebounceMs`（默认 3 秒）后触发一条 digest，不必等下一个回合；忙会话仍在 `turn/end` 后通知，日志把落板记为 `digest-queued` 而不是 `injected`。
 - 修复 digest 通知偶发不再投递：同一会话投过一次后，后续派单可能一直停在 pending（现改为投递前占位、失败即释放、超时自愈，并对每次延后/跳过记日志；超过 `digestNotifyWarnMs` 未投出记 WARN 并重试）。
 
+### Changed
+
+- 角色卡注入改为按工作区注册表的 `workers[<role>].sessionId` 反查，不再解析会话标题；`workspaces.json` 的 workers 也不再由标题自动派生，必须显式登记（`POST /mesh/workspaces/workers` 或 `rotate-session --role`）。标题只是显示名：改名不再影响角色卡，也不再把任意同名标题会话误绑成 worker。
+
 ## [0.8.0] - 2026-11-02
 
 ### Added
