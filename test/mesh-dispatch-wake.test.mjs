@@ -87,17 +87,17 @@ const sessions = [
   { id: 'session-arch', title: 'mesh · 协调 2', archived: true, live: true },
 ]
 
-test('wake: --dry-run by title resolves one active session and sends nothing', async () => {
+test('wake: --dry-run by title is refused, with a session hint', async () => {
   const { dir, indexFile, wakeTarget } = fixtureIndex()
   await withWaker(sessions, async ({ base, calls }) => {
     const result = await run(
       { MESH_WAKER_URL: base, MESH_SESSIONS_INDEX: indexFile, MESH_WAKE_TARGET: wakeTarget },
       ['--wake', '--title', 'mesh · 协调', '--text', '[WAKE] probe', '--dry-run', '--repo', dir],
     )
-    assert.equal(result.code, 0, result.stdout + result.stderr)
-    assert.match(result.stdout, /dry-run: session=session-coord/)
-    assert.match(result.stdout, /未投递/)
-    assert.equal(calls.post, 0, 'dry-run must not POST')
+    assert.equal(result.code, 2, result.stdout + result.stderr)
+    assert.match(result.stderr, /--title 已移除/)
+    assert.match(result.stderr, /--session/)
+    assert.equal(calls.post, 0, 'refused title must not POST')
   })
 })
 
@@ -115,16 +115,15 @@ test('wake: --dry-run with --session makes no requests at all', async () => {
   })
 })
 
-test('wake: a title that only matches archived sessions fails with an actionable hint', async () => {
+test('wake: --title is refused even for archived sessions', async () => {
   const { dir, indexFile, wakeTarget } = fixtureIndex()
   await withWaker(sessions, async ({ base, calls }) => {
     const result = await run(
       { MESH_WAKER_URL: base, MESH_SESSIONS_INDEX: indexFile, MESH_WAKE_TARGET: wakeTarget },
       ['--wake', '--title', 'mesh · 协调 2', '--text', '[WAKE] probe', '--dry-run', '--repo', dir],
     )
-    assert.notEqual(result.code, 0, result.stdout + result.stderr)
-    assert.match(result.stderr, /only matches archived/)
-    assert.match(result.stderr, /--session/)
+    assert.equal(result.code, 2, result.stdout + result.stderr)
+    assert.match(result.stderr, /--title 已移除/)
     assert.equal(calls.post, 0)
   })
 })
