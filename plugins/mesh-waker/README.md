@@ -188,6 +188,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `digestDelivery` | `'off'` | `'off'`（默认）= 派单直接注入正文，行为与之前逐字一致；`'on'` = **仅 `queue` 投递**改走任务板：回合结束后注入**一条** `[TASK-DIGEST]` 摘要（只列 taskId + 标题，不塞正文），窗口内合并、`notifyCount<2`、重提醒退避 10/30 分钟；digest 任务**只能 `mesh_complete` 结算**（不做 observed 结算）。**`steer` 等其它模式不受影响，仍然立即注入正文**。签收用 `mesh_ack`：只是板标记，不产生回执、不代表完成 |
 | `digestIdleDebounceMs` | `3000` | 空闲会话的 digest 触发防抖（clamp 500–60000ms）：任务落板后起一个 unref 定时器，到点若该会话 `openTurn == null` 就注入 digest（多条合并成一条），忙则等 `turn/end`；同会话只留一个定时器，dispose 时清空 |
 | `digestNotifyWarnMs` | `90000` | digest 任务「首通知」看门狗（1000–600000ms）：落板后超过该窗口仍 `notifiedAt=null` 时记 WARN `digest not-notified session=… tasks=…` 并重排一次 idle 触发（T-470；正常路径不该看到） |
+| `receiptNotifyWarnMs` | `90000` | 回执 digest 的「首通知」看门狗（1000–600000ms）：回执排队后超过该窗口仍 `receiptNotifyCount=0` 时记 WARN `receipt-digest not-notified session=… tasks=…` 并**立刻补投一次**（不依赖 `turn/end`，因为长会话可能几小时不给 idle 窗口） |
 | `receiptDigest` | `'off'` | `'on'` = **回执不再逐条排队**（owner 2026-11-14 要的能力）：`receiptMode='queue'` 的回执照旧写 `receipts.jsonl`，但注入改成 `turn/end` 或空闲（沿用 `digestIdleDebounceMs`）后合并成一条 `[RECEIPT-DIGEST]`；同一 requester 退避 10/30 分钟、最多 2 次，`mesh_ack({ids})` 签收后不再提醒（板标记，不产生新回执）。`file`/`wake` 语义不变，默认 `'off'` |
 | `roleInstructions` | `{}` | B 档角色注入：`{ "<role>": "<文件路径或文本>" }`（role ∈ `waker\|docs\|hub\|ops`）。目标会话 id 命中注册表 `workers[<role>].sessionId` 时，在注入文本**末尾**追加 `## 角色卡（自动注入 · <role>）` + 内容；值为路径时相对**目标会话 cwd** 解析（读不到只记 `role-card missing` 日志，不报错、不阻断）。默认空对象 = 零行为变化 |
 | `maxCoordinatorsPerWorkspace` | `3` | 同一工作区允许同时在线的协调数量上限（1–20）；超过后 claim 返回 409 + 现有列表 |
@@ -276,7 +277,21 @@ curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/heartbeat -d '{"session"
 - 值为路径时相对**目标会话 cwd** 解析（worker 的 cwd 就是仓库，`.worklog/roles/docs.md` 直接命中）；读不到记 `role-card missing role=… path=…`，**不报错、不阻断投递**。
 - 成功记 `role-card injected role=… session=… source=registry slug=… chars=…`；未配置、目标未登记为 worker、或内容为空时 prompt **逐字不变**（默认 `{}` 零行为变化）。
 
+### 两套签收标记（T-476，未发布）
+
+一个任务有两个读者，签收因此有两个标记，互不影响：
+
+| 字段 | 谁写 | 作用 |
+|---|---|---|
+| `ackedAt` / `ackBy` | 执行会话（target session） | 表示「这条派单通知我看过了」，停掉 task digest 的提醒 |
+| `receiptAckedAt` / `receiptAckBy` | 派单方（requester） | 表示「这条回执我看过了」，停掉 receipt digest 的提醒 |
+
+`mesh_ack` 按调用方自动选边：调用方是 target 就写 `ackedAt`，是 `receiptDigestSessionId` 就写 `receiptAckedAt`（两者都满足时两个都写）。历史上 worker 签收自己的任务会把派单方的回执通知一起取消（实测丢 3 条），现在不会了——老数据按 `ackBy === receiptDigestSessionId` 兼容读取。
+
+
 ### digest 投递的可观测性（未发布）
+
+**defer 之后怎么补投（T-476）**：idle 触发撞上回合中时不再只留一条 `deferred` 日志干等 `turn/end` —— 同一次 defer 会**重排**该会话的 idle 定时器（延迟翻倍、上限 60s、最多 6 次），因此长回合结束后也会自己再试；`turn/end` 到达时另有快路径立即尝试。两条都不成立（事件丢失或长会话无 idle）时，`digestNotifyWarnMs` / `receiptNotifyWarnMs` 到点会记 WARN 并**直接补投一次**。每次 `turn/end` 到达还会记一行限流诊断 `turn-end seen session=… turn=…`（每会话每分钟最多 1 行），用来一眼确认事件链没断。
 
 - 任务行与 `GET /mesh/tasks/<id>` 已带 `notifiedAt` / `notifyCount`：`notifiedAt=null` 表示**还没通知过**（不是「在排队」），`notifiedAt` 有值表示已投过 digest、等 worker 签收（`ackedAt`）。
 - 静默返回现在都有日志：`digest deferred session=… reason=turn-open`（idle 触发撞上回合中，改由 `turn/end` 补投）、`digest skipped … reason=in-flight`（同会话已有在飞 digest）、`digest not-notified …`（超过 `digestNotifyWarnMs` 仍未投出，WARN + 重排一次）。

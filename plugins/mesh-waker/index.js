@@ -638,6 +638,9 @@ function normalizeBase(config) {
     // A digest task that is still unnotified after this window is a delivery bug, not a
     // queue: log a WARN and retry once (T-470).
     digestNotifyWarnMs: clampInterval(c.digestNotifyWarnMs, 90_000, 1000, 600_000),
+    // The receipt digest answers a different deadline (a dispatcher waiting on a completion),
+    // so it gets its own key instead of sharing the task-digest window (T-476).
+    receiptNotifyWarnMs: clampInterval(c.receiptNotifyWarnMs, 90_000, 1000, 600_000),
     // Receipt digest (T-467): queue-mode receipts are merged into one notice instead of one
     // turn each. Off by default; file/wake delivery keeps its existing behaviour.
     receiptDigest: String(c.receiptDigest) === 'on' ? 'on' : 'off',
@@ -2165,9 +2168,10 @@ export function apply(ctx, config) {
       .filter((row) => row.targetSessionId === sessionId || row.receiptDigestSessionId === sessionId)
       .filter((row) => {
         if (status === 'all') return true
-        if (row.ackedAt) return false
-        // Unacked = an open task, or a settled task whose receipt is still unacked (T-467).
-        return !row.settledAt || row.receiptDigestSessionId === sessionId
+        if (!row.settledAt) return !row.ackedAt
+        // Settled: the receipt side has its own marker (T-476).
+        if (row.receiptAckedAt) return false
+        return row.receiptDigestSessionId === sessionId
       })
       .sort((left, right) => Number(left.createdAt ?? 0) - Number(right.createdAt ?? 0))
       .slice(0, limit)
@@ -2189,6 +2193,7 @@ export function apply(ctx, config) {
           receiptStatus: row.settledAt ? (row.receiptStatus ?? row.reasonKind ?? null) : null,
           receiptNotifiedAt: row.receiptNotifiedAt ?? null,
           receiptNotifyCount: Number(row.receiptNotifyCount) || 0,
+          receiptAckedAt: row.receiptAckedAt ?? null,
         }
         if (include !== 'text') return base
         const body = readTaskBody(row)
@@ -2213,7 +2218,12 @@ export function apply(ctx, config) {
         skipped.push({ id, reason: 'not-found' })
         continue
       }
-      if (row.ackedAt) {
+      // T-476: two audiences, two markers. A worker acking the task digest must not cancel
+      // the requester's receipt notice, so each side writes its own field.
+      const isReceiptSide = row.settledAt && row.receiptDigestSessionId === by
+      const isTaskSide = row.targetSessionId === by
+      const alreadyAcked = isReceiptSide ? Boolean(row.receiptAckedAt) : Boolean(row.ackedAt)
+      if (alreadyAcked) {
         skipped.push({ id, reason: 'already-acked' })
         continue
       }
@@ -2225,12 +2235,25 @@ export function apply(ctx, config) {
       }
       // A receipt belongs to the session that must review it (T-467), so owning the target OR
       // the receipt-digest destination is enough.
-      const mine = row.targetSessionId === by || row.receiptDigestSessionId === by
+      const mine = isTaskSide || isReceiptSide
       if (!force && !mine) {
         skipped.push({ id, reason: 'not-mine' })
         continue
       }
-      taskRegistry.updateTaskRow(id, { ackedAt: at, ackBy: by })
+      const patch = {}
+      if (isReceiptSide) {
+        patch.receiptAckedAt = at
+        patch.receiptAckBy = by
+      }
+      if (isTaskSide && !row.settledAt) {
+        patch.ackedAt = at
+        patch.ackBy = by
+      } else if (force && !row.ackedAt) {
+        // A coordinator forcing an ack also silences the task side for an open row.
+        patch.ackedAt = at
+        patch.ackBy = by
+      }
+      taskRegistry.updateTaskRow(id, patch)
       acked.push(id)
     }
     fileLog(`tasks ack by=${by} acked=${acked.length} skipped=${skipped.length}${force ? ' force' : ''}`)
@@ -4725,7 +4748,14 @@ export function apply(ctx, config) {
     receiptDigest: {
       enabled: c.receiptDigest === 'on',
       enqueue(receipt, task, sessionId) {
-        taskRegistry.updateTaskRow(receipt.taskId, { receiptDigestSessionId: sessionId })
+        // Write the counters up front so a row plainly says "queued, never notified"
+        // (receiptNotifyCount=0) instead of leaving the fields undefined (T-476).
+        taskRegistry.updateTaskRow(receipt.taskId, {
+          receiptDigestSessionId: sessionId,
+          receiptNotifyCount: 0,
+          receiptNotifiedAt: null,
+        })
+        armReceiptWatchdog(sessionId)
         scheduleIdleDigest(sessionId)
       },
     },
@@ -4776,9 +4806,14 @@ export function apply(ctx, config) {
   // any post-await bookkeeping and used to leave a permanent flag). Entries also expire so a
   // prompt the host never turns into a turn can only block for DIGEST_INFLIGHT_STALE_MS.
   const DIGEST_INFLIGHT_STALE_MS = 10 * 60 * 1000
+  // T-476: one diagnostic line per session per minute proves whether turn/end reaches us.
+  const turnEndSeenAt = new Map()
+  const TURN_END_LOG_INTERVAL_MS = 60_000
+
   const digestInFlight = new Map()
   const receiptDigestInFlight = new Map()
   let digestWatchdogTimers = new Map()
+  let receiptWatchdogTimers = new Map()
 
   function inFlight(map, sessionId) {
     const at = map.get(sessionId)
@@ -4791,15 +4826,21 @@ export function apply(ctx, config) {
   // One pending idle trigger per session: a burst of dispatches must coalesce into one digest.
   const digestIdleTimers = new Map()
 
-  function scheduleIdleDigest(sessionId) {
+  // T-476: a deferral must never depend on the host telling us the turn ended — a long
+  // conversation can go hours without a turn/end we can act on. Each deferral re-arms this
+  // same per-session timer, with a doubling delay capped at 60s, until the digest lands.
+  const digestRetryAttempts = new Map()
+
+  function scheduleIdleDigest(sessionId, { delayMs = null } = {}) {
     if ((c.digestDelivery !== 'on' && c.receiptDigest !== 'on') || !sessionId) return
     armDigestWatchdog(sessionId)
     if (digestIdleTimers.has(sessionId)) return
+    const wait = delayMs ?? c.digestIdleDebounceMs
     const timer = setTimeout(() => {
       digestIdleTimers.delete(sessionId)
       void maybeInjectDigest(sessionId, { requireIdle: true })
       void maybeInjectReceiptDigest(sessionId, { requireIdle: true })
-    }, c.digestIdleDebounceMs)
+    }, wait)
     timer.unref?.()
     digestIdleTimers.set(sessionId, timer)
   }
@@ -4816,18 +4857,69 @@ export function apply(ctx, config) {
       fileLog(
         `WARN digest not-notified session=${sessionId} waited=${c.digestNotifyWarnMs}ms tasks=${stuck.map((row) => row.taskId).join(',')}`,
       )
-      scheduleIdleDigest(sessionId)
+      // Last resort. A queue-mode digest is a followup, not an interruption, so delivering
+      // while the turn is still open is safe — and better than losing the notice because the
+      // host never told us the turn ended (T-476).
+      void maybeInjectDigest(sessionId, { requireIdle: false })
     }, c.digestNotifyWarnMs)
     timer.unref?.()
     digestWatchdogTimers.set(sessionId, timer)
   }
 
+  /** Re-arm after a deferral: no retry counter is kept per digest, only a capped backoff. */
+  function retryLater(sessionId) {
+    const attempts = (digestRetryAttempts.get(sessionId) ?? 0) + 1
+    digestRetryAttempts.set(sessionId, attempts)
+    if (attempts > 6) {
+      // Bounded: a session that stays busy for hours should not be re-polled forever.
+      // turn/end (fast path) and the watchdog (last resort) still cover it.
+      fileLog(`digest retry capped session=${sessionId} attempts=${attempts}`)
+      return
+    }
+    const delay = Math.min(c.digestIdleDebounceMs * 2 ** Math.min(attempts, 5), 60_000)
+    scheduleIdleDigest(sessionId, { delayMs: delay })
+  }
+
+  function clearRetryState(sessionId) {
+    digestRetryAttempts.delete(sessionId)
+  }
+
+  /**
+   * Receipt watchdog (T-476): a queued receipt that is still unnotified after
+   * `receiptNotifyWarnMs` means the deferral chain broke, not that the requester is busy.
+   * Log it once and try once more — the row keeps receiptNotifyCount=0 so anyone can tell
+   * "never notified" from "notified, still unread".
+   */
+  function armReceiptWatchdog(sessionId) {
+    if (c.receiptDigest !== 'on' || receiptWatchdogTimers.has(sessionId)) return
+    const timer = setTimeout(() => {
+      receiptWatchdogTimers.delete(sessionId)
+      const stuck = [...taskRows.values()].filter(
+        (row) =>
+          row.receiptDigestSessionId === sessionId && row.settledAt && !row.ackedAt && !Number(row.receiptNotifyCount),
+      )
+      if (!stuck.length) return
+      fileLog(
+        `WARN receipt-digest not-notified session=${sessionId} waited=${c.receiptNotifyWarnMs}ms tasks=${stuck.map((row) => row.taskId).join(',')}`,
+      )
+      // Last resort: the requester waited long enough, and a queue-mode digest does not
+      // interrupt the running turn — deliver now rather than lose the notice (T-476).
+      void maybeInjectReceiptDigest(sessionId, { requireIdle: false })
+    }, c.receiptNotifyWarnMs)
+    timer.unref?.()
+    receiptWatchdogTimers.set(sessionId, timer)
+  }
+
   function clearIdleDigestTimers() {
+    digestRetryAttempts.clear()
     for (const timer of digestIdleTimers.values()) clearTimeout(timer)
     digestIdleTimers.clear()
     for (const timer of digestWatchdogTimers.values()) clearTimeout(timer)
     digestWatchdogTimers.clear()
     digestWatchdogTimers = new Map()
+    for (const timer of receiptWatchdogTimers.values()) clearTimeout(timer)
+    receiptWatchdogTimers.clear()
+    receiptWatchdogTimers = new Map()
   }
 
   async function maybeInjectDigest(sessionId, { requireIdle = false } = {}) {
@@ -4839,6 +4931,7 @@ export function apply(ctx, config) {
     // From the idle trigger: never interrupt a running turn; its turn/end will call us.
     if (requireIdle && liveness.get(sessionId)?.openTurn != null) {
       fileLog(`digest deferred session=${sessionId} reason=turn-open`)
+      retryLater(sessionId)
       return null
     }
     // Never jump ahead of a queue-mode task that still waits for its own turn.
@@ -4866,6 +4959,7 @@ export function apply(ctx, config) {
         notifyCount: (Number(row.notifyCount) || 0) + 1,
       })
     }
+    clearRetryState(sessionId)
     fileLog(
       `digest session=${sessionId} tasks=${rows.length} ids=${rows.map((row) => row.taskId).join(',')} notifyCount=${(Number(rows[0].notifyCount) || 0) + 1}`,
     )
@@ -4880,6 +4974,7 @@ export function apply(ctx, config) {
     }
     if (requireIdle && liveness.get(sessionId)?.openTurn != null) {
       fileLog(`receipt-digest deferred session=${sessionId} reason=turn-open`)
+      retryLater(sessionId)
       return null
     }
     const now = Date.now()
@@ -4900,6 +4995,7 @@ export function apply(ctx, config) {
         receiptNotifyCount: (Number(row.receiptNotifyCount) || 0) + 1,
       })
     }
+    clearRetryState(sessionId)
     fileLog(`receipt-digest session=${sessionId} tasks=${rows.length} ids=${rows.map((row) => row.taskId).join(',')}`)
     return { count: rows.length, ids: rows.map((row) => row.taskId) }
   }
@@ -5470,6 +5566,12 @@ export function apply(ctx, config) {
         }
         lifecycle.handleSessionEvent(session, event)
         if (type === 'turn/end' && eventSessionId) {
+          const lastSeen = turnEndSeenAt.get(eventSessionId) ?? 0
+          const now = Date.now()
+          if (now - lastSeen >= TURN_END_LOG_INTERVAL_MS) {
+            turnEndSeenAt.set(eventSessionId, now)
+            fileLog(`turn-end seen session=${eventSessionId} turn=${event.turn ?? event?.data?.turn ?? '-'}`)
+          }
           void maybeInjectDigest(eventSessionId)
           void maybeInjectReceiptDigest(eventSessionId)
         }

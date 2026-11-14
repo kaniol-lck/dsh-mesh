@@ -22,7 +22,13 @@ export function isReceiptDigestCandidate(row, { sessionId, now = Date.now() } = 
   if (!row || typeof row !== 'object') return false
   if (!sessionId || row.receiptDigestSessionId !== sessionId) return false
   if (!row.settledAt) return false
-  if (row.ackedAt) return false
+  // T-476: `ackedAt` belongs to the executing session (task digest). The requester has its
+  // own marker, otherwise a worker acking its task would silently cancel the receipt notice
+  // — which is exactly what happened to T-472/T-473/T-475 on 2026-11-14.
+  if (row.receiptAckedAt) return false
+  // Backward compatibility for rows acked before the split: only an ack made by the receipt
+  // recipient itself may suppress the receipt notice.
+  if (row.ackedAt && row.ackBy && row.ackBy === row.receiptDigestSessionId) return false
   const count = Number(row.receiptNotifyCount) || 0
   if (count >= RECEIPT_DIGEST_MAX_NOTIFY) return false
   return now - Number(row.receiptNotifiedAt || 0) >= receiptBackoffMs(count)

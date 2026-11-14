@@ -35,6 +35,7 @@
 - 开启任务 digest 后 `steer`（插队）仍然立即注入正文：digest 只影响 `queue` 排队投递，steer 任务也不会被列进 digest 摘要。
 - 空闲会话不再漏收任务通知：开启 digest 后，任务落板会在 `digestIdleDebounceMs`（默认 3 秒）后触发一条 digest，不必等下一个回合；忙会话仍在 `turn/end` 后通知，日志把落板记为 `digest-queued` 而不是 `injected`。
 - 修复 digest 通知偶发不再投递：同一会话投过一次后，后续派单可能一直停在 pending（现改为投递前占位、失败即释放、超时自愈，并对每次延后/跳过记日志；超过 `digestNotifyWarnMs` 未投出记 WARN 并重试）。
+- 回执通知不再因为目标会话正在回合中而丢失：推迟的通知会自己重试，超过 `receiptNotifyWarnMs`（默认 90 秒）仍未投出时记 WARN 并立即补投一次；任务行以 `receiptNotifyCount: 0` 明确表示「尚未通知」，与「已通知待签收」区分开。
 
 ### Changed
 

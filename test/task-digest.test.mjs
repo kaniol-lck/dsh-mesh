@@ -564,6 +564,24 @@ test('digest on: a task that never gets notified trips a WARN watchdog', async (
   }
 })
 
+test('digest logs turn-end once per session per minute (T-476 diagnostic)', async () => {
+  const logFile = path.join(os.tmpdir(), `waker-turnend-${process.pid}-${Date.now()}.log`)
+  const h = await startHarness({ digestDelivery: 'on', digestIdleDebounceMs: 500, logFile })
+  try {
+    h.emit('turn/start', 1)
+    h.emit('turn/end', 1, { reason: { kind: 'completed' } })
+    await sleep(100)
+    h.emit('turn/end', 2, { reason: { kind: 'completed' } })
+    await sleep(100)
+    const log = fs.readFileSync(logFile, 'utf8')
+    const seen = log.match(/turn-end seen session=session-digest/g) ?? []
+    assert.equal(seen.length, 1, 'throttled to one line per minute per session')
+    assert.match(log, /turn-end seen session=session-digest turn=1/)
+  } finally {
+    h.close()
+  }
+})
+
 test('buildDigestText contract', () => {
   const text = buildDigestText([
     { taskId: 'T-1', subject: 'first task' },

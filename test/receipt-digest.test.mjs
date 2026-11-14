@@ -47,7 +47,7 @@ async function request(base, route, { method = 'GET', body } = {}) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /** Two sessions: a requester (coordinator-like) and a worker that settles tasks. */
-async function startHarness({ receiptDigest = 'on', digestIdleDebounceMs = 500, receiptMode = 'queue' } = {}) {
+async function startHarness({ receiptDigest = 'on', digestIdleDebounceMs = 500, receiptNotifyWarnMs = 90000, logFile = '', receiptMode = 'queue' } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-receipt-digest-'))
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
@@ -147,6 +147,8 @@ async function startHarness({ receiptDigest = 'on', digestIdleDebounceMs = 500, 
     receiptMode,
     receiptDigest,
     digestIdleDebounceMs,
+    receiptNotifyWarnMs,
+    ...(logFile ? { logFile } : {}),
   })
   const base = `http://127.0.0.1:${port}`
   const emit = (sessionId, type, turn, extra = {}) => {
@@ -300,6 +302,96 @@ test('mesh_tasks unacked lists a settled task whose receipt is unacked', async (
     await h.tool('mesh_ack').execute({ ids: ['T-l1'] }, { sessionId: REQ })
     const after = await h.tool('mesh_tasks').execute({}, { sessionId: REQ })
     assert.ok(!after.tasks.some((entry) => entry.taskId === 'T-l1'))
+  } finally {
+    h.close()
+  }
+})
+
+test('receipt-digest: a turn-open deferral keeps retrying until the requester is idle (T-476)', async () => {
+  const logFile = path.join(os.tmpdir(), `waker-receipt-defer-${process.pid}-${Date.now()}.log`)
+  const h = await startHarness({ digestIdleDebounceMs: 300, logFile })
+  try {
+    h.emit(REQ, 'turn/start', 1)
+    await dispatchTask(h, 'T-def1')
+    await completeTask(h, 'T-def1')
+    // Several debounce windows pass while the requester stays in its turn.
+    await sleep(1200)
+    const log = fs.readFileSync(logFile, 'utf8')
+    assert.match(log, /receipt-digest deferred session=session-req reason=turn-open/)
+    assert.equal(h.requesterPrompts().length, 0, 'a busy requester is never interrupted')
+    h.emit(REQ, 'turn/end', 1, { reason: { kind: 'completed' } })
+    await sleep(200)
+    assert.equal(h.requesterPrompts().length, 1)
+    assert.match(h.requesterPrompts()[0].content[0].text, /T-def1/)
+  } finally {
+    h.close()
+  }
+})
+
+test('receipt-digest: a deferral re-arms itself instead of waiting for one turn/end (T-476)', async () => {
+  const logFile = path.join(os.tmpdir(), `waker-receipt-retry-${process.pid}-${Date.now()}.log`)
+  const h = await startHarness({ digestIdleDebounceMs: 300, logFile })
+  try {
+    h.emit(REQ, 'turn/start', 1)
+    await dispatchTask(h, 'T-retry1')
+    await completeTask(h, 'T-retry1')
+    // A long turn: no turn/end for the whole window. The deferral must keep re-arming,
+    // otherwise the only remaining trigger is a turn/end that may never come (T-476).
+    await sleep(2500)
+    const log = fs.readFileSync(logFile, 'utf8')
+    const deferrals = (log.match(/receipt-digest deferred/g) ?? []).length
+    assert.ok(deferrals >= 2, `expected repeated deferrals, saw ${deferrals}`)
+    assert.equal(h.requesterPrompts().length, 0)
+    h.emit(REQ, 'turn/end', 1, { reason: { kind: 'completed' } })
+    await sleep(200)
+    assert.equal(h.requesterPrompts().length, 1, 'the first idle moment delivers without waiting for a timer')
+  } finally {
+    h.close()
+  }
+})
+
+test('receipt-digest: the watchdog delivers when no turn/end ever arrives (T-476)', async () => {
+  const logFile = path.join(os.tmpdir(), `waker-receipt-watch-${process.pid}-${Date.now()}.log`)
+  const h = await startHarness({ digestIdleDebounceMs: 300, receiptNotifyWarnMs: 1000, logFile })
+  try {
+    h.emit(REQ, 'turn/start', 1)
+    await dispatchTask(h, 'T-watch1')
+    await completeTask(h, 'T-watch1')
+    await sleep(500)
+    assert.equal(h.requesterPrompts().length, 0)
+    const rowBefore = await h.request(h.base, '/mesh/tasks/T-watch1')
+    // A queued-but-never-notified row must say so (0), not leave the field undefined.
+    assert.equal(rowBefore.json?.task?.receiptNotifyCount, 0)
+    assert.equal(rowBefore.json?.task?.receiptNotifiedAt ?? null, null)
+    await sleep(1400)
+    const log = fs.readFileSync(logFile, 'utf8')
+    assert.match(log, /WARN receipt-digest not-notified session=session-req/)
+    assert.equal(h.requesterPrompts().length, 1, 'the watchdog delivers rather than losing the notice')
+    const rowAfter = await h.request(h.base, '/mesh/tasks/T-watch1')
+    assert.equal(rowAfter.json?.task?.receiptNotifyCount, 1)
+  } finally {
+    h.close()
+  }
+})
+
+test('receipt-digest: a worker acking its own task does not cancel the requester notice (T-476)', async () => {
+  const h = await startHarness()
+  try {
+    await dispatchTask(h, 'T-split1')
+    await completeTask(h, 'T-split1')
+    // The worker clears its own task digest — the exact act that lost three receipts in prod.
+    const ack = await h.tool('mesh_ack').execute({ ids: ['T-split1'] }, { sessionId: WORKER })
+    assert.deepEqual(ack.acked, ['T-split1'])
+    await sleep(900)
+    const prompts = h.requesterPrompts()
+    assert.equal(prompts.length, 1, 'the requester still needs to see the completed receipt')
+    assert.match(prompts[0].content[0].text, /T-split1/)
+    // And the requester can ack it separately.
+    const ack2 = await h.tool('mesh_ack').execute({ ids: ['T-split1'] }, { sessionId: REQ })
+    assert.deepEqual(ack2.acked, ['T-split1'])
+    const row = await h.request(h.base, '/mesh/tasks/T-split1')
+    assert.ok(Number(row.json?.task?.receiptAckedAt) > 0)
+    assert.equal(row.json?.task?.receiptAckBy, REQ)
   } finally {
     h.close()
   }

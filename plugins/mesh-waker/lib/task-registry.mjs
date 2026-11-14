@@ -221,6 +221,8 @@ export function createTaskRegistry(deps) {
       receiptDigestSessionId: row.receiptDigestSessionId ?? null,
       receiptNotifiedAt: row.receiptNotifiedAt ?? null,
       receiptNotifyCount: Number(row.receiptNotifyCount) || 0,
+      receiptAckedAt: row.receiptAckedAt ?? null,
+      receiptAckBy: row.receiptAckBy ?? null,
     }
     if (!withText) return base
     return { ...base, text: resolveTaskText(row, deps.taskTextsDir) }
