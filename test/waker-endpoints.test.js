@@ -7819,6 +7819,18 @@ async function main() {
     report('coordinators: an expired lease is not a coordinator and can be claimed again', ok, `identity=${identity.json?.coordinatorStatus} view=${workspacesView.json?.workspaces?.['coord-lease']?.coordinators?.length ?? 0} reclaim=${reclaimed.status}`)
   })
 
+  await runCase('coordinators: a permanent claim has no expiry and heartbeat keeps it', async (boot) => {
+    const cwd = coordWorkspace('permanent')
+    const h = await boot({ seedSessions: [{ id: 'session-c-perm', title: 'plain perm', cwd }] })
+    seedCoordWorkspace(h, 'coord-perm', cwd)
+    const claimed = await coordPost(h.base, 'claim', { session: 'session-c-perm', slug: 'coord-perm', permanent: true })
+    const member = registryOf(h).workspaces?.['coord-perm']?.coordinators?.[0]
+    const hb = await coordPost(h.base, 'heartbeat', { session: 'session-c-perm', slug: 'coord-perm' })
+    const memberAfter = registryOf(h).workspaces?.['coord-perm']?.coordinators?.[0]
+    const ok = claimed.status === 201 && member?.leaseUntil === null && hb.status === 200 && memberAfter?.leaseUntil === null
+    report('coordinators: a permanent claim has no expiry and heartbeat keeps it', ok, `claim=${claimed.status} hb=${hb.status} lease=${JSON.stringify(member?.leaseUntil)} afterHb=${JSON.stringify(memberAfter?.leaseUntil)}`)
+  })
+
   await runCase('coordinators: a duplicate claim is refused with the current list', async (boot) => {
     const cwd = coordWorkspace('dup')
     const h = await boot({ seedSessions: [{ id: 'session-c-dup', title: 'plain dup', cwd }] })

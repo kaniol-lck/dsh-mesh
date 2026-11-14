@@ -7145,13 +7145,14 @@ export function apply(ctx, config) {
         const autoApprove = bootstrap && !c.coordinatorOwnerTokenFile
         const approved = autoApprove || ownerOk
         const now = Date.now()
+        const permanent = draft.permanent === true
         const member = {
           sessionId,
           ...(draft.channel ? { channel: String(draft.channel).slice(0, 40) } : {}),
           isPrimary: false,
           status: approved ? 'approved' : 'pending',
           claimedAt: approved ? now : null,
-          leaseUntil: approved ? now + c.coordinatorLeaseMs : null,
+          leaseUntil: approved && !permanent ? now + c.coordinatorLeaseMs : null,
           ...(autoApprove ? { approvedBy: 'bootstrap' } : approved ? { approvedBy: 'owner' } : {}),
           requestedAt: now,
         }
@@ -7319,14 +7320,15 @@ export function apply(ctx, config) {
         if (!target || target.status !== 'approved') {
           return { ok: false, status: 404, body: { ok: false, error: 'not an approved coordinator of that workspace' } }
         }
-        target.leaseUntil = Date.now() + c.coordinatorLeaseMs
+        target.leaseUntil = target.leaseUntil === null ? null : Date.now() + c.coordinatorLeaseMs
         return { ok: true }
       })
       if (!outcome.ok) {
         sendCoordinator(res, outcome.status, outcome.body)
         return
       }
-      sendCoordinator(res, 200, { ok: true, slug, sessionId, leaseUntil: Date.now() + c.coordinatorLeaseMs })
+      const member = outcome.entry.coordinators.find((item) => item.sessionId === sessionId)
+      sendCoordinator(res, 200, { ok: true, slug, sessionId, leaseUntil: member?.leaseUntil ?? null })
       return
     }
 
