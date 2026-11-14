@@ -28,7 +28,7 @@ import { zstdDecompressSync } from 'node:zlib'
 // ── Pure helpers moved to lib/ (T-292); re-exported below so external imports are stable.
 import { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
 import { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, buildBatchReceipt } from './lib/receipt.mjs'
-import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
+import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, MESH_TASKS_TOOL, TASKS_OUTPUT, MESH_ACK_TOOL, ACK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
 import { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, classifyRoleCandidates, ROLE_UNRECOGNIZED_MAX } from './lib/session.mjs'
 import { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settings.mjs'
@@ -42,12 +42,13 @@ import { readGitContext, describeArtifacts, normalizeArtifacts } from './lib/git
 import { createWorkspaceLocks } from './lib/workspace-locks.mjs'
 import { createDshTitleReader, applyDshTitles } from './lib/session-titles.mjs'
 import { createSettleHook } from './lib/settle-hook.mjs'
+import { digestCandidates, buildDigestText } from './lib/task-digest.mjs'
 import { normalizeCoordinators, coordinatorsView, expireCoordinators, syncPrimary, primaryOf, isOwnerTokenValid, recordAudit } from './lib/coordinators.mjs'
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
 export { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
 export { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, buildBatchReceipt } from './lib/receipt.mjs'
-export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
+export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, MESH_TASKS_TOOL, TASKS_OUTPUT, MESH_ACK_TOOL, ACK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
 export { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, ROLE_NAMES, ROLE_UNRECOGNIZED_MAX, titleRoleCandidate, classifyRoleCandidates } from './lib/session.mjs'
 export { createReceiptFlow } from './lib/receipt-flow.mjs'
 export { createThreads } from './lib/threads.mjs'
@@ -627,6 +628,9 @@ function normalizeBase(config) {
       : [],
     settleHookTimeoutMs: clampInterval(c.settleHookTimeoutMs, 60000, 5000, 300000),
     settleHookDebounceMs: clampInterval(c.settleHookDebounceMs, 300000, 0, 600000),
+    // Task digest (T-459): off by default so an upgrade behaves exactly as before. When on,
+    // dispatches only land on the board and one short digest is injected after a turn ends.
+    digestDelivery: String(c.digestDelivery) === 'on' ? 'on' : 'off',
     // Multi-coordinator claim protocol (T-395): bounded online coordinators, a lease per
     // member, and a pending TTL. The owner token file (when configured) is required for the
     // first claim in an empty workspace and for approve/reject/release by the owner.
@@ -2109,6 +2113,100 @@ export function apply(ctx, config) {
       released: result.released,
       ...(result.lock ? { lock: result.lock } : {}),
     }
+  }
+
+  /** Task body for mesh_tasks: a missing textRef file is data (`textMissing`), not an error. */
+  function readTaskBody(row) {
+    const ref = typeof row?.textRef === 'string' ? row.textRef : ''
+    if (ref) {
+      const match = /^sha256:([a-f0-9]{64})$/.exec(ref)
+      if (!match) return { text: '', missing: true }
+      try {
+        return { text: readFileSync(join(taskTextsDir, `${match[1]}.txt`), 'utf8'), missing: false }
+      } catch {
+        return { text: '', missing: true }
+      }
+    }
+    if (typeof row?.text === 'string') return { text: row.text, missing: false }
+    return { text: '', missing: false }
+  }
+
+  /** mesh_tasks: the board a digest points at (T-459). */
+  function meshTasks(args = {}, extra = null) {
+    const caller = callerSessionFrom(extra)
+    const sessionId = String(args.session ?? '').trim() || caller
+    if (!sessionId) {
+      throw new Error('mesh_tasks needs a session: pass session, or call it from a session (the host did not pass one)')
+    }
+    const include = args.include === 'text' ? 'text' : 'meta'
+    const status = args.status === 'all' ? 'all' : 'unacked'
+    const limit = Math.min(100, Math.max(1, Number(args.limit) || 20))
+    const rows = [...taskRows.values()]
+      .filter((row) => row.targetSessionId === sessionId)
+      .filter((row) => (status === 'all' ? true : !row.ackedAt && !row.settledAt))
+      .sort((left, right) => Number(left.createdAt ?? 0) - Number(right.createdAt ?? 0))
+      .slice(0, limit)
+      .map((row) => {
+        const base = {
+          taskId: row.taskId,
+          subject: row.subject ?? null,
+          status: row.status ?? null,
+          acked: Boolean(row.ackedAt),
+          ackedAt: row.ackedAt ?? null,
+          ackBy: row.ackBy ?? null,
+          notifiedAt: row.notifiedAt ?? null,
+          notifyCount: Number(row.notifyCount) || 0,
+          createdAt: row.createdAt ?? null,
+          targetTitle: row.targetTitle ?? null,
+        }
+        if (include !== 'text') return base
+        const body = readTaskBody(row)
+        return { ...base, text: body.text, ...(body.missing ? { textMissing: true } : {}) }
+      })
+    const unackedCount = rows.filter((row) => !row.acked).length
+    fileLog(`mesh_tasks session=${sessionId} status=${status} count=${rows.length} unacked=${unackedCount}`)
+    return { ok: true, sessionId, include, status, count: rows.length, unackedCount, tasks: rows }
+  }
+
+  /** Shared ack implementation for the tool and POST /mesh/tasks/ack (T-459). */
+  function ackTasks({ ids, by, force = false } = {}) {
+    const wanted = [...new Set((Array.isArray(ids) ? ids : []).map((id) => String(id ?? '').trim()).filter(Boolean))]
+    if (!wanted.length) throw new Error('ids must be a non-empty array of task ids')
+    if (wanted.length > 50) throw new Error('mesh_ack accepts at most 50 ids per call')
+    const acked = []
+    const skipped = []
+    const at = Date.now()
+    for (const id of wanted) {
+      const row = taskRows.get(id)
+      if (!row) {
+        skipped.push({ id, reason: 'not-found' })
+        continue
+      }
+      if (row.ackedAt) {
+        skipped.push({ id, reason: 'already-acked' })
+        continue
+      }
+      if (row.settledAt) {
+        skipped.push({ id, reason: 'settled' })
+        continue
+      }
+      if (!force && row.targetSessionId !== by) {
+        skipped.push({ id, reason: 'not-mine' })
+        continue
+      }
+      taskRegistry.updateTaskRow(id, { ackedAt: at, ackBy: by })
+      acked.push(id)
+    }
+    fileLog(`tasks ack by=${by} acked=${acked.length} skipped=${skipped.length}${force ? ' force' : ''}`)
+    return { ok: true, acked, skipped }
+  }
+
+  function meshAck(args = {}, extra = null) {
+    const caller = callerSessionFrom(extra)
+    if (!caller) {
+      throw new Error('mesh_ack needs the calling session; the host did not pass one (no default session is guessed)')
+    }
+    return ackTasks({ ids: args.ids, by: caller, force: args.force === true })
   }
 
   function throttleSummary() {
@@ -4605,6 +4703,44 @@ export function apply(ctx, config) {
     fileLog,
   })
 
+  // ---------------------------------------------------------------- task digest (T-459)
+  //
+  // With digestDelivery='on' a dispatch only lands on the board; after a turn ends one short
+  // notice lists the unacked tasks. Ack is a board marker (mesh_ack), never a receipt, and a
+  // digest task only settles when the worker declares it (mesh_complete).
+  const digestInFlight = new Set()
+
+  async function maybeInjectDigest(sessionId) {
+    if (c.digestDelivery !== 'on' || !sessionId) return null
+    if (digestInFlight.has(sessionId)) return null
+    // Never jump ahead of a queue-mode task that still waits for its own turn.
+    const ahead = [...pendingTasks.values()].some(
+      (task) => task.sessionId === sessionId && !task.settled && !task.declaredOnly && task.mode === 'queue',
+    )
+    if (ahead) return null
+    const rows = digestCandidates([...taskRows.values()], { sessionId, now: Date.now() })
+    if (!rows.length) return null
+    const text = buildDigestText(rows)
+    try {
+      await promptWithResume(sessionId, text, 'queue')
+    } catch (error) {
+      fileLog(`digest injection failed session=${sessionId}: ${error?.message ?? error}`)
+      return null
+    }
+    const now = Date.now()
+    for (const row of rows) {
+      taskRegistry.updateTaskRow(row.taskId, {
+        notifiedAt: Number(row.notifiedAt) || now,
+        notifyCount: (Number(row.notifyCount) || 0) + 1,
+      })
+    }
+    digestInFlight.add(sessionId)
+    fileLog(
+      `digest session=${sessionId} tasks=${rows.length} ids=${rows.map((row) => row.taskId).join(',')} notifyCount=${(Number(rows[0].notifyCount) || 0) + 1}`,
+    )
+    return { count: rows.length, ids: rows.map((row) => row.taskId) }
+  }
+
   const lifecycle = createTaskLifecycle({
     // 在飞任务（taskId → task）
     pendingTasks,
@@ -5160,7 +5296,14 @@ export function apply(ctx, config) {
 
   if (typeof ctx.on === 'function') {
     ctx.effect(() => {
-      const off = ctx.on('session/event', lifecycle.handleSessionEvent)
+      const off = ctx.on('session/event', (session, event) => {
+        const eventSessionId = typeof session === 'string' ? session : session?.id ?? session?.sessionId
+        const type = String(event?.data?.type ?? event?.type ?? '')
+        // A digest prompt becomes the next turn: clear the in-flight marker when it starts.
+        if (type === 'turn/start' && eventSessionId) digestInFlight.delete(eventSessionId)
+        lifecycle.handleSessionEvent(session, event)
+        if (type === 'turn/end' && eventSessionId) void maybeInjectDigest(eventSessionId)
+      })
       return typeof off === 'function' ? off : undefined
     })
     // Remote approvals: disabled installs delegate straight to the next answerer.
@@ -5386,6 +5529,7 @@ export function apply(ctx, config) {
       ...(args.receiptSummary === true ? { receiptSummary: true } : {}),
       ...(expectBranch ? { expectBranch } : {}),
       ...(artifacts.length ? { artifacts } : {}),
+      ...(c.digestDelivery === 'on' ? { declaredOnly: true } : {}),
       ...(resolved.deadlineMs ? { deadlineMs: resolved.deadlineMs } : {}),
     }
     const deliveredText = c.injectHeader
@@ -5398,7 +5542,9 @@ export function apply(ctx, config) {
     let taskId = null
     try {
       taskId = lifecycle.registerPendingTask(session, meta, deliveryMode, text)
-      if (waitForLock) {
+      if (c.digestDelivery === 'on') {
+        // T-459: board only — a digest after turn/end announces it; nothing is injected now.
+      } else if (waitForLock) {
         lifecycle.deferForLock(taskId, { text: deliveredText, mode: deliveryMode, workspace: sessionLock.workspace })
       } else {
         await promptWithResume(session.id, deliveredText, deliveryMode)
@@ -5438,6 +5584,7 @@ export function apply(ctx, config) {
       // Dispatch-time git snapshot (T-416): null when the cwd is not a git repo or git is
       // unavailable. The receipt carries the settled-time snapshot for comparison.
       git: dispatchGit,
+      ...(c.digestDelivery === 'on' ? { digestQueued: true } : {}),
       ...(waitForLock
         ? {
             waitingLock: {
@@ -5596,6 +5743,8 @@ export function apply(ctx, config) {
     complete: { ok: false, error: null },
     cancel: { ok: false, error: null },
     lock: { ok: false, error: null },
+    tasks: { ok: false, error: null },
+    ack: { ok: false, error: null },
   }
 
   // ══ 子系统：工具注册与代码自检 ══════════════════════════════════════════════════
@@ -5723,6 +5872,26 @@ export function apply(ctx, config) {
       execute: (args, extra) => meshLock(args, extra),
     })
     installModelTool(lockDefinition, 'lock')
+
+    const tasksDefinition = await buildToolDefinition({
+      name: MESH_TASKS_TOOL.name,
+      description: MESH_TASKS_TOOL.description,
+      parameters: MESH_TASKS_TOOL.parameters,
+      required: MESH_TASKS_TOOL.required,
+      output: TASKS_OUTPUT,
+      execute: (args, extra) => meshTasks(args, extra),
+    })
+    installModelTool(tasksDefinition, 'tasks')
+
+    const ackDefinition = await buildToolDefinition({
+      name: MESH_ACK_TOOL.name,
+      description: MESH_ACK_TOOL.description,
+      parameters: MESH_ACK_TOOL.parameters,
+      required: MESH_ACK_TOOL.required,
+      output: ACK_OUTPUT,
+      execute: (args, extra) => meshAck(args, extra),
+    })
+    installModelTool(ackDefinition, 'ack')
 
     const completeDefinition = await buildToolDefinition({
       name: MESH_COMPLETE_TOOL.name,
@@ -6340,6 +6509,37 @@ export function apply(ctx, config) {
             .map((row) => taskRegistry.taskRowForApi(row, { withText: params.get('include') === 'text' })),
         }),
       )
+      return
+    }
+
+    if (path === '/mesh/tasks/ack' && req.method === 'POST') {
+      // T-459: loopback ack (no receipt, no injection) — same shape as the mesh_ack tool.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const raw = await readRequestBuffer()
+      if (!raw) {
+        res.writeHead(413).end()
+        return
+      }
+      let draft = {}
+      try {
+        draft = JSON.parse(raw.toString('utf8') || '{}')
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end('{"ok":false,"error":"invalid JSON body"}')
+        return
+      }
+      try {
+        const result = ackTasks({ ids: draft.ids, by: String(draft.by ?? 'loopback'), force: draft.force === true })
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify(result))
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
       return
     }
 
@@ -7077,6 +7277,7 @@ export function apply(ctx, config) {
         try {
           if (!meta.taskId) meta.taskId = `T-${Date.now().toString(36)}`
           // Register before prompting: a very fast turn can end before this request returns.
+          if (c.digestDelivery === 'on') meta.declaredOnly = true
           taskId = lifecycle.registerPendingTask(target, meta, mode, text)
           deliveredText = c.injectHeader
             ? withTaskHeader(text, {
@@ -7087,7 +7288,9 @@ export function apply(ctx, config) {
                 thread,
               })
             : text
-          if (injectWaitsForLock) {
+          if (c.digestDelivery === 'on') {
+            // T-459: board only; the digest announces it after the next turn/end.
+          } else if (injectWaitsForLock) {
             lifecycle.deferForLock(taskId, { text: deliveredText, mode, workspace: injectLock.workspace })
           } else {
             await promptWithResume(target.id, deliveredText, mode)
@@ -7251,6 +7454,8 @@ export function apply(ctx, config) {
                 complete: toolState.complete.ok,
                 cancel: toolState.cancel.ok,
                 lock: toolState.lock.ok,
+                tasks: toolState.tasks.ok,
+                ack: toolState.ack.ok,
               },
               toolsError:
                 toolState.dispatch.error ??
@@ -7259,6 +7464,8 @@ export function apply(ctx, config) {
                 toolState.complete.error ??
                 toolState.cancel.error ??
                 toolState.lock.error ??
+                toolState.tasks.error ??
+                toolState.ack.error ??
                 null,
               // T-418: advisory workspace locks are in-memory; this is the live view.
               workspaceLocks: { count: workspaceLocks.count(), locks: workspaceLocks.list() },

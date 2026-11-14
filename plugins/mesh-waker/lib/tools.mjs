@@ -332,6 +332,99 @@ export const LOCK_OUTPUT = {
   render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
 }
 
+/** Board-side task listing for the session that received the work (T-459). */
+export const MESH_TASKS_TOOL = {
+  name: 'mesh_tasks',
+  description:
+    'List tasks dispatched to this session (or an explicit session). status=unacked (default) lists tasks that are unacked and unsettled, so it is the board a digest points at; status=all lists every task of the session. include=text adds each task body, and a body whose file is gone comes back with textMissing:true instead of failing. count is the number of returned rows and unackedCount is how many of those rows are unacked — both computed from the same list.',
+  parameters: {
+    session: { type: 'string', description: 'Session id to inspect (coordinator use); defaults to the calling session.' },
+    include: { type: 'string', enum: ['meta', 'text'], description: 'meta (default) = ids/titles; text also returns each task body.' },
+    status: {
+      type: 'string',
+      enum: ['unacked', 'all'],
+      description: 'unacked (default) = ackedAt empty and not settled; all = every task of the session.',
+    },
+    limit: { type: 'number', description: 'Maximum rows (1–100, default 20).' },
+  },
+  required: [],
+}
+
+export const TASKS_OUTPUT = {
+  schema: {
+    type: 'object',
+    properties: {
+      ok: { type: 'boolean' },
+      sessionId: { type: 'string' },
+      include: { type: 'string' },
+      status: { type: 'string' },
+      count: { type: 'number' },
+      unackedCount: { type: 'number' },
+      tasks: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            taskId: { type: 'string' },
+            subject: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            status: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            acked: { type: 'boolean' },
+            ackedAt: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+            ackBy: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            notifiedAt: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+            notifyCount: { type: 'number' },
+            createdAt: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+            targetTitle: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            text: { type: 'string' },
+            textMissing: { type: 'boolean' },
+          },
+          required: ['taskId', 'acked', 'notifyCount'],
+        },
+      },
+    },
+    required: ['ok', 'sessionId', 'count', 'unackedCount', 'tasks'],
+  },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+}
+
+/**
+ * Ack is a *board marker* (T-459): it tells the waker "I have seen this notice, stop waking me
+ * for it". It never completes the task, never writes a receipt and never wakes anybody.
+ */
+export const MESH_ACK_TOOL = {
+  name: 'mesh_ack',
+  description:
+    'Mark tasks as acknowledged on the board: no receipt, no injection, no waiting — it only stops future digests for those tasks. Acking is NOT completion: the task still needs mesh_complete. Defaults to tasks of the calling session; force:true lets a coordinator ack another session\u2019s tasks (risk: the worker stops being reminded). At most 50 ids per call; returns {acked, skipped:[{id, reason}]} with reason one of not-found | not-mine | already-acked | settled.',
+  parameters: {
+    ids: { type: 'array', items: { type: 'string' }, required: true, description: 'Task ids to acknowledge (≤50).' },
+    force: { type: 'boolean', description: 'Allow acking tasks that belong to another session (coordinator only; hides the reminder from the worker).' },
+  },
+  required: ['ids'],
+}
+
+export const ACK_OUTPUT = {
+  schema: {
+    type: 'object',
+    properties: {
+      ok: { type: 'boolean' },
+      acked: { type: 'array', items: { type: 'string' } },
+      skipped: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            reason: { type: 'string' },
+          },
+          required: ['id', 'reason'],
+        },
+      },
+    },
+    required: ['ok', 'acked', 'skipped'],
+  },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+}
+
 /**
  * Validate a tool output definition against the host's enforced JSON Schema subset.
  * Returns `{ ok, issues }`; this is the guard test that would have caught T-236

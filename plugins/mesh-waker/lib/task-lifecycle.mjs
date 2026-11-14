@@ -327,6 +327,9 @@ export function createTaskLifecycle(deps) {
       routedTo: meta?.routedTo ? String(meta.routedTo).slice(0, 120) : null,
       settled: false,
       stallTimer: null,
+      // Digest mode (T-459): the task is announced but never injected, so only an explicit
+      // mesh_complete may settle it. Observed turn/end settlement is skipped entirely.
+      declaredOnly: meta?.declaredOnly === true,
       // T-416: settlement compares the branch the worker ended on and stats declared files.
       cwd: target.cwd ?? deps.sessionCwdOf(target.id) ?? null,
       expectBranch: meta?.expectBranch ? String(meta.expectBranch).slice(0, 200) : null,
@@ -360,12 +363,18 @@ export function createTaskLifecycle(deps) {
       // Persist the actual mode so a restart can still notify the dispatcher (T-273).
       receiptMode,
       noticeSummary: task.noticeSummary === true,
+      declaredOnly: task.declaredOnly === true,
       cwd: task.cwd ?? null,
       expectBranch: task.expectBranch ?? null,
       artifacts: task.artifacts ?? [],
     })
-    const timer = armStallTimer(taskId, task)
-    task.stallTimer = timer
+    if (task.declaredOnly) {
+      // No prompt was injected, so a not-started watchdog would be a false alarm.
+      task.stallTimer = null
+    } else {
+      const timer = armStallTimer(taskId, task)
+      task.stallTimer = timer
+    }
     deps.fileLog(
       `task ${taskId} pending on ${target.id} baselineTurn=${task.baselineTurn ?? 'unknown'} duringTurn=${injectedDuringTurn} mode=${task.mode} receipt=${receiptMode} requester=${task.requester ?? '-'}${batchId ? ` batch=${batchId}` : ''}`,
     )
@@ -454,7 +463,7 @@ export function createTaskLifecycle(deps) {
       if (type === 'turn/start') {
         if (turn !== null) deps.turnStartedAt.set(sessionId, Math.max(turn, deps.turnStartedAt.get(sessionId) ?? 0))
         for (const [taskId, task] of deps.pendingTasks) {
-          if (task.sessionId !== sessionId || task.settled || task.startedAt) continue
+          if (task.sessionId !== sessionId || task.settled || task.startedAt || task.declaredOnly) continue
           // Same ownership rule as settlement: a queue task owns a strictly later turn, a
           // steer task may own the running one. A null baseline means we had no turn
           // knowledge at injection (T-253): claim only if this turn starts within the
@@ -494,7 +503,7 @@ export function createTaskLifecycle(deps) {
           deps.fileLog(`task ${taskId} started turn=${turn} baselineTurn=${task.baselineTurn}`)
         }
         for (const task of deps.pendingTasks.values()) {
-          if (task.sessionId !== sessionId || task.settled) continue
+          if (task.sessionId !== sessionId || task.settled || task.declaredOnly) continue
           if (task.baselineTurn === null || (turn !== null && turn > task.baselineTurn)) clearPending(task)
         }
         if (turn !== null) {
@@ -527,6 +536,8 @@ export function createTaskLifecycle(deps) {
         ledger.ownedTaskIds = null
         for (const [taskId, task] of [...deps.pendingTasks]) {
           if (task.sessionId !== sessionId || task.settled) continue
+          // Digest tasks only settle when the worker declares completion (T-459).
+          if (task.declaredOnly) continue
           if (ownedIds && !ownedIds.has(taskId)) continue
           if (task.baselineTurn !== null && turn !== null) {
             // queue: the task only started in a strictly later turn; steer was inserted into

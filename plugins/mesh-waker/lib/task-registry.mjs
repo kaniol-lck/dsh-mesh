@@ -151,6 +151,8 @@ export function createTaskRegistry(deps) {
       routedTo: extra.routedTo ?? null,
       // Per-dispatch summary opt-in (T-404); persists so the batch can honour it after settle.
       ...(extra.noticeSummary === true ? { noticeSummary: true } : {}),
+      // Digest mode (T-459): the row is announced, never injected.
+      ...(extra.declaredOnly === true ? { declaredOnly: true } : {}),
       // Git/artifact context (T-416): persisted so a later reader can audit branch and files.
       ...(extra.cwd ? { cwd: String(extra.cwd) } : {}),
       ...(extra.expectBranch ? { expectBranch: String(extra.expectBranch) } : {}),
@@ -208,6 +210,12 @@ export function createTaskRegistry(deps) {
       reusedId: row.reusedId === true,
       textRef: row.textRef ?? null,
       hasTextFile: Boolean(row.textRef || row.textPath),
+      // Digest + ack fields (T-459): orthogonal to status; acked is a board marker only.
+      notifiedAt: row.notifiedAt ?? null,
+      notifyCount: Number(row.notifyCount) || 0,
+      ackedAt: row.ackedAt ?? null,
+      ackBy: row.ackBy ?? null,
+      ...(row.declaredOnly === true ? { declaredOnly: true } : {}),
     }
     if (!withText) return base
     return { ...base, text: resolveTaskText(row, deps.taskTextsDir) }
