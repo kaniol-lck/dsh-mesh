@@ -34,6 +34,7 @@
 - 会话标题以 DSH 实际标题为准（`/mesh/sessions` 带 `titleSource`/`titleStale`）：索引标题过期时按标题投递会被拒绝并提示改用 session id，不再把消息投进改过名的会话。
 - 开启任务 digest 后 `steer`（插队）仍然立即注入正文：digest 只影响 `queue` 排队投递，steer 任务也不会被列进 digest 摘要。
 - 空闲会话不再漏收任务通知：开启 digest 后，任务落板会在 `digestIdleDebounceMs`（默认 3 秒）后触发一条 digest，不必等下一个回合；忙会话仍在 `turn/end` 后通知，日志把落板记为 `digest-queued` 而不是 `injected`。
+- 修复 digest 通知偶发不再投递：同一会话投过一次后，后续派单可能一直停在 pending（现改为投递前占位、失败即释放、超时自愈，并对每次延后/跳过记日志；超过 `digestNotifyWarnMs` 未投出记 WARN 并重试）。
 
 ## [0.8.0] - 2026-11-02
 

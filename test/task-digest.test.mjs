@@ -45,7 +45,7 @@ async function request(base, route, { method = 'GET', body } = {}) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /** Minimal host: one seeded session, prompt capture and session/event listeners. */
-async function startHarness({ digestDelivery = 'on', digestIdleDebounceMs = 5000, logFile = '', seedSessions = [{ id: 'session-digest', title: 'digest worker' }] } = {}) {
+async function startHarness({ digestDelivery = 'on', digestIdleDebounceMs = 5000, digestNotifyWarnMs = 90000, autoTurnOnPrompt = false, logFile = '', seedSessions = [{ id: 'session-digest', title: 'digest worker' }] } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-digest-'))
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
@@ -86,6 +86,14 @@ async function startHarness({ digestDelivery = 'on', digestIdleDebounceMs = 5000
     },
     async prompt(prompt) {
       state.prompts.push(prompt)
+      // T-470: a real host starts the turn while the prompt call is still in flight; the
+      // race that leaked the in-flight flag is only reproducible if the fake host does too.
+      if (autoTurnOnPrompt) {
+        state.turn = (state.turn ?? 0) + 1
+        for (const fn of listeners.get('session/event') ?? []) {
+          fn({ id: prompt.sessionId }, { type: 'turn/start', turn: state.turn })
+        }
+      }
       return {}
     },
     async cancel() {},
@@ -142,6 +150,7 @@ async function startHarness({ digestDelivery = 'on', digestIdleDebounceMs = 5000
     settleHookCommand: '',
     digestDelivery,
     digestIdleDebounceMs,
+    digestNotifyWarnMs,
     ...(logFile ? { logFile } : {}),
   })
   const base = `http://127.0.0.1:${port}`
@@ -479,6 +488,77 @@ test('digest logs a board-only dispatch as digest-queued, never as injected', as
     assert.match(log, /digest-queued task=T-log-2 session=session-digest mode=queue/)
     assert.doesNotMatch(log, /injected .*T-log-2/)
     assert.equal(h.state.prompts.length, 1, 'one digest should cover both board-only tasks')
+  } finally {
+    h.close()
+  }
+})
+
+test('digest on: a dispatch during a running turn is delivered after turn/end (T-470)', async () => {
+  const h = await startHarness({ digestDelivery: 'on', digestIdleDebounceMs: 500 })
+  try {
+    h.emit('turn/start', 1)
+    await dispatch(h, { target: 'digest worker', text: 'while busy', taskId: 'T-during-1' })
+    await sleep(900)
+    assert.equal(h.state.prompts.length, 0, 'the idle trigger must not interrupt the running turn')
+    h.emit('turn/end', 1, { reason: { kind: 'completed' } })
+    await sleep(100)
+    assert.equal(h.state.prompts.length, 1)
+    assert.match(h.state.prompts[0].content[0].text, /T-during-1/)
+  } finally {
+    h.close()
+  }
+})
+
+test('digest on: a deferred idle trigger says why in the log', async () => {
+  const logFile = path.join(os.tmpdir(), `waker-digest-defer-${process.pid}-${Date.now()}.log`)
+  const h = await startHarness({ digestDelivery: 'on', digestIdleDebounceMs: 500, logFile })
+  try {
+    h.emit('turn/start', 1)
+    await dispatch(h, { target: 'digest worker', text: 'log why', taskId: 'T-defer-1' })
+    await sleep(900)
+    const log = fs.readFileSync(logFile, 'utf8')
+    assert.match(log, /digest deferred session=session-digest reason=turn-open/)
+    assert.equal(h.state.prompts.length, 0)
+  } finally {
+    h.close()
+  }
+})
+
+test('digest on: a second digest is delivered after the first one ended its turn (T-470 race)', async () => {
+  // The fake host starts the turn from inside prompt(): the very race that permanently leaked
+  // the in-flight flag on 2026-11-14 (digest never delivered again for that session).
+  const h = await startHarness({ digestDelivery: 'on', digestIdleDebounceMs: 500, autoTurnOnPrompt: true })
+  try {
+    await dispatch(h, { target: 'digest worker', text: 'first', taskId: 'T-race-1' })
+    await sleep(900)
+    assert.equal(h.state.prompts.length, 1, 'the first digest must be delivered')
+    h.emit('turn/end', h.state.turn, { reason: { kind: 'completed' } })
+    await dispatch(h, { target: 'digest worker', text: 'second', taskId: 'T-race-2' })
+    await sleep(900)
+    assert.equal(h.state.prompts.length, 2, 'a later digest must not be swallowed by a leaked flag')
+    assert.match(h.state.prompts[1].content[0].text, /T-race-2/)
+  } finally {
+    h.close()
+  }
+})
+
+test('digest on: a task that never gets notified trips a WARN watchdog', async () => {
+  const logFile = path.join(os.tmpdir(), `waker-digest-watchdog-${process.pid}-${Date.now()}.log`)
+  const h = await startHarness({
+    digestDelivery: 'on',
+    digestIdleDebounceMs: 500,
+    digestNotifyWarnMs: 1000,
+    logFile,
+  })
+  try {
+    h.emit('turn/start', 1)
+    await dispatch(h, { target: 'digest worker', text: 'stuck', taskId: 'T-watch-1' })
+    await sleep(1600)
+    const log = fs.readFileSync(logFile, 'utf8')
+    assert.match(log, /WARN digest not-notified session=session-digest/)
+    h.emit('turn/end', 1, { reason: { kind: 'completed' } })
+    await sleep(100)
+    assert.equal(h.state.prompts.length, 1)
   } finally {
     h.close()
   }

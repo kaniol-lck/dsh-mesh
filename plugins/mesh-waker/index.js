@@ -635,6 +635,9 @@ function normalizeBase(config) {
     // An idle session never emits turn/end, so a digest would never fire: the registration
     // path also schedules one after this debounce (T-462).
     digestIdleDebounceMs: clampInterval(c.digestIdleDebounceMs, 3000, 500, 60_000),
+    // A digest task that is still unnotified after this window is a delivery bug, not a
+    // queue: log a WARN and retry once (T-470).
+    digestNotifyWarnMs: clampInterval(c.digestNotifyWarnMs, 90_000, 1000, 600_000),
     // Receipt digest (T-467): queue-mode receipts are merged into one notice instead of one
     // turn each. Off by default; file/wake delivery keeps its existing behaviour.
     receiptDigest: String(c.receiptDigest) === 'on' ? 'on' : 'off',
@@ -4791,13 +4794,29 @@ export function apply(ctx, config) {
   // With digestDelivery='on' a dispatch only lands on the board; after a turn ends one short
   // notice lists the unacked tasks. Ack is a board marker (mesh_ack), never a receipt, and a
   // digest task only settles when the worker declares it (mesh_complete).
-  const digestInFlight = new Set()
-  const receiptDigestInFlight = new Set()
+  // T-470: sessionId -> injectedAt. Set BEFORE the prompt is awaited (the host can start the
+  // digest turn while promptWithResume is still resolving; a turn/start then arrives before
+  // any post-await bookkeeping and used to leave a permanent flag). Entries also expire so a
+  // prompt the host never turns into a turn can only block for DIGEST_INFLIGHT_STALE_MS.
+  const DIGEST_INFLIGHT_STALE_MS = 10 * 60 * 1000
+  const digestInFlight = new Map()
+  const receiptDigestInFlight = new Map()
+  let digestWatchdogTimers = new Map()
+
+  function inFlight(map, sessionId) {
+    const at = map.get(sessionId)
+    if (!at) return false
+    if (Date.now() - at < DIGEST_INFLIGHT_STALE_MS) return true
+    map.delete(sessionId)
+    fileLog(`digest in-flight flag expired session=${sessionId} age=${Date.now() - at}ms`)
+    return false
+  }
   // One pending idle trigger per session: a burst of dispatches must coalesce into one digest.
   const digestIdleTimers = new Map()
 
   function scheduleIdleDigest(sessionId) {
     if ((c.digestDelivery !== 'on' && c.receiptDigest !== 'on') || !sessionId) return
+    armDigestWatchdog(sessionId)
     if (digestIdleTimers.has(sessionId)) return
     const timer = setTimeout(() => {
       digestIdleTimers.delete(sessionId)
@@ -4808,16 +4827,43 @@ export function apply(ctx, config) {
     digestIdleTimers.set(sessionId, timer)
   }
 
+  /** One WARN per session when a digest task is still unnotified after the window (T-470). */
+  function armDigestWatchdog(sessionId) {
+    if (c.digestDelivery !== 'on' || digestWatchdogTimers.has(sessionId)) return
+    const timer = setTimeout(() => {
+      digestWatchdogTimers.delete(sessionId)
+      const stuck = [...taskRows.values()].filter(
+        (row) => row.targetSessionId === sessionId && row.status === 'pending' && row.declaredOnly === true && !row.ackedAt && !Number(row.notifyCount),
+      )
+      if (!stuck.length) return
+      fileLog(
+        `WARN digest not-notified session=${sessionId} waited=${c.digestNotifyWarnMs}ms tasks=${stuck.map((row) => row.taskId).join(',')}`,
+      )
+      scheduleIdleDigest(sessionId)
+    }, c.digestNotifyWarnMs)
+    timer.unref?.()
+    digestWatchdogTimers.set(sessionId, timer)
+  }
+
   function clearIdleDigestTimers() {
     for (const timer of digestIdleTimers.values()) clearTimeout(timer)
     digestIdleTimers.clear()
+    for (const timer of digestWatchdogTimers.values()) clearTimeout(timer)
+    digestWatchdogTimers.clear()
+    digestWatchdogTimers = new Map()
   }
 
   async function maybeInjectDigest(sessionId, { requireIdle = false } = {}) {
     if (c.digestDelivery !== 'on' || !sessionId) return null
-    if (digestInFlight.has(sessionId)) return null
+    if (inFlight(digestInFlight, sessionId)) {
+      fileLog(`digest skipped session=${sessionId} reason=in-flight`)
+      return null
+    }
     // From the idle trigger: never interrupt a running turn; its turn/end will call us.
-    if (requireIdle && liveness.get(sessionId)?.openTurn != null) return null
+    if (requireIdle && liveness.get(sessionId)?.openTurn != null) {
+      fileLog(`digest deferred session=${sessionId} reason=turn-open`)
+      return null
+    }
     // Never jump ahead of a queue-mode task that still waits for its own turn.
     const ahead = [...pendingTasks.values()].some(
       (task) => task.sessionId === sessionId && !task.settled && !task.declaredOnly && task.mode === 'queue',
@@ -4826,9 +4872,13 @@ export function apply(ctx, config) {
     const rows = digestCandidates([...taskRows.values()], { sessionId, now: Date.now() })
     if (!rows.length) return null
     const text = buildDigestText(rows)
+    // Claim the session BEFORE the await: the host may start the digest turn (and emit
+    // turn/start) while promptWithResume is still resolving (T-470).
+    digestInFlight.set(sessionId, Date.now())
     try {
       await promptWithResume(sessionId, text, 'queue')
     } catch (error) {
+      digestInFlight.delete(sessionId)
       fileLog(`digest injection failed session=${sessionId}: ${error?.message ?? error}`)
       return null
     }
@@ -4839,7 +4889,6 @@ export function apply(ctx, config) {
         notifyCount: (Number(row.notifyCount) || 0) + 1,
       })
     }
-    digestInFlight.add(sessionId)
     fileLog(
       `digest session=${sessionId} tasks=${rows.length} ids=${rows.map((row) => row.taskId).join(',')} notifyCount=${(Number(rows[0].notifyCount) || 0) + 1}`,
     )
@@ -4848,15 +4897,23 @@ export function apply(ctx, config) {
 
   async function maybeInjectReceiptDigest(sessionId, { requireIdle = false } = {}) {
     if (c.receiptDigest !== 'on' || !sessionId) return null
-    if (receiptDigestInFlight.has(sessionId)) return null
-    if (requireIdle && liveness.get(sessionId)?.openTurn != null) return null
+    if (inFlight(receiptDigestInFlight, sessionId)) {
+      fileLog(`receipt-digest skipped session=${sessionId} reason=in-flight`)
+      return null
+    }
+    if (requireIdle && liveness.get(sessionId)?.openTurn != null) {
+      fileLog(`receipt-digest deferred session=${sessionId} reason=turn-open`)
+      return null
+    }
     const now = Date.now()
     const rows = receiptDigestCandidates([...taskRows.values()], { sessionId, now })
     if (!rows.length) return null
     const text = buildReceiptDigestText(rows)
+    receiptDigestInFlight.set(sessionId, Date.now())
     try {
       await promptWithResume(sessionId, text, 'queue')
     } catch (error) {
+      receiptDigestInFlight.delete(sessionId)
       fileLog(`receipt-digest injection failed session=${sessionId}: ${error?.message ?? error}`)
       return null
     }
@@ -4866,7 +4923,6 @@ export function apply(ctx, config) {
         receiptNotifyCount: (Number(row.receiptNotifyCount) || 0) + 1,
       })
     }
-    receiptDigestInFlight.add(sessionId)
     fileLog(`receipt-digest session=${sessionId} tasks=${rows.length} ids=${rows.map((row) => row.taskId).join(',')}`)
     return { count: rows.length, ids: rows.map((row) => row.taskId) }
   }
