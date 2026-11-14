@@ -16,6 +16,7 @@
 | [agents-template.md](agents-template.md) | AGENTS.md 协作宪章模板（占位符替换即用） |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | 仓库结构、本地验证、提交规范 |
 | [reference/README.md](reference/README.md) | 参考资料索引：外部结构 / 既有实践，每条带 URL、抓取日期与可复用结论 |
+| [reference/dsh-endpoints.md](reference/dsh-endpoints.md) | DSH 端点清单：waker 55 个本机端点、宿主 26 个 Session Remote 方法、会话改名结论（有无 + 替代路径与风险） |
 
 技能（给 agent 看）：
 

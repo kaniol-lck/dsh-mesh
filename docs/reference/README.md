@@ -20,6 +20,12 @@
 | REF-003 | 告警分级 / 去重 / 抑制 | [Alertmanager · Prometheus](https://prometheus.io/docs/alerting/latest/alertmanager/) | 2026-11-14 | 同构 | 相似告警**合并成一条**通知；根因告警在响时**抑制**症状告警（inhibition）；按标签**路由**到不同接收方；静默要带匹配器与时限，重复提醒用 `repeat_interval` 节流 |
 | REF-004 | 值班指挥与执行分离 | [Managing Incidents · Google SRE Book 第 14 章](https://sre.google/sre-book/managing-incidents/) | 2026-11-14 | 同构 | 指挥者**不修问题**（分工可递归、可再委托）；必须有可读的实时状态文档，交接要显式确认「你现在是指挥」。单一指挥者不收窄输入量就会变成瓶颈 |
 
+## 同目录的其他参考
+
+| 文件 | 是什么 |
+|---|---|
+| [dsh-endpoints.md](dsh-endpoints.md) | DSH 当前可用端点清单（waker 55 个本机端点 + 宿主 26 个 Session Remote 方法）；「会话改名」有无与替代路径的结论 |
+
 ## 本索引支撑的评估
 
 | 评估 | 用到的条目 | 结论 |
