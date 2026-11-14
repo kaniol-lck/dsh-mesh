@@ -5529,21 +5529,23 @@ export function apply(ctx, config) {
       ...(args.receiptSummary === true ? { receiptSummary: true } : {}),
       ...(expectBranch ? { expectBranch } : {}),
       ...(artifacts.length ? { artifacts } : {}),
-      ...(c.digestDelivery === 'on' ? { declaredOnly: true } : {}),
       ...(resolved.deadlineMs ? { deadlineMs: resolved.deadlineMs } : {}),
     }
     const deliveredText = c.injectHeader
       ? withTaskHeader(text, { taskId: meta.taskId, batchId: meta.batchId, requester, thread })
       : text
     const deliveryMode = args.mode === 'steer' ? 'steer' : 'queue'
+    // T-460: digest only changes *queue* delivery; steer keeps injecting immediately.
+    const digestQueue = c.digestDelivery === 'on' && deliveryMode === 'queue'
+    if (digestQueue) meta.declaredOnly = true
     // T-418: a workspace lock from someone else parks the task instead of racing the worktree.
     const sessionLock = lockForSession(session.id)
     const waitForLock = Boolean(sessionLock) && !lockExempt(sessionLock.lock, callerSession, requester)
     let taskId = null
     try {
       taskId = lifecycle.registerPendingTask(session, meta, deliveryMode, text)
-      if (c.digestDelivery === 'on') {
-        // T-459: board only — a digest after turn/end announces it; nothing is injected now.
+      if (digestQueue) {
+        // T-459/T-460: board only — a digest after turn/end announces it; nothing is injected now.
       } else if (waitForLock) {
         lifecycle.deferForLock(taskId, { text: deliveredText, mode: deliveryMode, workspace: sessionLock.workspace })
       } else {
@@ -5584,7 +5586,7 @@ export function apply(ctx, config) {
       // Dispatch-time git snapshot (T-416): null when the cwd is not a git repo or git is
       // unavailable. The receipt carries the settled-time snapshot for comparison.
       git: dispatchGit,
-      ...(c.digestDelivery === 'on' ? { digestQueued: true } : {}),
+      ...(digestQueue ? { digestQueued: true } : {}),
       ...(waitForLock
         ? {
             waitingLock: {
@@ -7277,7 +7279,8 @@ export function apply(ctx, config) {
         try {
           if (!meta.taskId) meta.taskId = `T-${Date.now().toString(36)}`
           // Register before prompting: a very fast turn can end before this request returns.
-          if (c.digestDelivery === 'on') meta.declaredOnly = true
+          // T-460: digest only applies to queue delivery; steer still injects immediately.
+          if (c.digestDelivery === 'on' && mode === 'queue') meta.declaredOnly = true
           taskId = lifecycle.registerPendingTask(target, meta, mode, text)
           deliveredText = c.injectHeader
             ? withTaskHeader(text, {
@@ -7288,7 +7291,7 @@ export function apply(ctx, config) {
                 thread,
               })
             : text
-          if (c.digestDelivery === 'on') {
+          if (c.digestDelivery === 'on' && mode === 'queue') {
             // T-459: board only; the digest announces it after the next turn/end.
           } else if (injectWaitsForLock) {
             lifecycle.deferForLock(taskId, { text: deliveredText, mode, workspace: injectLock.workspace })

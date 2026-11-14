@@ -29,6 +29,7 @@
 - 队列任务不再被无关回合误结算成 completed：一个 `turn/end` 只结算该回合开始时已排队、或 steer 插入本回合的任务，跨回合积压按队列位置计算。
 - 未绑定 conversation 的跨机消息不再自动新建「Mesh 收件箱」会话并消费：消息保持 unread 等人工 `/mesh/bind`，已有绑定/面板绑定继续投递且不会被覆盖；投递失败保留绑定并延后，不再静默改投入收件箱。
 - 会话标题以 DSH 实际标题为准（`/mesh/sessions` 带 `titleSource`/`titleStale`）：索引标题过期时按标题投递会被拒绝并提示改用 session id，不再把消息投进改过名的会话。
+- 开启任务 digest 后 `steer`（插队）仍然立即注入正文：digest 只影响 `queue` 排队投递，steer 任务也不会被列进 digest 摘要。
 
 ## [0.8.0] - 2026-11-02
 

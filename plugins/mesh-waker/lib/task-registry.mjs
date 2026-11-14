@@ -151,7 +151,7 @@ export function createTaskRegistry(deps) {
       routedTo: extra.routedTo ?? null,
       // Per-dispatch summary opt-in (T-404); persists so the batch can honour it after settle.
       ...(extra.noticeSummary === true ? { noticeSummary: true } : {}),
-      // Digest mode (T-459): the row is announced, never injected.
+      // Delivery mode (T-460): only queue tasks are eligible for a digest.\n      ...(extra.mode ? { mode: String(extra.mode) } : {}),\n      // Digest mode (T-459): the row is announced, never injected.
       ...(extra.declaredOnly === true ? { declaredOnly: true } : {}),
       // Git/artifact context (T-416): persisted so a later reader can audit branch and files.
       ...(extra.cwd ? { cwd: String(extra.cwd) } : {}),

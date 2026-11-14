@@ -23,6 +23,9 @@ export function isDigestCandidate(row, { sessionId, now = Date.now() } = {}) {
   if (!sessionId || row.targetSessionId !== sessionId) return false
   if (row.settledAt) return false
   if (String(row.status ?? '') !== 'pending') return false
+  // T-460: only queue deliveries are digested; a steer task is injected immediately and must
+  // never be listed again (rows written before the field existed default to queue).
+  if (row.mode && String(row.mode) !== 'queue') return false
   if (row.ackedAt) return false
   const count = Number(row.notifyCount) || 0
   if (count >= DIGEST_MAX_NOTIFY) return false

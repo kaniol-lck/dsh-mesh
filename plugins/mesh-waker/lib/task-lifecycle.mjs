@@ -364,6 +364,7 @@ export function createTaskLifecycle(deps) {
       receiptMode,
       noticeSummary: task.noticeSummary === true,
       declaredOnly: task.declaredOnly === true,
+      mode: task.mode,
       cwd: task.cwd ?? null,
       expectBranch: task.expectBranch ?? null,
       artifacts: task.artifacts ?? [],

@@ -356,6 +356,54 @@ test('mesh_tasks count and unackedCount come from the same list', async () => {
   }
 })
 
+test('digest on: a steer dispatch still injects immediately (T-460)', async () => {
+  const h = await startHarness({ digestDelivery: 'on' })
+  try {
+    const result = await dispatch(h, { target: 'digest worker', text: 'interrupt now', taskId: 'T-steer-1', mode: 'steer' })
+    assert.equal(result.ok, true)
+    assert.equal(h.state.prompts.length, 1)
+    assert.equal(h.state.prompts[0].mode, 'steer')
+    assert.match(JSON.stringify(h.state.prompts[0].content), /interrupt now/)
+    const row = await h.request(h.base, '/mesh/tasks/T-steer-1')
+    assert.equal(row.json?.task?.declaredOnly, undefined)
+    assert.equal(result.digestQueued, undefined)
+  } finally {
+    h.close()
+  }
+})
+
+test('digest on: a queue dispatch stays on the board (regression)', async () => {
+  const h = await startHarness({ digestDelivery: 'on' })
+  try {
+    const result = await dispatch(h, { target: 'digest worker', text: 'queue quietly', taskId: 'T-queue-1', mode: 'queue' })
+    assert.equal(result.digestQueued, true)
+    assert.equal(h.state.prompts.length, 0)
+    const row = await h.request(h.base, '/mesh/tasks/T-queue-1')
+    assert.equal(row.json?.task?.declaredOnly, true)
+  } finally {
+    h.close()
+  }
+})
+
+test('digest on: a steer task is never listed in a digest', async () => {
+  const h = await startHarness({ digestDelivery: 'on' })
+  try {
+    await dispatch(h, { target: 'digest worker', text: 'queue task', taskId: 'T-dq-1', mode: 'queue' })
+    await dispatch(h, { target: 'digest worker', text: 'steer task', taskId: 'T-ds-1', mode: 'steer' })
+    h.emit('turn/start', 1)
+    h.emit('turn/end', 1, { reason: { kind: 'completed' } })
+    await sleep(50)
+    // The steer prompt itself was the only injection; the digest lists queue work only.
+    const digest = h.state.prompts.find((prompt) => JSON.stringify(prompt.content).includes('[TASK-DIGEST]'))
+    assert.ok(digest, 'a digest should have been injected for the queue task')
+    const text = digest.content[0].text
+    assert.match(text, /- T-dq-1 /)
+    assert.doesNotMatch(text, /T-ds-1/)
+  } finally {
+    h.close()
+  }
+})
+
 test('buildDigestText contract', () => {
   const text = buildDigestText([
     { taskId: 'T-1', subject: 'first task' },
