@@ -320,6 +320,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
     catchUpDelayMs: 600000,
     historySyncIntervalMs: 3600000,
     registerIntervalMs: 3600000,
+    allowTitleAddressing: true,
     ...config,
   }
   for (const key of Object.keys(merged)) {
@@ -1371,6 +1372,16 @@ async function main() {
     const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'dup live', text: 'nope' } })
     const ok = res.status === 400 && /多个/.test(res.json?.error ?? '') && /archived/.test(res.json?.error ?? '') && h.state.prompts.length === 0
     report('title resolution still refuses two live namesakes, with the archived hint', ok, `status=${res.status} hint=${/archived/.test(res.json?.error ?? '')}`)
+  })
+
+  await runCase('title resolution is disabled by default', async (boot) => {
+    const h = await boot({
+      config: { allowTitleAddressing: false },
+      seedSessions: [{ id: 'session-no-title', title: 'mesh · 协调' }],
+    })
+    const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { title: 'mesh · 协调', text: 'nope' } })
+    const ok = res.status === 400 && /title addressing is disabled/.test(res.json?.error ?? '') && h.state.prompts.length === 0
+    report('title resolution is disabled by default', ok, `status=${res.status} prompts=${h.state.prompts.length}`)
   })
 
   await runCase('GET /mesh/sessions?live=1 lists only non-archived sessions', async (boot) => {

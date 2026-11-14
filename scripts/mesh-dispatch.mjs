@@ -28,21 +28,18 @@ const DEBOUNCE_MS = 60_000
 const USAGE = `mesh-dispatch — dispatch via the waker plugin CLI (single implementation)
 
 Usage:
-  node scripts/mesh-dispatch.mjs --title "<project> · <role>" --file task.txt
-  node scripts/mesh-dispatch.mjs --target <id|title> --thread TH-1 --text "..."
+  node scripts/mesh-dispatch.mjs --session <id> --file task.txt
+  node scripts/mesh-dispatch.mjs --target <session-id> --thread TH-1 --text "..."
   node scripts/mesh-dispatch.mjs --coordinator <slug> --wake --text "[WAKE] ..."
   node scripts/mesh-dispatch.mjs --wake --create --text "[WAKE] ..."   # new <slug> · 协调 <n>
   node scripts/mesh-dispatch.mjs --session <id> --text "..." --dry-run
 
 Local extensions (not part of the plugin CLI):
-  --title <s>        resolve title -> session id (sessions-index.json, filtered by --repo);
-                     refuses when the title matches several active sessions or only archived ones
-  --coordinator <s>  resolve the live coordinator of workspace <s> (title "<s> · 协调…"),
-                     excluding archived/live=false sessions; --role is an alias
+  --coordinator <s>  resolve the live coordinator of workspace <s>, excluding archived/live=false; --role is an alias
   --create           with --wake and no target: create "<slug> · 协调 <n>" for this workspace
   --wake             send directly to the waker inject API; text must start with "[WAKE]"
   --dry-run          with --wake: print target + dedupe key + 未投递, send nothing
-  --repo <path>      workspace used by --title/--coordinator and the wake dedupe file (default: cwd)
+  --repo <path>      workspace used by --coordinator and the wake dedupe file (default: cwd)
   --expect-branch <b>  expected branch of the target workspace (forwarded as meta.expectBranch).
                      Dispatch with "dev" in this repo by default — main only takes release merges.
                      The script sets no default: omitted means nothing is sent (assign.mjs adds dev
@@ -50,7 +47,7 @@ Local extensions (not part of the plugin CLI):
                      a mismatch only adds a "branch mismatch: ..." warning in warnings and never
                      blocks delivery; workers must not "git switch" on their own.
 
-Wake target: explicit --session/--target/--thread/--coordinator/--role/--title is used as-is.
+Wake target: explicit --session/--target/--thread/--coordinator/--role is used as-is; title addressing is removed.
 With no target, --wake no longer falls back to the recorded coordinator: --create makes a new
 "<slug> · 协调 <n>" session bound to the current workspace (workspacePath echo is verified), and
 without --create it exits 2 with the three explicit options. --role is an alias of --coordinator.
@@ -288,6 +285,10 @@ async function wake(argv) {
 async function main() {
   const argv = process.argv.slice(2)
   if (argv.includes('-h') || argv.includes('--help')) { console.log(USAGE); return 0 }
+  if (argv.includes('--title')) {
+    console.error('--title 已移除：标题只做显示；请用 --session <id>、--role <role> 或 --coordinator <slug>')
+    return 2
+  }
   if (argv.includes('--wake')) { await wake(argv); return 0 }
   const forwarded = []
   let title
@@ -298,6 +299,16 @@ async function main() {
     if (arg === '--title') { title = argv[index + 1]; index += 1; continue }
     if (arg === '--coordinator') { coordinator = argv[index + 1]; index += 1; continue }
     if (arg === '--repo') { repo = argv[index + 1]; index += 1; continue }
+    if (arg === '--target') {
+      const value = argv[index + 1]
+      if (!argv.includes('--create') && !/^session-[A-Za-z0-9-]+$/.test(String(value ?? ''))) {
+        console.error('--target 只接受 session id（标题寻址已移除）；按角色用 --role，按协调用 --coordinator')
+        return 2
+      }
+      forwarded.push('--target', value)
+      index += 1
+      continue
+    }
     if (arg === '--session') { forwarded.push('--target', argv[index + 1]); index += 1; continue }
     forwarded.push(arg)
   }

@@ -191,6 +191,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `receiptNotifyWarnMs` | `90000` | 回执 digest 的「首通知」看门狗（1000–600000ms）：回执排队后超过该窗口仍 `receiptNotifyCount=0` 时记 WARN `receipt-digest not-notified session=… tasks=…` 并**立刻补投一次**（不依赖 `turn/end`，因为长会话可能几小时不给 idle 窗口） |
 | `receiptDigest` | `'off'` | `'on'` = **回执不再逐条排队**（owner 2026-11-14 要的能力）：`receiptMode='queue'` 的回执照旧写 `receipts.jsonl`，但注入改成 `turn/end` 或空闲（沿用 `digestIdleDebounceMs`）后合并成一条 `[RECEIPT-DIGEST]`；同一 requester 退避 10/30 分钟、最多 2 次，`mesh_ack({ids})` 签收后不再提醒（板标记，不产生新回执）。`file`/`wake` 语义不变，默认 `'off'` |
 | `roleInstructions` | `{}` | B 档角色注入：`{ "<role>": "<文件路径或文本>" }`（role ∈ `waker\|docs\|hub\|ops`）。目标会话 id 命中注册表 `workers[<role>].sessionId` 时，在注入文本**末尾**追加 `## 角色卡（自动注入 · <role>）` + 内容；值为路径时相对**目标会话 cwd** 解析（读不到只记 `role-card missing` 日志，不报错、不阻断）。默认空对象 = 零行为变化 |
+| `allowTitleAddressing` | `false` | 兼容开关：默认**拒绝**按标题投递/定向（标题只做显示）；仅旧客户端或测试显式设 `true`。开启时每次按标题寻址记 `WARN title addressing deprecated` |
 | `maxCoordinatorsPerWorkspace` | `3` | 同一工作区允许同时在线的协调数量上限（1–20）；超过后 claim 返回 409 + 现有列表 |
 | `coordinatorLeaseMs` | `600000` | 协调租约（毫秒，60000–3600000）；执行期间按 `/mesh/coordinator/heartbeat` 续期，过期转 stale |
 | `coordinatorPendingTtlMs` | `1800000` | 待批准认领的存活时间（毫秒，60000–86400000），过期自动失效 |

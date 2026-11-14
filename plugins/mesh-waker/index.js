@@ -644,6 +644,9 @@ function normalizeBase(config) {
     // Receipt digest (T-467): queue-mode receipts are merged into one notice instead of one
     // turn each. Off by default; file/wake delivery keeps its existing behaviour.
     receiptDigest: String(c.receiptDigest) === 'on' ? 'on' : 'off',
+    // Title addressing is deprecated (2026-11-14): titles are display-only; callers must pass
+    // a session id. Kept as an opt-in only for legacy clients/tests.
+    allowTitleAddressing: c.allowTitleAddressing === true,
     // B-tier role injection (T-469): role -> file path (relative to the target cwd) or
     // inline text. Empty by default, so an unconfigured install appends nothing.
     roleInstructions:
@@ -1355,6 +1358,7 @@ export function apply(ctx, config) {
       if (hit) return hit
     }
     if (title) {
+      fileLog(`WARN title addressing deprecated title=${JSON.stringify(title).slice(0, 80)}; pass session id`)
       // T-429: a title whose index value disagrees with DSH is not trustworthy — refuse to
       // route by it and name the session so the caller can switch to its id.
       const eligible = sessions.filter((session) => !session.titleStale)
@@ -7518,6 +7522,9 @@ export function apply(ctx, config) {
         const routedTo = String(draft.routedTo ?? meta.routedTo ?? '').trim()
         if (routedTo) meta.routedTo = routedTo.slice(0, 120)
         const explicitTarget = Boolean(String(draft.session ?? draft.title ?? '').trim())
+        if (draft.title && !c.allowTitleAddressing) {
+          throw new Error('title addressing is disabled: pass a session id (legacy clients can set allowTitleAddressing: true)')
+        }
         let target
         if (!explicitTarget) {
           if (!thread) throw new Error('session/title is required unless a known thread is given')
