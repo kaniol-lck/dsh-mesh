@@ -7499,10 +7499,21 @@ async function main() {
       coord.json?.isCoordinator === true &&
       coord.json?.workspace === 'ident-repo' &&
       coord.json?.sessionId === 'session-ident-coord' &&
+      // T-468: the routing-position fields, and the old aliases still agree with them.
+      coord.json?.routingRole === 'primary' &&
+      coord.json?.isPrimaryRouter === true &&
+      coord.json?.primaryRouterSessionId === 'session-ident-coord' &&
+      coord.json?.primaryRouterSessionId === coord.json?.coordinatorSessionId &&
+      coord.json?.isPrimaryRouter === coord.json?.isCoordinator &&
+      worker.json?.routingRole === 'none' &&
+      worker.json?.isPrimaryRouter === false &&
+      worker.json?.primaryRouterSessionId === 'session-ident-coord' &&
       worker.json?.isCoordinator === false &&
       worker.json?.role === 'waker' &&
       worker.json?.coordinatorSessionId === 'session-ident-coord' &&
       plain.json?.isCoordinator === false &&
+      plain.json?.routingRole === 'none' &&
+      plain.json?.primaryRouterSessionId === 'session-ident-coord' &&
       plain.json?.role === null &&
       unknown.json?.ok === false &&
       /session not found/.test(unknown.json?.reason ?? '')
@@ -7540,8 +7551,10 @@ async function main() {
       created.status === 201 &&
       /\[身份\] sessionId=/.test(firstText) &&
       /workspace=ident-create/.test(firstText) &&
-      /isCoordinator=false/.test(firstText) &&
-      /coordinatorSessionId=session-ident-boss/.test(firstText) &&
+      /routingRole=none/.test(firstText) &&
+      /isPrimaryRouter=false/.test(firstText) &&
+      /primaryRouterSessionId=session-ident-boss/.test(firstText) &&
+      !/isCoordinator=/.test(firstText) &&
       all.length === 2 &&
       !secondText.includes('[身份]')
     report('identity: a created session gets the identity line on its first prompt only', ok, `first=${/\[身份\]/.test(firstText)} second=${/\[身份\]/.test(secondText)} prompts=${all.length} snippet=${firstText.slice(0, 220)}`)
@@ -7624,7 +7637,13 @@ async function main() {
       entry.coordinators?.length === 2 &&
       identityApproved.json?.isCoordinator === true &&
       identityApproved.json?.isPrimary === false &&
-      identityPrimary.json?.isPrimary === true
+      // T-468: an approved non-primary member reads routingRole='member', not 'primary'.
+      identityApproved.json?.routingRole === 'member' &&
+      identityApproved.json?.isPrimaryRouter === true &&
+      identityApproved.json?.primaryRouterSessionId === 'session-coord-1' &&
+      identityPending.json?.routingRole === 'none' &&
+      identityPrimary.json?.isPrimary === true &&
+      identityPrimary.json?.routingRole === 'primary'
     report('coordinators: a second coordinator is approved and both stay online', ok, `coordinators=${entry.coordinators?.length} identityApproved=${identityApproved.json?.isCoordinator} isPrimary(first)=${identityPrimary.json?.isPrimary}`)
   })
 

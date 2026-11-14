@@ -2531,6 +2531,11 @@ export function apply(ctx, config) {
       sessionId,
       cwd,
       workspace: slug,
+      // T-468: the routing-position names a session should use. `isCoordinator` /
+      // `coordinatorSessionId` stay as deprecated aliases so old callers keep working.
+      isPrimaryRouter: isCoordinator,
+      primaryRouterSessionId: coordinatorSessionId,
+      routingRole: isCoordinator ? (isPrimary ? 'primary' : 'member') : 'none',
       isCoordinator,
       coordinatorStatus,
       isPrimary,
@@ -2542,9 +2547,9 @@ export function apply(ctx, config) {
   function identityLine(sessionId, cwdHint = null) {
     const identity = identityFor(sessionId, cwdHint)
     if (!identity.ok) {
-      return `[身份] sessionId=${sessionId} workspace=unknown isCoordinator=false coordinatorSessionId=none（${identity.reason}；调 GET /mesh/session/identity?session=${sessionId} 复核）`
+      return `[身份] sessionId=${sessionId} workspace=unknown routingRole=none isPrimaryRouter=false primaryRouterSessionId=none（${identity.reason}；调 GET /mesh/session/identity?session=${sessionId} 复核）`
     }
-    return `[身份] sessionId=${identity.sessionId} workspace=${identity.workspace} isCoordinator=${identity.isCoordinator} coordinatorSessionId=${identity.coordinatorSessionId ?? 'none'}`
+    return `[身份] sessionId=${identity.sessionId} workspace=${identity.workspace} routingRole=${identity.routingRole} isPrimaryRouter=${identity.isPrimaryRouter} primaryRouterSessionId=${identity.primaryRouterSessionId ?? 'none'}`
   }
 
   async function promptWithResume(sid, content, mode = 'queue') {

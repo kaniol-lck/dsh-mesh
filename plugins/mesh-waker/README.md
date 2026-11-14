@@ -225,15 +225,16 @@ CA 只记 sha256 前 16 位，token 只记 `fp=<前6位>… len=<n>`；任何日
 
 ```bash
 curl.exe -s "http://127.0.0.1:8795/mesh/session/identity?session=<自己的 sessionId>"
-# 协调会话：  {"ok":true,"sessionId":"session-…","cwd":"D:\\…\\public","workspace":"dsh-mesh","isCoordinator":true,"coordinatorSessionId":"session-…","role":null}
-# worker 会话：{"ok":true,…,"isCoordinator":false,"coordinatorSessionId":"session-…","role":"waker"}
-# 普通会话：  {"ok":true,…,"isCoordinator":false,"coordinatorSessionId":"session-…","role":null}
+# primary 路由位：{"ok":true,"sessionId":"session-…","cwd":"D:\\…\\public","workspace":"dsh-mesh","routingRole":"primary","isPrimaryRouter":true,"primaryRouterSessionId":"session-…","isCoordinator":true,"coordinatorSessionId":"session-…","role":null}
+# worker 会话：{"ok":true,…,"routingRole":"none","isPrimaryRouter":false,"primaryRouterSessionId":"session-…","isCoordinator":false,"coordinatorSessionId":"session-…","role":"waker"}
+# 普通会话：  {"ok":true,…,"routingRole":"none","isPrimaryRouter":false,"primaryRouterSessionId":"session-…","isCoordinator":false,"coordinatorSessionId":"session-…","role":null}
 # 查不到时：  {"ok":false,"sessionId":"…","reason":"session not found on this machine"}   ← 不猜、不给默认值
 ```
 
-- **默认新建的会话不是协调**，除非注册表显式登记；`role` 从标题 `<项目> · <角色>` 解析，解析不出为 `null`。
+- **默认新建的会话不是 primary 路由位**，除非注册表显式登记；`role` 从标题 `<项目> · <角色>` 解析，解析不出为 `null`。
+- **命名（未发布）**：`coordinator` / `isCoordinator` / `coordinatorSessionId` 是**旧名**，语义 = 「primary 路由位」；新代码请用 `routingRole`（`primary` / `member` / `none`）、`isPrimaryRouter`、`primaryRouterSessionId`。旧字段**保留且值不变**，只是 `deprecated alias`，下个主题版本移除；`/mesh/coordinator/*` 端点与注册表字段名本轮不改。
 - waker 自己创建的会话（`/mesh/sessions/create`、`mesh_dispatch --create`、收件箱会话等）会在**首个 prompt** 前带一行身份头，之后不再重复：
-  `[身份] sessionId=<id> workspace=<slug> isCoordinator=true|false coordinatorSessionId=<id|none>`
+  `[身份] sessionId=<id> workspace=<slug> routingRole=primary|member|none isPrimaryRouter=true|false primaryRouterSessionId=<id|none>`
 - 不经过 waker 的普通用户会话无法自动注入，**请调上面的端点自查**。
 
 ### 协调认领（多协调在线，2026-11-10）
@@ -257,7 +258,7 @@ curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/heartbeat -d '{"session"
 - 同一工作区**允许多个协调同时在线**，上限 `maxCoordinatorsPerWorkspace`（默认 3），超出 claim 返回 409 + 现有列表；
 - **空工作区 bootstrap**：配置了 `coordinatorOwnerTokenFile` 时必须带 `ownerToken`；未配置时首任自动批准并标记 `approvedBy:"bootstrap"` + 写 WARN 日志（**v0 限制**，后续接 owner 审批）；
 - 待批准项 30 分钟 TTL（`coordinatorPendingTtlMs`）；租约过期转 `stale` 并可再次认领；primary 失效时按 `claimedAt` 最早顺位；
-- 身份端点据此回答：`isCoordinator` = 在 **approved** 的 `coordinators[]` 中，另返回 `coordinatorStatus` 与 `isPrimary`。
+- 身份端点据此回答：`isPrimaryRouter` = 在 **approved** 的 `coordinators[]` 中（旧名 `isCoordinator`）；`routingRole` 为 `primary`（approved 且 `isPrimary`）、`member`（approved 非 primary）或 `none`；另返回 `coordinatorStatus`、`isPrimary`、`primaryRouterSessionId`（旧名 `coordinatorSessionId`）。
 
 ## 信任与权限
 
