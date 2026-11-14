@@ -1384,6 +1384,21 @@ async function main() {
     report('title resolution is disabled by default', ok, `status=${res.status} prompts=${h.state.prompts.length}`)
   })
 
+  // T-478 regression: a client that sends the session id plus a title field (the CLI used to
+  // mirror the target into `title`) must still deliver — the id is the address.
+  await runCase('a session id plus a redundant title still delivers', async (boot) => {
+    const h = await boot({
+      config: { allowTitleAddressing: false },
+      seedSessions: [{ id: 'session-id-with-title', title: 'mesh · 协调' }],
+    })
+    const res = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { session: 'session-id-with-title', title: 'mesh · 协调', text: 'delivered' },
+    })
+    const ok = res.status === 200 && h.state.prompts.length === 1
+    report('a session id plus a redundant title still delivers', ok, `status=${res.status} prompts=${h.state.prompts.length}`)
+  })
+
   await runCase('GET /mesh/sessions?live=1 lists only non-archived sessions', async (boot) => {
     const h = await boot({
       seedSessions: [
@@ -1715,7 +1730,7 @@ async function main() {
       result.dryRun === true &&
       result.routedTo === 'workspace:dsh-mesh' &&
       result.payload.session === 'session-coord-1' &&
-      result.payload.title === 'session-coord-1' &&
+      result.payload.title === undefined &&
       result.resolvedCoordinator.coordinator === 'session-coord-1'
     report('CLI: --coordinator resolves the coordinator and records routedTo', ok, `target=${result.payload.session} routedTo=${result.routedTo}`)
   })

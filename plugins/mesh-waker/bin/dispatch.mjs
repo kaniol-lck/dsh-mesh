@@ -600,8 +600,17 @@ export async function run(options, fetchImpl = fetch) {
         ...(options.deadlineMs ? { deadlineMs: options.deadlineMs } : {}),
       }
     : undefined
+  const isSessionId = typeof options.target === 'string' && /^session-[A-Za-z0-9-]+$/.test(options.target)
   const payload = (session) => ({
-    ...(session ? { session } : options.target ? { session: options.target, title: options.target } : {}),
+    // A session id is not a title (T-478 regression): sending both made the title gate reject
+    // every legitimate id dispatch. Only a real title rides along as `title`.
+    ...(isSessionId
+      ? { session: options.target }
+      : session
+        ? { session }
+        : options.target
+          ? { session: options.target, title: options.target }
+          : {}),
     text,
     mode: options.mode,
     // Where this dispatch was addressed (T-355): the waker persists it on the task row.

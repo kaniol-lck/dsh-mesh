@@ -7522,7 +7522,10 @@ export function apply(ctx, config) {
         const routedTo = String(draft.routedTo ?? meta.routedTo ?? '').trim()
         if (routedTo) meta.routedTo = routedTo.slice(0, 120)
         const explicitTarget = Boolean(String(draft.session ?? draft.title ?? '').trim())
-        if (draft.title && !c.allowTitleAddressing) {
+        // A caller that already names a session id is not title addressing: ignore a title that
+        // merely repeats it (T-478 regression), and gate only real title-only addressing.
+        const hasSessionId = /^session-[A-Za-z0-9-]+$/.test(String(draft.session ?? '').trim())
+        if (draft.title && !hasSessionId && !c.allowTitleAddressing) {
           throw new Error('title addressing is disabled: pass a session id (legacy clients can set allowTitleAddressing: true)')
         }
         let target
