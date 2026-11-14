@@ -631,6 +631,9 @@ function normalizeBase(config) {
     // Task digest (T-459): off by default so an upgrade behaves exactly as before. When on,
     // dispatches only land on the board and one short digest is injected after a turn ends.
     digestDelivery: String(c.digestDelivery) === 'on' ? 'on' : 'off',
+    // An idle session never emits turn/end, so a digest would never fire: the registration
+    // path also schedules one after this debounce (T-462).
+    digestIdleDebounceMs: clampInterval(c.digestIdleDebounceMs, 3000, 500, 60_000),
     // Multi-coordinator claim protocol (T-395): bounded online coordinators, a lease per
     // member, and a pending TTL. The owner token file (when configured) is required for the
     // first claim in an empty workspace and for approve/reject/release by the owner.
@@ -4709,10 +4712,30 @@ export function apply(ctx, config) {
   // notice lists the unacked tasks. Ack is a board marker (mesh_ack), never a receipt, and a
   // digest task only settles when the worker declares it (mesh_complete).
   const digestInFlight = new Set()
+  // One pending idle trigger per session: a burst of dispatches must coalesce into one digest.
+  const digestIdleTimers = new Map()
 
-  async function maybeInjectDigest(sessionId) {
+  function scheduleIdleDigest(sessionId) {
+    if (c.digestDelivery !== 'on' || !sessionId) return
+    if (digestIdleTimers.has(sessionId)) return
+    const timer = setTimeout(() => {
+      digestIdleTimers.delete(sessionId)
+      void maybeInjectDigest(sessionId, { requireIdle: true })
+    }, c.digestIdleDebounceMs)
+    timer.unref?.()
+    digestIdleTimers.set(sessionId, timer)
+  }
+
+  function clearIdleDigestTimers() {
+    for (const timer of digestIdleTimers.values()) clearTimeout(timer)
+    digestIdleTimers.clear()
+  }
+
+  async function maybeInjectDigest(sessionId, { requireIdle = false } = {}) {
     if (c.digestDelivery !== 'on' || !sessionId) return null
     if (digestInFlight.has(sessionId)) return null
+    // From the idle trigger: never interrupt a running turn; its turn/end will call us.
+    if (requireIdle && liveness.get(sessionId)?.openTurn != null) return null
     // Never jump ahead of a queue-mode task that still waits for its own turn.
     const ahead = [...pendingTasks.values()].some(
       (task) => task.sessionId === sessionId && !task.settled && !task.declaredOnly && task.mode === 'queue',
@@ -5288,6 +5311,7 @@ export function apply(ctx, config) {
     if (lockSweepTimer) clearInterval(lockSweepTimer)
     lockSweepTimer = null
     settleHook.dispose()
+    clearIdleDigestTimers()
     state.pendingTasks = 0
   }
 
@@ -5545,7 +5569,9 @@ export function apply(ctx, config) {
     try {
       taskId = lifecycle.registerPendingTask(session, meta, deliveryMode, text)
       if (digestQueue) {
-        // T-459/T-460: board only — a digest after turn/end announces it; nothing is injected now.
+        // T-459/T-460/T-462: board only; an idle session is notified after the debounce, a
+        // busy one after its next turn/end. Nothing is injected right now.
+        scheduleIdleDigest(session.id)
       } else if (waitForLock) {
         lifecycle.deferForLock(taskId, { text: deliveredText, mode: deliveryMode, workspace: sessionLock.workspace })
       } else {
@@ -5556,9 +5582,14 @@ export function apply(ctx, config) {
       throw error
     }
     if (thread) threadFlow.bindThread(thread, session, taskId)
+    if (digestQueue) {
+      // Board only: nothing was delivered, so the line must not claim it was.
+      fileLog(`mesh_dispatch: ${text.length} chars digest-queued session=${session.id} task=${taskId} requester=${requester || '-'}${meta.batchId ? ` batch=${meta.batchId}` : ''}`)
+    } else {
     fileLog(
       `mesh_dispatch: ${text.length} chars (delivered ${deliveredText.length}) -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''}${thread ? ` thread=${thread}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession} header=${c.injectHeader}${explicitTarget ? ' explicit-target' : thread ? ' via-thread' : ''}`,
     )
+    }
     const effectiveWorkspacePath = createdWorkspacePath ?? sessionCwdOf(session.id) ?? null
     const warnings = [
       ...dispatchWarnings,
@@ -7292,7 +7323,8 @@ export function apply(ctx, config) {
               })
             : text
           if (c.digestDelivery === 'on' && mode === 'queue') {
-            // T-459: board only; the digest announces it after the next turn/end.
+            // T-459/T-462: board only; notify after the debounce (idle) or the next turn/end.
+            scheduleIdleDigest(target.id)
           } else if (injectWaitsForLock) {
             lifecycle.deferForLock(taskId, { text: deliveredText, mode, workspace: injectLock.workspace })
           } else {
@@ -7303,7 +7335,12 @@ export function apply(ctx, config) {
           throw error
         }
         if (thread) threadFlow.bindThread(thread, target, taskId)
+        if (c.digestDelivery === 'on' && mode === 'queue') {
+          // Board only: the digest (not this request) is what reaches the session.
+          fileLog(`digest-queued task=${taskId} session=${target.id} mode=${mode}`)
+        } else {
         fileLog(`injected ${text.length} chars (delivered ${deliveredText.length}) into local session ${target.id} (${target.title ?? 'no title'}) mode=${mode}${taskId ? ` task=${taskId}` : ''}${batchId ? ` batch=${batchId}` : ''}${thread ? ` thread=${thread}` : ''}${explicitTarget ? '' : ' via-thread'} header=${c.injectHeader}`)
+        }
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(
           JSON.stringify({

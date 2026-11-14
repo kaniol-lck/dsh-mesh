@@ -30,6 +30,7 @@
 - 未绑定 conversation 的跨机消息不再自动新建「Mesh 收件箱」会话并消费：消息保持 unread 等人工 `/mesh/bind`，已有绑定/面板绑定继续投递且不会被覆盖；投递失败保留绑定并延后，不再静默改投入收件箱。
 - 会话标题以 DSH 实际标题为准（`/mesh/sessions` 带 `titleSource`/`titleStale`）：索引标题过期时按标题投递会被拒绝并提示改用 session id，不再把消息投进改过名的会话。
 - 开启任务 digest 后 `steer`（插队）仍然立即注入正文：digest 只影响 `queue` 排队投递，steer 任务也不会被列进 digest 摘要。
+- 空闲会话不再漏收任务通知：开启 digest 后，任务落板会在 `digestIdleDebounceMs`（默认 3 秒）后触发一条 digest，不必等下一个回合；忙会话仍在 `turn/end` 后通知，日志把落板记为 `digest-queued` 而不是 `injected`。
 
 ## [0.8.0] - 2026-11-02
 

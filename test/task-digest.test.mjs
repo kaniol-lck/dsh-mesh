@@ -45,7 +45,7 @@ async function request(base, route, { method = 'GET', body } = {}) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /** Minimal host: one seeded session, prompt capture and session/event listeners. */
-async function startHarness({ digestDelivery = 'on', seedSessions = [{ id: 'session-digest', title: 'digest worker' }] } = {}) {
+async function startHarness({ digestDelivery = 'on', digestIdleDebounceMs = 5000, logFile = '', seedSessions = [{ id: 'session-digest', title: 'digest worker' }] } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-digest-'))
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
@@ -141,6 +141,8 @@ async function startHarness({ digestDelivery = 'on', seedSessions = [{ id: 'sess
     registerIntervalMs: 3600000,
     settleHookCommand: '',
     digestDelivery,
+    digestIdleDebounceMs,
+    ...(logFile ? { logFile } : {}),
   })
   const base = `http://127.0.0.1:${port}`
   const emit = (type, turn, extra = {}) => {
@@ -161,7 +163,7 @@ async function startHarness({ digestDelivery = 'on', seedSessions = [{ id: 'sess
     fs.rmSync(tmp, { recursive: true, force: true })
   }
   await sleep(50)
-  return { base, home, state, emit, tool, close, request }
+  return { base, home, logFile, state, emit, tool, close, request }
 }
 
 const dispatch = (h, args) => h.tool('mesh_dispatch').execute(args, { sessionId: 'session-digest' })
@@ -399,6 +401,84 @@ test('digest on: a steer task is never listed in a digest', async () => {
     const text = digest.content[0].text
     assert.match(text, /- T-dq-1 /)
     assert.doesNotMatch(text, /T-ds-1/)
+  } finally {
+    h.close()
+  }
+})
+
+test('digest idle: an idle session is notified after the debounce (T-462)', async () => {
+  const h = await startHarness({ digestDelivery: 'on', digestIdleDebounceMs: 500 })
+  try {
+    await dispatch(h, { target: 'digest worker', text: 'idle task', taskId: 'T-idle-1' })
+    assert.equal(h.state.prompts.length, 0)
+    await sleep(900)
+    assert.equal(h.state.prompts.length, 1)
+    assert.match(h.state.prompts[0].content[0].text, /\[TASK-DIGEST\]/)
+    const row = await h.request(h.base, '/mesh/tasks/T-idle-1')
+    assert.equal(row.json?.task?.notifyCount, 1)
+    assert.ok(Number(row.json?.task?.notifiedAt) > 0)
+  } finally {
+    h.close()
+  }
+})
+
+test('digest idle: a burst inside the window coalesces into one digest', async () => {
+  const h = await startHarness({ digestDelivery: 'on', digestIdleDebounceMs: 500 })
+  try {
+    await dispatch(h, { target: 'digest worker', text: 'one', taskId: 'T-burst-1' })
+    await dispatch(h, { target: 'digest worker', text: 'two', taskId: 'T-burst-2' })
+    await dispatch(h, { target: 'digest worker', text: 'three', taskId: 'T-burst-3' })
+    await sleep(900)
+    assert.equal(h.state.prompts.length, 1)
+    const text = h.state.prompts[0].content[0].text
+    assert.match(text, /3 条待办/)
+    for (const id of ['T-burst-1', 'T-burst-2', 'T-burst-3']) assert.match(text, new RegExp(`- ${id} `))
+  } finally {
+    h.close()
+  }
+})
+
+test('digest idle: a busy session waits for turn/end instead of being interrupted', async () => {
+  const h = await startHarness({ digestDelivery: 'on', digestIdleDebounceMs: 500 })
+  try {
+    h.emit('turn/start', 1)
+    await dispatch(h, { target: 'digest worker', text: 'while busy', taskId: 'T-busy-1' })
+    await sleep(900)
+    assert.equal(h.state.prompts.length, 0, 'the idle trigger must not interrupt a running turn')
+    h.emit('turn/end', 1, { reason: { kind: 'completed' } })
+    await sleep(100)
+    assert.equal(h.state.prompts.length, 1)
+    assert.match(h.state.prompts[0].content[0].text, /T-busy-1/)
+  } finally {
+    h.close()
+  }
+})
+
+test('digest idle: dispose clears pending idle timers', async () => {
+  const h = await startHarness({ digestDelivery: 'on', digestIdleDebounceMs: 500 })
+  await dispatch(h, { target: 'digest worker', text: 'no timer after close', taskId: 'T-dispose-1' })
+  h.close()
+  await sleep(900)
+  assert.equal(h.state.prompts.length, 0)
+})
+
+test('digest logs a board-only dispatch as digest-queued, never as injected', async () => {
+  const logFile = path.join(os.tmpdir(), `waker-digest-log-${process.pid}-${Date.now()}.log`)
+  const h = await startHarness({ digestDelivery: 'on', digestIdleDebounceMs: 500, logFile })
+  try {
+    const dispatched = await dispatch(h, { target: 'digest worker', text: 'tool queue', taskId: 'T-log-1' })
+    assert.equal(dispatched.digestQueued, true)
+    const injected = await h.request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { session: 'session-digest', text: 'http queue', meta: { taskId: 'T-log-2' } },
+    })
+    assert.equal(injected.status, 200)
+    await sleep(900)
+    const log = fs.readFileSync(logFile, 'utf8')
+    assert.match(log, /mesh_dispatch: .*digest-queued session=session-digest task=T-log-1/)
+    assert.match(log, /digest-queued task=T-log-2 session=session-digest mode=queue/)
+    assert.doesNotMatch(log, /injected .*T-log-2/)
+    assert.equal(h.state.prompts.length, 1, 'one digest should cover both board-only tasks')
   } finally {
     h.close()
   }
