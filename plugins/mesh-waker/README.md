@@ -188,6 +188,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `digestDelivery` | `'off'` | `'off'`（默认）= 派单直接注入正文，行为与之前逐字一致；`'on'` = **仅 `queue` 投递**改走任务板：回合结束后注入**一条** `[TASK-DIGEST]` 摘要（只列 taskId + 标题，不塞正文），窗口内合并、`notifyCount<2`、重提醒退避 10/30 分钟；digest 任务**只能 `mesh_complete` 结算**（不做 observed 结算）。**`steer` 等其它模式不受影响，仍然立即注入正文**。签收用 `mesh_ack`：只是板标记，不产生回执、不代表完成 |
 | `digestIdleDebounceMs` | `3000` | 空闲会话的 digest 触发防抖（clamp 500–60000ms）：任务落板后起一个 unref 定时器，到点若该会话 `openTurn == null` 就注入 digest（多条合并成一条），忙则等 `turn/end`；同会话只留一个定时器，dispose 时清空 |
 | `receiptDigest` | `'off'` | `'on'` = **回执不再逐条排队**（owner 2026-11-14 要的能力）：`receiptMode='queue'` 的回执照旧写 `receipts.jsonl`，但注入改成 `turn/end` 或空闲（沿用 `digestIdleDebounceMs`）后合并成一条 `[RECEIPT-DIGEST]`；同一 requester 退避 10/30 分钟、最多 2 次，`mesh_ack({ids})` 签收后不再提醒（板标记，不产生新回执）。`file`/`wake` 语义不变，默认 `'off'` |
+| `roleInstructions` | `{}` | B 档角色注入：`{ "<role>": "<文件路径或文本>" }`（role ∈ `waker\|docs\|hub\|ops`）。目标会话标题匹配 `^(.+?) · (role)$` 时，在注入文本**末尾**追加 `## 角色卡（自动注入 · <role>）` + 内容；值为路径时相对**目标会话 cwd** 解析（读不到只记 `role-card missing` 日志，不报错、不阻断）。默认空对象 = 零行为变化 |
 | `maxCoordinatorsPerWorkspace` | `3` | 同一工作区允许同时在线的协调数量上限（1–20）；超过后 claim 返回 409 + 现有列表 |
 | `coordinatorLeaseMs` | `600000` | 协调租约（毫秒，60000–3600000）；执行期间按 `/mesh/coordinator/heartbeat` 续期，过期转 stale |
 | `coordinatorPendingTtlMs` | `1800000` | 待批准认领的存活时间（毫秒，60000–86400000），过期自动失效 |
@@ -259,6 +260,20 @@ curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/heartbeat -d '{"session"
 - **空工作区 bootstrap**：配置了 `coordinatorOwnerTokenFile` 时必须带 `ownerToken`；未配置时首任自动批准并标记 `approvedBy:"bootstrap"` + 写 WARN 日志（**v0 限制**，后续接 owner 审批）；
 - 待批准项 30 分钟 TTL（`coordinatorPendingTtlMs`）；租约过期转 `stale` 并可再次认领；primary 失效时按 `claimedAt` 最早顺位；
 - 身份端点据此回答：`isPrimaryRouter` = 在 **approved** 的 `coordinators[]` 中（旧名 `isCoordinator`）；`routingRole` 为 `primary`（approved 且 `isPrimary`）、`member`（approved 非 primary）或 `none`；另返回 `coordinatorStatus`、`isPrimary`、`primaryRouterSessionId`（旧名 `coordinatorSessionId`）。
+
+### 角色卡自动注入（B 档，未发布）
+
+派活正文首行的「角色卡：先读 `.worklog/roles/<role>.md`」靠人写，漏写就失效。配置 `roleInstructions` 后，waker 在 `/mesh/inject`、`mesh_dispatch` 与 `/mesh/sessions/create` 构建 prompt 时，按**目标会话标题** `^(.+?) · (waker|docs|hub|ops)$` 解析 role，并把对应角色卡**追加到末尾**：
+
+```text
+…原任务正文…
+
+## 角色卡（自动注入 · docs）
+<.worklog/roles/docs.md 的内容>
+```
+
+- 值为路径时相对**目标会话 cwd** 解析（worker 的 cwd 就是仓库，`.worklog/roles/docs.md` 直接命中）；读不到记 `role-card missing role=… path=…`，**不报错、不阻断投递**。
+- 成功记 `role-card injected role=… session=… chars=…`；未配置、标题不匹配或内容为空时 prompt **逐字不变**（默认 `{}` 零行为变化）。
 
 ## 信任与权限
 

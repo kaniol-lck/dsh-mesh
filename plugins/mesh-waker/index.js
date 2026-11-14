@@ -19,7 +19,7 @@
 import { createServer } from 'node:http'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir, networkInterfaces, homedir, hostname } from 'node:os'
-import { join, dirname, resolve, basename } from 'node:path'
+import { join, dirname, resolve, basename, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { getCACertificates, setDefaultCACertificates } from 'node:tls'
@@ -638,6 +638,16 @@ function normalizeBase(config) {
     // Receipt digest (T-467): queue-mode receipts are merged into one notice instead of one
     // turn each. Off by default; file/wake delivery keeps its existing behaviour.
     receiptDigest: String(c.receiptDigest) === 'on' ? 'on' : 'off',
+    // B-tier role injection (T-469): role -> file path (relative to the target cwd) or
+    // inline text. Empty by default, so an unconfigured install appends nothing.
+    roleInstructions:
+      c.roleInstructions && typeof c.roleInstructions === 'object' && !Array.isArray(c.roleInstructions)
+        ? Object.fromEntries(
+            Object.entries(c.roleInstructions)
+              .filter(([, value]) => typeof value === 'string' && value.trim())
+              .slice(0, 20),
+          )
+        : {},
     // Multi-coordinator claim protocol (T-395): bounded online coordinators, a lease per
     // member, and a pending TTL. The owner token file (when configured) is required for the
     // first claim in an empty workspace and for approve/reject/release by the owner.
@@ -2550,6 +2560,43 @@ export function apply(ctx, config) {
       return `[身份] sessionId=${sessionId} workspace=unknown routingRole=none isPrimaryRouter=false primaryRouterSessionId=none（${identity.reason}；调 GET /mesh/session/identity?session=${sessionId} 复核）`
     }
     return `[身份] sessionId=${identity.sessionId} workspace=${identity.workspace} routingRole=${identity.routingRole} isPrimaryRouter=${identity.isPrimaryRouter} primaryRouterSessionId=${identity.primaryRouterSessionId ?? 'none'}`
+  }
+
+  // ---------------------------------------------------------------- role card (T-469)
+  //
+  // A target session titled `<project> · <role>` gets `.worklog/roles/<role>.md` appended to
+  // the injected task text. The config is empty by default: no role, no config, or a missing
+  // file all leave the prompt byte-for-byte unchanged.
+  const ROLE_TITLE_RE = /^(.+?)\s*·\s*(waker|docs|hub|ops)$/
+
+  function roleFromTitle(title) {
+    const match = ROLE_TITLE_RE.exec(String(title ?? '').trim())
+    return match ? match[2] : null
+  }
+
+  function roleCardText(session) {
+    const role = roleFromTitle(session?.title)
+    if (!role) return ''
+    const configured = c.roleInstructions?.[role]
+    if (typeof configured !== 'string' || !configured.trim()) return ''
+    const source = configured.trim()
+    // A path-looking value is resolved against the target session cwd; anything else is
+    // inline text (short instructions keep the config self-contained).
+    let content = source
+    if (/[\\/]/.test(source) || /\.md$/i.test(source)) {
+      const cwd = session?.cwd ?? sessionCwdOf(session?.id) ?? null
+      const full = isAbsolute(source) ? source : cwd ? join(cwd, source) : null
+      try {
+        if (!full) throw new Error('no cwd to resolve against')
+        content = readFileSync(full, 'utf8')
+      } catch {
+        fileLog(`role-card missing role=${role} path=${full ?? source}`)
+        return ''
+      }
+    }
+    if (!content.trim()) return ''
+    fileLog(`role-card injected role=${role} session=${session?.id ?? '-'} chars=${content.length}`)
+    return `\n\n## 角色卡（自动注入 · ${role}）\n${content.trimEnd()}\n`
   }
 
   async function promptWithResume(sid, content, mode = 'queue') {
@@ -5641,7 +5688,7 @@ export function apply(ctx, config) {
       } else if (waitForLock) {
         lifecycle.deferForLock(taskId, { text: deliveredText, mode: deliveryMode, workspace: sessionLock.workspace })
       } else {
-        await promptWithResume(session.id, deliveredText, deliveryMode)
+        await promptWithResume(session.id, deliveredText + roleCardText(session), deliveryMode)
       }
     } catch (error) {
       if (taskId) lifecycle.cancelPendingTask(taskId)
@@ -7297,7 +7344,11 @@ export function apply(ctx, config) {
         const prompt = String(draft.prompt ?? '').trim()
         let prompted = false
         if (prompt) {
-          await promptWithResume(sessionId, prompt, draft.mode === 'steer' ? 'steer' : 'queue')
+          await promptWithResume(
+            sessionId,
+            prompt + roleCardText({ id: sessionId, title, cwd: workspacePath ?? null }),
+            draft.mode === 'steer' ? 'steer' : 'queue',
+          )
           prompted = true
         }
         fileLog(`created local session ${sessionId} title="${title}" workspacePath=${workspacePath ?? '(default)'} prompted=${prompted}`)
@@ -7394,7 +7445,7 @@ export function apply(ctx, config) {
           } else if (injectWaitsForLock) {
             lifecycle.deferForLock(taskId, { text: deliveredText, mode, workspace: injectLock.workspace })
           } else {
-            await promptWithResume(target.id, deliveredText, mode)
+            await promptWithResume(target.id, deliveredText + roleCardText(target), mode)
           }
         } catch (error) {
           if (taskId) lifecycle.cancelPendingTask(taskId)

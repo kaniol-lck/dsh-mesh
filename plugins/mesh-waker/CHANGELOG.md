@@ -20,6 +20,7 @@
 - 可选的「任务 digest + 签收」：开启 `digestDelivery` 后，派单只上任务板，回合结束后注入一条 `[TASK-DIGEST]` 摘要；`mesh_tasks` 查正文、`mesh_ack` 批量签收（板标记，不产生回执、不代表完成）。默认关闭。
 - 可选的「回执 digest」：开启 `receiptDigest` 后，任务回执不再逐条排队注入——会话空闲或回合结束后收到一条 `[RECEIPT-DIGEST]` 合并通知，`mesh_tasks` 可列未签收回执，`mesh_ack` 签收后不再提醒。默认关闭。
 - 身份自查改用「primary 路由位」的说法：`GET /mesh/session/identity` 新增 `routingRole` / `isPrimaryRouter` / `primaryRouterSessionId`，注入的身份头同样用新名；`isCoordinator` / `coordinatorSessionId` 保留为弃用别名（下个主题版本移除）。
+- 按目标会话标题自动附角色卡（`roleInstructions`）：配好后派活与新建会话会把 `.worklog/roles/<role>.md` 追加到注入文本末尾，不必再靠派活正文手写；默认关闭，不配置时行为不变。
 
 ### Fixed
 

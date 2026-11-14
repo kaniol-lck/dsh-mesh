@@ -7560,6 +7560,115 @@ async function main() {
     report('identity: a created session gets the identity line on its first prompt only', ok, `first=${/\[身份\]/.test(firstText)} second=${/\[身份\]/.test(secondText)} prompts=${all.length} snippet=${firstText.slice(0, 220)}`)
   })
 
+  // ---- T-469: B-tier role injection (role card appended by target title) ----
+
+  const roleCwd = (slug) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `waker-role-${slug}-`))
+    fs.mkdirSync(path.join(cwd, '.worklog', 'roles'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, '.worklog', 'roles', 'docs.md'), '# docs role\n\n只改 docs 范围。\n')
+    return cwd
+  }
+
+  await runCase('role card: a configured role file is appended to the injected task', async (boot) => {
+    const cwd = roleCwd('inject')
+    const logFile = path.join(os.tmpdir(), `waker-role-inject-${process.pid}-${Date.now()}.log`)
+    try {
+      const h = await boot({
+        config: { roleInstructions: { docs: '.worklog/roles/docs.md' }, logFile },
+        seedSessions: [{ id: 'session-role-docs', title: 'mesh · docs', cwd }],
+      })
+      const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-role-docs', text: 'do the thing' } })
+      const text = JSON.stringify(h.state.prompts[0]?.content ?? '')
+      const log = fs.readFileSync(logFile, 'utf8')
+      const ok =
+        res.status === 200 &&
+        /do the thing/.test(text) &&
+        text.includes('## 角色卡（自动注入 · docs）') &&
+        text.includes('只改 docs 范围。') &&
+        /role-card injected role=docs/.test(log)
+      report(
+        'role card: a configured role file is appended to the injected task',
+        ok,
+        `status=${res.status} card=${/角色卡/.test(text)} injectedLog=${/role-card injected/.test(log)}`,
+      )
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('role card: without configuration the prompt is byte-for-byte unchanged', async (boot) => {
+    const h = await boot({
+      config: { injectHeader: false },
+      seedSessions: [{ id: 'session-role-plain', title: 'mesh · docs', cwd: roleCwd('plain') }],
+    })
+    const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-role-plain', text: 'exact body' } })
+    const text = h.state.prompts[0]?.content?.[0]?.text ?? ''
+    const ok = res.status === 200 && text === 'exact body'
+    report('role card: without configuration the prompt is byte-for-byte unchanged', ok, `status=${res.status} text=${JSON.stringify(text).slice(0, 80)}`)
+  })
+
+  await runCase('role card: a missing file is logged and never fails the injection', async (boot) => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-role-missing-'))
+    const logFile = path.join(os.tmpdir(), `waker-role-missing-${process.pid}-${Date.now()}.log`)
+    try {
+      const h = await boot({
+        config: { roleInstructions: { docs: '.worklog/roles/docs.md' }, logFile, injectHeader: false },
+        seedSessions: [{ id: 'session-role-missing', title: 'mesh · docs', cwd }],
+      })
+      const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-role-missing', text: 'still delivered' } })
+      const text = h.state.prompts[0]?.content?.[0]?.text ?? ''
+      const log = fs.readFileSync(logFile, 'utf8')
+      const ok =
+        res.status === 200 &&
+        text === 'still delivered' &&
+        /role-card missing role=docs path=/.test(log) &&
+        !/角色卡（自动注入/.test(text)
+      report('role card: a missing file is logged and never fails the injection', ok, `status=${res.status} missingLog=${/role-card missing/.test(log)}`)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('role card: a non-role title gets no injection', async (boot) => {
+    const cwd = roleCwd('nonrole')
+    try {
+      const h = await boot({
+        config: { roleInstructions: { docs: '.worklog/roles/docs.md' } },
+        seedSessions: [{ id: 'session-role-none', title: 'plain session', cwd }],
+      })
+      const res = await request(h.base, '/mesh/inject', { method: 'POST', body: { session: 'session-role-none', text: 'no card here' } })
+      const text = h.state.prompts[0]?.content?.[0]?.text ?? ''
+      const ok = res.status === 200 && !/角色卡（自动注入/.test(text)
+      report('role card: a non-role title gets no injection', ok, `status=${res.status} card=${/角色卡/.test(text)}`)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('role card: a created session is greeted with its role card', async (boot) => {
+    const cwd = roleCwd('create')
+    try {
+      const h = await boot({
+        config: { roleInstructions: { docs: '.worklog/roles/docs.md' } },
+        seedSessions: [],
+      })
+      const created = await request(h.base, '/mesh/sessions/create', {
+        method: 'POST',
+        body: { title: 'mesh · docs', prompt: 'start work', workspacePath: cwd },
+      })
+      const prompt = h.state.prompts.find((entry) => entry.sessionId === created.json?.sessionId)
+      const text = JSON.stringify(prompt?.content ?? '')
+      const ok =
+        created.status === 201 &&
+        /start work/.test(text) &&
+        text.includes('## 角色卡（自动注入 · docs）') &&
+        text.includes('只改 docs 范围。')
+      report('role card: a created session is greeted with its role card', ok, `status=${created.status} card=${/角色卡/.test(text)}`)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
   // ---- T-395: multi-coordinator claim protocol ----
   const coordPost = (base, action, body) => request(base, `/mesh/coordinator/${action}`, { method: 'POST', body })
   const coordWorkspace = (id) => path.join(os.tmpdir(), 'Projects', `coord-${id}`, 'public')
