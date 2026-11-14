@@ -145,6 +145,18 @@ export function createReceiptFlow(deps) {
       }
       return
     }
+    const digestTarget = task?.requesterSessionId ? String(task.requesterSessionId) : ''
+    // T-467: queue-mode receipts are merged into one notice when receiptDigest is on. file and
+    // wake keep their existing semantics (wake still steers immediately).
+    if (deps.receiptDigest?.enabled && receipt.receiptMode === 'queue' && digestTarget) {
+      try {
+        deps.receiptDigest.enqueue(receipt, task, digestTarget)
+        deps.fileLog(`receipt ${receipt.taskId} ${receipt.status} → receipt-digest queued for ${digestTarget}`)
+        return
+      } catch (error) {
+        deps.fileLog(`receipt-digest enqueue failed for ${receipt.taskId}: ${error.message}; delivering normally`)
+      }
+    }
     const deliveredTo = await deliverNotice(
       receipt.receiptMode,
       deps.receiptBody(receipt),

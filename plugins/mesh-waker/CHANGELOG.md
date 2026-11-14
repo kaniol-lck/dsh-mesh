@@ -18,6 +18,7 @@
 - 工作区 advisory 锁（`POST /mesh/workspace/lock`、`/unlock`、`mesh_lock`）：持锁期间向该 workspace 的派活以 `waiting-lock` 排队，锁释放或 TTL 过期后自动投递；锁被他人持有时返回 409；锁只在进程内，重启即清空。不建 worktree、不切分支、不阻止读操作。
 - 可选的「收单钩子」：配置 `settleHookCommand` 后，任务结算会触发一次本地脚本（`--settle-tasks <ids>`，窗口内合并、可配超时、不阻塞结算）；默认关闭，不配置时行为与之前一致。
 - 可选的「任务 digest + 签收」：开启 `digestDelivery` 后，派单只上任务板，回合结束后注入一条 `[TASK-DIGEST]` 摘要；`mesh_tasks` 查正文、`mesh_ack` 批量签收（板标记，不产生回执、不代表完成）。默认关闭。
+- 可选的「回执 digest」：开启 `receiptDigest` 后，任务回执不再逐条排队注入——会话空闲或回合结束后收到一条 `[RECEIPT-DIGEST]` 合并通知，`mesh_tasks` 可列未签收回执，`mesh_ack` 签收后不再提醒。默认关闭。
 
 ### Fixed
 

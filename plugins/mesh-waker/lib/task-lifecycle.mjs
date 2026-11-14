@@ -174,6 +174,9 @@ export function createTaskLifecycle(deps) {
     deps.taskRegistry.updateTaskRow(taskId, {
       status: receipt.status === 'not-started' ? 'stalled' : 'settled',
       settledAt: receipt.endedAt,
+      // The receipt's own status (completed/error/lost/…), kept separate from the registry
+      // status so a receipt digest can name it (T-467).
+      receiptStatus: receipt.status,
       durationMs: Math.max(0, receipt.endedAt - registryStartedAt),
       receiptRef: deps.config.receiptFile,
       receiptSummary: Array.from(receipt.summary ?? '').slice(0, 500).join(''),

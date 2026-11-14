@@ -216,6 +216,11 @@ export function createTaskRegistry(deps) {
       ackedAt: row.ackedAt ?? null,
       ackBy: row.ackBy ?? null,
       ...(row.declaredOnly === true ? { declaredOnly: true } : {}),
+      // Receipt digest (T-467): which requester the merged notice goes to, and when it was sent.
+      receiptStatus: row.receiptStatus ?? null,
+      receiptDigestSessionId: row.receiptDigestSessionId ?? null,
+      receiptNotifiedAt: row.receiptNotifiedAt ?? null,
+      receiptNotifyCount: Number(row.receiptNotifyCount) || 0,
     }
     if (!withText) return base
     return { ...base, text: resolveTaskText(row, deps.taskTextsDir) }

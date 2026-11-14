@@ -223,6 +223,10 @@ export const THREAD_OUTPUT = {
             // predate a field: the host rejects null under `type: string` (T-413).
             targetSessionId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
             targetTitle: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            settledAt: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+            receiptStatus: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            receiptNotifiedAt: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+            receiptNotifyCount: { type: 'number' },
             count: { type: 'number' },
             lastTaskId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
             updatedAt: { oneOf: [{ type: 'number' }, { type: 'null' }] },
@@ -336,14 +340,14 @@ export const LOCK_OUTPUT = {
 export const MESH_TASKS_TOOL = {
   name: 'mesh_tasks',
   description:
-    'List tasks dispatched to this session (or an explicit session). status=unacked (default) lists tasks that are unacked and unsettled, so it is the board a digest points at; status=all lists every task of the session. include=text adds each task body, and a body whose file is gone comes back with textMissing:true instead of failing. count is the number of returned rows and unackedCount is how many of those rows are unacked — both computed from the same list.',
+    'List tasks dispatched to this session (or an explicit session). status=unacked (default) lists tasks that are unacked and not closed, so it is the board a digest points at: open tasks plus settled tasks whose receipt is still unacked (receiptDigest); status=all lists every task of the session. include=text adds each task body, and a body whose file is gone comes back with textMissing:true instead of failing. count is the number of returned rows and unackedCount is how many of those rows are unacked — both computed from the same list.',
   parameters: {
     session: { type: 'string', description: 'Session id to inspect (coordinator use); defaults to the calling session.' },
     include: { type: 'string', enum: ['meta', 'text'], description: 'meta (default) = ids/titles; text also returns each task body.' },
     status: {
       type: 'string',
       enum: ['unacked', 'all'],
-      description: 'unacked (default) = ackedAt empty and not settled; all = every task of the session.',
+      description: 'unacked (default) = ackedAt empty and (not settled, or settled with an unacked receipt digest); all = every task of the session.',
     },
     limit: { type: 'number', description: 'Maximum rows (1–100, default 20).' },
   },
@@ -375,6 +379,10 @@ export const TASKS_OUTPUT = {
             notifyCount: { type: 'number' },
             createdAt: { oneOf: [{ type: 'number' }, { type: 'null' }] },
             targetTitle: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            settledAt: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+            receiptStatus: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            receiptNotifiedAt: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+            receiptNotifyCount: { type: 'number' },
             text: { type: 'string' },
             textMissing: { type: 'boolean' },
           },

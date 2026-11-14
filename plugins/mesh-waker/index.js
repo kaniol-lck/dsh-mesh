@@ -43,6 +43,7 @@ import { createWorkspaceLocks } from './lib/workspace-locks.mjs'
 import { createDshTitleReader, applyDshTitles } from './lib/session-titles.mjs'
 import { createSettleHook } from './lib/settle-hook.mjs'
 import { digestCandidates, buildDigestText } from './lib/task-digest.mjs'
+import { buildReceiptDigestText, receiptDigestCandidates } from './lib/receipt-digest.mjs'
 import { normalizeCoordinators, coordinatorsView, expireCoordinators, syncPrimary, primaryOf, isOwnerTokenValid, recordAudit } from './lib/coordinators.mjs'
 
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
@@ -634,6 +635,9 @@ function normalizeBase(config) {
     // An idle session never emits turn/end, so a digest would never fire: the registration
     // path also schedules one after this debounce (T-462).
     digestIdleDebounceMs: clampInterval(c.digestIdleDebounceMs, 3000, 500, 60_000),
+    // Receipt digest (T-467): queue-mode receipts are merged into one notice instead of one
+    // turn each. Off by default; file/wake delivery keeps its existing behaviour.
+    receiptDigest: String(c.receiptDigest) === 'on' ? 'on' : 'off',
     // Multi-coordinator claim protocol (T-395): bounded online coordinators, a lease per
     // member, and a pending TTL. The owner token file (when configured) is required for the
     // first claim in an empty workspace and for approve/reject/release by the owner.
@@ -2145,8 +2149,13 @@ export function apply(ctx, config) {
     const status = args.status === 'all' ? 'all' : 'unacked'
     const limit = Math.min(100, Math.max(1, Number(args.limit) || 20))
     const rows = [...taskRows.values()]
-      .filter((row) => row.targetSessionId === sessionId)
-      .filter((row) => (status === 'all' ? true : !row.ackedAt && !row.settledAt))
+      .filter((row) => row.targetSessionId === sessionId || row.receiptDigestSessionId === sessionId)
+      .filter((row) => {
+        if (status === 'all') return true
+        if (row.ackedAt) return false
+        // Unacked = an open task, or a settled task whose receipt is still unacked (T-467).
+        return !row.settledAt || row.receiptDigestSessionId === sessionId
+      })
       .sort((left, right) => Number(left.createdAt ?? 0) - Number(right.createdAt ?? 0))
       .slice(0, limit)
       .map((row) => {
@@ -2161,6 +2170,12 @@ export function apply(ctx, config) {
           notifyCount: Number(row.notifyCount) || 0,
           createdAt: row.createdAt ?? null,
           targetTitle: row.targetTitle ?? null,
+          settledAt: row.settledAt ?? null,
+          // Receipt side of a settled row (T-467): the task status is "settled"; this is
+          // what the receipt said.
+          receiptStatus: row.settledAt ? (row.receiptStatus ?? row.reasonKind ?? null) : null,
+          receiptNotifiedAt: row.receiptNotifiedAt ?? null,
+          receiptNotifyCount: Number(row.receiptNotifyCount) || 0,
         }
         if (include !== 'text') return base
         const body = readTaskBody(row)
@@ -2189,11 +2204,16 @@ export function apply(ctx, config) {
         skipped.push({ id, reason: 'already-acked' })
         continue
       }
-      if (row.settledAt) {
+      // A settled task is normally closed, but a settled row with a pending receipt digest is
+      // exactly what its requester must be able to acknowledge (T-467).
+      if (row.settledAt && !row.receiptDigestSessionId) {
         skipped.push({ id, reason: 'settled' })
         continue
       }
-      if (!force && row.targetSessionId !== by) {
+      // A receipt belongs to the session that must review it (T-467), so owning the target OR
+      // the receipt-digest destination is enough.
+      const mine = row.targetSessionId === by || row.receiptDigestSessionId === by
+      if (!force && !mine) {
         skipped.push({ id, reason: 'not-mine' })
         continue
       }
@@ -4669,6 +4689,14 @@ export function apply(ctx, config) {
     resolveLocalSession,
     // 真正投递（queue / steer）
     promptWithResume,
+    // T-467: queue-mode receipts can be merged into one notice instead of one turn each.
+    receiptDigest: {
+      enabled: c.receiptDigest === 'on',
+      enqueue(receipt, task, sessionId) {
+        taskRegistry.updateTaskRow(receipt.taskId, { receiptDigestSessionId: sessionId })
+        scheduleIdleDigest(sessionId)
+      },
+    },
     // 回执渲染成通知文本
     receiptBody,
     // 回执落盘
@@ -4712,15 +4740,17 @@ export function apply(ctx, config) {
   // notice lists the unacked tasks. Ack is a board marker (mesh_ack), never a receipt, and a
   // digest task only settles when the worker declares it (mesh_complete).
   const digestInFlight = new Set()
+  const receiptDigestInFlight = new Set()
   // One pending idle trigger per session: a burst of dispatches must coalesce into one digest.
   const digestIdleTimers = new Map()
 
   function scheduleIdleDigest(sessionId) {
-    if (c.digestDelivery !== 'on' || !sessionId) return
+    if ((c.digestDelivery !== 'on' && c.receiptDigest !== 'on') || !sessionId) return
     if (digestIdleTimers.has(sessionId)) return
     const timer = setTimeout(() => {
       digestIdleTimers.delete(sessionId)
       void maybeInjectDigest(sessionId, { requireIdle: true })
+      void maybeInjectReceiptDigest(sessionId, { requireIdle: true })
     }, c.digestIdleDebounceMs)
     timer.unref?.()
     digestIdleTimers.set(sessionId, timer)
@@ -4761,6 +4791,31 @@ export function apply(ctx, config) {
     fileLog(
       `digest session=${sessionId} tasks=${rows.length} ids=${rows.map((row) => row.taskId).join(',')} notifyCount=${(Number(rows[0].notifyCount) || 0) + 1}`,
     )
+    return { count: rows.length, ids: rows.map((row) => row.taskId) }
+  }
+
+  async function maybeInjectReceiptDigest(sessionId, { requireIdle = false } = {}) {
+    if (c.receiptDigest !== 'on' || !sessionId) return null
+    if (receiptDigestInFlight.has(sessionId)) return null
+    if (requireIdle && liveness.get(sessionId)?.openTurn != null) return null
+    const now = Date.now()
+    const rows = receiptDigestCandidates([...taskRows.values()], { sessionId, now })
+    if (!rows.length) return null
+    const text = buildReceiptDigestText(rows)
+    try {
+      await promptWithResume(sessionId, text, 'queue')
+    } catch (error) {
+      fileLog(`receipt-digest injection failed session=${sessionId}: ${error?.message ?? error}`)
+      return null
+    }
+    for (const row of rows) {
+      taskRegistry.updateTaskRow(row.taskId, {
+        receiptNotifiedAt: Number(row.receiptNotifiedAt) || now,
+        receiptNotifyCount: (Number(row.receiptNotifyCount) || 0) + 1,
+      })
+    }
+    receiptDigestInFlight.add(sessionId)
+    fileLog(`receipt-digest session=${sessionId} tasks=${rows.length} ids=${rows.map((row) => row.taskId).join(',')}`)
     return { count: rows.length, ids: rows.map((row) => row.taskId) }
   }
 
@@ -5324,9 +5379,15 @@ export function apply(ctx, config) {
         const eventSessionId = typeof session === 'string' ? session : session?.id ?? session?.sessionId
         const type = String(event?.data?.type ?? event?.type ?? '')
         // A digest prompt becomes the next turn: clear the in-flight marker when it starts.
-        if (type === 'turn/start' && eventSessionId) digestInFlight.delete(eventSessionId)
+        if (type === 'turn/start' && eventSessionId) {
+          digestInFlight.delete(eventSessionId)
+          receiptDigestInFlight.delete(eventSessionId)
+        }
         lifecycle.handleSessionEvent(session, event)
-        if (type === 'turn/end' && eventSessionId) void maybeInjectDigest(eventSessionId)
+        if (type === 'turn/end' && eventSessionId) {
+          void maybeInjectDigest(eventSessionId)
+          void maybeInjectReceiptDigest(eventSessionId)
+        }
       })
       return typeof off === 'function' ? off : undefined
     })

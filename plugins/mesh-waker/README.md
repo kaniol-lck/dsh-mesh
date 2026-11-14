@@ -187,6 +187,7 @@ dsh plugin --profile web add dsh-mesh-waker
 | `settleHookDebounceMs` | `300000` | 合并窗口（0–600000ms）：窗口内多次结算只跑一次，`--settle-tasks` 带去重后的逗号分隔 id；`0` 表示尽快跑 |
 | `digestDelivery` | `'off'` | `'off'`（默认）= 派单直接注入正文，行为与之前逐字一致；`'on'` = **仅 `queue` 投递**改走任务板：回合结束后注入**一条** `[TASK-DIGEST]` 摘要（只列 taskId + 标题，不塞正文），窗口内合并、`notifyCount<2`、重提醒退避 10/30 分钟；digest 任务**只能 `mesh_complete` 结算**（不做 observed 结算）。**`steer` 等其它模式不受影响，仍然立即注入正文**。签收用 `mesh_ack`：只是板标记，不产生回执、不代表完成 |
 | `digestIdleDebounceMs` | `3000` | 空闲会话的 digest 触发防抖（clamp 500–60000ms）：任务落板后起一个 unref 定时器，到点若该会话 `openTurn == null` 就注入 digest（多条合并成一条），忙则等 `turn/end`；同会话只留一个定时器，dispose 时清空 |
+| `receiptDigest` | `'off'` | `'on'` = **回执不再逐条排队**（owner 2026-11-14 要的能力）：`receiptMode='queue'` 的回执照旧写 `receipts.jsonl`，但注入改成 `turn/end` 或空闲（沿用 `digestIdleDebounceMs`）后合并成一条 `[RECEIPT-DIGEST]`；同一 requester 退避 10/30 分钟、最多 2 次，`mesh_ack({ids})` 签收后不再提醒（板标记，不产生新回执）。`file`/`wake` 语义不变，默认 `'off'` |
 | `maxCoordinatorsPerWorkspace` | `3` | 同一工作区允许同时在线的协调数量上限（1–20）；超过后 claim 返回 409 + 现有列表 |
 | `coordinatorLeaseMs` | `600000` | 协调租约（毫秒，60000–3600000）；执行期间按 `/mesh/coordinator/heartbeat` 续期，过期转 stale |
 | `coordinatorPendingTtlMs` | `1800000` | 待批准认领的存活时间（毫秒，60000–86400000），过期自动失效 |
@@ -338,6 +339,7 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 | `GET /mesh/workspace/lock?workspace=` | 当前锁（无锁 `lock:null`）；`GET /mesh/workspaces` 每条也带 `lock` |
 | `mesh_lock`（工具） | `{action:"acquire"\|"release"\|"status", workspace?, ttlMs?, reason?}`；`ownerSessionId` 取调用会话（拿不到报错不猜），`workspace` 省略时按调用会话 cwd 解析，解析不到列出候选 |
 | `mesh_tasks`（工具） | `{session?, include?:'meta'\|'text', status?:'unacked'\|'all', limit?}`：列发给调用方会话（或显式 `session`）的任务；默认只列 `ackedAt` 为空且未 settled 的；`include:'text'` 带正文，正文文件缺失时该条 `textMissing:true` 不报错；输出 `count` / `unackedCount` 与列表同源 |
+| `mesh_tasks`（工具） | `{session?, include?:'meta'\|'text', status?:'unacked'\|'all', limit?}`：列发给调用方会话（或显式 `session`）的任务；默认 `unacked` = `ackedAt` 为空且未关闭——包含进行中的任务**和已 settled 但回执未签收的任务**（`receiptDigest`），每条带 `receiptStatus`/`settledAt`/`acked`；`include:'text'` 带正文，正文文件缺失时该条 `textMissing:true` 不报错；输出 `count` / `unackedCount` 与列表同源 |
 | `mesh_ack`（工具） | `{ids: string[], force?: boolean}`：批量签收（≤50），只写任务行 `ackedAt`/`ackBy`——**不产生回执、不注入、不等待**；返回 `{acked, skipped:[{id, reason}]}`（`not-found`/`not-mine`/`already-acked`/`settled`）。默认只能签收自己会话的任务，`force:true` 供协调代签（会让 worker 不再被提醒）。**签收 ≠ 完成**，任务仍需 `mesh_complete` |
 | `GET /mesh/workspaces` | 本机工作区注册表（只读）：`{machine, count, workspaces}` |
 | `GET /mesh/threads` | 线程列表：`{ thread, targetSessionId, targetTitle, count, lastTaskId, updatedAt, taskIds[] }`（`taskIds` 从任务库派生，按 createdAt 升序） |
@@ -347,6 +349,8 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 **来源回退（未发布）**：`/mesh/inject` 未传 `requester` 时按 `draft.callerSession || draft.origin || draft.workspace` 回退，表头显示 `FROM unknown(<来源>)`；CLI `mesh-dispatch` 未传 `--requester` 时默认取环境变量 `DSH_SESSION_ID`（显式值优先，回退时在 stderr 提示），都不存在才保留裸 `unknown`。
 
 **线程（0.7.21）**：派活可带 `thread`（≤128 字节）把后续补丁归到同一线索。绑定写在 `~/.dsh/mesh-waker/threads.json`（0600，只在成功投递后更新）：`{ "TH-1": { targetSessionId, targetTitle, lastTaskId, count, updatedAt } }`。之后 `mesh_dispatch({ thread, text })` **可省略 `target`**，按绑定投递；未知 thread 直接报错并列出已知项（不猜、不回落到默认会话）；显式传 `target` 时以 target 为准并**改绑**该线程（日志 `thread TH-x rebound: old -> new`）。回执仍按 `requester` 返回派活方。
+
+**回执同样合并**：`receiptDigest:'on'` 时 `queue` 回执不再逐条注入——requester 空闲（`digestIdleDebounceMs` 防抖）或 `turn/end` 后收到一条 `[RECEIPT-DIGEST]`，`mesh_ack` 签收后停止提醒；`file`/`wake` 不变。
 
 **任务 digest 与签收（未发布，owner 2026-11-14 定）**：`digestDelivery:'on'` 时派单**不再直接注入正文**，只登记到任务板；会话 `turn/end` 之后注入一条 `[TASK-DIGEST] N 条待办（未签收）` 摘要（每行 `- <taskId> <标题>`，末尾提示用 `mesh_tasks({include:'text'})` 取正文、`mesh_ack({ids})` 签收），同一会话同时只有一条在飞 digest，重提醒退避 10/30 分钟且最多 2 次。digest **只改变 `queue` 排队行为**：`mode:'steer'`（明确要求立刻打断）仍然直接注入正文，且 steer 任务不会被列进 digest；**空闲会话不需要等下一个 turn**——落板后 `digestIdleDebounceMs`（默认 3s）到点且会话空闲就注入，多条会在窗口内合并成一条。**签收只是板标记**：不产生回执、不注入、不唤醒，也不改变任务生命周期；digest 模式的任务只能由 `mesh_complete` 结算（不做 observed 结算）。默认 `'off'`，与旧行为逐字一致。
 
