@@ -4148,11 +4148,11 @@ export function apply(ctx, config) {
     for (const [slug, list] of sessionsBySlug) {
       const entry = workspaces.workspaces[slug]
       if (!entry) continue
-      // T-395: an explicit claim list is the truth. Only legacy entries (no coordinators[])
-      // fall back to deriving a coordinator from session titles.
+      // T-395: an explicit claim list is the truth; legacy entries fall back only to the
+      // scalar field — never to a session title (user-renamable, not an identity).
       const claimedMembers = Array.isArray(entry.coordinators) ? entry.coordinators : []
-      // Legacy-only members are a projection of the scalar field; title derivation (T-287)
-      // still owns that field, so the projection is dropped and re-synthesized on next read.
+      // Legacy-only members are a projection of the scalar field; the projection is dropped
+      // and re-synthesized on next read.
       const onlyLegacy = claimedMembers.length > 0 && claimedMembers.every((member) => member.approvedBy === 'legacy')
       if (claimedMembers.length && !onlyLegacy) {
         const expired = expireCoordinators(claimedMembers, { now: Date.now(), pendingTtlMs: c.coordinatorPendingTtlMs })
@@ -4166,34 +4166,19 @@ export function apply(ctx, config) {
           delete entry.coordinators
           changed = true
         }
-        // T-376: an archived session must never be derived as the coordinator. A just-archived
-        // test session can still be live and have the newest last_active, and DSH refuses to
-        // delete live sessions — derivation is the only place that can exclude it.
-        const coordinators = list.filter((session) => isCoordinatorTitle(session.title) && session.archived !== true)
-        coordinators.sort((left, right) => Number(right.last_active ?? 0) - Number(left.last_active ?? 0))
-        const coordinator = coordinators[0] ?? null
-        const nextCoordinator = coordinator ? coordinator.id : null
-        const previousCoordinator = entry.coordinator ?? null
-        if (previousCoordinator !== nextCoordinator) {
-          if (nextCoordinator) entry.coordinator = nextCoordinator
-          else delete entry.coordinator
-          changed = true
-          // Correction of a retired/pointless binding must be visible in the log (T-287).
-          fileLog(`workspace ${slug} coordinator ${previousCoordinator ?? '(none)'} -> ${nextCoordinator ?? '(none)'}`)
-          changed = true
-        }
-        if (nextCoordinator) {
-          const idleMs = Date.now() - Number(coordinator.last_active ?? 0)
-          const stale = idleMs > 7 * 24 * 60 * 60 * 1000
-          if (stale && entry.coordinatorStale !== true) {
-            entry.coordinatorStale = true
+        // No title derivation: a coordinator is approved through coordinators[] (claim/approve)
+        // or the legacy scalar field. A title is user-renamable and never proves identity.
+        // Clear a legacy scalar only when its session is gone or archived.
+        if (entry.coordinator) {
+          const legacy = list.find((session) => session.id === entry.coordinator)
+          if (!legacy || legacy.archived === true) {
+            const previousCoordinator = entry.coordinator
+            delete entry.coordinator
             changed = true
-            fileLog(`WARN workspace ${slug} coordinator idle for ${Math.round(idleMs / 86400000)}d: ${nextCoordinator}`)
-          } else if (!stale && entry.coordinatorStale === true) {
-            delete entry.coordinatorStale
-            changed = true
+            fileLog(`workspace ${slug} legacy coordinator ${previousCoordinator} cleared (archived/missing)`)
           }
-        } else if (entry.coordinatorStale === true) {
+        }
+        if (entry.coordinatorStale === true) {
           delete entry.coordinatorStale
           changed = true
         }

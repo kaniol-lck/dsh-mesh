@@ -5108,7 +5108,6 @@ async function main() {
       wsRow?.workspace === 'wt-same-zone' &&
       localRows.length === 0 &&
       registry.workspaces?.['wt-same-zone']?.cwd === cwd &&
-      registry.workspaces?.['wt-same-zone']?.coordinator === 'session-coord' &&
       api.json?.count === 1
     report('storage: same-workspace tasks stay in ws/<slug>/', ok, `wsRow=${Boolean(wsRow)} localRows=${localRows.length} workspaces=${api.json?.count ?? '-'}`)
   })
@@ -5938,7 +5937,7 @@ async function main() {
     report('workspaces: an all-selftest cwd is dropped and its empty ws directory pruned', ok, `entries=${Object.keys(registry.workspaces ?? {}).join(',')}`)
   })
 
-  await runCase('workspaces: coordinator is the most recently active matching session', async (boot) => {
+  await runCase('workspaces: a title never makes a coordinator', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'coord-repo')
     const now = Date.now()
     const h = await boot({
@@ -5949,11 +5948,11 @@ async function main() {
       ],
     })
     const entry = registryOf(h).workspaces?.['coord-repo']
-    const ok = entry?.coordinator === 'session-coord-new' && entry?.coordinatorStale !== true && JSON.stringify(entry?.roles) === JSON.stringify(['ops'])
-    report('workspaces: coordinator is the most recently active matching session', ok, `coordinator=${entry?.coordinator ?? '-'} stale=${entry?.coordinatorStale ?? false}`)
+    const ok = !entry?.coordinator && JSON.stringify(entry?.roles) === JSON.stringify(['ops'])
+    report('workspaces: a title never makes a coordinator', ok, `coordinator=${entry?.coordinator ?? '-'} roles=${JSON.stringify(entry?.roles ?? [])}`)
   })
 
-  await runCase('workspaces: a coordinator idle for over a week is marked stale', async (boot) => {
+  await runCase('workspaces: an idle title is not a coordinator', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'stale-coord-repo')
     const logFile = path.join(os.tmpdir(), `waker-ws-stale-${process.pid}-${Date.now()}.log`)
     const h = await boot({
@@ -5962,14 +5961,13 @@ async function main() {
     })
     const registry = registryOf(h)
     const entry = registry.workspaces?.['stale-coord-repo']
-    const log = fs.readFileSync(logFile, 'utf8')
-    const ok = entry?.coordinator === 'session-coord-idle' && entry?.coordinatorStale === true && /coordinator idle for 8d/.test(log)
-    report('workspaces: a coordinator idle for over a week is marked stale', ok, `coordinator=${entry?.coordinator ?? '-'} stale=${entry?.coordinatorStale ?? false} warned=${/coordinator idle/.test(log)}`)
+    const ok = !entry?.coordinator && entry?.coordinatorStale !== true
+    report('workspaces: an idle title is not a coordinator', ok, `coordinator=${entry?.coordinator ?? '-'} stale=${entry?.coordinatorStale ?? false}`)
   })
 
   // T-376: an archived session can still be live and have the newest last_active (DSH refuses
   // to delete live sessions), so derivation must exclude archived ones instead of picking them.
-  await runCase('workspaces: an archived coordinator is never derived', async (boot) => {
+  await runCase('workspaces: an archived title is not a coordinator', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'archived-coord-repo')
     const now = Date.now()
     const h = await boot({
@@ -5980,11 +5978,11 @@ async function main() {
       archivedIds: ['session-coord-archived'],
     })
     const entry = registryOf(h).workspaces?.['archived-coord-repo']
-    const ok = entry?.coordinator === 'session-coord-live' && entry?.coordinator !== 'session-coord-archived'
-    report('workspaces: an archived coordinator is never derived', ok, `coordinator=${entry?.coordinator ?? '-'}`)
+    const ok = !entry?.coordinator
+    report('workspaces: an archived title is not a coordinator', ok, `coordinator=${entry?.coordinator ?? '-'}`)
   })
 
-  await runCase('workspaces: only archived coordinators leave the field empty', async (boot) => {
+  await runCase('workspaces: an archived-only title leaves no coordinator', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'only-archived-coord-repo')
     const h = await boot({
       seedSessions: [{ id: 'session-coord-gone', title: 'mesh · 协调', cwd, mtime: Date.now() }],
@@ -5992,7 +5990,7 @@ async function main() {
     })
     const entry = registryOf(h).workspaces?.['only-archived-coord-repo']
     const ok = entry !== undefined && !entry?.coordinator
-    report('workspaces: only archived coordinators leave the field empty', ok, `coordinator=${entry?.coordinator ?? '(none)'}`)
+    report('workspaces: an archived-only title leaves no coordinator', ok, `coordinator=${entry?.coordinator ?? '(none)'}`)
   })
 
   await runCase('workspaces: workers are explicit, never derived from titles', async (boot) => {
@@ -6097,7 +6095,7 @@ async function main() {
     const roles = entry?.roles ?? []
     const ok =
       Boolean(entry) &&
-      entry?.coordinator === 'session-coord' &&
+      !entry?.coordinator &&
       !roles.includes('协调 2') &&
       !roles.includes('协调') &&
       (entry?.rolesUnrecognized ?? []).length === 0
@@ -6242,7 +6240,7 @@ async function main() {
     report('coordinator: plain titles still match and body mentions do not', ok, `plain=${isCoordinatorTitle('mesh · 协调')} body=${isCoordinatorTitle('任务（协调会话，abc）：请处理')}`)
   })
 
-  await runCase('coordinator: the newest numbered coordinator wins in the registry', async (boot) => {
+  await runCase('coordinator: a legacy scalar is kept, not overwritten by titles', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'coord2-repo')
     const now = Date.now()
     const h = await boot({
@@ -6260,11 +6258,11 @@ async function main() {
       },
     })
     const entry = registryOf(h).workspaces?.['coord2-repo']
-    const ok = entry?.coordinator === 'session-coord2-new'
-    report('coordinator: the newest numbered coordinator wins in the registry', ok, `coordinator=${entry?.coordinator ?? '-'}`)
+    const ok = entry?.coordinator === 'session-coord2-old'
+    report('coordinator: a legacy scalar is kept, not overwritten by titles', ok, `coordinator=${entry?.coordinator ?? '-'}`)
   })
 
-  await runCase('coordinator: a retired binding is rewritten and logged', async (boot) => {
+  await runCase('coordinator: a legacy scalar is not rewritten by titles', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'coord3-repo')
     const logFile = path.join(os.tmpdir(), `waker-coord3-${process.pid}-${Date.now()}.log`)
     const h = await boot({
@@ -6284,10 +6282,8 @@ async function main() {
     })
     const entry = registryOf(h).workspaces?.['coord3-repo']
     const log = fs.readFileSync(logFile, 'utf8')
-    const ok =
-      entry?.coordinator === 'session-coord3-new' &&
-      /coordinator session-coord3-old -> session-coord3-new/.test(log)
-    report('coordinator: a retired binding is rewritten and logged', ok, `coordinator=${entry?.coordinator ?? '-'} logged=${/coordinator session-coord3-old -> session-coord3-new/.test(log)}`)
+    const ok = entry?.coordinator === 'session-coord3-old' && !/coordinator session-coord3-old ->/.test(log)
+    report('coordinator: a legacy scalar is not rewritten by titles', ok, `coordinator=${entry?.coordinator ?? '-'} rewritten=${/coordinator session-coord3-old ->/.test(log)}`)
   })
 
   await runCase('coordinator: requester inference reaches the numbered coordinator', async (boot) => {

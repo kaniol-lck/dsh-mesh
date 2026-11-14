@@ -36,6 +36,7 @@
 - 空闲会话不再漏收任务通知：开启 digest 后，任务落板会在 `digestIdleDebounceMs`（默认 3 秒）后触发一条 digest，不必等下一个回合；忙会话仍在 `turn/end` 后通知，日志把落板记为 `digest-queued` 而不是 `injected`。
 - 修复 digest 通知偶发不再投递：同一会话投过一次后，后续派单可能一直停在 pending（现改为投递前占位、失败即释放、超时自愈，并对每次延后/跳过记日志；超过 `digestNotifyWarnMs` 未投出记 WARN 并重试）。
 - 协调认领支持 `permanent:true`：获批后 `leaseUntil:null`，不参与租约过期，适合固定 primary（L1 综合管理）；heartbeat 对永久项保持 null。
+- coordinator 不再从会话标题（`mesh · 协调`）派生：只认 `coordinators[]`（claim/approve）或旧文件标量；标题只做显示；旧标量指向归档/不存在会话时清空。
 - 回执通知不再因为目标会话正在回合中而丢失：推迟的通知会自己重试，超过 `receiptNotifyWarnMs`（默认 90 秒）仍未投出时记 WARN 并立即补投一次；任务行以 `receiptNotifyCount: 0` 明确表示「尚未通知」，与「已通知待签收」区分开。
 
 ### Changed

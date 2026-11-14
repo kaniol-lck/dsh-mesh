@@ -262,6 +262,7 @@ curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/heartbeat -d '{"session"
 - **空工作区 bootstrap**：配置了 `coordinatorOwnerTokenFile` 时必须带 `ownerToken`；未配置时首任自动批准并标记 `approvedBy:"bootstrap"` + 写 WARN 日志（**v0 限制**，后续接 owner 审批）；
 - 待批准项 30 分钟 TTL（`coordinatorPendingTtlMs`）；租约过期转 `stale` 并可再次认领；primary 失效时按 `claimedAt` 最早顺位；
 - **永久协调**：claim 带 `permanent:true` 且获批时 `leaseUntil:null`，不参与租约过期；heartbeat 对 null 保持不变。适合固定 primary（如 L1 综合管理），普通协调仍用有限租约；
+- **不按标题派生**：coordinator 只来自 `coordinators[]`（claim/approve）或旧文件的标量字段；旧标量指向归档/不存在会话时清空，标题只做显示——用户改名不会改变路由位；
 - 身份端点据此回答：`isPrimaryRouter` = 在 **approved** 的 `coordinators[]` 中（旧名 `isCoordinator`）；`routingRole` 为 `primary`（approved 且 `isPrimary`）、`member`（approved 非 primary）或 `none`；另返回 `coordinatorStatus`、`isPrimary`、`primaryRouterSessionId`（旧名 `coordinatorSessionId`）。
 
 ### 角色卡自动注入（B 档，未发布）
