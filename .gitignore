@@ -26,8 +26,8 @@ hub/certs/
 
 .npmrc
 
-# 参考实现的工作笔记（默认不入库）
-REFS.md
+# 参考登记已收敛到 docs/reference/（owner 2026-11-14）：REFS.md 废止并不再忽略，
+# 万一有人重建它，应当作为未跟踪文件被看见、被清理，而不是被静默忽略。
 
 # Python bytecode from local preflight runs
 __pycache__/
