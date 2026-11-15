@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 
 import { messageText } from './text.mjs'
 import { buildReceipt, classifyTurnEnd } from './receipt.mjs'
+import { CLAIM_OK, CLAIM_STALL, CLAIM_WARN, claimState } from './digest-claim.mjs'
 import { normalizeThread } from './session.mjs'
 
 
@@ -25,6 +26,7 @@ export class TaskIdCollisionError extends Error {
  *
  * deps:
  *   pendingTasks        Map：在飞任务（taskId → task）
+ *   taskRows            Map：任务库内存索引（claimSweep 直接遍历）
  *   receiptTimers       Set：看门狗 / dormant 定时器（unref 后也登记，便于统一清理）
  *   liveness            Map：会话活跃账本（openTurn 等）
  *   assistantText       Map：最近一条 assistant 正文（结算摘要）
@@ -110,6 +112,61 @@ export function createTaskLifecycle(deps) {
     task.stallTimer = timer
     deps.receiptTimers.add(timer)
     return timer
+  }
+
+  /**
+   * Digest claim watchdog (T-mwgtchp6). A declaredOnly task is announced by a digest and is
+   * only closed by mesh_complete, so "announced but never declared" is invisible without
+   * this: at `digestClaimWarnMs` log WARN and send the dispatcher an advisory receipt
+   * (status unclaimed) without settling; at twice the window mark the row stalled and keep
+   * it. Nothing here ever settles a task on the worker's behalf.
+   */
+  let claimSweepTimer = null
+
+  function claimSweep() {
+    const windowMs = Number(deps.config.digestClaimWarnMs)
+    if (!Number.isFinite(windowMs) || windowMs <= 0) return
+    const now = Date.now()
+    for (const [taskId, row] of deps.taskRows) {
+      if (row.status !== 'pending' || !row.declaredOnly) continue
+      const task = deps.pendingTasks.get(taskId) ?? null
+      const claimStatus = claimState(row, {
+        now,
+        windowMs,
+        warnedAt: row.claimWarnedAt ?? 0,
+        stalledAt: row.stalledAt ?? 0,
+      })
+      if (claimStatus === CLAIM_OK) continue
+      const waited = now - Number(row.notifiedAt)
+      if (claimStatus === CLAIM_WARN) {
+        deps.fileLog(
+          `WARN digest task unclaimed task=${taskId} session=${row.targetSessionId} waited=${waited}ms started=${row.startedAt ? 'yes' : 'no'}`
+        )
+        deps.taskRegistry.updateTaskRow(taskId, { claimWarnedAt: now })
+        try {
+          deps.sendUnclaimedNotice?.(taskId, task ?? { sessionId: row.targetSessionId }, {
+            waitedMs: waited,
+            started: Boolean(row.startedAt),
+          })
+        } catch (error) {
+          deps.fileLog(`digest claim advisory failed task=${taskId}: ${error?.message ?? error}`)
+        }
+      } else {
+        // Twice the window and still nothing: say so on the board, keep the row for triage.
+        deps.taskRegistry.updateTaskRow(taskId, { status: 'stalled', stalledAt: now })
+        deps.fileLog(`WARN digest task stalled task=${taskId} session=${row.targetSessionId} waited=${waited}ms`)
+      }
+    }
+  }
+
+  function armClaimWatchdog() {
+    if (claimSweepTimer) return claimSweepTimer
+    const interval = Number(deps.config.claimSweepMs)
+    if (!Number.isFinite(interval) || interval <= 0) return null
+    claimSweepTimer = setInterval(claimSweep, interval)
+    claimSweepTimer.unref?.()
+    deps.receiptTimers.add(claimSweepTimer)
+    return claimSweepTimer
   }
 
   function settleTask(taskId, task, details) {
@@ -373,8 +430,12 @@ export function createTaskLifecycle(deps) {
       artifacts: task.artifacts ?? [],
     })
     if (task.declaredOnly) {
-      // No prompt was injected, so a not-started watchdog would be a false alarm.
+      // No prompt was injected, so the not-started watchdog would be a false alarm. The
+      // risk here is the opposite one: the digest was announced, the worker runs, and a
+      // forgotten mesh_complete leaves the task pending forever with no receipt and no
+      // alarm (T-mwgtchp6). Track it with the claim watchdog instead.
       task.stallTimer = null
+      armClaimWatchdog()
     } else {
       const timer = armStallTimer(taskId, task)
       task.stallTimer = timer
@@ -467,7 +528,7 @@ export function createTaskLifecycle(deps) {
       if (type === 'turn/start') {
         if (turn !== null) deps.turnStartedAt.set(sessionId, Math.max(turn, deps.turnStartedAt.get(sessionId) ?? 0))
         for (const [taskId, task] of deps.pendingTasks) {
-          if (task.sessionId !== sessionId || task.settled || task.startedAt || task.declaredOnly) continue
+          if (task.sessionId !== sessionId || task.settled || task.startedAt) continue
           // Same ownership rule as settlement: a queue task owns a strictly later turn, a
           // steer task may own the running one. A null baseline means we had no turn
           // knowledge at injection (T-253): claim only if this turn starts within the
@@ -477,13 +538,18 @@ export function createTaskLifecycle(deps) {
           const resumed = task.dormant === true
           const withinWindow =
             Number.isFinite(task.injectedAt) && now - task.injectedAt <= deps.config.startedClaimWindowMs
-          const ownsTurn = resumed
-            ? turn !== null &&
-              (task.baselineTurn === null ||
-                (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn))
-            : task.baselineTurn !== null
-              ? turn !== null && (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn)
-              : turn !== null && withinWindow
+          // A digest task was never injected as a prompt, so there is no baseline turn to
+          // own: any turn observed after the announcement is evidence the worker started
+          // (T-mwgtchp6). It still never settles the task.
+          const ownsTurn = task.declaredOnly
+            ? turn !== null
+            : resumed
+              ? turn !== null &&
+                (task.baselineTurn === null ||
+                  (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn))
+              : task.baselineTurn !== null
+                ? turn !== null && (task.mode === 'steer' ? turn >= task.baselineTurn : turn > task.baselineTurn)
+                : turn !== null && withinWindow
           if (!ownsTurn) continue
           if (resumed) {
             task.dormant = false
@@ -495,7 +561,7 @@ export function createTaskLifecycle(deps) {
             }
             deps.fileLog(`task ${taskId} resumed at turn=${turn} (not-started was advisory)`)
           }
-          if (task.baselineTurn === null) {
+          if (task.baselineTurn === null && !task.declaredOnly) {
             // A queued task owns strictly later turns; the claim turn itself is the start.
             task.baselineTurn = turn - 1
             deps.fileLog(
@@ -503,7 +569,12 @@ export function createTaskLifecycle(deps) {
             )
           }
           task.startedAt = now
-          deps.taskRegistry.updateTaskRow(taskId, { status: 'started', startedAt: now })
+          // A digest task stays "pending" on the board: startedAt is evidence the worker is
+          // running, never a licence to settle it (T-459 keeps settlement declared-only).
+          deps.taskRegistry.updateTaskRow(
+            taskId,
+            task.declaredOnly ? { startedAt: now } : { status: 'started', startedAt: now },
+          )
           deps.fileLog(`task ${taskId} started turn=${turn} baselineTurn=${task.baselineTurn}`)
         }
         for (const task of deps.pendingTasks.values()) {
@@ -612,5 +683,16 @@ export function createTaskLifecycle(deps) {
     return delivered
   }
 
-  return { clearPending, settleTask, registerPendingTask, cancelPendingTask, handleSessionEvent, deferForLock, flushWaitingTasks }
+  return {
+    clearPending,
+    settleTask,
+    registerPendingTask,
+    cancelPendingTask,
+    handleSessionEvent,
+    deferForLock,
+    flushWaitingTasks,
+    // Starts the digest-claim sweep; called once at boot so rows loaded from a previous
+    // process are watched too (T-mwgtchp6).
+    armClaimWatchdog,
+  }
 }

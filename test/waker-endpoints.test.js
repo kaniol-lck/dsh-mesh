@@ -6951,6 +6951,7 @@ async function main() {
   await runCase('lifecycle: the factory body has no free apply() references', async () => {
     const free = factoryFreeRefs(createTaskLifecycle, [
       'pendingTasks',
+      'taskRows',
       'receiptTimers',
       'liveness',
       'assistantText',

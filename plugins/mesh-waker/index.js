@@ -638,6 +638,13 @@ function normalizeBase(config) {
     // A digest task that is still unnotified after this window is a delivery bug, not a
     // queue: log a WARN and retry once (T-470).
     digestNotifyWarnMs: clampInterval(c.digestNotifyWarnMs, 90_000, 1000, 600_000),
+    // A digest task is announced and then only closed by mesh_complete, so a forgotten
+    // declaration is invisible: warn the dispatcher after this window, mark it stalled at
+    // twice the window (T-mwgtchp6).
+    digestClaimWarnMs: clampInterval(c.digestClaimWarnMs, 1_800_000, 60_000, 21_600_000),
+    // How often the claim sweep looks at digest tasks (a sweep, not a per-task timer, so a
+    // restart picks up the rows it loaded).
+    claimSweepMs: clampInterval(c.claimSweepMs, 15_000, 500, 600_000),
     // The receipt digest answers a different deadline (a dispatcher waiting on a completion),
     // so it gets its own key instead of sharing the task-digest window (T-476).
     receiptNotifyWarnMs: clampInterval(c.receiptNotifyWarnMs, 90_000, 1000, 600_000),
@@ -4597,6 +4604,40 @@ export function apply(ctx, config) {
   }
 
 
+  /**
+   * Advisory receipt for a digest task nobody claimed (T-mwgtchp6). It reports the situation
+   * to the dispatcher; the task stays pending (later stalled) and only mesh_complete closes
+   * it. Written to receipts.jsonl like any receipt so the record survives a restart.
+   */
+  function sendUnclaimedNotice(taskId, task, { waitedMs = 0, started = false } = {}) {
+    const row = taskRows.get(taskId)
+    const mode = ['file', 'queue', 'wake'].includes(row?.receiptMode) ? row.receiptMode : 'queue'
+    const receipt = buildReceipt({
+      taskId,
+      sessionId: task?.sessionId ?? null,
+      status: 'unclaimed',
+      reasonKind: 'unclaimed',
+      reasonDetail: `digest announced ${Math.round(waitedMs / 1000)}s ago, no mesh_complete yet${started ? ' (the session did start a turn)' : ' (no turn observed yet)'}`,
+      injectedAt: Number(row?.notifiedAt) || task?.injectedAt || null,
+      endedAt: Date.now(),
+      receiptMode: mode,
+      summaryChars: c.receiptSummaryChars,
+      source: 'observed',
+      noticeSummary: true,
+    })
+    try {
+      writeReceiptFile(receipt, row ? dirForRow(row) : receiptDirForTask(taskId))
+    } catch (error) {
+      fileLog(`unclaimed receipt write failed task=${taskId}: ${error?.message ?? error}`)
+    }
+    void receiptFlow
+      .deliverNotice(mode, receiptNoticeText(receipt, { includeSummary: true }), `receipt ${taskId} unclaimed`, task?.requesterSessionId ?? '')
+      .catch((error) => {
+        fileLog(`unclaimed receipt delivery failed task=${taskId}: ${error?.message ?? error}`)
+      })
+    return receipt
+  }
+
   function receiptBody(receipt) {
     // Global config or the dispatch's own opt-in (T-404); default stays status-only.
     return receiptNoticeText(receipt, { includeSummary: c.receiptNoticeSummary === true || receipt?.noticeSummary === true })
@@ -4992,6 +5033,9 @@ export function apply(ctx, config) {
   const lifecycle = createTaskLifecycle({
     // 在飞任务（taskId → task）
     pendingTasks,
+    // 任务库内存索引（claimSweep 直接遍历 deps.taskRows，漏传会抛
+    // TypeError: deps.taskRows is not iterable 并让 host 退出）
+    taskRows,
     // 看门狗 / dormant 定时器
     receiptTimers,
     // 会话活跃账本（openTurn）
@@ -5010,6 +5054,8 @@ export function apply(ctx, config) {
       receiptMode: c.receiptMode,
       requireNamespacedIds: c.requireNamespacedIds,
       startedClaimWindowMs: c.startedClaimWindowMs,
+      digestClaimWarnMs: c.digestClaimWarnMs,
+      claimSweepMs: c.claimSweepMs,
     },
     // 写 waker 日志
     fileLog,
@@ -5017,6 +5063,9 @@ export function apply(ctx, config) {
     taskRegistry,
     // 结算后交回执（投递实例）
     receiptFlow,
+    // Digest 任务「已通知但一直没人声明完成」的 advisory 回执（T-mwgtchp6）：只告知，
+    // 绝不结算任务本身 —— 结算权仍归 worker 的 mesh_complete。
+    sendUnclaimedNotice,
     // 写 apply() 的 lastReceipt 镜像
     setLastReceipt: (value) => {
       lastReceipt = value
@@ -5071,6 +5120,10 @@ export function apply(ctx, config) {
       })
     },
   })
+
+  // Boot-time start of the digest-claim sweep (T-mwgtchp6): rows loaded from a previous
+  // process have no in-memory timer, so the sweep is what keeps them observable.
+  lifecycle.armClaimWatchdog()
 
   // ══ 子系统：跨机任务消费（T1 P5，T-388） ══════════════════════════════════════
   // 职责：拉 pending → 条件认领 → blob 取正文 → 按 intent 投递 → 心跳续租 → settle
