@@ -42,6 +42,7 @@ import { readGitContext, describeArtifacts, normalizeArtifacts } from './lib/git
 import { createWorkspaceLocks } from './lib/workspace-locks.mjs'
 import { createDshTitleReader, applyDshTitles } from './lib/session-titles.mjs'
 import { createSettleHook } from './lib/settle-hook.mjs'
+import { createUnclaimedNotice } from './lib/unclaimed-notice.mjs'
 import { digestCandidates, buildDigestText } from './lib/task-digest.mjs'
 import { buildReceiptDigestText, receiptDigestCandidates } from './lib/receipt-digest.mjs'
 import { normalizeCoordinators, coordinatorsView, expireCoordinators, syncPrimary, primaryOf, isOwnerTokenValid, recordAudit } from './lib/coordinators.mjs'
@@ -4604,40 +4605,6 @@ export function apply(ctx, config) {
   }
 
 
-  /**
-   * Advisory receipt for a digest task nobody claimed (T-mwgtchp6). It reports the situation
-   * to the dispatcher; the task stays pending (later stalled) and only mesh_complete closes
-   * it. Written to receipts.jsonl like any receipt so the record survives a restart.
-   */
-  function sendUnclaimedNotice(taskId, task, { waitedMs = 0, started = false } = {}) {
-    const row = taskRows.get(taskId)
-    const mode = ['file', 'queue', 'wake'].includes(row?.receiptMode) ? row.receiptMode : 'queue'
-    const receipt = buildReceipt({
-      taskId,
-      sessionId: task?.sessionId ?? null,
-      status: 'unclaimed',
-      reasonKind: 'unclaimed',
-      reasonDetail: `digest announced ${Math.round(waitedMs / 1000)}s ago, no mesh_complete yet${started ? ' (the session did start a turn)' : ' (no turn observed yet)'}`,
-      injectedAt: Number(row?.notifiedAt) || task?.injectedAt || null,
-      endedAt: Date.now(),
-      receiptMode: mode,
-      summaryChars: c.receiptSummaryChars,
-      source: 'observed',
-      noticeSummary: true,
-    })
-    try {
-      writeReceiptFile(receipt, row ? dirForRow(row) : receiptDirForTask(taskId))
-    } catch (error) {
-      fileLog(`unclaimed receipt write failed task=${taskId}: ${error?.message ?? error}`)
-    }
-    void receiptFlow
-      .deliverNotice(mode, receiptNoticeText(receipt, { includeSummary: true }), `receipt ${taskId} unclaimed`, task?.requesterSessionId ?? '')
-      .catch((error) => {
-        fileLog(`unclaimed receipt delivery failed task=${taskId}: ${error?.message ?? error}`)
-      })
-    return receipt
-  }
-
   function receiptBody(receipt) {
     // Global config or the dispatch's own opt-in (T-404); default stays status-only.
     return receiptNoticeText(receipt, { includeSummary: c.receiptNoticeSummary === true || receipt?.noticeSummary === true })
@@ -4809,6 +4776,21 @@ export function apply(ctx, config) {
   // Receipt status → hub `result` for cross-machine tasks (T-388). `not-started`/`stalled`
   // are advisory and never settle the hub row.
   const HUB_TASK_RESULT = { completed: 'completed', partial: 'partial', error: 'error', failed: 'error', aborted: 'error', blocked: 'error', lost: 'lost' }
+
+  // Advisory receipt for a digest task nobody claimed (T-mwgtchp6). It reports the
+  // situation to the dispatcher; the task stays pending (later stalled) and only
+  // mesh_complete closes it. Written to receipts.jsonl so the record survives a restart.
+  const sendUnclaimedNotice = createUnclaimedNotice({
+    buildReceipt,
+    writeReceiptFile,
+    dirForRow,
+    receiptDirForTask,
+    rowFor: (taskId) => taskRows.get(taskId) ?? null,
+    deliverNotice: (mode, receipt, label, targetSessionId) =>
+      receiptFlow.deliverNotice(mode, receiptNoticeText(receipt, { includeSummary: true }), label, targetSessionId),
+    fileLog,
+    config: { receiptSummaryChars: c.receiptSummaryChars },
+  })
 
   // ══ 子系统：任务生命周期与结算 ══════════════════════════════════════════════════
   // 职责：pending 登记、started 认领、not-started 看门狗与 dormant 恢复、settle、turn 事件入口

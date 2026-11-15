@@ -692,7 +692,9 @@ export function createTaskLifecycle(deps) {
     deferForLock,
     flushWaitingTasks,
     // Starts the digest-claim sweep; called once at boot so rows loaded from a previous
-    // process are watched too (T-mwgtchp6).
+    // process are watched too (T-mwgtchp6). claimSweep is exported so the policy can be
+    // exercised without waiting a real 30-minute window.
     armClaimWatchdog,
+    claimSweep,
   }
 }
