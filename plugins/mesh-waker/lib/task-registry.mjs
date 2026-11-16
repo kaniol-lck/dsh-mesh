@@ -218,6 +218,9 @@ export function createTaskRegistry(deps) {
       ...(row.declaredOnly === true ? { declaredOnly: true } : {}),
       // Receipt digest (T-467): which requester the merged notice goes to, and when it was sent.
       receiptStatus: row.receiptStatus ?? null,
+      // T-484: a lost row that got a late declaration keeps both timestamps.
+      recoveredAt: row.recoveredAt ?? null,
+      lostAt: row.lostAt ?? null,
       receiptDigestSessionId: row.receiptDigestSessionId ?? null,
       receiptNotifiedAt: row.receiptNotifiedAt ?? null,
       receiptNotifyCount: Number(row.receiptNotifyCount) || 0,

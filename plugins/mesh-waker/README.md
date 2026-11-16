@@ -399,7 +399,24 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 **工作区锁（未发布，owner 2026-11-12 定 B 案）**：同一 workspace 里「会改 git」的任务应当串行。`POST /mesh/workspace/lock`（或 `mesh_lock({action:"acquire"})`）按 workspace 取一把 **advisory 锁**；持锁期间向该 workspace 的派活**照常登记任务与回执，但不投递 prompt**，任务行状态为 `waiting-lock`（等锁不消耗 baselineTurn、不会误判 `not-started`）；锁释放或过期后由 sweeper 自动投递一次。锁被他人持有时 `acquire` 返回 409（带持有人与到期时间），**不抢、不猜**；同会话重复 `acquire` 幂等续期。锁**只在进程内**：重启后 `GET /mesh/workspace/lock` 为空（日志 `workspace locks: cleared on start`）。**边界**：插件不创建 worktree、不切换分支、不跨机同步锁、不阻止任何读操作；`workspaceLockTtlMs` 控制默认 TTL。
 
-**状态流转（0.7.14 起含 `started`，0.7.26 起含 `lost`）**：派活写 `pending` → 目标会话的 `turn/start` 且该 turn 归属此任务时写 `started`（含 `startedAt`）→ 结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`；目标 workspace 被他人持锁时写 `waiting-lock`（锁释放后回到 `pending` 并投递，等锁期间不消耗 turn、不触发 `not-started`）。**宿主重启**后启动对账会把上一进程遗留的 `pending/started`（`settledAt=null`）标成 `lost` 并补发一条 `lost` 回执（摘要 `session restarted before this task finished; resend if still needed`），已结束的行不动。取消/停滞可以发生在 `pending` 或 `started`。**`durationMs` 口径**：任务库的 `durationMs` 从 `startedAt` 算起（未被观测到开始的从 `createdAt` 算），回执里的 `durationMs` 仍从投递时算。`refs[]` 由派活方经 `meta.refs` 传入（只存字符串，waker 不解析 `.worklog`）。
+**状态流转（0.7.14 起含 `started`，0.7.26 起含 `lost`）**：派活写 `pending` → 目标会话的 `turn/start` 且该 turn 归属此任务时写 `started`（含 `startedAt`）→ 结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`；目标 workspace 被他人持锁时写 `waiting-lock`（锁释放后回到 `pending` 并投递，等锁期间不消耗 turn、不触发 `not-started`）。**宿主重启**后启动对账会把上一进程遗留的 `pending/started`（`settledAt=null`）标成 `lost` 并补发一条 `lost` 回执（摘要 `session restarted before this task finished; resend if still needed`），已结束的行不动。取消/停滞可以发生在 `pending` 或 `started`。
+
+**`lost` 不是终态（T-484）**：重启对账只是「没收到声明」的临时判断，不代表活没干完。
+此后目标会话调用 `mesh_complete(status:"done"|"partial")` 命中 `status=lost` 的行时，waker 会**把行翻回 `settled`**
+（`receiptStatus` = `completed`/`partial`，写 `recoveredAt`，原时间保留在 `lostAt`），回执 `source: "declared"`，
+并在通知里明写「此前因宿主重启被标 lost，worker 已补交，无需重派」——派单方不必重派。
+**幂等边界不变**：已 `settled` 的行再次声明仍被拒收（不降级、不写第二条回执），但拒收会向派单方发一条
+`[RECEIPT-ADVISORY] <id> already <status> — duplicate <status> declaration from <session> ignored`，不再只有日志。
+
+状态流转图（含恢复边）：
+
+```text
+pending ──turn/start──▶ started ──turn/end / mesh_complete──▶ settled
+   │                      │
+   ├──stall──▶ stalled    └──cancel──▶ cancelled
+   │
+   └──restart──▶ lost ──mesh_complete(done|partial)──▶ settled  (recoveredAt, lostAt 保留)
+```**`durationMs` 口径**：任务库的 `durationMs` 从 `startedAt` 算起（未被观测到开始的从 `createdAt` 算），回执里的 `durationMs` 仍从投递时算。`refs[]` 由派活方经 `meta.refs` 传入（只存字符串，waker 不解析 `.worklog`）。
 
 **面板**：任务面板在「Mesh 信箱」页面顶部标签「派活任务」里（与「信箱」并列）；设置页只保留一行跳转说明。**左右分栏**：左栏按批次聚合（组头 `B-xxx · done/total · 总耗时`，可折叠；无 batchId 归「未分组」置底），行内 `ID / 状态 / 耗时(人读) / 目标会话`；右栏为选中任务详情（创建→开始→结束时间线、正文全文、回执摘要、refs、打开会话/取消任务），空态「选择左侧任务查看详情」；窄屏（<900px）退化为上下布局。顶部统计 `pending/进行中/今日完成/停滞`，支持状态与目标会话过滤；右栏 tab 顶部还有一条「派活任务：N 条待办/进行中」入口摘要。入口名可用 `entryLabel` 配置（默认 `Mesh 信箱`）。
 

@@ -93,6 +93,7 @@ function formatTaskStatus(status) {
     settled: '已完成',
     cancelled: '已取消',
     stalled: '停滞',
+    lost: '已丢失（可补交）',
   }
   return labels[String(status ?? '')] ?? String(status ?? '-')
 }
@@ -1522,6 +1523,7 @@ try {
               ['started', '进行中'],
               ['settled', '已完成'],
               ['stalled', '停滞'],
+              ['lost', '已丢失'],
               ['cancelled', '已取消'],
             ].map(([value, label]) => h('option', { key: value, value }, label)),
           ),

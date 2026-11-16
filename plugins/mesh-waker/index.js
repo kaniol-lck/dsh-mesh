@@ -5942,6 +5942,86 @@ export function apply(ctx, config) {
 
   const COMPLETE_STATUS = { done: 'completed', partial: 'partial', blocked: 'failed' }
 
+  /**
+   * A `lost` row is not a verdict, it is a missing declaration (T-484). A host restart
+   * marks every in-flight task lost and tells its dispatcher to resend; when the worker then
+   * actually finishes the work, refusing the declaration leaves the board permanently wrong
+   * (product in git, row lost). So a declared completion flips the row to settled, keeps the
+   * original lost timestamp and notifies the dispatcher that nothing needs resending.
+   */
+  function recoverLostTask(row, { requested, summary, detail, caller }) {
+    const now = Date.now()
+    const receiptStatus = COMPLETE_STATUS[requested]
+    const lostAt = Number(row.lostAt) || Number(row.settledAt) || null
+    taskRegistry.updateTaskRow(row.taskId, {
+      status: 'settled',
+      receiptStatus,
+      reasonKind: requested,
+      reasonDetail: detail || 'declared after the task had been marked lost by a host restart',
+      recoveredAt: now,
+      lostAt,
+      settledAt: now,
+      receiptSummary: summary,
+      receiptRef: c.receiptFile,
+    })
+    const updated = taskRows.get(row.taskId) ?? row
+    const note = '此前因宿主重启被标 lost，worker 已补交，无需重派'
+    const receipt = buildReceipt({
+      taskId: row.taskId,
+      sessionId: row.targetSessionId ?? null,
+      turn: null,
+      status: receiptStatus,
+      reasonKind: requested,
+      reasonDetail: note,
+      injectedAt: Number(row.notifiedAt) || Number(row.createdAt) || null,
+      endedAt: now,
+      summary: summary ? `${note}：${summary}` : note,
+      receiptMode: ['file', 'queue', 'wake'].includes(updated.receiptMode) ? updated.receiptMode : c.receiptMode,
+      summaryChars: c.receiptSummaryChars,
+      source: 'declared',
+      noticeSummary: true,
+    })
+    try {
+      writeReceiptFile(receipt, dirForRow(updated))
+    } catch (error) {
+      fileLog(`recovered receipt write failed task=${row.taskId}: ${error?.message ?? error}`)
+    }
+    void receiptFlow
+      .deliverReceipt(receipt, {
+        requester: updated.requester ?? null,
+        requesterSessionId: updated.requesterSessionId ?? null,
+        requesterInferred: false,
+      })
+      .catch((error) => {
+        fileLog(`recovered receipt delivery failed task=${row.taskId}: ${error?.message ?? error}`)
+      })
+    fileLog(
+      `mesh_complete ${row.taskId} recovered lost -> ${receiptStatus} by ${caller} (lostAt=${lostAt ?? '-'})`,
+    )
+    return receipt
+  }
+
+  /**
+   * A refused declaration used to be a log line nobody reads. The dispatcher gets an
+   * advisory instead — clearly marked so it is not mistaken for a second receipt.
+   */
+  function notifyRefusedDeclaration(row, { requested, caller }) {
+    const mode = row.requesterSessionId ? 'queue' : 'file'
+    const text =
+      `[RECEIPT-ADVISORY] ${row.taskId} already ${row.receiptStatus ?? row.status}` +
+      ` — duplicate ${requested} declaration from ${caller} ignored; nothing changed`
+    try {
+      void receiptFlow
+        .deliverNotice(mode, text, `receipt ${row.taskId} duplicate-declaration`, row.requesterSessionId ?? '')
+        .catch((error) => {
+          fileLog(`refused-declaration advisory failed task=${row.taskId}: ${error?.message ?? error}`)
+        })
+    } catch (error) {
+      fileLog(`refused-declaration advisory failed task=${row.taskId}: ${error?.message ?? error}`)
+    }
+    fileLog(`mesh_complete ${row.taskId} advisory sent: already ${row.status} by ${caller}`)
+  }
+
   /** Settle a task because its target session declared the outcome (0.7.31). */
   function completeTaskDeclared(args = {}, extra = null) {
     const caller = callerSessionFrom(extra)
@@ -5956,7 +6036,23 @@ export function apply(ctx, config) {
     if (!task) {
       const row = taskRows.get(taskId)
       if (!row) throw new Error(`unknown task "${taskId}"`)
+      const summary = String(args.summary ?? '').slice(0, 300)
+      const detail = String(args.detail ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)
+      // T-484: lost means "no declaration arrived", not "the work did not happen".
+      if (row.status === 'lost') {
+        const receipt = recoverLostTask(row, { requested, summary, detail, caller })
+        return {
+          ok: true,
+          taskId,
+          status: requested,
+          receiptStatus: receipt?.status ?? COMPLETE_STATUS[requested],
+          source: 'declared',
+          recovered: true,
+          summary: receipt?.summary ?? '',
+        }
+      }
       fileLog(`mesh_complete ${taskId} ignored: already settled (${row.status}) by ${caller}`)
+      notifyRefusedDeclaration(row, { requested, caller })
       return { ok: true, alreadySettled: true, taskId, status: row.status, source: 'declared' }
     }
     if (task.sessionId !== caller) {
