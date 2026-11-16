@@ -417,7 +417,16 @@ mesh_complete({
 - 上限 20000 码点；超出会被截断并在回执里标 `answerTruncated: true`（`answerChars` 仍是原始长度），**绝不静默丢**；
 - **不传 `answer` 时行为逐字不变**（回执里没有这三个字段，通知也没有那行提示）——普通工程任务照旧。
 
-为什么不是 `mesh_send`：`mesh_send` 面向 **agent（机器）**，同机 worker 回复同机派单方会被拒（`refusing to send a message to yourself`），这是设计使然；答案走回执才是同一台机器上的正确通道。
+**同机回信有三条路，语义不同（T-487 更正）**：
+
+| 做法 | 落在哪 | 后果 |
+|---|---|---|
+| `mesh_complete({answer})` | **回执通道** | 同一单闭环：派单方收到完成通知 + 指向全文，无需再处理任何东西 → **咨询交付首选** |
+| `mesh_dispatch({target: <派单方 session id>})` | **任务板** | 在**派单方板上新生成一条任务**，它得自己 ack/complete，多一轮往返 |
+| `mesh_send` | hub 的 agent→agent **跨机**通道 | 同机必然被拒（`refusing to send a message to yourself`，设计使然）——它寻址的是**机器**，不是会话 |
+
+所以「同机没办法回复派单方」是**错的**：`mesh_dispatch` 到派单方 session id 是通的（实测 `check-delivery => INJECTED`）。`mesh_send` 被拒不是缺通道，而是选错了工具。
+只是对**咨询**这类「产物就是答案」的交付，走回执（`answer`）比开一条新任务更省事、也不会把答案截断在 300 字。
 **兜底**：worker 既不 `mesh_complete` 也不写回执时，由 claim 看门狗覆盖——通知后 `digestClaimWarnMs`（默认 30 分钟）无声明即 `WARN digest task unclaimed` + 给派单方 advisory 回执，2× 窗口后行标 `stalled`（T-485）。
 
 **ack 不是完成（T-485）**：digest 任务被通知后，worker 按角色卡**先 `mesh_ack`**，再干活、最后 `mesh_complete`。

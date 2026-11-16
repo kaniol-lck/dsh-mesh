@@ -23,6 +23,7 @@
 - 身份自查改用「primary 路由位」的说法：`GET /mesh/session/identity` 新增 `routingRole` / `isPrimaryRouter` / `primaryRouterSessionId`，注入的身份头同样用新名；`isCoordinator` / `coordinatorSessionId` 保留为弃用别名（下个主题版本移除）。
 - 按目标会话标题自动附角色卡（`roleInstructions`）：配好后派活与新建会话会把 `.worklog/roles/<role>.md` 追加到注入文本末尾，不必再靠派活正文手写；默认关闭，不配置时行为不变。
 - 咨询类任务可以交付答案了：`mesh_complete` 新增可选 `answer`（上限 2 万码点），完整正文写进回执并可由 `GET /mesh/tasks/<id>` 的 `receiptAnswer` 读取，通知里加一行指向全文；不传时行为逐字不变。
+- 文档更正（T-487）：同机回信不是没有通道——`mesh_dispatch` 到派单方 session id 通，`mesh_send` 只面向 agent（机器）故同机被拒；咨询类交付建议走 `mesh_complete({answer})`（回执通道）而不是再开一条任务。
 
 ### Fixed
 
