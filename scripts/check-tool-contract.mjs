@@ -113,7 +113,8 @@ if (!existsSync(CONTRACT)) {
 }
 
 if (!existsSync(AGENTS)) {
-  fail('AGENTS.md 不存在')
+  // AGENTS.md 是本地专用文件（gitignored），CI 检出里没有；本地必须存在且指向契约页。
+  warn('AGENTS.md 不存在（本地专用文件），跳过引用检查')
 } else if (!readFileSync(AGENTS, 'utf8').includes('docs/tool-contract.md')) {
   fail('AGENTS.md 没有指向 docs/tool-contract.md')
 }
