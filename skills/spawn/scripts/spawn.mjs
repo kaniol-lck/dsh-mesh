@@ -10,6 +10,9 @@
  *   2) POST <waker>/mesh/inject 把 brief 作为首单投给它（meta.taskId 显式，requester = 父会话）
  *   3) 追加一行父子关系到 <cwd>/.worklog/dispatch/derived-sessions.jsonl
  *
+ * 不做标题查重：标题只是显示，身份走 session id（本项目收敛过，title 不参与任何判断）。
+ * 防重复靠的是「上一个派生会话是否还活着」——`/mesh/sessions` 的 live/archived/last_active。
+ *
  * 用法：
  *   node spawn.mjs --title "<标题>" --brief <brief.md> [--apply] [--json]
  *   node spawn.mjs --help
@@ -19,6 +22,7 @@
 import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
+import { fileURLToPath } from 'node:url'
 
 const BASE = process.env.MESH_WAKER_URL ?? 'http://127.0.0.1:8795'
 const RECENT_MS = 2 * 60 * 60 * 1000
@@ -43,7 +47,7 @@ const USAGE = `spawn.mjs — 派生一个专项会话（重构讨论 / 方案对
   --task-prefix <text>  taskId 前缀（默认 T）
   --task <id>           显式 taskId（覆盖前缀）
   --allow-nested        允许从派生会话再派生（默认只允许一层）
-  --force               跳过并发上限（默认 ${ACTIVE_LIMIT} 个在飞，${RECENT_MS / 3600000} 小时窗口）
+  --force               跳过「仍有存活派生会话」与并发上限的检查
   --apply               真正执行（默认 dry-run，零副作用）
   --json                机器可读输出
   -h, --help            本说明（零副作用）
@@ -66,13 +70,18 @@ class Refusal extends Error {
   constructor(message, code = 1) {
     super(message)
     this.exitCode = code
-    this.silent = true
+    /** Set once the message reached stderr, so the catch handler does not print it twice. */
+    this.printed = false
   }
 }
 
 function refuse(message, code = 1) {
+  // 拒绝理由必须打到 stderr：调用方要看见「已存在哪个会话 id」，否则只能猜。
+  console.error(message)
+  const error = new Refusal(message, code)
+  error.printed = true
   // 不要用 process.exit()：fetch 之后硬退出会撞 libuv 断言（UV_HANDLE_CLOSING）。
-  throw new Refusal(message, code)
+  throw error
 }
 
 async function jsonFetch(pathname, init) {
@@ -105,6 +114,50 @@ async function waitUntilIndexed(sessionId) {
     await new Promise((resolve) => setTimeout(resolve, INDEX_WAIT_MS))
   }
   return false
+}
+
+/**
+ * Pure part of the liveness check: which recent derived sessions are still running.
+ *
+ * Deliberately does NOT compare titles. A title is display text, an id is identity, and this
+ * project converged on never deriving identity from the title. The question answered here is
+ * "is the last derived session still running", from host facts only: `live` / `archived`.
+ * A receipt that says `lost` proves nothing about the session — that misreading is exactly
+ * how a duplicate same-topic session got spawned while the original was mid-analysis.
+ *
+ * `unknown` lists rows whose session no longer appears in the listing.
+ */
+export function pickAliveSessions(rows, sessions, { now = Date.now(), cwd = null, windowMs = RECENT_MS } = {}) {
+  const recent = rows.filter((row) => {
+    if (row.status !== 'dispatched') return false
+    if (cwd !== null && row.cwd !== cwd) return false
+    const created = Date.parse(row.createdAt)
+    if (!Number.isFinite(created)) return false
+    return now - created < windowMs
+  })
+  const byId = new Map((sessions ?? []).map((session) => [session.id, session]))
+  const alive = []
+  const unknown = []
+  for (const row of recent) {
+    const session = byId.get(row.child)
+    if (!session) { unknown.push(row.child); continue }
+    if (session.archived) continue
+    if (session.live === false) continue
+    const lastActiveMs = Number(session.last_active) || 0
+    alive.push({ child: row.child, lastActiveMs, idleMs: lastActiveMs ? now - lastActiveMs : null })
+  }
+  return { alive, unknown }
+}
+
+/** Fetch the session list and apply pickAliveSessions. */
+async function liveDerived(rows, cwd) {
+  const recent = rows.some(
+    (row) => row.status === 'dispatched' && row.cwd === cwd && Date.now() - Date.parse(row.createdAt) < RECENT_MS,
+  )
+  if (!recent) return { alive: [], unknown: [] }
+  const listing = await jsonFetch('/mesh/sessions?limit=500').catch(() => null)
+  if (!listing?.sessions) return { alive: [], unknown: [] }
+  return pickAliveSessions(rows, listing.sessions, { cwd })
 }
 
 async function main() {
@@ -149,6 +202,24 @@ async function main() {
     refuse(`在飞派生会话已有 ${active.length} 个（上限 ${ACTIVE_LIMIT}）；先收报告或加 --force`, 1)
   }
 
+  // 防重复开的真正判据：上一个派生会话**还活着**（宿主给的 live/archived/last_active），
+  // 不是标题像不像，也不是回执是不是 lost。回执 lost 只说明这一单的投递没闭环，
+  // 完全不能证明会话已停——那次事故就是这么来的。
+  const { alive, unknown } = await liveDerived(rows, cwd)
+  if (alive.length > 0 && !has('--force')) {
+    const detail = alive
+      .map((item) => {
+        const idle = item.idleMs === null ? '活跃时间未知' : `${Math.round(item.idleMs / 60000)} 分钟无活动`
+        return `  - ${item.child}（${idle}）`
+      })
+      .join('\n')
+    refuse(
+      `已有 ${alive.length} 个派生会话仍存活，默认不再开新的：\n${detail}\n` +
+        '先确认它是不是还在处理（GET /mesh/sessions，看 live/last_active）；确需再开一个加 --force。',
+      1,
+    )
+  }
+
   const header = roleCard ? `角色卡：先读 \`${roleCard}\` 并遵守；本单边界以下文为准。\n\n` : ''
   const footer = `\n\n---\n产物落 \`${reportDir}/\`；回执给父会话，细节放报告，不超过 10 行结论。`
   const text = brief.startsWith('角色卡：') ? brief : `${header}${brief}${footer}`
@@ -163,6 +234,8 @@ async function main() {
     reportDir,
     briefBytes: Buffer.byteLength(text, 'utf8'),
     activeDerived: active.length,
+    aliveDerived: alive.map((item) => ({ session: item.child, idleMinutes: item.idleMs === null ? null : Math.round(item.idleMs / 60000) })),
+    unknownDerived: unknown,
   }
 
   if (!apply) {
@@ -175,6 +248,7 @@ async function main() {
       console.log(`  task=${taskId} brief=${plan.briefBytes}B 在飞派生=${active.length}`)
       console.log(`  role-card=${plan.roleCard}`)
       console.log(`  report-dir=${reportDir}`)
+      if (alive.length > 0) console.log(`  仍存活的派生会话：${alive.map((item) => item.child).join(', ')}（--force 才放行）`)
       console.log('  加 --apply 才建会话并派首单')
     }
     return 0
@@ -237,9 +311,13 @@ async function main() {
   return 0
 }
 
-main()
-  .then((code) => { process.exitCode = code })
-  .catch((error) => {
-    if (!error?.silent) console.error(error?.message ?? error)
-    process.exitCode = error?.exitCode ?? 1
-  })
+// Only run as a CLI: importing this module (tests, tooling) must not create sessions.
+const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+if (invokedDirectly) {
+  main()
+    .then((code) => { process.exitCode = code })
+    .catch((error) => {
+      if (!error?.printed) console.error(error?.message ?? error)
+      process.exitCode = error?.exitCode ?? 1
+    })
+}
