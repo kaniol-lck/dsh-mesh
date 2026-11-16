@@ -372,11 +372,13 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 | 端点 | 用途 |
 |---|---|
+| `GET /mesh/sessions/:id` | **只读**会话存活探针（T-488）：`{id, title, cwd, workspace, archived, live, turnOpen, turn, lastActivityAt, lastTurnStartedAt, pendingTaskCount}`。`turnOpen` 直接读 liveness 账本（不经过 `livenessFor`，**查询不会创建/改变任何状态**）；`turn` = 开着的回合号，否则最近一次 `turn/start` 的回合号；`lastActivityAt` = 最近 `session/event` 时间戳（`last_active` 仍是文件 mtime，两者不同）；`pendingTaskCount` 是**数量**（该会话名下未结算任务数）。未知 id → **404**，body 带 `error: session not found: <id>`（不返回 200 空对象） |
+| `GET /mesh/sessions` | 列表每条新增 `turnOpen` 与 `lastActivityAt`（T-488）；`last_active` 保持旧语义不变 |
 | `GET /mesh/tasks?status=&session=&batch=&limit=&offset=&include=text` | 列表（跨层聚合，默认不含正文；`include=text` 时每条附 `text`（经 `textRef`/旧 `text` 解析）；默认 `limit=50`、`createdAt` 倒序、返回 `total`；`session` 同时匹配目标会话与 requester） |
 | `GET /mesh/tasks/:id` | 详情：全文 + 回执摘要（`receiptSummary`/`receiptRef`）+ 目标会话 `{sessionId, title, live}` |
 | `DELETE /mesh/tasks/:id` | 取消：**先停 turn 再结算**（回执 `aborted`，行状态 `cancelled`）；已 settled/stalled 返回 **409**，历史不改写 |
-| `POST /mesh/cancel` | 体 `{task?, session?, reason?}`：按 task 或 session（id/精确标题/唯一子串）取消，**只停 turn、不删会话**；等到 turn 关闭（≤`cancelWaitMs`）后把仍 pending 的任务结算为 `aborted`（`reasonDetail: cancelled by <by>[: reason]`）并投递回执；无 task 且无 open turn → **409 nothing to cancel**；未知 task → **404**；task 与 session 指向不同会话 → **400**。返回 `{ok, action, taskId, sessionId, by, turnWasOpen, turnStopped, sessionLive, taskStatus, receipt?}` |
-| `mesh_cancel`（工具） | 同 `POST /mesh/cancel`，`by` 取调用会话（拿不到报错不猜）；**停 turn 不等于删会话**（删会话用 `/mesh/sessions/delete`） |
+| `POST /mesh/cancel` | 体 `{task?, session?, reason?}`：按 task 或 session（id/精确标题/唯一子串）取消，**只停 turn、不删会话**；等到 turn 关闭（≤`cancelWaitMs`）后把仍 pending 的任务结算为 `aborted`（`reasonDetail: cancelled by <by>[: reason]`）并投递回执；无 task 且无 open turn → **409 nothing to cancel**；未知 task → **404**；task 与 session 指向不同会话 → **400**。返回 `{ok, action, taskId, sessionId, by, turnWasOpen, turnStopped, sessionLive, taskStatus, receipt?}`；`dryRun:true` 时**只读**：返回 `{dryRun:true, turnWasOpen, turn, sessionLive, taskStatus}`，**不 cancel、不停回合、不写回执、不改任务行**（查询「它在跑吗」不应变成「把它停掉」，T-488） |
+| `mesh_cancel`（工具） | 同 `POST /mesh/cancel`，`by` 取调用会话（拿不到报错不猜）；**停 turn 不等于删会话**（删会话用 `/mesh/sessions/delete`）；`dryRun:true` 零副作用（只报 `turnWasOpen`/`turn`/`sessionLive`/`taskStatus`） |
 | `POST /mesh/workspace/lock` | 体 `{workspace?, sessionId?, ttlMs?, reason?}`：按 workspace（slug 或 cwd）取 advisory 锁；被他人持有 → **409** + `holder`（含 `ownerSessionId`/`expiresAt`）；同会话重复取锁 → 幂等续期（`renewed:true`） |
 | `POST /mesh/workspace/unlock` | 体 `{workspace?, sessionId?}`：只有持有人能释放（他人 → 409）；返回 `{released, lock?}` |
 | `GET /mesh/workspace/lock?workspace=` | 当前锁（无锁 `lock:null`）；`GET /mesh/workspaces` 每条也带 `lock` |

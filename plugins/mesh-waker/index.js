@@ -1254,6 +1254,38 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * Read-only liveness probe for one session (T-488). The ledger is the only source of
+   * turn state, and until now the only way to read it was mesh_cancel — which stops the
+   * turn it is asked about. This reads `liveness.get` directly (never `livenessFor`, which
+   * would create an entry) so asking about a session cannot change it.
+   */
+  function sessionTurnState(sessionId) {
+    const ledger = liveness.get(sessionId) ?? null
+    const openTurn = ledger?.openTurn ?? null
+    const knownTurn = turnStartedAt.get(sessionId)
+    return {
+      turnOpen: openTurn !== null && openTurn !== undefined,
+      turn: openTurn ?? (Number.isFinite(knownTurn) ? knownTurn : null),
+      lastActivityAt: Number(ledger?.lastEventAt) || null,
+      lastTurnStartedAt: Number(ledger?.lastTurnStartAt) || null,
+      pendingTaskCount: countPendingForSession(sessionId),
+    }
+  }
+
+  /** Unsettled tasks naming this session, from the in-flight map and the registry rows. */
+  function countPendingForSession(sessionId) {
+    const seen = new Set()
+    for (const [taskId, task] of pendingTasks) {
+      if (task?.sessionId === sessionId) seen.add(taskId)
+    }
+    for (const [taskId, row] of taskRows) {
+      if (row?.targetSessionId !== sessionId) continue
+      if (row.status === 'pending' || row.status === 'started' || row.status === 'waiting-lock') seen.add(taskId)
+    }
+    return seen.size
+  }
+
   function archivedSessionIds() {
     try {
       const value = ctx.workspaceRegistry?.archivedSessionIds
@@ -1318,6 +1350,7 @@ export function apply(ctx, config) {
     const archived = archivedSessionIds()
     return applyDshTitles(discoverSessions().map((entry) => {
       const meta = sessionMeta(entry)
+      const turnState = sessionTurnState(entry.id)
       return {
         id: entry.id,
         title: meta.title,
@@ -1325,6 +1358,10 @@ export function apply(ctx, config) {
         workspace: entry.workspace,
         last_active: entry.mtime,
         live: isLive(entry.id),
+        // T-488: turn state and activity time, so "is it still running" needs no probe that
+        // kills the turn. last_active stays exactly as it was (file mtime).
+        turnOpen: turnState.turnOpen,
+        lastActivityAt: turnState.lastActivityAt,
         archived: archived.has(entry.id) && !archivedTombstones.has(entry.id),
         known: (() => {
           try {
@@ -2001,7 +2038,7 @@ export function apply(ctx, config) {
    * workspace kept working. Liveness (`openTurn`) decides whether a turn is really gone; a
    * still-pending task is then settled as aborted so the requester always gets a receipt.
    */
-  async function cancelTaskOrSession({ task, session, reason, by }) {
+  async function cancelTaskOrSession({ task, session, reason, by, dryRun = false }) {
     const httpError = (status, message) => Object.assign(new Error(message), { httpStatus: status })
     const taskId = String(task ?? '').trim()
     const sessionArg = String(session ?? '').trim()
@@ -2034,6 +2071,23 @@ export function apply(ctx, config) {
     }
     const openTurn = liveness.get(targetSessionId)?.openTurn ?? null
     const turnWasOpen = openTurn !== null && openTurn !== undefined
+    if (dryRun) {
+      // T-488: answer "is a turn running here?" without stopping it, settling anything,
+      // writing a receipt or touching a row. Nothing below this branch runs.
+      fileLog(`cancel dryRun task=${taskId || '-'} session=${targetSessionId} by=${by} turnWasOpen=${turnWasOpen}`)
+      return {
+        ok: true,
+        action: 'cancel',
+        dryRun: true,
+        taskId: taskId || null,
+        sessionId: targetSessionId,
+        by,
+        turnWasOpen,
+        ...(openTurn !== null && openTurn !== undefined ? { turn: openTurn } : {}),
+        sessionLive: isLive(targetSessionId),
+        taskStatus: row?.status ?? (pending ? 'pending' : null),
+      }
+    }
     if (!turnWasOpen && !pending && !(row && row.status === 'pending')) throw httpError(409, 'nothing to cancel')
     let cancelCalled = false
     try {
@@ -2101,7 +2155,13 @@ export function apply(ctx, config) {
     const task = String(args.task ?? '').trim()
     const session = String(args.session ?? '').trim()
     if (!task && !session) throw new Error('pass task (task id) or session (session id / title)')
-    const result = await cancelTaskOrSession({ task, session, reason: String(args.reason ?? '').trim() || null, by: caller })
+    const result = await cancelTaskOrSession({
+      task,
+      session,
+      reason: String(args.reason ?? '').trim() || null,
+      by: caller,
+      dryRun: args.dryRun === true,
+    })
     // The host validates this value against CANCEL_OUTPUT: a null under `type: string` throws
     // ToolOutputError after the turn was already stopped, so omit absent fields (T-408).
     const { taskId: resultTaskId, taskStatus: resultTaskStatus, ...rest } = result
@@ -6468,7 +6528,51 @@ export function apply(ctx, config) {
           res.end()
           return
         }
-        if (path === '/mesh/sessions' && req.method === 'GET') {
+        if (path.startsWith('/mesh/sessions/') && req.method === 'GET') {
+      // T-488: the read-only counterpart of mesh_cancel. Asking whether a session is
+      // running must never be the thing that stops it.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      let sessionId = ''
+      try {
+        sessionId = decodeURIComponent(path.slice('/mesh/sessions/'.length))
+      } catch {
+        sessionId = ''
+      }
+      const known = sessionId ? listLocalSessions().find((session) => session.id === sessionId) : null
+      if (!known) {
+        res.writeHead(404, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: `session not found: ${sessionId || '(empty id)'}` }))
+        return
+      }
+      const turnState = sessionTurnState(known.id)
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(
+        JSON.stringify({
+          ok: true,
+          session: {
+            id: known.id,
+            title: known.title,
+            cwd: known.cwd,
+            workspace: known.workspace,
+            archived: known.archived === true,
+            live: known.live === true,
+            turnOpen: turnState.turnOpen,
+            turn: turnState.turn,
+            lastActivityAt: turnState.lastActivityAt,
+            lastTurnStartedAt: turnState.lastTurnStartedAt,
+            // A count, named as one: how many unsettled tasks this session owns.
+            pendingTaskCount: turnState.pendingTaskCount,
+          },
+        }),
+      )
+      return
+    }
+
+    if (path === '/mesh/sessions' && req.method === 'GET') {
       if (!fromLoopback(req)) {
         res.writeHead(403, { 'content-type': 'application/json' })
         res.end('{"error":"loopback only"}')
@@ -7598,6 +7702,7 @@ export function apply(ctx, config) {
           session: draft.session,
           reason: draft.reason ? String(draft.reason).slice(0, 200) : null,
           by: 'loopback',
+          dryRun: draft.dryRun === true,
         })
         sendCoordinator(res, 200, result)
       } catch (error) {

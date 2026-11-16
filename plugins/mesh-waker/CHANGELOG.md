@@ -8,7 +8,7 @@
 
 ### Added
 
-- 修 claim 看门狗误报：startedAt 已落的行不再判 unclaimed（T-485 addendum，实测 XJ-SPAWN-01 一边输出 started=yes acked=yes 一边报 unclaimed）——startedAt 与 ckedAt 语义相反，前者证明任务已被接单；未开始的任务仍由该看门狗盯。- digest 任务未声明完成的看门狗（T-mwgtchp6）：`declaredOnly` 任务通知后超过 `digestClaimWarnMs`（默认 30min）未 `mesh_complete` 时记 WARN 并给派单方 advisory `unclaimed` 回执（不结算），2× 窗口标 `stalled` 保留行；`claimSweepMs` 控制扫描，重启后继续。`createTaskLifecycle` 的依赖补传 `taskRows`（漏传会让 host 因 `deps.taskRows is not iterable` 退出）。
+- 修 claim 看门狗误报：startedAt 已落的行不再判 unclaimed（T-485 addendum，实测 XJ-SPAWN-01 一边输出 started=yes acked=yes 一边报 unclaimed）——startedAt 与 ackedAt 语义相反，前者证明任务已被接单；未开始的任务仍由该看门狗盯。- digest 任务未声明完成的看门狗（T-mwgtchp6）：`declaredOnly` 任务通知后超过 `digestClaimWarnMs`（默认 30min）未 `mesh_complete` 时记 WARN 并给派单方 advisory `unclaimed` 回执（不结算），2× 窗口标 `stalled` 保留行；`claimSweepMs` 控制扫描，重启后继续。`createTaskLifecycle` 的依赖补传 `taskRows`（漏传会让 host 因 `deps.taskRows is not iterable` 退出）。
 - 跨机任务消费（默认关闭）：开启后按自己的节奏拉取、认领、续租并结算对端派来的任务，正文按内容哈希取回，不落本地副本；`/mesh/status` 的 `tasksPoll` 报告开关、最近拉取时间与错误。
 - 跨机派活（`dsh-mesh-dispatch --transport hub --to <agent>`）：正文上传为 blob、任务落到 hub，本机只留一行引用（不含正文、不建会话）；`--dry-run` 零网络，hub 失败时退出码非 0 且不留引用行。
 - 会话身份端点 `GET /mesh/session/identity?session=<id>`：以工作区注册表为准回答「是不是本区协调」（不看标题），waker 自建会话的首个 prompt 带一行 `[身份]` 头。
@@ -24,6 +24,7 @@
 - 按目标会话标题自动附角色卡（`roleInstructions`）：配好后派活与新建会话会把 `.worklog/roles/<role>.md` 追加到注入文本末尾，不必再靠派活正文手写；默认关闭，不配置时行为不变。
 - 咨询类任务可以交付答案了：`mesh_complete` 新增可选 `answer`（上限 2 万码点），完整正文写进回执并可由 `GET /mesh/tasks/<id>` 的 `receiptAnswer` 读取，通知里加一行指向全文；不传时行为逐字不变。
 - 文档更正（T-487）：同机回信不是没有通道——`mesh_dispatch` 到派单方 session id 通，`mesh_send` 只面向 agent（机器）故同机被拒；咨询类交付建议走 `mesh_complete({answer})`（回执通道）而不是再开一条任务。
+- 只读存活查询（T-488）：`GET /mesh/sessions/:id` 返回 `turnOpen`/`turn`/`lastActivityAt`/`lastTurnStartedAt`/`pendingTaskCount`（未知 id → 404），`GET /mesh/sessions` 列表每条新增 `turnOpen`/`lastActivityAt`；`mesh_cancel({dryRun:true})` 零副作用地报告回合状态——确认「它还在跑吗」不再需要把回合停掉。
 
 ### Fixed
 

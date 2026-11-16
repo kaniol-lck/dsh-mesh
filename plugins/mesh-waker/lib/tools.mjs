@@ -256,11 +256,16 @@ export const MESH_CANCEL_TOOL = {
     'Stop the running turn of a dispatched task (or of an explicit session) and settle its receipt as aborted. ' +
     'Pass task (task id) or session (session id / exact title / unique title substring); at least one is required, and both must resolve to the same session. ' +
     'This stops the turn only: the session stays alive and is NOT deleted or archived — use /mesh/sessions/delete to remove a session. ' +
-    'Returns turnWasOpen/turnStopped/sessionLive and the receipt status; 404 for an unknown task, 409 when there is nothing to cancel.',
+    'Returns turnWasOpen/turnStopped/sessionLive and the receipt status; 404 for an unknown task, 409 when there is nothing to cancel. ' +
+    'dryRun:true answers the same question WITHOUT stopping anything: it returns turnWasOpen/turn/sessionLive and changes no state — no cancel, no receipt, no task row. Use it to check whether a session is still running.',
   parameters: {
     task: { type: 'string', description: 'Task id whose target session should be stopped (e.g. T-mwasu2ot).' },
     session: { type: 'string', description: 'Session id, exact title, or a unique title substring to stop.' },
     reason: { type: 'string', description: 'Short reason recorded in the receipt (reasonDetail: "cancelled by <caller>: <reason>").' },
+    dryRun: {
+      type: 'boolean',
+      description: 'Read-only probe: report whether a turn is running here and change nothing (no cancel, no receipt, no row update). Defaults to false — the real cancel.',
+    },
   },
   required: [],
 }
@@ -275,6 +280,8 @@ export const CANCEL_OUTPUT = {
       sessionId: { type: 'string' },
       by: { type: 'string' },
       turnWasOpen: { type: 'boolean' },
+      dryRun: { type: 'boolean' },
+      turn: { type: 'number' },
       turnStopped: { type: 'boolean' },
       sessionLive: { type: 'boolean' },
       taskStatus: { type: 'string' },
