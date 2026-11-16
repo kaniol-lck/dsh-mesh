@@ -9,6 +9,7 @@
     "mesh/**",
     "handoff/**",
     "worklog/**",
+    "spawn/**",
     "README.md",
     "CHANGELOG.md",
     "bin/**",

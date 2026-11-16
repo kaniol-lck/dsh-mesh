@@ -1,10 +1,10 @@
 # dsh-mesh-skills
 
-DSH 技能包：把 **mesh 协作约定**、**handoff 工作区交接**、**worklog 多会话台账** 一次装进
-`~/.dsh/skills`。与插件 **`dsh-mesh-waker` 是两个包**：
+DSH 技能包：把 **mesh 协作约定**、**handoff 工作区交接**、**worklog 多会话台账**、**spawn 派生专项会话**
+一次装进 `~/.dsh/skills`。与插件 **`dsh-mesh-waker` 是两个包**：
 
 - `dsh-mesh-waker`：DSH 客户端插件（npm 包，`dsh plugin add dsh-mesh-waker`），负责唤醒与会话注入；
-- `dsh-mesh-skills`：本包，只装技能文件（`mesh/`、`handoff/`、`worklog/`），不含任何运行时依赖，
+- `dsh-mesh-skills`：本包，只装技能文件（`mesh/`、`handoff/`、`worklog/`、`spawn/`），不含任何运行时依赖，
   不启动服务、不改 DSH profile。
 
 两者同仓发布、分开安装：插件更新不影响技能，技能更新也不要求重装插件。
@@ -13,7 +13,7 @@ DSH 技能包：把 **mesh 协作约定**、**handoff 工作区交接**、**work
 
 ```bash
 npm i -g dsh-mesh-skills
-dsh-mesh-skills install                 # -> ~/.dsh/skills/{mesh,handoff,worklog}
+dsh-mesh-skills install                 # -> ~/.dsh/skills/{mesh,handoff,worklog,spawn}
 dsh-mesh-skills install --dest ./skills # 自定义目录
 ```
 
@@ -36,10 +36,13 @@ dsh-mesh-skills install --dest ./skills # 自定义目录
 | `mesh` | 局域网 agent 中枢 dsh-mesh 的协作约定：收件箱、消息/黑板、会话绑定与派活 |
 | `handoff` | 把工作区 + 上下文 + 依赖打成带 sha256 的 bundle，交给另一台机器/另一个 agent |
 | `worklog` | 多会话/多 agent 台账：`todo/<角色>.md`、`WORKLOG.md`、`roadmap.mjs` 总览与门禁 |
+| `spawn` | 从一个 L1/主导会话派生一层专项会话（重构讨论、方案对比、独立排查），主线只留结论与报告路径 |
+
+> **工作区不要再自带脚本副本。** 需要哪项能力就装技能，工作区 `AGENTS.md` 只写「用哪个技能、怎么调」。
+> 副本一旦出现就会各自演化（实测：`roadmap.mjs` 在两个仓已分叉成不同哈希）。
 
 ## 发布说明
 
-- 版本见 `CHANGELOG.md`；当前 `0.1.0`（MVP，**尚未 `npm publish`**，发布需 owner 明确批准）。
+- 版本见 `CHANGELOG.md`；当前 `0.1.0`（MVP，**尚未 `npm publish`**，发布需 owner 明确批准）；
 - 发布包**不包含** `__pycache__`/`.pyc`/`.pyo`（`.npmignore` 排除；`files` 白名单里也加了对应 `!` 规则——npm 在有 `files` 时只看白名单，单靠 `.npmignore` 不会生效）。
-- 本包暂未纳入仓库根的门禁（`check-changelog` / `check-version-sync` 目前只覆盖三个插件/hub）；
-  TODO：发布前把 `skills/package.json` 的版本与 `CHANGELOG.md` 接入门禁。
+- 本包已纳入仓库根门禁：`check-changelog` 与 `check-version-sync` 覆盖 `skills/`（版本 = `package.json` = `CHANGELOG` 最新已发布段）。

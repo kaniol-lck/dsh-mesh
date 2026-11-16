@@ -17,7 +17,7 @@ import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const SKILLS = ['mesh', 'handoff', 'worklog']
+const SKILLS = ['mesh', 'handoff', 'worklog', 'spawn']
 const USAGE = `dsh-mesh-skills — install the bundled DSH skills
 
 Usage:

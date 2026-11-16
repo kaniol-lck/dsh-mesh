@@ -107,6 +107,10 @@ function main() {
   if (approvalYamlText === null) missing.push('plugins/mesh-approval/plugin.yaml')
   const approvalChangelogText = read('plugins/mesh-approval/CHANGELOG.md')
   if (approvalChangelogText === null) missing.push('plugins/mesh-approval/CHANGELOG.md')
+  const skillsPackageText = read('skills/package.json')
+  if (skillsPackageText === null) missing.push('skills/package.json')
+  const skillsChangelogText = read('skills/CHANGELOG.md')
+  if (skillsChangelogText === null) missing.push('skills/CHANGELOG.md')
 
   if (missing.length) {
     const report = { missing, ok: false }
@@ -123,6 +127,8 @@ function main() {
   const approvalMatch = /^version:\s*(\d+\.\d+\.\d+)/m.exec(approvalYamlText)
   const approvalVersion = approvalMatch ? approvalMatch[1] : null
   const approvalChangelog = changelogVersions(approvalChangelogText)
+  const skillsPackage = JSON.parse(skillsPackageText).version
+  const skillsChangelog = changelogVersions(skillsChangelogText)
 
   const hubOk = hubVersion === hubPackage && hubVersion === hubChangelog.latest
   const wakerExact = wakerPackage === wakerChangelog.latest
@@ -130,6 +136,7 @@ function main() {
     wakerChangelog.unreleased && wakerChangelog.latest && compareSemver(wakerPackage, wakerChangelog.latest) > 0
   const wakerOk = Boolean(wakerExact || wakerUnreleasedAhead)
   const approvalOk = approvalVersion === null || approvalVersion === approvalChangelog.latest
+  const skillsOk = skillsPackage === skillsChangelog.latest
 
   const report = {
     hub: { server: hubVersion, package: hubPackage, changelog: hubChangelog.latest, ok: hubOk },
@@ -146,7 +153,12 @@ function main() {
       skipped: approvalVersion === null,
       ok: approvalOk,
     },
-    ok: Boolean(hubOk && wakerOk && approvalOk),
+    skills: {
+      package: skillsPackage,
+      changelog: skillsChangelog.latest,
+      ok: skillsOk,
+    },
+    ok: Boolean(hubOk && wakerOk && approvalOk && skillsOk),
   }
 
   if (options.json) {
@@ -161,6 +173,7 @@ function main() {
       `approval ${approvalOk ? 'OK  ' : 'FAIL'} ` +
         (approvalVersion === null ? 'plugin.yaml 无版本，已跳过' : `plugin.yaml=${approvalVersion} CHANGELOG=${approvalChangelog.latest}`),
     )
+    console.log(`skills   ${skillsOk ? 'OK  ' : 'FAIL'} package=${skillsPackage} CHANGELOG=${skillsChangelog.latest}`)
   }
   process.exit(report.ok ? 0 : 1)
 }

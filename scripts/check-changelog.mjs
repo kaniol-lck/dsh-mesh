@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * check-changelog.mjs — standing invariant: the three CHANGELOG files share one format.
+ * check-changelog.mjs — standing invariant: every product CHANGELOG file shares one format.
  *
- * Checked per product (hub/, plugins/mesh-waker/, plugins/mesh-approval/):
+ * Checked per product (hub/, plugins/mesh-waker/, plugins/mesh-approval/, skills/):
  *   1. `CHANGELOG.md` exists and `CHANGES.md` does not;
  *   2. first line `# Changelog`; a description line with the Keep a Changelog link and SemVer;
  *   3. every `##` heading is `## [未发布]` or `## [x.y.z] - YYYY-MM-DD`;
@@ -19,10 +19,10 @@ import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 let ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const PRODUCTS = ['hub', 'plugins/mesh-waker', 'plugins/mesh-approval']
+const PRODUCTS = ['hub', 'plugins/mesh-waker', 'plugins/mesh-approval', 'skills']
 const CATEGORIES = new Set(['Added', 'Changed', 'Fixed', 'Removed', 'Security', 'Known limitations'])
 const RELEASED = /^## \[(\d+\.\d+\.\d+)\] - (\d{4}-\d{2}-\d{2})$/
-const USAGE = `check-changelog.mjs — Keep a Changelog rules for the three products
+const USAGE = `check-changelog.mjs — Keep a Changelog rules for every product
 
 Usage:
   node check-changelog.mjs [--root <dir>] [--json]
@@ -179,7 +179,7 @@ function main() {
       }
       for (const problem of entry.problems) console.log(`${entry.file}:${problem.line}: ${problem.message}`)
     }
-    if (violations === 0) console.log('ok 三处 CHANGELOG 均符合 Keep a Changelog 规则')
+    if (violations === 0) console.log('ok 各产品 CHANGELOG 均符合 Keep a Changelog 规则')
   }
   process.exit(violations ? 1 : 0)
 }
