@@ -8,12 +8,18 @@ on:
       - 'plugins/mesh-waker/**'
       - 'test/**'
       - 'scripts/**'
+      - 'docs/**'
+      - 'skills/**'
+      - 'AGENTS.md'
       - '.github/workflows/plugin-check.yml'
   pull_request:
     paths:
       - 'plugins/mesh-waker/**'
       - 'test/**'
       - 'scripts/**'
+      - 'docs/**'
+      - 'skills/**'
+      - 'AGENTS.md'
 
 jobs:
   check:
@@ -38,6 +44,9 @@ jobs:
 
       - name: Path/topology guard
         run: node scripts/check-paths.mjs
+
+      - name: Tool contract guard
+        run: node scripts/check-tool-contract.mjs --no-failures
 
       - name: No duplicate tool implementations
         run: node scripts/check-duplicates.mjs

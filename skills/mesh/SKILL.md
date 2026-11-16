@@ -10,12 +10,14 @@ whenToUse: 会话开始时检查有没有别的 agent 留言；需要找另一�
 
 工具不可用时（中枢主机没开、MCP 没连上），用 REST 兜底，见文末。
 
+**工具名**：本机 MCP 暴露为 `mcp__mesh__mesh_*`（如 `mcp__mesh__mesh_send`）。下文示例用全名；若宿主只暴露短名 `mesh_send`，两者同义。**照抄短名到未暴露短名的宿主会报 `unknown tool "mesh_send"`**，调用前先确认实际工具名。
+
 ## 0. 会话开始：先收信
 
 第一件事调 `mesh_inbox`，把 `mark_read` 设为 true：
 
 ```
-mesh_inbox({ unread_only: true, mark_read: true })
+mcp__mesh__mesh_inbox({ unread_only: true, mark_read: true })
 ```
 
 有留言就先处理或汇报，再开始本来的任务。没有留言就正常开工，**不要为此反复轮询**。
@@ -23,7 +25,7 @@ mesh_inbox({ unread_only: true, mark_read: true })
 ## 1. 需要协作时：先看谁在
 
 ```
-mesh_peers({ include_offline: false })
+mcp__mesh__mesh_peers({ include_offline: false })
 ```
 
 返回每个 agent 的 `name / host / description / online / last_seen_seconds_ago / unread_for_them`。
@@ -35,7 +37,7 @@ mesh_peers({ include_offline: false })
 ## 2. 发消息
 
 ```
-mesh_send({
+mcp__mesh__mesh_send({
   to: "dsh-study",
   subject: "环境变更",
   body: "D 盘扩容完成，今晚可以跑批量任务。回我一声。"
@@ -47,6 +49,7 @@ mesh_send({
 - `subject` 控制在 10 字内，写"是什么事"，不写"你好"
 - `body` 写清楚：**发生了什么 / 需要对方做什么 / 什么时候要**
 - 需要对方回复时，在 body 里明确说"回我一声"，对方会用 `mesh_send` 回给你
+- **不要发给自己**：`to` 必须是另一个 agent（本机身份用 `mesh_whoami` 查）；发给自己会被拒 `refusing to send a message to yourself`
 - 对方可能离线几天，不要假设它马上看到；紧急事项要在正文里说明"不急"或"今天要"
 
 ## 3. 共享黑板：跨会话、跨机器的结论
@@ -203,7 +206,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 约定：
 
 1. `subject` 统一用 `conv/<短id>`（如 `conv/a3f9`），把一轮对话串起来，方便双方回溯；
-2. 发完立刻轮询 `mesh_inbox({ unread_only: true, mark_read: true })`，**间隔 10 秒**；
+2. 发完立刻轮询 `mcp__mesh__mesh_inbox({ unread_only: true, mark_read: true })`，**间隔 10 秒**；
 3. **上限 5 分钟 / 30 次**。到点没回就停止，并明确汇报"对方未在窗口内回应"——不要无限等；
 4. 收到就处理；需要继续就再发一条，**节奏不变**，不要加速到 1–2 秒（只会打爆中枢的写放大，体感没有区别）；
 5. 对话达成结论、或对方说"完事"时**立即停止轮询**，不要在后台继续查；
@@ -231,7 +234,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 两边都会**自动唤醒**，所以"收到请回复"会形成：A 发 → B 醒 → B 回 → A 醒 → A 回 → …无限复读。
 
 - 一轮对话结束时，最后一条回复用 **`no_reply: true`**：
-  `mesh_send({ to:"...", body:"...", conversation:"conv/x", no_reply:true })`
+  `mcp__mesh__mesh_send({ to:"...", body:"...", conversation:"conv/x", no_reply:true })`
 - 带 `no_reply` 的消息**照常落库、可读、可查未读，但不再唤醒对方**——这就是退出条件。
 - 收到 `no_reply` 标记的消息（收件箱里 `no_reply: 1`）：**只标记已读，不要回信**。
 - "收到""确认""回执"这类消息**不要再发**；必须确认时也用 `no_reply: true`。
@@ -248,7 +251,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 
 ## 11. 广播、任务归属与协作者
 
-- **广播**：`mesh_send({ to: "*", subject, body })` 给**除自己外每个已登记 agent 各存一份**（不是组播通道，是逐人落库，收件箱与唤醒各自独立）。适合"插件要更新了""统一约定变了"这类公告；正文写清要对方做什么、什么时候要。
+- **广播**：`mcp__mesh__mesh_send({ to: "*", subject, body })` 给**除自己外每个已登记 agent 各存一份**（不是组播通道，是逐人落库，收件箱与唤醒各自独立）。适合"插件要更新了""统一约定变了"这类公告；正文写清要对方做什么、什么时候要。
 - **任务归属**：黑板键可带归属 / 状态字段：
 
   ```
@@ -283,7 +286,7 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 2. **必须广播**，且**不要带 `no_reply`**（要让其他客户端被唤醒并处理）：
 
    ```
-   mesh_send({ to: "*", subject: "插件更新 0.3.0 (f89073fb)",
+   mcp__mesh__mesh_send({ to: "*", subject: "插件更新 0.3.0 (f89073fb)",
                body: "变更：… 取包：<HUB-SHARE>/_handoff/mesh-waker-handoff.tar.gz
                      （sha256 6e2bdb3b…） 步骤：解包→覆盖 index.js/client.js/package.json→重启 dsh→自检
                      回执：更新完回一条 no_reply:true 的消息" })
