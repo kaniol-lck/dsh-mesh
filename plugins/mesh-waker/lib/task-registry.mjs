@@ -221,6 +221,10 @@ export function createTaskRegistry(deps) {
       // T-484: a lost row that got a late declaration keeps both timestamps.
       recoveredAt: row.recoveredAt ?? null,
       lostAt: row.lostAt ?? null,
+      // T-485: the claim watchdog state, so "why is nobody warning me" is answerable.
+      claimWarnedAt: row.claimWarnedAt ?? null,
+      claimDismissedAt: row.claimDismissedAt ?? null,
+      claimDismissedBy: row.claimDismissedBy ?? null,
       receiptDigestSessionId: row.receiptDigestSessionId ?? null,
       receiptNotifiedAt: row.receiptNotifiedAt ?? null,
       receiptNotifyCount: Number(row.receiptNotifyCount) || 0,

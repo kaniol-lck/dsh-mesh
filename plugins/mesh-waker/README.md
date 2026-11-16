@@ -401,6 +401,24 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 **状态流转（0.7.14 起含 `started`，0.7.26 起含 `lost`）**：派活写 `pending` → 目标会话的 `turn/start` 且该 turn 归属此任务时写 `started`（含 `startedAt`）→ 结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`；目标 workspace 被他人持锁时写 `waiting-lock`（锁释放后回到 `pending` 并投递，等锁期间不消耗 turn、不触发 `not-started`）。**宿主重启**后启动对账会把上一进程遗留的 `pending/started`（`settledAt=null`）标成 `lost` 并补发一条 `lost` 回执（摘要 `session restarted before this task finished; resend if still needed`），已结束的行不动。取消/停滞可以发生在 `pending` 或 `started`。
 
+**ack 不是完成（T-485）**：digest 任务被通知后，worker 按角色卡**先 `mesh_ack`**，再干活、最后 `mesh_complete`。
+因此看门狗盯的正是「已通知 → 已声明」这段，而它恰好**在 ack 之后**——`claimState` 曾把 `ackedAt` 当成「已解决」，
+结果是**按规矩签收的 worker 让告警永久静默**（T-mwj664cc 就是这么丢的：通知→ack→回合结束→无声明，30 分钟后什么都没发生）。
+现在只有两种东西能让看门狗闭嘴：
+
+| 标记 | 谁写 | 语义 | 会停看门狗吗 |
+|---|---|---|---|
+| `settledAt` | 结算（`mesh_complete` / `turn/end`） | 任务真的结束了 | **会** |
+| `ackedAt` / `ackBy` | worker 的 `mesh_ack` | 「我看到了」，**不是**完成 | **不会**（T-485 前会，属 bug） |
+| `receiptAckedAt` / `receiptAckBy` | 派单方对回执的签收 | 「这条回执我看过了」 | **不会**（且只有已结算的行才会有） |
+| `claimDismissedAt` / `claimDismissedBy` | **派单方** `mesh_ack({dismissClaim:true})` | 显式免打扰：这条别再提醒我 | **会** |
+
+**窗口语义**：`digestClaimWarnMs`（默认 30 分钟）从 `notifiedAt` 起算——到点仍无 `settledAt` → 日志 `WARN digest task unclaimed`
+（带 `started=` / `acked=` 便于判断卡在哪一步）+ 给派单方一条 `status: unclaimed` 的 advisory 回执，**行保持 `pending`**；
+到 2× 窗口仍未声明 → 行标 `stalled` 并保留待人工处置。扫描间隔 `claimSweepMs`（默认 15 秒）。
+**免打扰只能由派单方发起**：目标会话调 `dismissClaim:true` 会被拒（`skipped: [{reason:"dismiss-is-requester-side"}]`），
+否则 worker 又能把自己的告警关掉。dismissal 只停告警，不结算、不写回执。
+
 **`lost` 不是终态（T-484）**：重启对账只是「没收到声明」的临时判断，不代表活没干完。
 此后目标会话调用 `mesh_complete(status:"done"|"partial")` 命中 `status=lost` 的行时，waker 会**把行翻回 `settled`**
 （`receiptStatus` = `completed`/`partial`，写 `recoveredAt`，原时间保留在 `lostAt`），回执 `source: "declared"`，

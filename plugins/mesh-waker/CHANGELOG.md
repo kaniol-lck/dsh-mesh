@@ -41,6 +41,7 @@
 - `scripts/mesh-dispatch.mjs` 移除 `--title` 与标题版 `--target`：只接受 session id（`--role`/`--coordinator` 由注册表解析）；`/mesh/inject` 的 title 默认拒绝（`allowTitleAddressing:false`），仅旧客户端显式开启；使用标题时记 `WARN title addressing deprecated`。
 - 回执通知不再因为目标会话正在回合中而丢失：推迟的通知会自己重试，超过 `receiptNotifyWarnMs`（默认 90 秒）仍未投出时记 WARN 并立即补投一次；任务行以 `receiptNotifyCount: 0` 明确表示「尚未通知」，与「已通知待签收」区分开。
 - 重启后被标 `lost` 的任务可以补交了：worker 事后调用 `mesh_complete` 会把行恢复为已完成并通知派单方「无需重派」；重复声明仍幂等拒收，但拒收会发一条 `[RECEIPT-ADVISORY]` 而不是只写日志。
+- digest claim 看门狗被 `mesh_ack` 废掉：`claimState` 把 `ackedAt` 当成已解决，而 worker 按角色卡第一步就是签收，于是「已通知但从不声明」永远不告警。现在只有 `settledAt`（或派单方的显式 `claimDismissedAt`）能停看门狗；新增 `mesh_ack({dismissClaim:true})` 供派单方免打扰（worker 不能关自己的告警）。
 
 ### Changed
 

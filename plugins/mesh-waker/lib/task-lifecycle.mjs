@@ -140,7 +140,7 @@ export function createTaskLifecycle(deps) {
       const waited = now - Number(row.notifiedAt)
       if (claimStatus === CLAIM_WARN) {
         deps.fileLog(
-          `WARN digest task unclaimed task=${taskId} session=${row.targetSessionId} waited=${waited}ms started=${row.startedAt ? 'yes' : 'no'}`
+          `WARN digest task unclaimed task=${taskId} session=${row.targetSessionId} waited=${waited}ms started=${row.startedAt ? 'yes' : 'no'} acked=${row.ackedAt ? 'yes' : 'no'}`
         )
         deps.taskRegistry.updateTaskRow(taskId, { claimWarnedAt: now })
         try {

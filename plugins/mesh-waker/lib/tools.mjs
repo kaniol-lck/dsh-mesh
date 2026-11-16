@@ -402,10 +402,14 @@ export const TASKS_OUTPUT = {
 export const MESH_ACK_TOOL = {
   name: 'mesh_ack',
   description:
-    'Mark tasks as acknowledged on the board: no receipt, no injection, no waiting — it only stops future digests for those tasks. Acking is NOT completion: the task still needs mesh_complete. Defaults to tasks of the calling session; force:true lets a coordinator ack another session\u2019s tasks (risk: the worker stops being reminded). At most 50 ids per call; returns {acked, skipped:[{id, reason}]} with reason one of not-found | not-mine | already-acked | settled.',
+    'Mark tasks as acknowledged on the board: no receipt, no injection, no waiting — it only stops future digests for those tasks. Acking is NOT completion: the task still needs mesh_complete, and an ack does NOT stop the unclaimed-task watchdog (T-485) — that alarm exists precisely for the announced-but-never-declared window after an ack. Defaults to tasks of the calling session; force:true lets a coordinator ack another session\u2019s tasks (risk: the worker stops being reminded). dismissClaim:true is a different action: the requesting side explicitly stops watching a task, so the watchdog never warns about it (the target session cannot dismiss its own task). At most 50 ids per call; returns {acked, skipped:[{id, reason}]} with reason one of not-found | not-mine | already-acked | settled (dismissClaim returns {dismissed, skipped} with reason dismiss-is-requester-side).',
   parameters: {
     ids: { type: 'array', items: { type: 'string' }, required: true, description: 'Task ids to acknowledge (≤50).' },
     force: { type: 'boolean', description: 'Allow acking tasks that belong to another session (coordinator only; hides the reminder from the worker).' },
+    dismissClaim: {
+      type: 'boolean',
+      description: 'Stop the unclaimed-task watchdog for these tasks (requester side only; a worker cannot silence its own task). Distinct from an ack: dismissal says "do not warn me about this one", ack says "I saw it".',
+    },
   },
   required: ['ids'],
 }
@@ -416,6 +420,7 @@ export const ACK_OUTPUT = {
     properties: {
       ok: { type: 'boolean' },
       acked: { type: 'array', items: { type: 'string' } },
+      dismissed: { type: 'array', items: { type: 'string' } },
       skipped: {
         type: 'array',
         items: {
@@ -428,7 +433,7 @@ export const ACK_OUTPUT = {
         },
       },
     },
-    required: ['ok', 'acked', 'skipped'],
+    required: ['ok', 'skipped'],
   },
   render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
 }

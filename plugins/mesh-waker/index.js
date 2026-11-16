@@ -2220,17 +2220,30 @@ export function apply(ctx, config) {
   }
 
   /** Shared ack implementation for the tool and POST /mesh/tasks/ack (T-459). */
-  function ackTasks({ ids, by, force = false } = {}) {
+  function ackTasks({ ids, by, force = false, dismissClaim = false } = {}) {
     const wanted = [...new Set((Array.isArray(ids) ? ids : []).map((id) => String(id ?? '').trim()).filter(Boolean))]
     if (!wanted.length) throw new Error('ids must be a non-empty array of task ids')
     if (wanted.length > 50) throw new Error('mesh_ack accepts at most 50 ids per call')
     const acked = []
+    const dismissed = []
     const skipped = []
     const at = Date.now()
     for (const id of wanted) {
       const row = taskRows.get(id)
       if (!row) {
         skipped.push({ id, reason: 'not-found' })
+        continue
+      }
+      // T-485: dismissal is the requesting side explicit "stop watching this one". It is
+      // deliberately NOT the worker ack — a worker must never be able to silence the alarm
+      // that exists to catch a worker that never declares.
+      if (dismissClaim) {
+        if (row.targetSessionId === by && !force) {
+          skipped.push({ id, reason: 'dismiss-is-requester-side' })
+          continue
+        }
+        taskRegistry.updateTaskRow(id, { claimDismissedAt: at, claimDismissedBy: by })
+        dismissed.push(id)
         continue
       }
       // T-476: two audiences, two markers. A worker acking the task digest must not cancel
@@ -2271,6 +2284,10 @@ export function apply(ctx, config) {
       taskRegistry.updateTaskRow(id, patch)
       acked.push(id)
     }
+    if (dismissClaim) {
+      fileLog(`tasks dismiss-claim by=${by} dismissed=${dismissed.length} skipped=${skipped.length}`)
+      return { ok: true, dismissed, skipped }
+    }
     fileLog(`tasks ack by=${by} acked=${acked.length} skipped=${skipped.length}${force ? ' force' : ''}`)
     return { ok: true, acked, skipped }
   }
@@ -2280,7 +2297,7 @@ export function apply(ctx, config) {
     if (!caller) {
       throw new Error('mesh_ack needs the calling session; the host did not pass one (no default session is guessed)')
     }
-    return ackTasks({ ids: args.ids, by: caller, force: args.force === true })
+    return ackTasks({ ids: args.ids, by: caller, force: args.force === true, dismissClaim: args.dismissClaim === true })
   }
 
   function throttleSummary() {
@@ -6946,7 +6963,12 @@ export function apply(ctx, config) {
         return
       }
       try {
-        const result = ackTasks({ ids: draft.ids, by: String(draft.by ?? 'loopback'), force: draft.force === true })
+        const result = ackTasks({
+          ids: draft.ids,
+          by: String(draft.by ?? 'loopback'),
+          force: draft.force === true,
+          dismissClaim: draft.dismissClaim === true,
+        })
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify(result))
       } catch (error) {

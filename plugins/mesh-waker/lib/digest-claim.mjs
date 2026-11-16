@@ -12,7 +12,8 @@ export const CLAIM_WARN = 'warn'
 export const CLAIM_STALL = 'stall'
 
 /**
- * @param row     task row (needs notifiedAt; settledAt/ackedAt end the watch)
+ * @param row     task row (needs notifiedAt; settledAt or an explicit claimDismissedAt end
+ *                the watch — an ack does NOT, see below)
  * @param opts.now       clock
  * @param opts.windowMs  digestClaimWarnMs
  * @param opts.warnedAt  when the advisory was sent (0/undefined = not yet)
@@ -20,7 +21,11 @@ export const CLAIM_STALL = 'stall'
  */
 export function claimState(row, { now = Date.now(), windowMs = 1_800_000, warnedAt = 0, stalledAt = 0 } = {}) {
   if (!row || typeof row !== 'object') return CLAIM_OK
-  if (row.settledAt || row.ackedAt) return CLAIM_OK
+  // T-485: an ack is "I saw it", not "it is done". The worker is REQUIRED to ack first, so
+  // treating ackedAt as a resolution silenced the watchdog for exactly the window it exists
+  // to watch (announced -> declared). Only a declaration (settledAt) or an explicit
+  // dismissal by the requesting side ends the watch.
+  if (row.settledAt || row.claimDismissedAt) return CLAIM_OK
   const notifiedAt = Number(row.notifiedAt) || 0
   if (!notifiedAt) return CLAIM_OK
   const waited = now - notifiedAt

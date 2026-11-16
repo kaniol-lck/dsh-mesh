@@ -42,13 +42,32 @@ test('claimState: twice the window stalls exactly once', () => {
   assert.equal(claimState(row, { now, windowMs: WINDOW, warnedAt: now - WINDOW, stalledAt: now - 1000 }), CLAIM_OK)
 })
 
-test('claimState: settled, acked or never-announced rows are never watched', () => {
+test('claimState: settled, dismissed or never-announced rows are never watched', () => {
   const now = 10_000_000
   const old = now - WINDOW * 5
   assert.equal(claimState({ notifiedAt: old, settledAt: now - 1 }, { now, windowMs: WINDOW }), CLAIM_OK)
-  assert.equal(claimState({ notifiedAt: old, ackedAt: now - 1 }, { now, windowMs: WINDOW }), CLAIM_OK)
+  assert.equal(claimState({ notifiedAt: old, claimDismissedAt: now - 1 }, { now, windowMs: WINDOW }), CLAIM_OK)
   assert.equal(claimState({ notifiedAt: null }, { now, windowMs: WINDOW }), CLAIM_OK)
   assert.equal(claimState(null, { now, windowMs: WINDOW }), CLAIM_OK)
+})
+
+// ── T-485: an ack is not a resolution ────────────────────────────────────────
+test('claimState: an acked row is still watched — ack is "I saw it", not "it is done"', () => {
+  const now = 10_000_000
+  const base = { notifiedAt: now - WINDOW - 1, status: 'pending' }
+  assert.equal(claimState(base, { now, windowMs: WINDOW }), CLAIM_WARN)
+  // The worker acked right after the digest — the exact real-world sequence.
+  assert.equal(claimState({ ...base, ackedAt: now - 1000, ackBy: 'worker' }, { now, windowMs: WINDOW }), CLAIM_WARN)
+  // The requester's receipt ack is a different marker and does not suppress it either.
+  assert.equal(claimState({ ...base, receiptAckedAt: now - 1000 }, { now, windowMs: WINDOW }), CLAIM_WARN)
+  // Nor does the ack push a stalled row back: twice the window still stalls.
+  assert.equal(
+    claimState(
+      { notifiedAt: now - WINDOW * 2 - 1, ackedAt: now - WINDOW * 2, claimWarnedAt: now - WINDOW },
+      { now, windowMs: WINDOW, warnedAt: now - WINDOW },
+    ),
+    CLAIM_STALL,
+  )
 })
 
 // ── 2. the sweep, driven directly (no 30-minute wait) ─────────────────────────
@@ -162,14 +181,75 @@ test('claim sweep: twice the window marks the row stalled and keeps it', () => {
   assert.equal(notices.length, 0, 'the stall replaces the advisory, it does not repeat it')
 })
 
-test('claim sweep: a completed or acked digest task raises no alarm', () => {
+test('claim sweep: a settled digest task raises no alarm', () => {
   const { flow, logs, notices, taskRows } = makeLifecycle()
   taskRows.set('T-settled', staleRow({ taskId: 'T-settled', settledAt: Date.now() }))
-  taskRows.set('T-acked', staleRow({ taskId: 'T-acked', ackedAt: Date.now() }))
   taskRows.set('T-open', staleRow({ taskId: 'T-open', status: 'started' }))
   flow.claimSweep()
   assert.equal(logs.length, 0)
   assert.equal(notices.length, 0)
+})
+
+// ── T-485 cases a–e, driven through the real sweep ──────────────────────────
+test('claim sweep (a): an acked row past the window still warns and sends the advisory', () => {
+  const { flow, logs, notices, taskRows } = makeLifecycle()
+  taskRows.set('T-acked-old', staleRow({ taskId: 'T-acked-old', ackedAt: Date.now() - WINDOW }))
+  flow.claimSweep()
+  assert.match(logs.join('\n'), /WARN digest task unclaimed task=T-acked-old/)
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0].taskId, 'T-acked-old')
+  assert.equal(taskRows.get('T-acked-old').status, 'pending', 'an ack never settles anything')
+})
+
+test('claim sweep (b): an acked row declared inside the window never warns', () => {
+  const { flow, logs, notices, taskRows } = makeLifecycle()
+  taskRows.set('T-acked-done', staleRow({ taskId: 'T-acked-done', ackedAt: Date.now() - WINDOW }))
+  // The worker declares before the sweep runs: settledAt wins over any staleness.
+  taskRows.set('T-acked-done', { ...taskRows.get('T-acked-done'), settledAt: Date.now(), status: 'settled' })
+  flow.claimSweep()
+  assert.equal(logs.length, 0)
+  assert.equal(notices.length, 0)
+})
+
+test('claim sweep (c): an acked row past twice the window is marked stalled and kept', () => {
+  const { flow, logs, notices, taskRows } = makeLifecycle()
+  taskRows.set(
+    'T-acked-stall',
+    staleRow({
+      taskId: 'T-acked-stall',
+      ackedAt: Date.now() - WINDOW * 2,
+      notifiedAt: Date.now() - WINDOW * 3,
+      claimWarnedAt: Date.now() - WINDOW * 2,
+    }),
+  )
+  flow.claimSweep()
+  assert.match(logs.join('\n'), /WARN digest task stalled task=T-acked-stall/)
+  assert.equal(taskRows.get('T-acked-stall').status, 'stalled')
+  assert.equal(taskRows.get('T-acked-stall').taskId, 'T-acked-stall')
+  assert.equal(notices.length, 0)
+})
+
+test('claim sweep (d): a settled row never warns even if every other marker is old', () => {
+  const { flow, logs, notices, taskRows } = makeLifecycle()
+  taskRows.set(
+    'T-settled-old',
+    staleRow({ taskId: 'T-settled-old', ackedAt: Date.now() - WINDOW * 2, settledAt: Date.now() }),
+  )
+  flow.claimSweep()
+  assert.equal(logs.length, 0)
+  assert.equal(notices.length, 0)
+})
+
+test('claim sweep (e): an explicit dismissal silences the watch, unlike an ack', () => {
+  const { flow, logs, notices, taskRows } = makeLifecycle()
+  taskRows.set('T-dismissed', staleRow({ taskId: 'T-dismissed', claimDismissedAt: Date.now(), claimDismissedBy: REQ }))
+  taskRows.set('T-acked-only', staleRow({ taskId: 'T-acked-only', ackedAt: Date.now() - WINDOW }))
+  flow.claimSweep()
+  // Same clock, same age: only the marker separates the two rows.
+  assert.doesNotMatch(logs.join('\n'), /task=T-dismissed/)
+  assert.match(logs.join('\n'), /WARN digest task unclaimed task=T-acked-only/)
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0].taskId, 'T-acked-only')
 })
 
 test('claim sweep: a digest task inside the window is left alone', () => {
@@ -505,6 +585,39 @@ test('advisory: a declared digest task raises no alarm and writes no unclaimed r
     assert.doesNotMatch(h.log(), /WARN digest task unclaimed task=T-claim-ok/)
     assert.doesNotMatch(h.log(), /WARN digest task stalled task=T-claim-ok/)
     assert.ok(!h.receiptLines().some((line) => JSON.parse(line).status === 'unclaimed'))
+  } finally {
+    h.close()
+  }
+})
+
+// ── T-485: ack and dismissal are different markers on the board ─────────────
+test('board markers: a worker ack leaves the watchdog armed, only the requester can dismiss it', async () => {
+  const h = await startHarness({ sweepMs: 500 })
+  try {
+    await dispatchTask(h, 'T-marker')
+    await waitFor(() => /digest session=session-claim-worker tasks=1 ids=T-marker/.test(h.log()))
+
+    // 1. The worker acks, as the role card tells it to. That must NOT silence the watch.
+    const workerAck = await h.tool('mesh_ack').execute({ ids: ['T-marker'] }, { sessionId: WORKER })
+    assert.deepEqual(workerAck.acked, ['T-marker'])
+    let row = await h.request(h.base, '/mesh/tasks/T-marker')
+    assert.ok(Number(row.json?.task?.ackedAt) > 0, 'the worker ack is recorded')
+    assert.equal(row.json?.task?.claimDismissedAt ?? null, null, 'an ack must not dismiss the watchdog')
+
+    // 2. The worker cannot dismiss its own task — that would restore the silent hole.
+    const selfDismiss = await h.tool('mesh_ack').execute({ ids: ['T-marker'], dismissClaim: true }, { sessionId: WORKER })
+    assert.deepEqual(selfDismiss.skipped, [{ id: 'T-marker', reason: 'dismiss-is-requester-side' }])
+    row = await h.request(h.base, '/mesh/tasks/T-marker')
+    assert.equal(row.json?.task?.claimDismissedAt ?? null, null)
+
+    // 3. The requester (dispatcher side) can dismiss explicitly, and it is recorded who did.
+    const dismiss = await h.tool('mesh_ack').execute({ ids: ['T-marker'], dismissClaim: true }, { sessionId: REQ })
+    assert.deepEqual(dismiss.dismissed, ['T-marker'])
+    row = await h.request(h.base, '/mesh/tasks/T-marker')
+    assert.ok(Number(row.json?.task?.claimDismissedAt) > 0, 'dismissal is a separate marker')
+    assert.equal(row.json?.task?.claimDismissedBy, REQ)
+    assert.equal(row.json?.task?.status, 'pending', 'dismissal is not a settlement either')
+    assert.match(h.log(), /tasks dismiss-claim by=session-claim-req dismissed=1/)
   } finally {
     h.close()
   }
