@@ -8,7 +8,7 @@
 
 ### Added
 
-- digest 任务未声明完成的看门狗（T-mwgtchp6）：`declaredOnly` 任务通知后超过 `digestClaimWarnMs`（默认 30min）未 `mesh_complete` 时记 WARN 并给派单方 advisory `unclaimed` 回执（不结算），2× 窗口标 `stalled` 保留行；`claimSweepMs` 控制扫描，重启后继续。`createTaskLifecycle` 的依赖补传 `taskRows`（漏传会让 host 因 `deps.taskRows is not iterable` 退出）。
+- 修 claim 看门狗误报：startedAt 已落的行不再判 unclaimed（T-485 addendum，实测 XJ-SPAWN-01 一边输出 started=yes acked=yes 一边报 unclaimed）——startedAt 与 ckedAt 语义相反，前者证明任务已被接单；未开始的任务仍由该看门狗盯。- digest 任务未声明完成的看门狗（T-mwgtchp6）：`declaredOnly` 任务通知后超过 `digestClaimWarnMs`（默认 30min）未 `mesh_complete` 时记 WARN 并给派单方 advisory `unclaimed` 回执（不结算），2× 窗口标 `stalled` 保留行；`claimSweepMs` 控制扫描，重启后继续。`createTaskLifecycle` 的依赖补传 `taskRows`（漏传会让 host 因 `deps.taskRows is not iterable` 退出）。
 - 跨机任务消费（默认关闭）：开启后按自己的节奏拉取、认领、续租并结算对端派来的任务，正文按内容哈希取回，不落本地副本；`/mesh/status` 的 `tasksPoll` 报告开关、最近拉取时间与错误。
 - 跨机派活（`dsh-mesh-dispatch --transport hub --to <agent>`）：正文上传为 blob、任务落到 hub，本机只留一行引用（不含正文、不建会话）；`--dry-run` 零网络，hub 失败时退出码非 0 且不留引用行。
 - 会话身份端点 `GET /mesh/session/identity?session=<id>`：以工作区注册表为准回答「是不是本区协调」（不看标题），waker 自建会话的首个 prompt 带一行 `[身份]` 头。

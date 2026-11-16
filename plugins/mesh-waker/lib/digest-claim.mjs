@@ -26,6 +26,11 @@ export function claimState(row, { now = Date.now(), windowMs = 1_800_000, warned
   // to watch (announced -> declared). Only a declaration (settledAt) or an explicit
   // dismissal by the requesting side ends the watch.
   if (row.settledAt || row.claimDismissedAt) return CLAIM_OK
+  // T-485 addendum: `startedAt` is the opposite signal from `ackedAt` — the worker already
+  // opened a turn for this task, so "announced but never claimed" cannot be true. Ignoring it
+  // fired the advisory at a session that was mid-flight (XJ-SPAWN-01: started=yes acked=yes,
+  // still reported unclaimed). A started task is watched by the stall watchdog instead.
+  if (Number(row.startedAt) > 0) return CLAIM_OK
   const notifiedAt = Number(row.notifiedAt) || 0
   if (!notifiedAt) return CLAIM_OK
   const waited = now - notifiedAt

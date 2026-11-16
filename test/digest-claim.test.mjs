@@ -70,6 +70,23 @@ test('claimState: an acked row is still watched — ack is "I saw it", not "it i
   )
 })
 
+test('claimState: a row the worker already started is claimed, not unclaimed', () => {
+  // XJ-SPAWN-01 regression: the worker opened a turn (startedAt set) and was mid-flight, yet
+  // the advisory still fired because only settledAt/dismissal ended the watch. `startedAt` is
+  // the opposite of `ackedAt`: it proves the task was picked up.
+  const now = 10_000_000
+  const base = { notifiedAt: now - WINDOW - 1, status: 'pending', startedAt: now - WINDOW }
+  assert.equal(claimState(base, { now, windowMs: WINDOW }), CLAIM_OK)
+  // Even well past twice the window: a started task is the stall watchdog's business, not this.
+  assert.equal(
+    claimState({ ...base, notifiedAt: now - WINDOW * 3 }, { now, windowMs: WINDOW }),
+    CLAIM_OK,
+  )
+  // A settled row is still settled, and an explicit dismissal still wins.
+  assert.equal(claimState({ ...base, settledAt: now - 1000 }, { now, windowMs: WINDOW }), CLAIM_OK)
+  assert.equal(claimState({ ...base, claimDismissedAt: now - 1000 }, { now, windowMs: WINDOW }), CLAIM_OK)
+})
+
 // ── 2. the sweep, driven directly (no 30-minute wait) ─────────────────────────
 function makeLifecycle(overrides = {}) {
   const logs = []
