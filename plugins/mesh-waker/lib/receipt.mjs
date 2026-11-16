@@ -79,6 +79,12 @@ export function buildReceipt({
   git = null,
   artifacts = null,
   warnings = [],
+  // T-487: a consultation answer does not fit in a 300-char summary, and the dispatcher has
+  // no other channel for it. When present it rides in the receipt itself, with its own size
+  // so a reader can tell a complete answer from a truncated one.
+  answer = null,
+  answerChars = 0,
+  answerTruncated = false,
 } = {}) {
   const at = endedAt ?? Date.now()
   return {
@@ -109,6 +115,13 @@ export function buildReceipt({
     ...(git ? { git } : {}),
     ...(Array.isArray(artifacts) && artifacts.length ? { artifacts } : {}),
     ...(Array.isArray(warnings) && warnings.length ? { warnings } : {}),
+    ...(answer
+      ? {
+          answer: String(answer),
+          answerChars: Number(answerChars) || Array.from(String(answer)).length,
+          ...(answerTruncated === true ? { answerTruncated: true } : {}),
+        }
+      : {}),
   }
 }
 
@@ -127,8 +140,13 @@ export function receiptNoticeText(receipt, { includeSummary = false } = {}) {
       .trim()
     return detail ? `${first}\n${truncateText(detail, 120)}` : first
   }
-  if (includeSummary && receipt.summary) return `${first}\n${receipt.summary}`
-  return first
+  // The notice is a signal, not the letter: with an answer attached it says where to read it
+  // instead of injecting kilobytes into a turn (T-487).
+  const answerHint = receipt.answer
+    ? `完整答复 ${receipt.answerChars ?? 0} 字见 GET /mesh/tasks/${receipt.taskId} 的 receiptAnswer（同 receipts.jsonl）`
+    : ''
+  const withSummary = includeSummary && receipt.summary ? `${first}\n${receipt.summary}` : first
+  return answerHint ? `${withSummary}\n${answerHint}` : withSummary
 }
 
 /**

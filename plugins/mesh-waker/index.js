@@ -5959,6 +5959,20 @@ export function apply(ctx, config) {
 
   const COMPLETE_STATUS = { done: 'completed', partial: 'partial', blocked: 'failed' }
 
+  // A declared answer is prose a human must read, so it may be long — but one receipt line
+  // still has to stay bounded. 20k code points is ~60 KB of CJK and far past any answer
+  // anyone types into a turn; beyond it the text is cut and the receipt says so.
+  const ANSWER_MAX_CHARS = 20_000
+
+  function normalizeAnswer(raw) {
+    if (raw === undefined || raw === null) return { answer: null, answerChars: 0, answerTruncated: false }
+    const text = String(raw)
+    if (!text.trim()) return { answer: null, answerChars: 0, answerTruncated: false }
+    const chars = Array.from(text)
+    if (chars.length <= ANSWER_MAX_CHARS) return { answer: text, answerChars: chars.length, answerTruncated: false }
+    return { answer: chars.slice(0, ANSWER_MAX_CHARS).join(''), answerChars: chars.length, answerTruncated: true }
+  }
+
   /**
    * A `lost` row is not a verdict, it is a missing declaration (T-484). A host restart
    * marks every in-flight task lost and tells its dispatcher to resend; when the worker then
@@ -5966,7 +5980,7 @@ export function apply(ctx, config) {
    * (product in git, row lost). So a declared completion flips the row to settled, keeps the
    * original lost timestamp and notifies the dispatcher that nothing needs resending.
    */
-  function recoverLostTask(row, { requested, summary, detail, caller }) {
+  function recoverLostTask(row, { requested, summary, detail, caller, answer = null, answerChars = 0, answerTruncated = false }) {
     const now = Date.now()
     const receiptStatus = COMPLETE_STATUS[requested]
     const lostAt = Number(row.lostAt) || Number(row.settledAt) || null
@@ -5980,6 +5994,8 @@ export function apply(ctx, config) {
       settledAt: now,
       receiptSummary: summary,
       receiptRef: c.receiptFile,
+      receiptAnswer: answer,
+      receiptAnswerChars: answer ? answerChars : 0,
     })
     const updated = taskRows.get(row.taskId) ?? row
     const note = '此前因宿主重启被标 lost，worker 已补交，无需重派'
@@ -5993,6 +6009,9 @@ export function apply(ctx, config) {
       injectedAt: Number(row.notifiedAt) || Number(row.createdAt) || null,
       endedAt: now,
       summary: summary ? `${note}：${summary}` : note,
+      answer,
+      answerChars,
+      answerTruncated,
       receiptMode: ['file', 'queue', 'wake'].includes(updated.receiptMode) ? updated.receiptMode : c.receiptMode,
       summaryChars: c.receiptSummaryChars,
       source: 'declared',
@@ -6055,9 +6074,10 @@ export function apply(ctx, config) {
       if (!row) throw new Error(`unknown task "${taskId}"`)
       const summary = String(args.summary ?? '').slice(0, 300)
       const detail = String(args.detail ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)
+      const declaredAnswer = normalizeAnswer(args.answer)
       // T-484: lost means "no declaration arrived", not "the work did not happen".
       if (row.status === 'lost') {
-        const receipt = recoverLostTask(row, { requested, summary, detail, caller })
+        const receipt = recoverLostTask(row, { requested, summary, detail, caller, ...declaredAnswer })
         return {
           ok: true,
           taskId,
@@ -6080,7 +6100,14 @@ export function apply(ctx, config) {
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 300)
+    // T-487: a consultation has an answer, not a summary. The full text goes into the
+    // receipt (bounded, and flagged when truncated) while `summary` stays the short signal
+    // the notice carries. Omitting it keeps the old behaviour byte for byte.
+    const { answer, answerChars, answerTruncated } = normalizeAnswer(args.answer)
     const receipt = lifecycle.settleTask(taskId, task, {
+      answer,
+      answerChars,
+      answerTruncated,
       turn: liveness.get(task.sessionId)?.openTurn ?? null,
       status: COMPLETE_STATUS[requested],
       reasonKind: requested,
@@ -6096,6 +6123,7 @@ export function apply(ctx, config) {
       receiptStatus: receipt?.status ?? COMPLETE_STATUS[requested],
       source: 'declared',
       summary: receipt?.summary ?? '',
+      ...(answer ? { answerChars, answerTruncated } : {}),
     }
   }
 

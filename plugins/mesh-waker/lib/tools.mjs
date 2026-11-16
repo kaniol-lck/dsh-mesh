@@ -159,12 +159,16 @@ export const ASK_OUTPUT = {
 export const MESH_COMPLETE_TOOL = {
   name: 'mesh_complete',
   description:
-    'Declare the outcome of a task dispatched to THIS session. status done|partial|blocked settles the task immediately with source=declared; summary is your own ≤300-char summary for the receipt file. Unknown tasks, tasks of other sessions, and already-settled tasks are rejected (already-settled returns alreadySettled:true). Tasks that never call this still settle from turn/end with source=observed.',
+    'Declare the outcome of a task dispatched to THIS session. status done|partial|blocked settles the task immediately with source=declared; summary is your own ≤300-char summary for the receipt file. For a consultation — a task whose deliverable IS the answer — pass the full text as answer: it is stored in the receipt and served as receiptAnswer by GET /mesh/tasks/<id>, while the notice the dispatcher receives carries the summary plus one line saying where to read the whole answer. answer is optional and bounded (20k chars; beyond that it is cut and flagged answerTruncated). Unknown tasks, tasks of other sessions, and already-settled tasks are rejected (already-settled returns alreadySettled:true). Tasks that never call this still settle from turn/end with source=observed.',
   parameters: {
     taskId: { type: 'string', required: true, description: 'Task id from the [TASK …] header.' },
     status: { type: 'string', required: true, enum: ['done', 'partial', 'blocked'], description: 'done | partial | blocked' },
     summary: { type: 'string', description: 'Your own summary (≤300 chars), stored in receipts.jsonl only.' },
     detail: { type: 'string', description: 'One-line reason when blocked (goes into the receipt reasonDetail).' },
+    answer: {
+      type: 'string',
+      description: 'Full answer text for a consultation task (bounded at 20k chars). Stored in the receipt and returned as receiptAnswer by GET /mesh/tasks/<id>; the dispatcher notice says where to read it. Omit for ordinary work tasks — summary alone is then exactly as before.',
+    },
   },
   required: ['taskId', 'status'],
 }
@@ -180,6 +184,7 @@ export const COMPLETE_OUTPUT = {
       source: { type: 'string' },
       alreadySettled: { type: 'boolean' },
       summary: { type: 'string' },
+      answerChars: { type: 'number' },
     },
     required: ['ok', 'taskId', 'status'],
   },

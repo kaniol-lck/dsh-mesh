@@ -338,7 +338,7 @@ npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task --receipt
 | `receiptNoticeSummary` | `false` | 注入的回执通知是否附带摘要正文。默认只发状态行（回执是完成信号，不是信件）；`error`/`lost` 始终附一行 `reasonDetail`（≤120 字）供处置；摘要仍写入 `receipts.jsonl`、面板与任务 API 可查 |
 | `receiptSummary`（单次） | `false` | 派活时按单索要摘要：`mesh_dispatch` 参数 / `/mesh/inject` 的 `meta.receiptSummary` / CLI `--receipt-summary`；batch 任一成员 opt-in 即整批带摘要（body 上限 min(`maxInlineBytes`, 8 KiB)） |
 
-回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode / baselineTurn / settledTurn / injectedDuringTurn`；派活时另可带 `git`（结算时刻快照 `{cwd, branch, head, dirty}`，非 git 工作区为 `null`）、`artifacts`（派生产物清单，见上）与 `warnings`（例如 `expectBranch` 不一致）；`mesh_dispatch` 的**返回体**带派发时刻的 `git` 快照与 `warnings`，便于在任务开跑前就发现分支不对。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。`baselineTurn`/`settledTurn` 是结算诊断：`queue` 注入发生在回合进行中时 `baselineTurn` 等于该回合，只有更晚回合的 `turn/end` 才会结算（`settledTurn > baselineTurn`），`steer` 则同一回合即可。注入给接收方的通知首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`；**0.7.28 起默认只有这一行**（摘要留在文件/面板/API，避免回执被当成回信对刷）。`status ∈ {error, lost}` 时附一行 `reasonDetail`（≤120 字）。**要摘要有两个开关（0.8.1 起）**：全局配置 `receiptNoticeSummary: true`，或单次派活 `receiptSummary: true`（工具参数 / `meta.receiptSummary` / CLI `--receipt-summary`）——后者让跨工作区的派活方不必改对端配置也能索要摘要。批次聚合通知同样尊重这两个开关：任一成员 opt-in 即整批带摘要，成员摘要缩进两格、失败项仍带 `← 失败`；**批次 body 总长上限 = min(`maxInlineBytes`, 8 KiB)**，超限按顺序截断并在末尾追加 `…（摘要已截断，详见 GET /mesh/tasks/<id>）`；单条摘要与批次成员摘要都按 `receiptSummaryChars`（默认 300）截断。**取详情的三条现成途径**：`GET /mesh/tasks/<id>` 的 `receiptSummary`、`receipts.jsonl` 的 `summary`（批次记录在 `tasks[].summary`）、面板「派活任务」右栏。
+回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode / baselineTurn / settledTurn / injectedDuringTurn`（声明式结算另可带 `answer` / `answerChars` / `answerTruncated`，T-487 咨询答复）；派活时另可带 `git`（结算时刻快照 `{cwd, branch, head, dirty}`，非 git 工作区为 `null`）、`artifacts`（派生产物清单，见上）与 `warnings`（例如 `expectBranch` 不一致）；`mesh_dispatch` 的**返回体**带派发时刻的 `git` 快照与 `warnings`，便于在任务开跑前就发现分支不对。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。`baselineTurn`/`settledTurn` 是结算诊断：`queue` 注入发生在回合进行中时 `baselineTurn` 等于该回合，只有更晚回合的 `turn/end` 才会结算（`settledTurn > baselineTurn`），`steer` 则同一回合即可。注入给接收方的通知首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`；**0.7.28 起默认只有这一行**（摘要留在文件/面板/API，避免回执被当成回信对刷）。`status ∈ {error, lost}` 时附一行 `reasonDetail`（≤120 字）。**要摘要有两个开关（0.8.1 起）**：全局配置 `receiptNoticeSummary: true`，或单次派活 `receiptSummary: true`（工具参数 / `meta.receiptSummary` / CLI `--receipt-summary`）——后者让跨工作区的派活方不必改对端配置也能索要摘要。批次聚合通知同样尊重这两个开关：任一成员 opt-in 即整批带摘要，成员摘要缩进两格、失败项仍带 `← 失败`；**批次 body 总长上限 = min(`maxInlineBytes`, 8 KiB)**，超限按顺序截断并在末尾追加 `…（摘要已截断，详见 GET /mesh/tasks/<id>）`；单条摘要与批次成员摘要都按 `receiptSummaryChars`（默认 300）截断。**取详情的三条现成途径**：`GET /mesh/tasks/<id>` 的 `receiptSummary`、`receipts.jsonl` 的 `summary`（批次记录在 `tasks[].summary`）、面板「派活任务」右栏。
 
 **回执投递给谁（0.7.7 / 0.7.24 收紧）**：优先投给**派活方**（requester），否则 `receiptTo`，都没有才只写文件。0.7.24 起 file 模式也会在 waker 日志留一行 `receipt <id> <status> → file only (requester=有/无, receiptTo=有/无)`；两者都缺时额外写 `WARN … nobody was notified`。requester 缺失时按**目标会话的 cwd** 推断同工作区唯一的协调会话（标题以 `· 协调`/`· coordinator` 结尾）：恰好 1 个才用，0 个或多个不猜（日志写 `requester inference ambiguous`）；**不会**拿全局 `receiptTo` 跨工作区兜底。
 
@@ -383,7 +383,7 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 | `mesh_lock`（工具） | `{action:"acquire"\|"release"\|"status", workspace?, ttlMs?, reason?}`；`ownerSessionId` 取调用会话（拿不到报错不猜），`workspace` 省略时按调用会话 cwd 解析，解析不到列出候选 |
 | `mesh_tasks`（工具） | `{session?, include?:'meta'\|'text', status?:'unacked'\|'all', limit?}`：列发给调用方会话（或显式 `session`）的任务；默认只列 `ackedAt` 为空且未 settled 的；`include:'text'` 带正文，正文文件缺失时该条 `textMissing:true` 不报错；输出 `count` / `unackedCount` 与列表同源 |
 | `mesh_tasks`（工具） | `{session?, include?:'meta'\|'text', status?:'unacked'\|'all', limit?}`：列发给调用方会话（或显式 `session`）的任务；默认 `unacked` = `ackedAt` 为空且未关闭——包含进行中的任务**和已 settled 但回执未签收的任务**（`receiptDigest`），每条带 `receiptStatus`/`settledAt`/`acked`；`include:'text'` 带正文，正文文件缺失时该条 `textMissing:true` 不报错；输出 `count` / `unackedCount` 与列表同源 |
-| `mesh_ack`（工具） | `{ids: string[], force?: boolean}`：批量签收（≤50），只写任务行 `ackedAt`/`ackBy`——**不产生回执、不注入、不等待**；返回 `{acked, skipped:[{id, reason}]}`（`not-found`/`not-mine`/`already-acked`/`settled`）。默认只能签收自己会话的任务，`force:true` 供协调代签（会让 worker 不再被提醒）。**签收 ≠ 完成**，任务仍需 `mesh_complete` |
+| `mesh_ack`（工具） | `{ids: string[], force?: boolean}`：批量签收（≤50），只写任务行 `ackedAt`/`ackBy`——**不产生回执、不注入、不等待**；返回 `{acked, skipped:[{id, reason}]}`（`not-found`/`not-mine`/`already-acked`/`settled`）。默认只能签收自己会话的任务，`force:true` 供协调代签（会让 worker 不再被提醒）。**签收 ≠ 完成**，任务仍需 `mesh_complete`；`dismissClaim:true` 是另一件事——**派单方**显式停掉该任务的 claim 看门狗（返回 `{dismissed, skipped}`，目标会话自 dismiss 会被拒 `dismiss-is-requester-side`） |
 | `GET /mesh/workspaces` | 本机工作区注册表（只读）：`{machine, count, workspaces}` |
 | `GET /mesh/threads` | 线程列表：`{ thread, targetSessionId, targetTitle, count, lastTaskId, updatedAt, taskIds[] }`（`taskIds` 从任务库派生，按 createdAt 升序） |
 
@@ -400,6 +400,25 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 **工作区锁（未发布，owner 2026-11-12 定 B 案）**：同一 workspace 里「会改 git」的任务应当串行。`POST /mesh/workspace/lock`（或 `mesh_lock({action:"acquire"})`）按 workspace 取一把 **advisory 锁**；持锁期间向该 workspace 的派活**照常登记任务与回执，但不投递 prompt**，任务行状态为 `waiting-lock`（等锁不消耗 baselineTurn、不会误判 `not-started`）；锁释放或过期后由 sweeper 自动投递一次。锁被他人持有时 `acquire` 返回 409（带持有人与到期时间），**不抢、不猜**；同会话重复 `acquire` 幂等续期。锁**只在进程内**：重启后 `GET /mesh/workspace/lock` 为空（日志 `workspace locks: cleared on start`）。**边界**：插件不创建 worktree、不切换分支、不跨机同步锁、不阻止任何读操作；`workspaceLockTtlMs` 控制默认 TTL。
 
 **状态流转（0.7.14 起含 `started`，0.7.26 起含 `lost`）**：派活写 `pending` → 目标会话的 `turn/start` 且该 turn 归属此任务时写 `started`（含 `startedAt`）→ 结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`；目标 workspace 被他人持锁时写 `waiting-lock`（锁释放后回到 `pending` 并投递，等锁期间不消耗 turn、不触发 `not-started`）。**宿主重启**后启动对账会把上一进程遗留的 `pending/started`（`settledAt=null`）标成 `lost` 并补发一条 `lost` 回执（摘要 `session restarted before this task finished; resend if still needed`），已结束的行不动。取消/停滞可以发生在 `pending` 或 `started`。
+
+**咨询类任务的答案交付（T-487）**：只回答、不改代码的任务，「产物就是答案」，而 `mesh_complete` 的 `summary` 上限 300 字装不下它。
+现在 `mesh_complete` 多了可选 `answer`：
+
+```js
+mesh_complete({
+  taskId: 'T-xxx', status: 'done',
+  summary: '推荐 10809，回退 10818/10808，别用 SP-WB',   // ≤300 字，进通知
+  answer: <完整答复全文>,                                  // 进回执 + 任务 API
+})
+```
+
+- 完整正文写进**回执**（`receipts.jsonl` 的 `answer` 字段，带 `answerChars`），并镜像到任务行，`GET /mesh/tasks/<id>` 的 `task.receiptAnswer` 直接可读；
+- 派单方收到的通知仍是「状态行 + 摘要」，**额外一行**指向全文：`完整答复 N 字见 GET /mesh/tasks/<id> 的 receiptAnswer（同 receipts.jsonl）`——不把 KB 级正文塞进一个回合；
+- 上限 20000 码点；超出会被截断并在回执里标 `answerTruncated: true`（`answerChars` 仍是原始长度），**绝不静默丢**；
+- **不传 `answer` 时行为逐字不变**（回执里没有这三个字段，通知也没有那行提示）——普通工程任务照旧。
+
+为什么不是 `mesh_send`：`mesh_send` 面向 **agent（机器）**，同机 worker 回复同机派单方会被拒（`refusing to send a message to yourself`），这是设计使然；答案走回执才是同一台机器上的正确通道。
+**兜底**：worker 既不 `mesh_complete` 也不写回执时，由 claim 看门狗覆盖——通知后 `digestClaimWarnMs`（默认 30 分钟）无声明即 `WARN digest task unclaimed` + 给派单方 advisory 回执，2× 窗口后行标 `stalled`（T-485）。
 
 **ack 不是完成（T-485）**：digest 任务被通知后，worker 按角色卡**先 `mesh_ack`**，再干活、最后 `mesh_complete`。
 因此看门狗盯的正是「已通知 → 已声明」这段，而它恰好**在 ack 之后**——`claimState` 曾把 `ackedAt` 当成「已解决」，

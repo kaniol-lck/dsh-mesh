@@ -206,6 +206,9 @@ export function createTaskRegistry(deps) {
       durationMs: row.durationMs ?? null,
       receiptRef: row.receiptRef ?? null,
       receiptSummary: row.receiptSummary ?? null,
+      // T-487: a consultation answer that cannot fit in a 300-char summary.
+      receiptAnswer: row.receiptAnswer ?? null,
+      receiptAnswerChars: row.receiptAnswerChars ?? 0,
       refs: Array.isArray(row.refs) ? row.refs : [],
       reusedId: row.reusedId === true,
       textRef: row.textRef ?? null,

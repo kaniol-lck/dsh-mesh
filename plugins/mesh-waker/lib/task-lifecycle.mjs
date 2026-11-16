@@ -219,6 +219,10 @@ export function createTaskLifecycle(deps) {
       source: details.source ?? task.source ?? 'observed',
       routedTo: task.routedTo ?? null,
       noticeSummary: task.noticeSummary === true,
+      // T-487: the declared answer rides in the receipt; summary stays the ≤300-char signal.
+      answer: details.answer ?? null,
+      answerChars: details.answerChars ?? 0,
+      answerTruncated: details.answerTruncated === true,
       git: settleGit,
       artifacts: settleArtifacts,
       warnings: [...(Array.isArray(details.warnings) ? details.warnings : []), ...settleWarnings],
@@ -237,6 +241,10 @@ export function createTaskLifecycle(deps) {
       durationMs: Math.max(0, receipt.endedAt - registryStartedAt),
       receiptRef: deps.config.receiptFile,
       receiptSummary: Array.from(receipt.summary ?? '').slice(0, 500).join(''),
+      // T-487: the answer is served from the task API too, so "read the full reply" needs
+      // no filesystem access on the dispatcher side.
+      receiptAnswer: receipt.answer ?? null,
+      receiptAnswerChars: receipt.answer ? receipt.answerChars : 0,
     })
     const receiptMirror = { taskId: receipt.taskId, status: receipt.status, at: receipt.endedAt, deliveredTo: null }
     deps.setLastReceipt(receiptMirror)
