@@ -1028,7 +1028,9 @@ async function main() {
 
   // 15. task receipts: a completed turn settles once with a code-point-safe summary.
   await runCase('receipt: completed turn writes one truncated receipt', async (boot) => {
-    const h = await boot({ seedSessions: [{ id: 'session-receipt', title: 'receipt target' }], config: { receiptSummaryChars: 20 } })
+    // T-483: receipt notifications are now the default; this case pins the quiet file-only
+    // behaviour explicitly via receiptMode:'file'.
+    const h = await boot({ seedSessions: [{ id: 'session-receipt', title: 'receipt target' }], config: { receiptSummaryChars: 20, receiptMode: 'file' } })
     const injected = await request(h.base, '/mesh/inject', {
       method: 'POST',
       body: { title: 'receipt target', text: 'do the thing', meta: { taskId: 'T-completed' } },

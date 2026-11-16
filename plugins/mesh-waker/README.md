@@ -329,7 +329,7 @@ npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task --receipt
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `receiptMode` | `file` | `file` 只写 JSONL；`queue` 再把 `[RECEIPT]` 注入 `receiptTo`（mode=queue）；`wake` 额外唤醒（需 `wakeSecret`，否则降级 queue 并记 WARN） |
+| `receiptMode` | `queue` | **默认 `queue`（T-483）**：不传 `receipt` 的派单，回执会投给派单方（开启 `receiptDigest` 时走合并通知）。`file` 改为**显式 opt-in**：只写 JSONL、不通知（脚本里写死 `--receipt file` 的仍安静）；`wake` 额外唤醒（需 `wakeSecret`，否则降级 queue 并记 WARN） |
 | `receiptFile` | `~/.dsh/mesh-waker/receipts.jsonl` | 追加写，一行一条 JSON（0600） |
 | `receiptTo` | 空 | 接收回执的会话：标题（如 `<session-title>`）或 `session-…`；为空则只写文件 |
 | `receiptSummaryChars` | `300` | 摘要按**码点**截断，不会切出半个字符 |

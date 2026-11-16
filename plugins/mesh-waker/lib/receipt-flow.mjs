@@ -218,7 +218,14 @@ export function createReceiptFlow(deps) {
         summary,
         // Rows written before 0.7.30 have no receiptMode. A named requester asked to be told,
         // so default those to queue; without a requester a file-only notice has no value (T-273).
-        receiptMode: ['file', 'queue', 'wake'].includes(row.receiptMode) ? row.receiptMode : requester ? 'queue' : 'file',
+        // T-483: rows that already had a receipt-digest target keep it — the migration
+        // exists so their dispatchers eventually hear the outcome. Bare file rows stay
+        // file-only unless a requester asked for more.
+        receiptMode: row.receiptDigestSessionId
+          ? 'queue'
+          : ['file', 'queue', 'wake'].includes(row.receiptMode)
+            ? row.receiptMode
+            : requester ? 'queue' : 'file',
         summaryChars: deps.config.receiptSummaryChars,
       })
       deps.writeReceiptFile(receipt, deps.dirForRow(row))

@@ -48,7 +48,7 @@ export const MESH_DISPATCH_TOOL = {
     mode: { type: 'string', enum: ['queue', 'steer'], description: 'queue (default) or steer.' },
     taskId: { type: 'string', description: 'Receipt task id; a T-<base36 timestamp> is generated when omitted.' },
     batchId: { type: 'string', description: 'Batch barrier id: one aggregate receipt after every task ends.' },
-    receipt: { type: 'string', enum: ['file', 'queue', 'wake'], description: 'Override the plugin receipt mode.' },
+    receipt: { type: 'string', enum: ['file', 'queue', 'wake'], description: 'Override the plugin receipt mode. Omit to inherit it — the default is queue (the requester gets notified; with receiptDigest on, via the merged digest). Use file for a quiet, JSONL-only receipt with no notification.' },
     receiptSummary: {
       type: 'boolean',
       description:

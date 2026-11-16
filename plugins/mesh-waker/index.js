@@ -579,9 +579,12 @@ function normalizeBase(config) {
     catchUpMaxConversations: Number(c.catchUpMaxConversations ?? 3),
     // --- task receipts (0.5.1) -------------------------------------------------------
     // A task injected with meta.taskId gets exactly one receipt when its turn ends (or
-    // when it never starts). file = JSONL only (quiet default); queue/wake also notify
-    // receiptTo. Nothing here ever carries a token or a secret.
-    receiptMode: ['file', 'queue', 'wake'].includes(String(c.receiptMode)) ? String(c.receiptMode) : 'file',
+    // when it never starts). queue notifies the requester (or receiptTo, via the receipt
+    // digest when enabled); file = JSONL only, an explicit opt-in for quiet/automated
+    // flows. Nothing here ever carries a token or a secret. (T-483: the default used to
+    // be file, which silently bypassed the whole notification stack for any dispatch
+    // that did not pass receipt:"queue".)
+    receiptMode: ['file', 'queue', 'wake'].includes(String(c.receiptMode)) ? String(c.receiptMode) : 'queue',
     receiptFile: c.receiptFile ? String(c.receiptFile) : join(homedir(), '.dsh', 'mesh-waker', 'receipts.jsonl'),
     receiptTo: c.receiptTo ? String(c.receiptTo).trim() : '',
     receiptSummaryChars: clampInterval(c.receiptSummaryChars, 300, 20, 4000),
@@ -6280,6 +6283,15 @@ export function apply(ctx, config) {
   // Split legacy single files into tier files before anything loads or rewrites rows.
   migrateLegacyStorage()
   taskRegistry.loadTaskRegistry()
+  // T-483: receipts only reach their dispatcher when the row carries receiptDigestSessionId.
+  // Rows that settled while the old file-only default was active never got one; the number
+  // makes the migration visible instead of silently swallowed.
+  {
+    const silent = [...taskRows.values()].filter(
+      (row) => row.settledAt && !row.receiptDigestSessionId && !row.receiptAckedAt && row.requesterSessionId,
+    ).length
+    fileLog(`receipt-digest migration: ${silent} settled row(s) without a receipt-digest target`)
+  }
   // A receipt must live with its task row (T-300): fix historical mismatches once, idempotently.
   realignReceiptTiersAtBoot()
   threadFlow.loadThreads()
