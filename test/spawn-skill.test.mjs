@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
+import path from 'node:path'
 import { test } from 'node:test'
 
 import { pickAliveSessions } from '../skills/spawn/scripts/spawn.mjs'
 
 const NOW = 1_800_000_000_000
-const CWD = 'D:/work/repo'
+const CWD = path.join('work', 'repo')
 
 function row(child, { createdAt = NOW - 60_000, cwd = CWD, status = 'dispatched', title = 'x' } = {}) {
   return { child, cwd, status, title, createdAt: new Date(createdAt).toISOString() }
@@ -37,7 +38,7 @@ test('spawn liveness: a row whose session is gone is unknown, not alive', () => 
 test('spawn liveness: rows outside the window or from another workspace do not block', () => {
   const rows = [
     row('session-old', { createdAt: NOW - 3 * 60 * 60 * 1000 }),
-    row('session-other', { cwd: 'D:/work/other' }),
+    row('session-other', { cwd: path.join('work', 'other') }),
     row('session-settled', { status: 'done' }),
   ]
   const sessions = [session('session-old'), session('session-other'), session('session-settled')]
