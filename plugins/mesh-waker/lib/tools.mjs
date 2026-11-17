@@ -13,14 +13,21 @@ const TOOL_SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integ
 export const MESH_DISPATCH_TOOL = {
   name: 'mesh_dispatch',
   description:
-    'Dispatch a task text into another local DSH session (same machine, no hub). target = session id, full title, or a unique title substring. ' +
+    'Send work to another session. ONE entry for both cases — the plugin routes it for you: ' +
+    'target = a local session (id / unique title substring) → injected locally; target = a known remote agent name (another machine) → ' +
+    'sent over the hub. Never hand-pick between "local" and "hub" yourself; that choice is the source of past mistakes. ' +
     'Returns immediately with taskId; do NOT poll or wait for the result — the waker writes a receipt when that turn ends (file by default). ' +
     'Pass the same batchId for several tasks to get exactly one aggregate notice after all of them finish (batch barrier). ' +
     'Pass a thread id to group follow-ups: once bound, a later dispatch may omit target and goes to the same session. ' +
     'Set createIfMissing:true to create the session when target does not resolve. A created session always lives in a workspace: it inherits the caller session\u2019s cwd by default, or the absolute path you pass as workspacePath; a cross-workspace create is refused. ' +
     'requester names the session that should receive the receipt (usually passed by the CLI; models may omit it).',
   parameters: {
-    target: { type: 'string', description: 'Session id, full title, or a unique title substring. Required unless a known `thread` is given.' },
+    target: {
+      type: 'string',
+      description:
+        'Session id / unique title substring (local dispatch), or a registered remote agent name such as "hermes" (hub dispatch). ' +
+        'Required unless a known `thread` is given. There is no "send to myself": this machine\u2019s own agent id is never a valid target — name the session instead.',
+    },
     text: { type: 'string', required: true, description: 'Task text, delivered verbatim after a one-line [TASK …] header (max 64 KiB).' },
     workspacePath: {
       type: 'string',

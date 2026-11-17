@@ -5918,6 +5918,136 @@ export function apply(ctx, config) {
     return hit ? String(hit).trim() : ''
   }
 
+  /**
+   * T-487: is `target` a *different machine's* agent? Returns the peer row, or null.
+   *
+   * Deliberately excludes this machine's own name: sending to yourself is never meaningful over
+   * the hub, and treating it as remote would hide the real mistake (naming an agent instead of
+   * a session). Never throws — peer discovery is best effort; a hub outage must fall through to
+   * the local path rather than fail a dispatch that would have worked locally.
+   */
+  async function resolveRemoteAgentTarget(target) {
+    if (!hubReady || !selfName) return null
+    if (target === selfName) return null
+    try {
+      const res = await hubFetch('/api/peers?offline=1', {
+        headers: { authorization: `Bearer ${c.token}` },
+        signal: AbortSignal.timeout(3000),
+      })
+      if (!res.ok) return null
+      const data = await res.json()
+      const peer = (data.peers ?? []).find((row) => row?.name === target)
+      if (!peer) return null
+      // Same machine, same agent id: not a remote target.
+      if (peer.name === selfName) return null
+      return peer
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * T-487: the hub branch of mesh_dispatch — same three steps the CLI uses (T-389), so a hub
+   * task is indistinguishable from one dispatched by `dsh-mesh-dispatch --transport hub`:
+   *   1. upload the body as a blob and check the returned sha256
+   *   2. create the task row on the hub carrying text_ref
+   *   3. record the local reference row (so the returning receipt can be matched)
+   * Any failure throws before step 3, so a half-made task never looks local and cannot run twice.
+   */
+  async function dispatchOverHub(agent, args, text, requester, peer = null, callerSession = null) {
+    const taskId =
+      String(args.taskId ?? '').trim() ||
+      `${String(args.taskPrefix ?? 'DMSH').toUpperCase()}-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(Date.now() % 100000).padStart(5, '0')}`
+    if (!HUB_TASK_ID_RE.test(taskId)) {
+      throw new Error(`taskId "${taskId}" is not <PREFIX>-<YYYYMMDD>-<SEQ>; the hub rejects bare ids like T-123`)
+    }
+    const callerCwd = sessionCwdOf(callerSession) ?? sessionCwdOf(requester) ?? c.sessionCwd ?? c.workspacePath ?? null
+    const originWs = String(args.originWs ?? (callerCwd ? workspaceSlugForPath(callerCwd) : '') ?? '').trim()
+    if (!originWs) {
+      throw new Error(
+        'a hub dispatch needs to say which workspace it came from: pass originWs:"<slug>", ' +
+          'or dispatch from a session whose workspace is known',
+      )
+    }
+    const subject = (String(args.subject ?? '').trim() || previewText(text, 120)).slice(0, 120)
+    const bytes = Buffer.byteLength(text, 'utf8')
+    const sha = sha256Hex(text)
+
+    // 1. blob
+    const blobRes = await hubFetch(`/api/blob?name=${encodeURIComponent(`task-${taskId}.txt`)}&sha256=${sha}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${c.token}`, 'content-type': 'text/plain; charset=utf-8' },
+      body: text,
+      signal: AbortSignal.timeout(30000),
+    })
+    const blob = await blobRes.json().catch(() => null)
+    if (!blobRes.ok) throw new Error(`blob upload failed: HTTP ${blobRes.status} ${blob?.error ?? ''}`.trim())
+    if (blob?.sha256 && blob.sha256 !== sha) {
+      throw new Error(`blob sha256 mismatch: sent ${sha.slice(0, 12)}…, hub stored ${String(blob.sha256).slice(0, 12)}…`)
+    }
+
+    // 2. task row (field names are the hub's, not ours: target_agent / text_ref / origin_ws)
+    const taskRes = await hubFetch('/api/tasks', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        task_id: taskId,
+        target_agent: agent,
+        origin_ws: originWs,
+        subject,
+        intent: 'auto',
+        requester: requester || null,
+        thread: args.thread ?? null,
+        batch_id: args.batchId ?? null,
+        text_ref: `sha256:${sha}`,
+        text_bytes: bytes,
+        ...(args.deadline ? { deadline_ms: Date.now() + durationToMs(args.deadline) } : {}),
+        ...(args.expectBranch ? { expect: String(args.expectBranch) } : {}),
+      }),
+      signal: AbortSignal.timeout(20000),
+    })
+    const taskJson = await taskRes.json().catch(() => null)
+    if (taskRes.status === 409) throw new Error(`hub already has task ${taskId}; pass another taskId`)
+    if (!taskRes.ok) throw new Error(`hub rejected the task: HTTP ${taskRes.status} ${taskJson?.error ?? ''}`.trim())
+
+    // 3. local reference row — the only local trace, and what makes the receipt matchable
+    const refRes = await hubFetch('/api/receipts/hub-ref', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${c.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        taskId,
+        textRef: `sha256:${sha}`,
+        textBytes: bytes,
+        targetAgent: agent,
+        originWs,
+        subject,
+        requester,
+        thread: args.thread,
+        batchId: args.batchId,
+      }),
+      signal: AbortSignal.timeout(10000),
+    }).catch(() => null)
+    if (refRes && !refRes.ok) {
+      const detail = await refRes.text().catch(() => '')
+      throw new Error(
+        `task ${taskId} exists on the hub but the local reference row failed: HTTP ${refRes.status} ${detail.slice(0, 160)}; ` +
+          'the receipt will not match unless it is recorded',
+      )
+    }
+
+    fileLog(`dispatch -> hub agent=${agent} task=${taskId} chars=${text.length} bytes=${bytes}`)
+    return {
+      ok: true,
+      transport: 'hub',
+      target: agent,
+      host: peer?.host ?? null,
+      taskId,
+      textRef: `sha256:${sha}`,
+      textBytes: bytes,
+      note: 'created on the hub; the remote consumer claims it and its receipt returns here',
+    }
+  }
+
   async function dispatchLocalTask(args = {}, extra = null) {
     // Probe once: hosts differ in what they pass as the tool handler's second argument.
     if (!toolExtraLogged && extra && typeof extra === 'object') {
@@ -5944,6 +6074,22 @@ export function apply(ctx, config) {
     if (!target) throw new Error('target is required unless a known thread is given (pass target, or thread with a known binding)')
     if (!text.trim()) throw new Error('text is required')
     if (text.length > 64 * 1024) throw new Error('text is too large (max 64 KiB)')
+
+    // T-487: ONE entry, routed here instead of asking the model to choose between "local" and
+    // "hub". The recurring failure was a session addressing its own machine's agent id through
+    // mesh_send (5 times in 3 weeks); deciding by target shape in one place removes that class.
+    //
+    // Local wins: a session on this box must always be reachable by its name even if a peer
+    // shares it, because local dispatch is the common case. Only when nothing local matches do
+    // we treat the name as a remote agent.
+    if (!thread && target && selfName && target === selfName) {
+      throw new Error(
+        `"${target}" is this machine's own agent id — every session here shares it, so it is not a ` +
+          'dispatch target. Name the session instead: target = a session id or a unique title substring ' +
+          '(list_local_sessions shows them).',
+      )
+    }
+
     let session = null
     let createdSession = false
     let createdWorkspacePath = null
@@ -5954,6 +6100,13 @@ export function apply(ctx, config) {
         throw new Error(`thread "${thread}" target is unavailable (${target}): ${error.message}; pass target to re-bind it`)
       }
       if (args.createIfMissing !== true) {
+        // T-487: nothing local matched. Before failing, check whether the caller named a
+        // *remote* agent — that is the case people were reaching for with mesh_send, and it
+        // must work through this same entry rather than a second tool they have to remember.
+        if (explicitTarget && !thread) {
+          const remote = await resolveRemoteAgentTarget(explicitTarget)
+          if (remote) return await dispatchOverHub(explicitTarget, args, text, requester, remote, callerSession)
+        }
         throw new Error(
           `找不到会话 "${target}"；可用 list_local_sessions 查看，或设 createIfMissing:true 新建（${error.message}）`,
         )

@@ -8,6 +8,7 @@
 
 ### Added
 
+- `mesh_dispatch` 成为**唯一发放入口**并在实现内部分流（T-487）：`target` 是本机会话 → 本地注入；是已注册的远端 agent → 自动走 hub（正文上传为 blob、任务行带 `text_ref`、再落本地引用行，与 `dsh-mesh-dispatch --transport hub` 等价）；是本机自己的 agent 名 → 直接拒绝并指向本地会话。此前要把活交给"本机另一个会话"，只能在这些工具之间自行猜测，3 周内 5 次误用 `mesh_send` 打自己而被 hub 拒绝。
 - 未读对账看门狗（T-486）：定期读信箱，把「未读且超过 `unreadOverdueMs`（默认 30 分钟）仍未唤醒」的消息数写进 `/mesh/status.overdueUnread`，并记 `WARN unread overdue`。此前没有任何东西能回答「信箱里有未读、却没被唤醒」；`ops-check` 的 `waker-unread` 直接读该字段判红。
 - 唤醒抑制改为**延后补发**（T-486）：`busy` 时不再丢弃，改为合并记忆一次并在当前唤醒结束后重跑；入口冷却与 throttle cap 不再静默 `return`，而是按剩余时间重排一次唤醒（每 `(conversation, reason)` 只留一个定时器）。`/mesh/status` 新增 `wakeSuppressed` / `wakeDeferred` / `wakeFailed` 计数。
 

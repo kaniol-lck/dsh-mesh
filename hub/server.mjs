@@ -939,7 +939,19 @@ function buildServer(agentName, agentHost, publicUrl) {
           note: extras.note ?? 'broadcast to every other registered agent',
         }
       }
-      if (to === agentName) throw new Error('refusing to send a message to yourself')
+      if (to === agentName) {
+        // T-487: the bare "refusing to send to yourself" left the caller with nowhere to go,
+        // and this fired five times over three weeks. Name the actual mistake: a mesh agent is
+        // a *machine*, and every session on that machine shares one identity — so "tell the
+        // session on my own box" is not a hub operation. Give the local route instead.
+        throw new BadRequest(
+          `"${to}" is this machine's own agent id, and every session here shares it — a hub message cannot target a local session. ` +
+            'To hand work to another session on this machine use the local dispatch path ' +
+            '(`mesh_dispatch` with a session id, or scripts/mesh-dispatch.mjs --session <id>); ' +
+            'mesh_send is only for a different agent (another machine).',
+          { code: 'self_send', to, hint: 'local_dispatch', agent: agentName },
+        )
+      }
       const target = db.prepare('SELECT name FROM agents WHERE name = ?').get(to)
       const id = randomUUID()
       db.prepare('INSERT INTO messages (id, sender, recipient, subject, body, created_at, reply_to, conversation, no_reply, pinned, interrupt, origin_session, delivery_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
