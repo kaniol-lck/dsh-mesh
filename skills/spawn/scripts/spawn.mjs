@@ -59,6 +59,14 @@ const USAGE = `spawn.mjs — 派生一个专项会话（重构讨论 / 方案对
 const ROLE_CANDIDATES = ['.worklog/roles/special.md', '.worklog/roles/l1-special.md', '.worklog/roles/l1.md']
 const REPORT_CANDIDATES = ['.worklog/specs', '.worklog/reports']
 
+/**
+ * 标题命名规约（owner 2026-11-17）：标题只做显示，身份走 session id。
+ * 不得用 `<工作区> · <角色>` 承载身份，也不得再用「协调 / coordinator」这类已废弃角色词。
+ * 这条校验在创建之前执行——宁可拒绝，也不要生成一个违反规约的会话。
+ */
+const TITLE_LEGACY_PATTERN = /^.+\s·\s.+$/
+const TITLE_LEGACY_WORDS = ['协调', 'coordinator']
+
 const argv = process.argv.slice(2)
 const has = (flag) => argv.includes(flag)
 const val = (flag) => {
@@ -184,6 +192,22 @@ async function main() {
   const asJson = has('--json')
 
   if (title.length > 60) refuse(`标题过长：${title.length} > 60`, 2)
+  if (TITLE_LEGACY_PATTERN.test(title)) {
+    refuse(
+      `标题 "${title}" 使用了已废弃的 <工作区> · <角色> 形式。\n` +
+        '标题只做显示，身份走 session id；请用描述这件事本身的名字（如「重构讨论：发言架构」）。',
+      2,
+    )
+  }
+  for (const word of TITLE_LEGACY_WORDS) {
+    if (title.toLowerCase().includes(word.toLowerCase())) {
+      refuse(
+        `标题 "${title}" 含已废弃角色词「${word}」：通用协调会话模型已废弃，不再按角色命名会话。\n` +
+          '请用描述这件事本身的名字。',
+        2,
+      )
+    }
+  }
 
   const briefFile = path.resolve(briefPath)
   if (!existsSync(briefFile)) refuse(`brief 不存在：${briefFile}`, 1)

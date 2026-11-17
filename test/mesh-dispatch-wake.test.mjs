@@ -128,17 +128,41 @@ test('wake: --title is refused even for archived sessions', async () => {
   })
 })
 
-test('wake: --coordinator picks the live coordinator and skips archived ones', async () => {
+// 行为变更（owner 2026-11-17）：--coordinator 不再按标题前缀找会话，改读注册表的
+// `coordinator` 字段（session id）。这条用例验证「标题里有协调字样但注册表指向别处」时，
+// 用的是注册表的值——即标题不参与寻址。
+test('wake: --coordinator resolves from the registry coordinator field, not from titles', async () => {
   const { dir, indexFile, wakeTarget } = fixtureIndex()
-  await withWaker(sessions, async ({ base, calls }) => {
-    const result = await run(
-      { MESH_WAKER_URL: base, MESH_SESSIONS_INDEX: indexFile, MESH_WAKE_TARGET: wakeTarget },
-      ['--wake', '--coordinator', 'mesh', '--text', '[WAKE] probe', '--dry-run', '--repo', dir],
-    )
-    assert.equal(result.code, 0, result.stdout + result.stderr)
-    assert.match(result.stdout, /session=session-coord/)
-    assert.equal(calls.post, 0)
-  })
+  await withWaker(
+    sessions,
+    async ({ base }) => {
+      const result = await run(
+        { MESH_WAKER_URL: base, MESH_SESSIONS_INDEX: indexFile, MESH_WAKE_TARGET: wakeTarget },
+        ['--wake', '--coordinator', 'mesh', '--text', '[WAKE] probe', '--dry-run', '--repo', dir],
+      )
+      assert.equal(result.code, 0, result.stdout + result.stderr)
+      // 注册表说 registry-session，就投给 registry-session；标题里的 session-coord 不被采用。
+      assert.match(result.stdout, /session=session-registry/)
+    },
+    { workspaces: { mesh: { cwd: dir, coordinator: 'session-registry' } } },
+  )
+})
+
+test('wake: --coordinator refuses when the registry has no usable coordinator', async () => {
+  const { dir, indexFile, wakeTarget } = fixtureIndex()
+  await withWaker(
+    sessions,
+    async ({ base }) => {
+      const result = await run(
+        { MESH_WAKER_URL: base, MESH_SESSIONS_INDEX: indexFile, MESH_WAKE_TARGET: wakeTarget },
+        ['--wake', '--coordinator', 'mesh', '--text', '[WAKE] probe', '--dry-run', '--repo', dir],
+      )
+      assert.notEqual(result.code, 0)
+      assert.match(result.stderr, /没有登记可用的 coordinator/)
+      assert.match(result.stderr, /--session/)
+    },
+    { workspaces: { mesh: { cwd: dir } } },
+  )
 })
 
 test('wake: a real send posts once and the 60s dedupe suppresses the second', async () => {
@@ -170,9 +194,10 @@ test('wake: no target and no --create exits 2 with the three explicit options', 
   })
 })
 
-test('wake: no target with --create makes <slug> · 协调 <n>, verifies workspacePath and injects', async () => {
+// 行为变更（owner 2026-11-17）：通用协调会话模型废弃，--create 不再生成 `<slug> · 协调 <n>`。
+// 这条用例从「断言新标题」改为「断言拒绝」，并且验证它**没有**发出任何创建请求。
+test('wake: --create is refused (generic coordinator sessions are retired)', async () => {
   const { dir, indexFile, wakeTarget } = fixtureIndex()
-  const createdTitle = `${path.basename(dir)} · 协调 2`
   await withWaker(
     sessions,
     async ({ base, calls }) => {
@@ -180,14 +205,13 @@ test('wake: no target with --create makes <slug> · 协调 <n>, verifies workspa
         { MESH_WAKER_URL: base, MESH_SESSIONS_INDEX: indexFile, MESH_WAKE_TARGET: wakeTarget },
         ['--wake', '--create', '--text', '[WAKE] probe', '--repo', dir],
       )
-      assert.equal(result.code, 0, result.stdout + result.stderr)
-      assert.match(result.stdout, /session=session-created/)
-      assert.match(result.stdout, /created=true/)
-      assert.match(result.stdout, new RegExp(`workspacePath=`))
-      assert.equal(calls.create, 1)
-      assert.equal(calls.post, 1)
+      assert.equal(result.code, 2, result.stdout + result.stderr)
+      assert.match(result.stderr, /--create 已移除/)
+      assert.match(result.stderr, /--session/)
+      assert.equal(calls.create, 0, 'refused --create must not create a session')
+      assert.equal(calls.post, 0, 'refused --create must not inject')
     },
-    { workspaces: { 'demo-ws': { cwd: dir } }, createdTitle, workspacePath: dir },
+    { workspaces: { 'demo-ws': { cwd: dir } } },
   )
 })
 

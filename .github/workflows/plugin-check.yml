@@ -48,6 +48,10 @@ jobs:
       - name: Tool contract guard
         run: node scripts/check-tool-contract.mjs --no-failures
 
+      # QA 行为层（L2）：真调创建入口看产出，见 qa/charter.md
+      - name: QA behaviour probes
+        run: node qa/run.mjs
+
       - name: No duplicate tool implementations
         run: node scripts/check-duplicates.mjs
 

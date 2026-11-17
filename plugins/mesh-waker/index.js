@@ -7285,6 +7285,32 @@ export function apply(ctx, config) {
       return
     }
 
+    if (path === '/mesh/sessions/rename' && req.method === 'POST') {
+      // 原地改名：只换标题，session id 不变，不打断在飞回合、不丢上下文。
+      // create+archive 是「换人」，不是改名——对正在干活的会话用它会直接把活截断。
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      try {
+        const draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        const target = resolveLocalSession(draft)
+        const title = String(draft.title ?? '').trim().slice(0, 60)
+        if (!title) throw new Error('title is required')
+        await ctx.sessionController.rename({ sessionId: target.id, title })
+        fileLog(`renamed local session ${target.id}: "${target.title ?? ''}" -> "${title}"`)
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: true, sessionId: target.id, oldTitle: target.title ?? null, title }))
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
+      return
+    }
+
     if (path === '/mesh/sessions/archive' && req.method === 'POST') {
       if (!fromLoopback(req)) {
         res.writeHead(403, { 'content-type': 'application/json' })

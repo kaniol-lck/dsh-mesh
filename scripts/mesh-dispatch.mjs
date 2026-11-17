@@ -31,12 +31,11 @@ Usage:
   node scripts/mesh-dispatch.mjs --session <id> --file task.txt
   node scripts/mesh-dispatch.mjs --target <session-id> --thread TH-1 --text "..."
   node scripts/mesh-dispatch.mjs --coordinator <slug> --wake --text "[WAKE] ..."
-  node scripts/mesh-dispatch.mjs --wake --create --text "[WAKE] ..."   # new <slug> · 协调 <n>
   node scripts/mesh-dispatch.mjs --session <id> --text "..." --dry-run
 
 Local extensions (not part of the plugin CLI):
-  --coordinator <s>  resolve the live coordinator of workspace <s>, excluding archived/live=false; --role is an alias
-  --create           with --wake and no target: create "<slug> · 协调 <n>" for this workspace
+  --coordinator <s>  resolve the workspace <s> routing session from the registry field 'coordinator'
+                     field (a session id); --role is an alias. Titles are never matched.
   --wake             send directly to the waker inject API; text must start with "[WAKE]"
   --dry-run          with --wake: print target + dedupe key + 未投递, send nothing
   --repo <path>      workspace used by --coordinator and the wake dedupe file (default: cwd)
@@ -48,12 +47,11 @@ Local extensions (not part of the plugin CLI):
                      blocks delivery; workers must not "git switch" on their own.
 
 Wake target: explicit --session/--target/--thread/--coordinator/--role is used as-is; title addressing is removed.
-With no target, --wake no longer falls back to the recorded coordinator: --create makes a new
-"<slug> · 协调 <n>" session bound to the current workspace (workspacePath echo is verified), and
-without --create it exits 2 with the three explicit options. --role is an alias of --coordinator.
+With no target, --wake exits 2 with the explicit options. --create is removed: the generic
+coordinator-session model is retired (owner 2026-11-17), and titles are display-only — never
+"<workspace> · <role>". Need a new session? Derive one from L1 with the spawn skill.
 Everything else is forwarded unchanged
-(--target/--thread/--task/--receipt/--requester/--file/--text/--mode/--batch/--deadline/
---dry-run/--json/--create).
+(--target/--thread/--task/--receipt/--requester/--file/--text/--mode/--batch/--deadline/--dry-run/--json).
 `
 
 function normalize(value) {
@@ -131,18 +129,29 @@ async function resolveTitle(title, repo) {
   return pickActive(title, active, archived, meta, `repo ${wanted}`)
 }
 
+/**
+ * 按 slug 解析该工作区的路由会话：**读注册表的 coordinator 字段（session id）**，
+ * 不再按标题前缀猜（标题只做显示；`<工作区> · 协调` 已废弃，见 owner 2026-11-17）。
+ */
 async function resolveCoordinator(slug, repo) {
-  const index = readIndex()
   const wanted = normalize(repo ?? process.cwd())
-  const meta = await sessionMeta()
-  const prefix = `${slug} · 协调`
-  const candidates = Object.entries(index).filter(
-    ([, session]) => session && session.title && session.title.startsWith(prefix) && session.cwd && normalize(session.cwd) === wanted,
+  try {
+    const response = await fetch(`${BASE}/mesh/workspaces`)
+    if (response.ok) {
+      const payload = await response.json()
+      const workspace = payload.workspaces?.[slug]
+      const sessionId = workspace?.coordinator
+      if (typeof sessionId === 'string' && /^session-[A-Za-z0-9-]+$/.test(sessionId)) {
+        if (!workspace?.cwd || normalize(workspace.cwd) === wanted) return sessionId
+      }
+    }
+  } catch {
+    /* fall through to the explicit error below */
+  }
+  throw new Error(
+    `工作区 "${slug}" 没有登记可用的 coordinator（注册表 coordinator 字段）；` +
+      '按标题猜协调会话的做法已废弃——请改用 --session <id>。',
   )
-  const isArchived = ([id]) => meta.get(id)?.archived === true || meta.get(id)?.live === false
-  const active = candidates.filter((entry) => !isArchived(entry))
-  const archived = candidates.filter((entry) => isArchived(entry))
-  return pickActive(`coordinator ${slug}`, active, archived, meta, `repo ${wanted}`)
 }
 
 function valueOf(argv, index) {
@@ -165,49 +174,17 @@ async function workspaceSlug(repo) {
   return path.basename(path.resolve(repo))
 }
 
-async function nextCoordinatorTitle(slug) {
-  const response = await fetch(`${BASE}/mesh/sessions`)
-  if (!response.ok) throw new Error(`GET /mesh/sessions -> HTTP ${response.status}`)
-  const payload = await response.json()
-  const prefix = `${slug} · 协调`
-  let highest = 0
-  for (const session of payload.sessions ?? []) {
-    const title = String(session.title ?? '')
-    if (title === prefix) highest = Math.max(highest, 1)
-    const match = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} (\\d+)$`).exec(title)
-    if (match) highest = Math.max(highest, Number(match[1]))
-  }
-  return `${prefix} ${highest + 1}`
-}
-
-/** Default target: create "<slug> · 协调 <n>" bound to the current workspace. */
-async function createCoordinator(repo) {
-  const slug = await workspaceSlug(repo)
-  const title = await nextCoordinatorTitle(slug)
-  const response = await fetch(`${BASE}/mesh/sessions/create`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ title, workspacePath: path.resolve(repo), workspaceTitle: slug }),
-  })
-  const raw = await response.text()
-  if (!response.ok) {
-    console.error(`POST /mesh/sessions/create -> HTTP ${response.status}: ${raw}`)
-    process.exit(response.status >= 400 && response.status < 500 ? 2 : 1)
-  }
-  const created = JSON.parse(raw)
-  const sessionId = created.sessionId
-  if (!sessionId) throw new Error('create returned no sessionId')
-  const echoed = created.workspacePath ? normalize(created.workspacePath) : null
-  if (echoed !== normalize(repo)) {
-    throw new Error(`created session workspacePath mismatch: echoed ${created.workspacePath} != ${path.resolve(repo)}`)
-  }
-  // New sessions are not necessarily visible to /mesh/inject immediately; wait briefly.
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const listing = await fetch(`${BASE}/mesh/sessions`).then((response) => response.json()).catch(() => null)
-    if (listing?.sessions?.some((session) => session.id === sessionId)) break
-    await new Promise((resolve) => setTimeout(resolve, 100))
-  }
-  return { sessionId, title: created.title ?? title, workspacePath: created.workspacePath, created: true }
+/**
+ * 通用协调会话模型已废弃（owner 2026-11-17）：不再按 `<工作区> · 协调 <n>` 建会话。
+ * 需要唤醒一个还没起的会话时，用显式 `--session <id>`，或先由 L1 派生专项会话
+ * （`spawn` 技能）。这里保留函数只为给出可执行的报错，不再创建任何东西。
+ */
+async function refuseLegacyCreate() {
+  console.error(
+    '--create 已移除：通用协调会话模型已废弃，且不再按 "<工作区> · <角色>" 生成标题。\n' +
+      '改用：--session <session-id>（已存在的会话）；需要新会话时由 L1 用 spawn 技能派生。',
+  )
+  process.exit(2)
 }
 
 async function wake(argv) {
@@ -233,7 +210,6 @@ async function wake(argv) {
   if (!WAKE_PREFIX.test(text.replace(/^\uFEFF/, ''))) {
     throw new Error('wake payload must start with "[WAKE] <one-line summary>"')
   }
-  let createdInfo = null
   let target
   if (session) {
     target = session
@@ -246,18 +222,18 @@ async function wake(argv) {
   } else if (title) {
     target = await resolveTitle(title, repo)
   } else if (create) {
-    createdInfo = await createCoordinator(repo)
-    target = createdInfo.sessionId
+    await refuseLegacyCreate()
+    return
   } else {
     console.error(
-      '--wake needs an explicit target: --session <id> | --coordinator <slug> | --create ' +
-        '(creates "<slug> · 协调 <n>" bound to the current workspace)',
+      '--wake needs an explicit target: --session <id> | --coordinator <slug>。' +
+        '（--create 已移除：通用协调会话模型废弃；新会话由 L1 用 spawn 技能派生）',
     )
     process.exit(2)
   }
   const dedupeFile = path.join(path.resolve(repo), '.worklog', 'dispatch', '.wake-dedupe.json')
   const key = `${target}|${createHash('sha256').update(text).digest('hex').slice(0, 16)}`
-  const createdFlag = createdInfo ? ` created=true title=${JSON.stringify(createdInfo.title)} workspacePath=${createdInfo.workspacePath}` : ''
+  const createdFlag = ''
   if (dryRun) {
     console.log(`dry-run: session=${target} dedupeKey=${key} chars=${text.length} wake=yes 未投递（未写去重文件）${createdFlag}`)
     return

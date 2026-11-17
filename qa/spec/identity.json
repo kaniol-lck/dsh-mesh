@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "note": "机器可读契约。改这里要 DECISION: 记账 + owner/L2 复核（见 qa/charter.md §3/§4）。tier: L1=静态文本, L2=行为（真调入口）, L3=事实（对真实数据）。",
+  "specs": [
+    {
+      "id": "identity.no-workspace-prefix-in-title",
+      "statement": "任何本机创建入口产出的会话标题，都不得用 `<工作区> · <角色>` 形式承载身份；标题只是显示名，身份走 session id。",
+      "why": "2026-11-17 事故：portal 会话用 mesh-dispatch --create 建出 `saros · 协调`，违反两条既有决定（通用协调会话已废弃；`<工作区> · 前缀` 已废弃）。",
+      "since": "2026-11-17",
+      "tier": "L2",
+      "probes": ["probes/no-workspace-prefix.mjs", "probes/no-workspace-prefix-spawn.mjs"],
+      "forbiddenPatterns": ["^.+ · .+$"],
+      "forbiddenSubstrings": ["协调", "coordinator"],
+      "exceptions": []
+    }
+  ]
+}
