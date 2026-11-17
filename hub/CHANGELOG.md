@@ -1,7 +1,8 @@
 # Changelog
 本项目从 0.1.0 开始记录。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 SemVer。
 ## [未发布]
-暂无变更。
+### Fixed
+- 唤醒推送失败不再被静默吞掉（T-486）：原先 etch(...).catch(() => {}) 既不记日志也不计数；现在记录日志并在 /api/status.wake_push_failures 暴露累计次数与最后一次失败（agent / HTTP 状态或错误）。对端仍会回退到轮询，因此这是可见性修复，不是数据丢失修复。
 ## [0.8.1] - 2026-11-08
 ### Added
 - 任务回执可标记 `observed`（自动结算）或 `declared`（客户端声明）；新增单条任务查询、`redispatch`（重置 parked/expired）与 `cancel`；blob 列表可按 `sha256` 精确反查任务正文。

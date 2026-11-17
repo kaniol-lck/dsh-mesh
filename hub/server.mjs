@@ -318,6 +318,8 @@ function purgeExpired() {
 
 // ---------------------------------------------------------------- wake
 const wakeRecent = new Map()
+// T-486: wake pushes that never landed. Total + last, surfaced on /api/status.
+const wakePushFailures = { total: 0, last: null }
 
 /** Validate a self-registered wake endpoint: absolute http(s) URL, bounded length. */
 function wakeUrlOf(value) {
@@ -423,6 +425,9 @@ function wakeAgent(agentName, conversation, meta = {}) {
   const agentSecret = row.wake_secret || ensureWakeSecret(agentName)
   const secret = agentSecret || WAKE_SECRET
   const signature = createHmac('sha256', secret).update(body).digest('hex')
+  // T-486: a failed push used to be swallowed (`.catch(() => {})`). The receiver falls back
+  // to polling, so the message is not lost - but nobody could see that the wake never landed.
+  // Count it and log it; `/api/status` reports the counter so a stuck receiver is visible.
   fetch(row.wake_url, {
     method: 'POST',
     headers: {
@@ -433,7 +438,19 @@ function wakeAgent(agentName, conversation, meta = {}) {
     },
     body,
     signal: AbortSignal.timeout(WAKE_TIMEOUT_MS),
-  }).catch(() => {})
+  })
+    .then((response) => {
+      if (!response.ok) {
+        wakePushFailures.total += 1
+        wakePushFailures.last = { agent: agentName, status: response.status, at: ts }
+        console.warn(`[hub] wake push to ${agentName} failed: HTTP ${response.status}`)
+      }
+    })
+    .catch((error) => {
+      wakePushFailures.total += 1
+      wakePushFailures.last = { agent: agentName, error: String(error?.message ?? error).slice(0, 120), at: ts }
+      console.warn(`[hub] wake push to ${agentName} failed: ${error?.message ?? error}`)
+    })
 }
 
 /**
@@ -2399,6 +2416,9 @@ async function handleRest(req, res, url) {
         hub: { version: HUB_VERSION, min_waker: MIN_WAKER },
         plugin_versions: pluginVersions,
         outdated: outdatedAgents,
+        // T-486: a non-zero total means a receiver was not actually woken; it falls back
+        // to polling, so this is a visibility signal, not data loss.
+        wake_push_failures: wakePushFailures,
       })
     }
 

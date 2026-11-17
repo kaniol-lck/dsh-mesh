@@ -8,6 +8,11 @@
 
 ### Added
 
+- 未读对账看门狗（T-486）：定期读信箱，把「未读且超过 `unreadOverdueMs`（默认 30 分钟）仍未唤醒」的消息数写进 `/mesh/status.overdueUnread`，并记 `WARN unread overdue`。此前没有任何东西能回答「信箱里有未读、却没被唤醒」；`ops-check` 的 `waker-unread` 直接读该字段判红。
+- 唤醒抑制改为**延后补发**（T-486）：`busy` 时不再丢弃，改为合并记忆一次并在当前唤醒结束后重跑；入口冷却与 throttle cap 不再静默 `return`，而是按剩余时间重排一次唤醒（每 `(conversation, reason)` 只留一个定时器）。`/mesh/status` 新增 `wakeSuppressed` / `wakeDeferred` / `wakeFailed` 计数。
+
+### Fixed
+
 - 修 claim 看门狗误报：startedAt 已落的行不再判 unclaimed（T-485 addendum，实测 XJ-SPAWN-01 一边输出 started=yes acked=yes 一边报 unclaimed）——startedAt 与 ackedAt 语义相反，前者证明任务已被接单；未开始的任务仍由该看门狗盯。- digest 任务未声明完成的看门狗（T-mwgtchp6）：`declaredOnly` 任务通知后超过 `digestClaimWarnMs`（默认 30min）未 `mesh_complete` 时记 WARN 并给派单方 advisory `unclaimed` 回执（不结算），2× 窗口标 `stalled` 保留行；`claimSweepMs` 控制扫描，重启后继续。`createTaskLifecycle` 的依赖补传 `taskRows`（漏传会让 host 因 `deps.taskRows is not iterable` 退出）。
 - 跨机任务消费（默认关闭）：开启后按自己的节奏拉取、认领、续租并结算对端派来的任务，正文按内容哈希取回，不落本地副本；`/mesh/status` 的 `tasksPoll` 报告开关、最近拉取时间与错误。
 - 跨机派活（`dsh-mesh-dispatch --transport hub --to <agent>`）：正文上传为 blob、任务落到 hub，本机只留一行引用（不含正文、不建会话）；`--dry-run` 零网络，hub 失败时退出码非 0 且不留引用行。

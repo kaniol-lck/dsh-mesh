@@ -214,6 +214,7 @@ if (!wakerStatus.ok || wakerStatus.status !== 200) {
   add('waker-stale', 'waker disk/process versions match', 'SKIP', 'waker unreachable')
   add('waker-registered', 'waker registered with hub', 'SKIP', 'waker unreachable')
   add('waker-backlog', 'waker pending tasks low', 'SKIP', 'waker unreachable')
+  add('waker-unread', 'no unread mail left unwoken', 'SKIP', 'waker unreachable')
 } else {
   const versions = wakerBody?.pluginVersions ?? {}
   add('waker', 'waker status reachable', 'PASS', `${originOf(options.waker)} (plugin ${versions.process ?? '?'})`)
@@ -222,6 +223,19 @@ if (!wakerStatus.ok || wakerStatus.status !== 200) {
   add('waker-registered', 'waker registered with hub', wakerBody?.registered === true && wakerBody?.lastError === null ? 'PASS' : 'WARN', `registered=${wakerBody?.registered} lastError=${wakerBody?.lastError ?? 'null'}`)
   const pending = Number(wakerBody?.pendingTasks ?? 0)
   add('waker-backlog', 'waker pending tasks low', pending > 10 ? 'WARN' : 'PASS', `${pending} pending task(s)`)
+  // T-486: mail sitting unread that nobody was woken for. The waker computes it (unread
+  // watchdog), so this stays a single HTTP read and needs no hub credentials.
+  const overdue = wakerBody?.overdueUnread ?? {}
+  const overdueCount = Number(overdue.count ?? 0)
+  const oldestMinutes = overdue.oldestAgeMs ? Math.round(overdue.oldestAgeMs / 60000) : null
+  add(
+    'waker-unread',
+    'no unread mail left unwoken',
+    overdueCount > 0 ? 'FAIL' : (overdue.checkedAt ? 'PASS' : 'WARN'),
+    overdueCount > 0
+      ? `${overdueCount} unread message(s) never woken, oldest ${oldestMinutes}m`
+      : (overdue.checkedAt ? 'none overdue' : 'not checked yet (watchdog has not run)'),
+  )
 }
 
 // ---------------------------------------------------------------- local ports

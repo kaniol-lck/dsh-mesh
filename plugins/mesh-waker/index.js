@@ -32,6 +32,7 @@ import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_CO
 import { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, classifyRoleCandidates, ROLE_UNRECOGNIZED_MAX } from './lib/session.mjs'
 import { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settings.mjs'
+import { classifyOverdue, describeOverdue } from './lib/unread-watchdog.mjs'
 import { findOutboundSession, readLogTail } from './lib/origin-scan.mjs'
 import { createReceiptFlow } from './lib/receipt-flow.mjs'
 import { createThreads } from './lib/threads.mjs'
@@ -445,6 +446,8 @@ const SAVED_CONFIG_KEYS = [
   'throttleMaxWakesPerWindow',
   'throttleWindowMs',
   'conversationCooldownMs',
+  'unreadWatchdogMs',
+  'unreadOverdueMs',
 ]
 
 const savedConfigPath = () => join(homedir(), '.dsh', 'mesh-waker', 'config.json')
@@ -577,6 +580,10 @@ function normalizeBase(config) {
     catchUpOnStart: c.catchUpOnStart !== false,
     catchUpDelayMs: Number(c.catchUpDelayMs ?? 12000),
     catchUpMaxConversations: Number(c.catchUpMaxConversations ?? 3),
+    // T-486: how often to reconcile inbox against wake history, and how old an unread
+    // message must be before it counts as 'nobody was woken for this'. 0 disables the timer.
+    unreadWatchdogMs: clampInterval(c.unreadWatchdogMs ?? 300000, 0, 3600000),
+    unreadOverdueMs: clampInterval(c.unreadOverdueMs ?? 1800000, 60000, 86400000),
     // --- task receipts (0.5.1) -------------------------------------------------------
     // A task injected with meta.taskId gets exactly one receipt when its turn ends (or
     // when it never starts). queue notifies the requester (or receiptTo, via the receipt
@@ -832,6 +839,13 @@ export function apply(ctx, config) {
 
   let lastWakeAt = 0
   let busy = false
+  // T-486: a wake that arrives while another is running used to be dropped silently
+  // (`if (busy) return`), leaving the mail unread forever. Coalesce it instead: remember the
+  // latest meta and run one more wake when the current one finishes.
+  let pendingWakeMeta = null
+  // Suppressed wakes are re-armed rather than lost: keyed by (conversation, reason) so the
+  // status page can show why a wake did not happen when it was asked for.
+  const deferredWakeTimers = new Map()
   let selfName = null
   let attachmentDisabled = false
   // Throttle per conversation: a burst inside one dialogue collapses into one turn, but
@@ -855,6 +869,14 @@ export function apply(ctx, config) {
     trust: c.trust,
     lastCatchUpAt: null,
     lastCatchUpCount: null,
+    // T-486: wake accounting. `suppressed` counts wakes that did not run at the moment they
+    // were requested (busy / cooldown / cap / trivial), `deferred` counts the ones re-armed to
+    // run later, `failed` counts exceptions. `overdueUnread` is the reconciliation view:
+    // unread mail old enough that a session should already have been woken for it.
+    wakeSuppressed: { busy: 0, cooldown: 0, cap: 0, trivial: 0 },
+    wakeDeferred: { cooldown: 0, cap: 0, busy: 0 },
+    wakeFailed: 0,
+    overdueUnread: { count: 0, oldestAgeMs: null, checkedAt: null, sample: [] },
     // Pull mode (contract section 4): when the last poll finished, how long the current
     // cadence is, and when the next one fires (the status route reports the countdown).
     lastPullAt: null,
@@ -3210,8 +3232,35 @@ export function apply(ctx, config) {
     fileLog(`conversation=${conversation} target=deferred reason=unbound messages=${messages.length}`)
   }
 
+  /**
+   * Re-arm a suppressed wake instead of dropping it (T-486).
+   *
+   * Dropping was the bug: the mail stays unread, the sender believes it was delivered, and
+   * nothing records that no session was ever woken. One pending timer per (conversation,
+   * reason) keeps a burst from stacking up.
+   */
+  function scheduleDeferredWake(reason, waitMs, meta = {}) {
+    const key = `${meta.conversation ?? '_default'}|${reason}`
+    if (deferredWakeTimers.has(key)) return
+    const timer = setTimeout(() => {
+      deferredWakeTimers.delete(key)
+      void wake(meta)
+    }, Math.max(50, waitMs))
+    if (typeof timer.unref === 'function') timer.unref()
+    deferredWakeTimers.set(key, timer)
+    state.wakeDeferred[reason] = (state.wakeDeferred[reason] ?? 0) + 1
+    fileLog(`wake re-armed (${reason}) in ${Math.round(waitMs)}ms conv=${meta.conversation ?? '-'}`)
+  }
+
   async function wake(meta = {}) {
-    if (busy) return
+    // T-486: coalesce instead of dropping. The mail stays unread either way, so the next run
+    // picks it up; dropping the request was what made it invisible.
+    if (busy) {
+      pendingWakeMeta = { ...(pendingWakeMeta ?? {}), ...meta }
+      state.wakeSuppressed.busy += 1
+      fileLog(`wake deferred (busy) conv=${meta.conversation ?? '-'} — will re-run after the current wake`)
+      return
+    }
     busy = true
     const t0 = Date.now()
     try {
@@ -3221,6 +3270,7 @@ export function apply(ctx, config) {
         const bodies = messages.map((message) => String(message.body ?? '').trim())
         if (bodies.every((body) => body.length < c.minMessageChars && TRIVIAL_RE.test(body))) {
           recordBlocked(meta.conversation, 'trivial', 'ack-only batch')
+          state.wakeSuppressed.trivial += 1
           return
         }
         const [, entry] = throttleEntry(meta.conversation)
@@ -3228,6 +3278,11 @@ export function apply(ctx, config) {
         const recent = (entry.wakes ?? []).filter((at) => Date.now() - at < c.throttleWindowMs)
         if (recent.length >= cap) {
           recordBlocked(meta.conversation, 'cap', `${recent.length}/${cap} in window`)
+          state.wakeSuppressed.cap += 1
+          // Re-arm for when the window frees up, instead of waiting for the sender to try again.
+          const oldest = Math.min(...recent)
+          const waitMs = Math.max(1000, Math.min(c.throttleWindowMs, oldest + c.throttleWindowMs - Date.now() + 50))
+          scheduleDeferredWake('cap', waitMs, meta)
           return
         }
       }
@@ -3276,6 +3331,7 @@ export function apply(ctx, config) {
       log.info(`[mesh-waker] woke session ${sessionId}`)
     } catch (error) {
       state.lastError = `${error.name}: ${error.message}`
+      state.wakeFailed += 1
       fileLog(`wake FAILED conv=${meta?.conversation ?? '-'} from=${meta?.sender ?? '-'}: ${state.lastError}`)
       log.warn(`[mesh-waker] wake failed: ${error.message}`)
       if (!meta.conversation) {
@@ -3286,6 +3342,12 @@ export function apply(ctx, config) {
       }
     } finally {
       busy = false
+      // Run the coalesced wake (T-486). Deferred with a tick so the stack unwinds first.
+      if (pendingWakeMeta) {
+        const next = pendingWakeMeta
+        pendingWakeMeta = null
+        setTimeout(() => { void wake(next) }, 0)
+      }
     }
   }
 
@@ -3709,9 +3771,42 @@ export function apply(ctx, config) {
     }
     hubLater(() => void syncHistory(), Math.max(1000, c.catchUpDelayMs) + 2000)
     hubEvery(() => void syncHistory(), Math.max(60_000, c.historySyncIntervalMs ?? 600_000))
+    // T-486: the reconciliation nobody had. Unread mail old enough that a session should
+    // already have been woken for it is surfaced on /mesh/status, not left to be discovered.
+    if (c.unreadWatchdogMs > 0) {
+      hubLater(() => void checkUnreadOverdue(), Math.max(5000, c.catchUpDelayMs))
+      hubEvery(() => void checkUnreadOverdue(), c.unreadWatchdogMs)
+    }
     if (effectiveMode !== 'push') schedulePull(1200)
     // Cross-machine tasks (T-388): opt-in, independent cadence from the message pull.
     if (c.tasksPollEnabled) hubTasks?.start()
+  }
+
+  /**
+   * T-486: reconcile inbox against wake history.
+   *
+   * The failure this catches: mail arrives, the wake is suppressed (busy / cooldown / cap) or
+   * the push never lands, and the message simply sits unread. Before this, nothing could
+   * answer "is there mail nobody was woken for?" — the counters existed but nobody read them.
+   */
+  async function checkUnreadOverdue() {
+    if (!hubReady) return
+    try {
+      const messages = await fetchInbox()
+      const result = classifyOverdue(messages, { thresholdMs: c.unreadOverdueMs })
+      state.overdueUnread = {
+        count: result.count,
+        oldestAgeMs: result.oldestAgeMs,
+        checkedAt: Date.now(),
+        sample: result.overdue.slice(0, 5),
+      }
+      if (result.count > 0) {
+        fileLog(`WARN unread overdue: ${describeOverdue(result)} — no wake recorded for these`)
+        log.warn(`[mesh-waker] unread overdue: ${describeOverdue(result)}`)
+      }
+    } catch (error) {
+      fileLog(`unread watchdog failed: ${error.message}`)
+    }
   }
 
   function disposeHubWork() {
@@ -3723,6 +3818,9 @@ export function apply(ctx, config) {
     hubTimers.length = 0
     if (pullTimer) clearTimeout(pullTimer)
     pullTimer = null
+    // T-486: dropped deferred wakes would otherwise fire after teardown.
+    for (const timer of deferredWakeTimers.values()) clearTimeout(timer)
+    deferredWakeTimers.clear()
     hubFeaturesStarted = false
   }
 
@@ -8621,7 +8719,15 @@ export function apply(ctx, config) {
         const ts = Date.now()
         const throttleKey = meta.conversation || '_default'
         const interval = meta.conversation ? c.conversationCooldownMs : c.cooldownMs
-        if (ts - (recentByKey.get(throttleKey) ?? 0) < interval) return
+        const lastFor = recentByKey.get(throttleKey) ?? 0
+        if (ts - lastFor < interval) {
+          // T-486: cooldown used to `return` and lose the wake. Re-arm it for when the
+          // cooldown ends, and record why it did not run now.
+          recentByKey.set(throttleKey, ts)
+          state.wakeSuppressed.cooldown += 1
+          scheduleDeferredWake('cooldown', interval - (ts - lastFor) + 50, meta)
+          return
+        }
         recentByKey.set(throttleKey, ts)
         lastWakeAt = ts
         void wake(meta)

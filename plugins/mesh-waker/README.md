@@ -190,6 +190,8 @@ dsh plugin --profile web add dsh-mesh-waker
 | `digestNotifyWarnMs` | `90000` | digest 任务「首通知」看门狗（1000–600000ms）：落板后超过该窗口仍 `notifiedAt=null` 时记 WARN `digest not-notified session=… tasks=…` 并重排一次 idle 触发（T-470；正常路径不该看到） |
 | `receiptNotifyWarnMs` | `90000` | 回执 digest 的「首通知」看门狗（1000–600000ms）：回执排队后超过该窗口仍 `receiptNotifyCount=0` 时记 WARN `receipt-digest not-notified session=… tasks=…` 并**立刻补投一次**（不依赖 `turn/end`，因为长会话可能几小时不给 idle 窗口） |
 | `digestClaimWarnMs` | `1800000` | digest 任务通知后仍未 `mesh_complete` 的看门狗（clamp 60000–21600000ms；T-mwgtchp6）：超过窗口记 WARN + 给派单方 advisory `unclaimed` 回执（**不结算**），2× 窗口标 `stalled` 保留行。**只看"通知了但没开始"**：`startedAt` 已落（worker 已开回合）或 `settledAt`/`claimDismissedAt` 已落时一律不报，避免误报正在做的任务 |
+| `unreadWatchdogMs` | `300000` | 未读对账看门狗的间隔（clamp 0–3600000ms；0 = 关闭；T-486）：定期读信箱，把"未读且超过 `unreadOverdueMs` 仍未唤醒"的消息数写进 `/mesh/status.overdueUnread`，并记 `WARN unread overdue` |
+| `unreadOverdueMs` | `1800000` | 未读邮件"该唤醒却没唤醒"的判定阈值（clamp 60000–86400000ms；T-486）：消息 `created_at` 距今超过该值且 `read_at` 为空即计入 `overdueUnread`。默认 30 分钟 |
 | `claimSweepMs` | `15000` | digest claim 扫描间隔（clamp 500–600000ms）；重启后从任务行重新扫描，不依赖进程内定时器 |
 | `receiptDigest` | `'off'` | `'on'` = **回执不再逐条排队**（owner 2026-11-14 要的能力）：`receiptMode='queue'` 的回执照旧写 `receipts.jsonl`，但注入改成 `turn/end` 或空闲（沿用 `digestIdleDebounceMs`）后合并成一条 `[RECEIPT-DIGEST]`；同一 requester 退避 10/30 分钟、最多 2 次，`mesh_ack({ids})` 签收后不再提醒（板标记，不产生新回执）。`file`/`wake` 语义不变，默认 `'off'` |
 | `roleInstructions` | `{}` | B 档角色注入：`{ "<role>": "<文件路径或文本>" }`（role ∈ `waker\|docs\|hub\|ops`）。目标会话 id 命中注册表 `workers[<role>].sessionId` 时，在注入文本**末尾**追加 `## 角色卡（自动注入 · <role>）` + 内容；值为路径时相对**目标会话 cwd** 解析（读不到只记 `role-card missing` 日志，不报错、不阻断）。默认空对象 = 零行为变化 |
