@@ -23,7 +23,7 @@ const REPO = path.join(import.meta.dirname, '..')
 const ENTRY = path.join(REPO, 'plugins', 'mesh-waker', 'index.js')
 process.env.MESH_WAKER_LOG = path.join(os.tmpdir(), `waker-dispatch-routing-${process.pid}.log`)
 
-const SELF = 'dsh-kaniol-pc'
+const SELF = 'local-box'
 const REMOTE = 'hermes'
 const LOCAL = 'session-rq-local'
 const CALLER = 'session-rq-caller'
