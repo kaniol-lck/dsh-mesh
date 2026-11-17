@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "note": "会话模型类规格。准入按 qa/charter.md §4.5：可机械判定 + 稳定观测点 + 已被真实违反 + 违反时表面看不出。",
+  "specs": [
+    {
+      "id": "session-model.spawn-refuses-alive",
+      "statement": "已存在存活的派生会话时，派生入口默认必须拒绝，且不得发出创建请求；只有显式 --force 才放行。",
+      "why": "2026-11-17 事故：某会话据「回执 lost + 目录 17 分钟无写入」判定派生会话已停，又派生了一个同主题会话；实际原会话正在 32 分钟深度分析，两个都被 owner 手动掐掉。判据必须是宿主给的 live/archived，不是回执或文件写入时间。",
+      "since": "2026-11-17",
+      "tier": "L2",
+      "probes": ["probes/spawn-refuses-alive.mjs"],
+      "exceptions": []
+    }
+  ]
+}
