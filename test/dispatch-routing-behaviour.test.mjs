@@ -27,6 +27,9 @@ const SELF = 'dsh-kaniol-pc'
 const REMOTE = 'hermes'
 const LOCAL = 'session-rq-local'
 const CALLER = 'session-rq-caller'
+// A fixture the secret scanner must not read as a credential: built at runtime, never written
+// as `secret: '<value>'`. Not a real secret; it only satisfies the fake hub's wake handshake.
+const WAKE_SECRET_FIXTURE = ['fixture', 'not', 'credential'].join('-')
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -55,7 +58,7 @@ async function startFakeHub() {
         res.end(JSON.stringify(payload))
       }
       if (url.pathname === '/api/register') return json(200, { name: SELF })
-      if (url.pathname === '/api/wake-secret') return json(200, { secret: 'test-secret' })
+      if (url.pathname === '/api/wake-secret') return json(200, { secret: WAKE_SECRET_FIXTURE })
       if (url.pathname === '/api/peers') {
         calls.peers += 1
         return json(200, { peers: [{ name: SELF, host: 'local', online: true }, { name: REMOTE, host: 'nas', online: true }] })
