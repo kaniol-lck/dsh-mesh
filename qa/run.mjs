@@ -29,12 +29,30 @@ const listOnly = argv.includes('--list')
 const onlyIndex = argv.indexOf('--spec')
 const only = onlyIndex >= 0 ? argv[onlyIndex + 1] : null
 
+/**
+ * 载入规格，并按 charter §4.5 做**准入校验**：不是所有决定都该变成规格。
+ * 缺 `why`（真实违反记录）或 `since` 的规格直接拒绝 —— 这是在运行时阻止「凑规格」。
+ */
+const REQUIRED_FIELDS = ['id', 'statement', 'why', 'since', 'tier']
+
 function loadSpecs() {
   if (!existsSync(SPEC_DIR)) return []
   const specs = []
   for (const file of readdirSync(SPEC_DIR).filter((name) => name.endsWith('.json')).sort()) {
     const parsed = JSON.parse(readFileSync(path.join(SPEC_DIR, file), 'utf8'))
-    for (const spec of parsed.specs ?? []) specs.push({ ...spec, file })
+    for (const spec of parsed.specs ?? []) {
+      const missing = REQUIRED_FIELDS.filter((field) => !spec[field])
+      if (missing.length) {
+        throw new Error(
+          `规格 ${spec.id ?? `(${file})`} 缺字段 ${missing.join('/')}：` +
+            'charter §4.5 要求 `why` 指向真实违反记录，否则不该是规格',
+        )
+      }
+      if (!['L1', 'L2', 'L3'].includes(spec.tier)) {
+        throw new Error(`规格 ${spec.id} 的 tier 非法：${spec.tier}`)
+      }
+      specs.push({ ...spec, file })
+    }
   }
   return specs
 }
@@ -147,4 +165,11 @@ function main() {
   return failed.length === 0 ? 0 : 1
 }
 
-process.exitCode = main()
+try {
+  process.exitCode = main()
+} catch (error) {
+  // 规格准入失败（缺 why/since、tier 非法）属于**体系自身错误**，不是「判红」：
+  // 退出码 2 与「规格未通过」的 1 区分开，避免把配置错误当成业务回归。
+  console.error(`QA 无法运行：${error?.message ?? error}`)
+  process.exitCode = 2
+}
