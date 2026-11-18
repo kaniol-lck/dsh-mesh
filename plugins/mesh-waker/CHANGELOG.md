@@ -54,6 +54,9 @@
 
 ### Changed
 
+- 未投递的唤醒不再记为「已唤醒」（T-490）：`recordWake` 只在**真正注入会话**时计入限流窗口，`parked`/`deferred`/`skipped`/`denied` 改为单独计数。此前 `woke conversation … in 9ms` 这类日志把「尝试」写成「投递」，导致 3649 次限流拦截与 0 次真实投递可以同时存在而无人察觉。
+- 未绑定对话改为**落盘队列**而非永远未读（T-490，owner 2026-11-18 选 B）：消息标记已读并写入 `unbound.jsonl`（保留 id / 发送方 / 主题引用），`/mesh/status.unboundPending` 报告待绑定对话数，`ops-check` 的 `waker-unbound` 判红。原 T-426 的「保持未读直到人工绑定」会让 pull 每 5 秒重新领取同一批消息、每轮 defer 而不投递（实测两个对话 62 轮、0 投递、无告警）；绑定后 `backfill` 从 hub 历史回放正文，不依赖 `read_at`，因此标记已读不会让消息失联。
+
 - 角色卡注入改为按工作区注册表的 `workers[<role>].sessionId` 反查，不再解析会话标题；`workspaces.json` 的 workers 也不再由标题自动派生，必须显式登记（`POST /mesh/workspaces/workers` 或 `rotate-session --role`）。标题只是显示名：改名不再影响角色卡，也不再把任意同名标题会话误绑成 worker。
 - 回执默认改为通知：`receiptMode` 的插件默认值从 `file` 改为 `queue`——不显式传 `receipt` 的派单，派单方现在会收到回执通知（开启 `receiptDigest` 时走合并通知）；`file` 保留为显式的安静选项，只写 JSONL、不通知。
 

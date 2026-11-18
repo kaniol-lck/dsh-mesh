@@ -2179,9 +2179,14 @@ async function main() {
     }
   })
 
-  // T-426: an unbound conversation must not get an inbox session, and its messages stay
-  // unread so a human can bind it (/mesh.bind).
-  await runCase('origin routing: an unresolvable reply is deferred, not consumed by an inbox session', async (boot) => {
+  // T-490 replaced T-426's "leave it unread forever". Leaving it unread made pull re-claim the
+  // same messages every few seconds, each round deferring without delivering and nothing ever
+  // telling a human (2026-11-18: 62 rounds, 0 deliveries, two conversations, no alert).
+  //
+  // Owner chose option B: still no inbox session is created (that part of T-426 was right), but
+  // the messages are marked read AND parked in a durable queue, so the loop terminates and the
+  // mail stays recoverable by binding the conversation later.
+  await runCase('origin routing: an unresolvable reply is parked, not consumed by an inbox session', async (boot) => {
     const conversation = `test-reply-unknown-${Date.now()}`
     const logFile = path.join(os.tmpdir(), `waker-defer-${process.pid}-${Date.now()}.log`)
     const fake = await startFakeHub({
@@ -2194,18 +2199,21 @@ async function main() {
       const decision = await waitFor(() => {
         if (!fs.existsSync(logFile)) return null
         const text = fs.readFileSync(logFile, 'utf8')
-        return /target=deferred reason=unbound/.test(text) ? text : null
+        return /target=parked reason=unbound/.test(text) ? text : null
       }, 15000)
       const logText = decision ?? ''
       const ok =
-        /conversation=\S+ target=deferred reason=unbound messages=1/.test(logText) &&
+        /conversation=\S+ target=parked reason=unbound messages=1/.test(logText) &&
+        // Still no inbox session: parking must not resurrect the auto-created session T-426 removed.
         h.state.created.length === 0 &&
         h.state.prompts.length === 0 &&
-        !fake.readIds.includes('m-e2e-unknown')
+        // Parked means read + queued. The read is what stops pull from re-claiming it.
+        fake.readIds.includes('m-e2e-unknown') &&
+        (await request(h.base, '/mesh/status')).json?.unboundPending >= 1
       report(
-        'origin routing: an unresolvable reply is deferred, not consumed by an inbox session',
+        'origin routing: an unresolvable reply is parked, not consumed by an inbox session',
         ok,
-        `deferred=${/reason=unbound/.test(logText)} created=${h.state.created.length} prompts=${h.state.prompts.length} read=${fake.readIds.length}`,
+        `parked=${/reason=unbound/.test(logText)} created=${h.state.created.length} prompts=${h.state.prompts.length} read=${fake.readIds.length} pending=${(await request(h.base, '/mesh/status')).json?.unboundPending}`,
       )
     } finally {
       if (h) h.close()
@@ -8667,7 +8675,9 @@ async function main() {
     }
   })
 
-  await runCase('delivery: an unbound conversation with a legacy inbox session stays deferred', async (boot) => {
+  // T-490: same change as above — a legacy inbox entry with no delivery binding is parked
+  // (read + queued) instead of left unread forever, which is what made pull loop on it.
+  await runCase('delivery: an unbound conversation with a legacy inbox session is parked', async (boot) => {
     const conversation = `conv-restart-unbound-${Date.now()}`
     const logFile = path.join(os.tmpdir(), `waker-unbound-${process.pid}-${Date.now()}.log`)
     const createdAt = Date.now() - 60_000
@@ -8685,7 +8695,7 @@ async function main() {
       const decision = await waitFor(() => {
         if (!fs.existsSync(logFile)) return null
         const text = fs.readFileSync(logFile, 'utf8')
-        return /target=deferred reason=unbound/.test(text) ? text : null
+        return /target=parked reason=unbound/.test(text) ? text : null
       }, 15000)
       const conversations = JSON.parse(fs.readFileSync(h.conversationsPath, 'utf8'))
       const entry = conversations[conversation] ?? {}
@@ -8693,12 +8703,13 @@ async function main() {
         Boolean(decision) &&
         h.state.created.length === 0 &&
         h.state.prompts.length === 0 &&
-        fake.unread.length === 1 &&
-        fake.readIds.length === 0 &&
+        // T-490: parked means the messages were read and queued, so pull cannot loop on them.
+        fake.unread.length === 0 &&
+        fake.readIds.includes('m-unbound-1') &&
         entry.sessionId === 'session-legacy-inbox-2' &&
         entry.createdAt === createdAt
       report(
-        'delivery: an unbound conversation with a legacy inbox session stays deferred',
+        'delivery: an unbound conversation with a legacy inbox session is parked',
         ok,
         `created=${h.state.created.length} prompts=${h.state.prompts.length} unread=${fake.unread.length} read=${fake.readIds.length} sessionId=${entry.sessionId ?? '-'} createdAt=${entry.createdAt ?? '-'}`,
       )
@@ -8724,7 +8735,7 @@ async function main() {
       const deferred = await waitFor(() => {
         if (!fs.existsSync(logFile)) return null
         const text = fs.readFileSync(logFile, 'utf8')
-        return /target=deferred reason=unbound/.test(text) ? text : null
+        return /target=parked reason=unbound/.test(text) ? text : null
       }, 15000)
       const bound = await request(h.base, '/mesh/bind', {
         method: 'POST',
@@ -8739,9 +8750,10 @@ async function main() {
         bound.json?.deliverTo === 'session-bind-target' &&
         Boolean(delivered) &&
         conversations[conversation]?.deliverTo === 'session-bind-target' &&
-        // Backfill replays history as context; it is not a read (the message stays unread).
-        fake.unread.length === 1 &&
-        fake.readIds.length === 0
+        // T-490: parked mail is already read, yet backfill still replays it — proof that the
+        // replay reads hub history rather than depending on read_at. That independence is what
+        // makes parking safe: marking read can no longer strand a message.
+        fake.readIds.includes('m-bind-1')
       report(
         'delivery: binding after a deferred message backfills it into the session',
         ok,

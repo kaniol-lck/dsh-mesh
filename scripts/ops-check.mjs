@@ -215,6 +215,7 @@ if (!wakerStatus.ok || wakerStatus.status !== 200) {
   add('waker-registered', 'waker registered with hub', 'SKIP', 'waker unreachable')
   add('waker-backlog', 'waker pending tasks low', 'SKIP', 'waker unreachable')
   add('waker-unread', 'no unread mail left unwoken', 'SKIP', 'waker unreachable')
+  add('waker-unbound', 'no mail parked without a target', 'SKIP', 'waker unreachable')
 } else {
   const versions = wakerBody?.pluginVersions ?? {}
   add('waker', 'waker status reachable', 'PASS', `${originOf(options.waker)} (plugin ${versions.process ?? '?'})`)
@@ -235,6 +236,19 @@ if (!wakerStatus.ok || wakerStatus.status !== 200) {
     overdueCount > 0
       ? `${overdueCount} unread message(s) never woken, oldest ${oldestMinutes}m`
       : (overdue.checkedAt ? 'none overdue' : 'not checked yet (watchdog has not run)'),
+  )
+  // T-490: mail that arrived with no delivery target is now parked (read + queued) instead of
+  // left unread forever. Parking is what stops the pull loop, but it also means nothing else
+  // will ever notice — so this check is the only thing that turns "nobody bound this
+  // conversation" into something a human sees. Fails, not warns: the mail is not being handled.
+  const parkedCount = Number(wakerBody?.unboundPending ?? 0)
+  add(
+    'waker-unbound',
+    'no mail parked without a target',
+    parkedCount > 0 ? 'FAIL' : 'PASS',
+    parkedCount > 0
+      ? `${parkedCount} conversation(s) parked, nobody bound to receive them — bind with POST /mesh/bind {conversation,sessionId}`
+      : 'none parked',
   )
 }
 

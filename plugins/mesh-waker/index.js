@@ -877,6 +877,11 @@ export function apply(ctx, config) {
     wakeDeferred: { cooldown: 0, cap: 0, busy: 0 },
     wakeFailed: 0,
     overdueUnread: { count: 0, oldestAgeMs: null, checkedAt: null, sample: [] },
+    // T-490: mail that arrived with no delivery target. It is parked (read + queued) rather
+    // than left unread, so this is the only signal that somebody has to bind a conversation.
+    // `unboundPending` counts parked conversations, not messages, and it never clears itself.
+    unboundPending: 0,
+    lastOutcome: null,
     // Pull mode (contract section 4): when the last poll finished, how long the current
     // cadence is, and when the next one fires (the status route reports the countdown).
     lastPullAt: null,
@@ -1110,6 +1115,12 @@ export function apply(ctx, config) {
 
   // ---------------------------------------------------------------- throttle ledger
   const THROTTLE_PATH = c.tokenFile ? join(dirname(c.tokenFile), 'throttle.json') : join(tmpdir(), 'mesh-waker-throttle.json')
+  // T-490: conversations that have no delivery target get a durable queue instead of an infinite
+  // retry loop. This file is the queue: the message body stays on the hub, we keep the reference
+  // and why it is parked. It is the only reason an unbound conversation can be marked read
+  // without the mail quietly disappearing (T-426's concern).
+  const UNBOUND_PATH = c.tokenFile ? join(dirname(c.tokenFile), 'unbound.jsonl') : join(tmpdir(), 'mesh-waker-unbound.jsonl')
+  const UNBOUND_MAX_ROWS = 500
   const TRIVIAL_RE = /^(ping|pong|ack|acknowledged|ok|okay|roger|received|thanks?|thx|收到|好的|好|谢谢|了解|明白|已阅)[。.!！?？,，\s]*$/i
   let throttleLedger = (() => {
     try {
@@ -1145,9 +1156,25 @@ export function apply(ctx, config) {
     fileLog(`throttled ${key}: ${reason}${detail ? ` (${detail})` : ''}`)
   }
 
-  function recordWake(conversation) {
-    const [key, entry] = throttleEntry(conversation)
+  /**
+   * T-490: count only real deliveries against the wake window.
+   *
+   * `wakes` drives the rate cap, so it must mean "a session was actually prompted". Counting
+   * parked/deferred/skipped rounds there let a looping conversation burn its whole cap without
+   * ever delivering anything (2026-11-18: 62 rounds, 0 deliveries) and hid the fact that nothing
+   * was being processed. Non-delivery outcomes are still recorded, just in their own bucket.
+   */
+  function recordWake(conversation, outcome = 'delivered') {
+    const [, entry] = throttleEntry(conversation)
     const now = Date.now()
+    entry.outcomes = entry.outcomes ?? {}
+    entry.outcomes[outcome] = (entry.outcomes[outcome] ?? 0) + 1
+    if (outcome !== 'delivered') {
+      entry.lastSkippedAt = now
+      entry.lastSkipReason = outcome
+      saveThrottle()
+      return
+    }
     entry.wakes = (entry.wakes ?? []).filter((at) => now - at < c.throttleWindowMs)
     entry.wakes.push(now)
     entry.lastWakeAt = now
@@ -3096,11 +3123,11 @@ export function apply(ctx, config) {
     // reservation was missed.
     if (conversation.startsWith(questionBridge.conversationPrefix)) {
       if (!questionWaiting.has(conversation)) await consumeQuestionTraffic(conversation, messages)
-      return
+      return { outcome: 'consumed', reason: 'question-bridge' }
     }
     if (bridge.enabled && conversation.startsWith(bridge.conversationPrefix)) {
       if (!bridgeWaiting.has(conversation)) await consumeApprovalTraffic(conversation, messages)
-      return
+      return { outcome: 'consumed', reason: 'approval-bridge' }
     }
     const topic = topics.get(conversation)
     if (topic) {
@@ -3110,7 +3137,7 @@ export function apply(ctx, config) {
       if (topic.allowFrom.length && !topic.allowFrom.includes(sender)) {
         // Never claim, never read, never inject: the message stays unread for audit.
         logTopicDenied(topic, sender, messages)
-        return
+        return { outcome: 'denied', reason: 'topic-allowFrom' }
       }
       ensureTopicBinding(topic)
     }
@@ -3123,7 +3150,7 @@ export function apply(ctx, config) {
       const fresh = messages.filter((m) => stillUnread.has(m.id))
       if (!fresh.length) {
         fileLog(`wake for ${conversation} skipped: messages were already read`)
-        return
+        return { outcome: 'skipped', reason: 'already-read' }
       }
       messages = fresh
     }
@@ -3201,7 +3228,7 @@ export function apply(ctx, config) {
           recordTopicDelivery(conversation)
           fileLog(`delivered ${messages.length} msg into branch session ${branch} (${conversation}) mode=branch`)
           fileLog(`conversation=${conversation} target=${branch} reason=bound messages=${messages.length} mode=branch`)
-          return
+          return { outcome: 'delivered', target: branch, mode: 'branch' }
         }
         await promptWithResume(target, built.parts, mode)
         await markRead(messages)
@@ -3213,23 +3240,108 @@ export function apply(ctx, config) {
         recordTopicDelivery(conversation)
         fileLog(`delivered ${messages.length} msg into bound session ${target} (${conversation}) mode=${mode}`)
         fileLog(`conversation=${conversation} target=${target} reason=bound messages=${messages.length} mode=${mode}`)
-        return
+        return { outcome: 'delivered', target, mode }
       } catch (error) {
         // Keep the binding: clearing it here is what let an unbound conversation fall through to
         // a freshly created inbox session (T-426). The messages stay unread for a retry/bind.
         state.lastError = `delivery to bound session ${target} failed: ${error.message}`
         fileLog(`conversation=${conversation} target=deferred reason=delivery-failed session=${target} error=${error.message}`)
-        return
+        return { outcome: 'failed', reason: 'delivery-failed', target }
       }
     }
-    // T-426: no binding means no target. Do not create an inbox session, do not mark the
-    // messages read: they stay unread until a human binds the conversation (/mesh.bind),
-    // which is what keeps an unbound conversation visible instead of silently consumed.
+    // T-490 (replaces T-426's "leave it unread forever"): an unbound conversation has no
+    // delivery target, but leaving the mail unread made it an infinite loop — pull re-claimed
+    // the same messages every 5s, each round deferred without delivering, and nothing ever
+    // told a human. Measured 2026-11-18: two conversations, 62 deferred wakes, 0 deliveries.
+    //
+    // Owner decision 2026-11-18 (option B): mark the messages read and park them in a durable
+    // queue. `read_at` should mean "handled", not "some loop touched it"; the queue keeps the
+    // mail visible (and replayable by binding the conversation later), which is what T-426 was
+    // actually trying to protect.
     if (!hadEntry) delete conversations[conversation]
+    const parked = await parkUnbound(conversation, meta, messages)
+    if (!parked) {
+      // Parking failed: do NOT mark read, or the mail would become invisible with nothing in
+      // its place. Leave it deferred and let the next round try again — but that is now an
+      // error path, logged as such, not the normal one.
+      state.lastDeferredAt = Date.now()
+      state.lastDeferredConversation = conversation
+      state.lastDeferredReason = 'unbound-park-failed'
+      fileLog(`conversation=${conversation} target=deferred reason=unbound-park-failed messages=${messages.length}`)
+      return { outcome: 'deferred', reason: 'unbound-park-failed' }
+    }
     state.lastDeferredAt = Date.now()
     state.lastDeferredConversation = conversation
     state.lastDeferredReason = 'unbound'
-    fileLog(`conversation=${conversation} target=deferred reason=unbound messages=${messages.length}`)
+    fileLog(`conversation=${conversation} target=parked reason=unbound messages=${messages.length} pending=${state.unboundPending}`)
+    return { outcome: 'parked', reason: 'unbound', messages: messages.length }
+  }
+
+  /**
+   * T-490: durable queue for mail that has no delivery target.
+   *
+   * Keeps a reference per message (hub body stays where it is), so binding the conversation
+   * later can replay it. Returns true when the messages are parked AND marked read — the two
+   * must happen together, or we either loop (read without a copy) or lose mail (copy without
+   * read is fine, but then the loop continues).
+   */
+  async function parkUnbound(conversation, meta, messages = []) {
+    const rows = Array.isArray(messages) ? messages.filter((m) => m && m.id) : []
+    if (!rows.length) return true
+    try {
+      const at = Date.now()
+      const entry = {
+        at,
+        conversation,
+        sender: String(meta?.sender ?? '') || null,
+        subject: String(meta?.subject ?? '') || null,
+        messages: rows.slice(0, 50).map((m) => ({
+          id: m.id,
+          sender: m.sender ?? null,
+          subject: m.subject ?? null,
+          createdAt: Number(m.created_at) || null,
+        })),
+        note: 'no delivery target; bind the conversation (POST /mesh/bind) then replay',
+      }
+      appendFileSync(UNBOUND_PATH, `${JSON.stringify(entry)}\n`)
+      trimUnboundQueue()
+      state.unboundPending = countUnboundConversations()
+      await markRead(rows)
+      return true
+    } catch (error) {
+      fileLog(`parking unbound ${conversation} failed: ${error.message}`)
+      return false
+    }
+  }
+
+  /** Keep the queue bounded; oldest entries fall off (the hub still holds the messages). */
+  function trimUnboundQueue() {
+    try {
+      const lines = readFileSync(UNBOUND_PATH, 'utf8').split('\n').filter(Boolean)
+      if (lines.length <= UNBOUND_MAX_ROWS) return
+      writeFileSync(UNBOUND_PATH, `${lines.slice(-UNBOUND_MAX_ROWS).join('\n')}\n`)
+    } catch {
+      /* trimming is housekeeping; never break the wake path over it */
+    }
+  }
+
+  function readUnboundQueue() {
+    try {
+      return readFileSync(UNBOUND_PATH, 'utf8').split('\n').filter(Boolean).map((line) => {
+        try { return JSON.parse(line) } catch { return null }
+      }).filter(Boolean)
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * T-490: one number a human can act on. A conversation may be parked several times (more mail
+   * arrives while it is still unbound), so counting queue rows would overstate the problem;
+   * one bind fixes one conversation regardless of how many rows it left behind.
+   */
+  function countUnboundConversations() {
+    return new Set(readUnboundQueue().map((row) => row?.conversation).filter(Boolean)).size
   }
 
   /**
@@ -3287,13 +3399,24 @@ export function apply(ctx, config) {
         }
       }
       if (meta.conversation) {
-        await wakeConversation(meta.conversation, meta, messages)
-        recordWake(meta.conversation)
+        const result = await wakeConversation(meta.conversation, meta, messages)
+        // T-490: `recordWake` used to run unconditionally, so a deferred or denied round was
+        // counted as a wake and logged as "woke … in 9ms" — a 9ms "wake" delivers nothing. That
+        // made the throttle ledger and the log both measure attempts while claiming deliveries,
+        // which is why 3649 blocked records and 0 real deliveries could coexist unnoticed.
+        const outcome = result?.outcome ?? 'delivered'
+        recordWake(meta.conversation, outcome)
         state.lastWakeAt = Date.now()
         state.lastError = null
         state.lastDurationMs = Date.now() - t0
-        fileLog(`woke conversation ${meta.conversation} (${messages.length} msg) in ${state.lastDurationMs}ms`)
-        return
+        state.lastOutcome = outcome
+        // Say what actually happened. Only a real injection may be called a wake.
+        fileLog(
+          outcome === 'delivered'
+            ? `woke conversation ${meta.conversation} (${messages.length} msg) in ${state.lastDurationMs}ms`
+            : `${outcome} conversation ${meta.conversation} (${messages.length} msg) in ${state.lastDurationMs}ms — nothing delivered`,
+        )
+        return result
       }
       await rotateIfNeeded()
       fileLog(`wake start${sessionId ? ` (reuse ${sessionId})` : ' (new session)'}, ${messages.length} msg`)
@@ -6747,6 +6870,12 @@ export function apply(ctx, config) {
   // A receipt must live with its task row (T-300): fix historical mismatches once, idempotently.
   realignReceiptTiersAtBoot()
   threadFlow.loadThreads()
+  // T-490: the unbound queue must survive a restart, or parked mail looks like it vanished.
+  // Counting conversations (not rows) is what a human acts on: one bind clears one entry's worth.
+  state.unboundPending = new Set(readUnboundQueue().map((row) => row?.conversation).filter(Boolean)).size
+  if (state.unboundPending > 0) {
+    fileLog(`${state.unboundPending} conversation(s) parked with no delivery target — bind with POST /mesh/bind`)
+  }
   // Migrate inline bodies before anything reads or rewrites rows (idempotent, T-277).
   compactTaskTexts()
   // Once per process: pending/started rows from a previous host process can never settle.
