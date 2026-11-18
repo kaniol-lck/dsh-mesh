@@ -50,6 +50,11 @@ export function normalizeCoordinators(value) {
       isPrimary: item.isPrimary === true,
       status: COORDINATOR_STATUSES.has(item.status) ? item.status : 'pending',
       claimedAt: timeOrNull(item.claimedAt),
+      // T-mwmcgl07: `permanent` used to be consumed at claim time and then forgotten, so the
+      // first approve after a rotation (which is the normal rotation order) put a finite
+      // lease back on a member that was claimed as permanent. It is a property of the
+      // member, so it has to survive a round-trip through the registry file.
+      permanent: item.permanent === true,
       leaseUntil: timeOrNull(item.leaseUntil),
       ...(item.approvedBy ? { approvedBy: String(item.approvedBy).slice(0, 80) } : {}),
       requestedAt: timeOrNull(item.requestedAt),
@@ -135,6 +140,7 @@ export function coordinatorsView(coordinators) {
     isPrimary: member.isPrimary === true,
     ...(member.channel ? { channel: member.channel } : {}),
     claimedAt: member.claimedAt,
+    permanent: member.permanent === true,
     leaseUntil: member.leaseUntil,
     ...(member.approvedBy ? { approvedBy: member.approvedBy } : {}),
     requestedAt: member.requestedAt,

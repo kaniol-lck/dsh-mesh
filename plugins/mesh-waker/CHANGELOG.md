@@ -31,6 +31,7 @@
 - 咨询类任务可以交付答案了：`mesh_complete` 新增可选 `answer`（上限 2 万码点），完整正文写进回执并可由 `GET /mesh/tasks/<id>` 的 `receiptAnswer` 读取，通知里加一行指向全文；不传时行为逐字不变。
 - 文档更正（T-487）：同机回信不是没有通道——`mesh_dispatch` 到派单方 session id 通，`mesh_send` 只面向 agent（机器）故同机被拒；咨询类交付建议走 `mesh_complete({answer})`（回执通道）而不是再开一条任务。
 - 只读存活查询（T-488）：`GET /mesh/sessions/:id` 返回 `turnOpen`/`turn`/`lastActivityAt`/`lastTurnStartedAt`/`pendingTaskCount`（未知 id → 404），`GET /mesh/sessions` 列表每条新增 `turnOpen`/`lastActivityAt`；`mesh_cancel({dryRun:true})` 零副作用地报告回合状态——确认「它还在跑吗」不再需要把回合停掉。
+- 永久协调不再被 approve 降级：claim 的 `permanent` 现在存进成员并持久化，approve 只在非永久时写有限租约（此前轮换必然把永久 primary 变成 10 分钟成员，租约到期后被剪、`coordinator` 变空，消息回流退役会话）。
 
 ### Fixed
 

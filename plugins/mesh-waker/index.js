@@ -7844,6 +7844,9 @@ export function apply(ctx, config) {
           isPrimary: false,
           status: approved ? 'approved' : 'pending',
           claimedAt: approved ? now : null,
+          // T-mwmcgl07: keep the intent on the member, not just in this expression — the
+          // approve step runs later (and always runs later during a rotation).
+          permanent,
           leaseUntil: approved && !permanent ? now + c.coordinatorLeaseMs : null,
           ...(autoApprove ? { approvedBy: 'bootstrap' } : approved ? { approvedBy: 'owner' } : {}),
           requestedAt: now,
@@ -7921,7 +7924,10 @@ export function apply(ctx, config) {
           const now = Date.now()
           target.status = 'approved'
           target.claimedAt = now
-          target.leaseUntil = now + c.coordinatorLeaseMs
+          // T-mwmcgl07: a permanent claim stays permanent. Rotation is exactly the case where
+          // the new session claims before the old one approves, so an unconditional lease
+          // here silently downgraded every rotation to a 10-minute membership.
+          target.leaseUntil = target.permanent === true ? null : now + c.coordinatorLeaseMs
           target.approvedBy = byApproved ? by : 'owner'
           recordAudit(fileLog, 'coordinator.approve', { slug, session: sessionId, by: target.approvedBy })
           return { ok: true }

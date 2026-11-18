@@ -262,11 +262,14 @@ curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/release -d '{"session":"
 curl.exe -X POST http://127.0.0.1:8795/mesh/coordinator/heartbeat -d '{"session":"<id>","slug":"dsh-mesh"}'
 ```
 
-- 数据模型：`workspaces.json.<slug>.coordinators[]`（`sessionId / channel / isPrimary / status / claimedAt / leaseUntil / approvedBy / requestedAt`），`coordinator` 字段始终等于 primary；
+- 数据模型：`workspaces.json.<slug>.coordinators[]`（`sessionId / channel / isPrimary / status / permanent / claimedAt / leaseUntil / approvedBy / requestedAt`），`coordinator` 字段始终等于 primary；
 - 同一工作区**允许多个协调同时在线**，上限 `maxCoordinatorsPerWorkspace`（默认 3），超出 claim 返回 409 + 现有列表；
 - **空工作区 bootstrap**：配置了 `coordinatorOwnerTokenFile` 时必须带 `ownerToken`；未配置时首任自动批准并标记 `approvedBy:"bootstrap"` + 写 WARN 日志（**v0 限制**，后续接 owner 审批）；
 - 待批准项 30 分钟 TTL（`coordinatorPendingTtlMs`）；租约过期转 `stale` 并可再次认领；primary 失效时按 `claimedAt` 最早顺位；
-- **永久协调**：claim 带 `permanent:true` 且获批时 `leaseUntil:null`，不参与租约过期；heartbeat 对 null 保持不变。适合固定 primary（如 L1 综合管理），普通协调仍用有限租约；
+- **永久协调**：claim 带 `permanent:true` → 成员上记 `permanent:true` 且 `leaseUntil:null`，不参与租约过期；heartbeat 对 null 保持不变。适合固定 primary（如 L1 综合管理），普通协调仍用有限租约；
+  - **`permanent` 由 claim 决定，approve 不会把它变回有限租约**（T-mwmcgl07）。轮换的正常时序是「旧协调仍 approved → 新会话 claim（落在 pending）→ 旧协调 approve」——
+    早先 approve 无条件写 `now + coordinatorLeaseMs`，于是每次轮换都把永久申请降级成 10 分钟成员，10 分钟内无人续租就被 `expireCoordinators` 剪掉、`coordinator` 变空、消息回流退役会话。
+    现在 approve 按成员的 `permanent` 决定：`permanent:true → leaseUntil:null`，否则仍是有限租约；该字段随注册表持久化（重启后仍在），`coordinatorsView` 也会回显它。
 - **不按标题派生**：coordinator 只来自 `coordinators[]`（claim/approve）或旧文件的标量字段；旧标量指向归档/不存在会话时清空，标题只做显示——用户改名不会改变路由位；
 - 身份端点据此回答：`isPrimaryRouter` = 在 **approved** 的 `coordinators[]` 中（旧名 `isCoordinator`）；`routingRole` 为 `primary`（approved 且 `isPrimary`）、`member`（approved 非 primary）或 `none`；另返回 `coordinatorStatus`、`isPrimary`、`primaryRouterSessionId`（旧名 `coordinatorSessionId`）。
 
