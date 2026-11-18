@@ -437,6 +437,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
  * Minimal hub for bootstrap + pull: /api/bootstrap, /api/enroll, /api/inbox, /api/read,
  * /api/conversations, /api/peers. Messages stay unread until /api/read, like the real hub.
  */
+
 async function startFakeHub({ token = 'tok-' + 'selftest', messages = [], sendDelayMs = 0, sendStatus = 201, onSend = null, failTaskStatus = 0 } = {}) {
   const requests = []
   const readIds = []
@@ -8820,6 +8821,44 @@ async function main() {
       ok,
       `byTitle=${byTitle.status} byId=${byId.status} prompts=${h.state.prompts.length} logStale=${/title stale/.test(logText)}`,
     )
+  })
+
+  // T-mwxcog4: the unread watchdog must actually run in a hub-mode process. The classifier
+  // was always right — what was broken was the wiring: a three-arg clampInterval produced
+  // NaN for the interval and the threshold, so `unreadWatchdogMs > 0` was false and neither
+  // timer was ever registered. `checkedAt` staying null is the observable symptom.
+  await runCase('unread watchdog: a hub-mode process actually runs the reconciliation', async (boot) => {
+    const fake = await startFakeHub({ token: 'tok-' + 'selftest' })
+    let h = null
+    try {
+      h = await boot({
+        config: {
+          hubUrl: fake.url,
+          unreadWatchdogMs: 60_000,
+          unreadOverdueMs: 60_000,
+        },
+      })
+      const seen = await waitFor(async () => {
+        const status = await request(h.base, '/mesh/status')
+        return status.json?.overdueUnread?.checkedAt ? status.json.overdueUnread : null
+      }, 20000)
+      const status = await request(h.base, '/mesh/status')
+      const ok =
+        Boolean(seen) &&
+        Number.isFinite(seen.checkedAt) &&
+        seen.checkedAt > 0 &&
+        Number.isFinite(seen.count) &&
+        seen.count === 0
+      report(
+        'unread watchdog: a hub-mode process actually runs the reconciliation',
+        ok,
+        `checkedAt=${seen?.checkedAt ?? 'null'} count=${seen?.count ?? '-'} ` +
+        `lastError=${status.json?.overdueUnread?.lastError ?? '-'} hub=${status.json?.hubConnected}`,
+      )
+    } finally {
+      h?.close?.()
+      await fake.close?.()
+    }
   })
 
   const failed = results.filter((result) => !result.ok)

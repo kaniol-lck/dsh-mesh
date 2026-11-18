@@ -32,6 +32,7 @@
 - 文档更正（T-487）：同机回信不是没有通道——`mesh_dispatch` 到派单方 session id 通，`mesh_send` 只面向 agent（机器）故同机被拒；咨询类交付建议走 `mesh_complete({answer})`（回执通道）而不是再开一条任务。
 - 只读存活查询（T-488）：`GET /mesh/sessions/:id` 返回 `turnOpen`/`turn`/`lastActivityAt`/`lastTurnStartedAt`/`pendingTaskCount`（未知 id → 404），`GET /mesh/sessions` 列表每条新增 `turnOpen`/`lastActivityAt`；`mesh_cancel({dryRun:true})` 零副作用地报告回合状态——确认「它还在跑吗」不再需要把回合停掉。
 - 永久协调不再被 approve 降级：claim 的 `permanent` 现在存进成员并持久化，approve 只在非永久时写有限租约（此前轮换必然把永久 primary 变成 10 分钟成员，租约到期后被剪、`coordinator` 变空，消息回流退役会话）。
+- 未读对账看门狗此前从未真正运行（T-mwmcxog4）：两个配置项漏传 `max` 参数被算成 `NaN`、首次执行又借用 `catchUpDelayMs`（默认 10 分钟），而且 `/mesh/status` 根本没输出这个字段。现在配置正确、首次对账在 hub 起来 5 秒后独立调度、状态里能看到 `checkedAt`/`attemptedAt`/`lastError`。
 
 ### Fixed
 

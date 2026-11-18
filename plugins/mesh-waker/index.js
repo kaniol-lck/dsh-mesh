@@ -31,7 +31,7 @@ import { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, 
 import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, MESH_TASKS_TOOL, TASKS_OUTPUT, MESH_ACK_TOOL, ACK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
 import { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, classifyRoleCandidates, ROLE_UNRECOGNIZED_MAX } from './lib/session.mjs'
 import { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
-import { LOG_MAX_BYTES_DEFAULT, clampInterval, normalizeSha } from './lib/settings.mjs'
+import { LOG_MAX_BYTES_DEFAULT, clampInterval, resolveUnreadWatchdog, normalizeSha } from './lib/settings.mjs'
 import { classifyOverdue, describeOverdue } from './lib/unread-watchdog.mjs'
 import { findOutboundSession, readLogTail } from './lib/origin-scan.mjs'
 import { createReceiptFlow } from './lib/receipt-flow.mjs'
@@ -450,6 +450,13 @@ const SAVED_CONFIG_KEYS = [
   'unreadOverdueMs',
 ]
 
+/**
+ * How long after the hub comes up the first unread reconciliation runs (T-mwmcxog4). Deliberately
+ * independent of `catchUpDelayMs`: that knob answers "when may we replay missed history", and
+ * borrowing it made the watchdog invisible for its default ten minutes.
+ */
+const UNREAD_WATCHDOG_FIRST_RUN_MS = 5000
+
 const savedConfigPath = () => join(homedir(), '.dsh', 'mesh-waker', 'config.json')
 
 /** Settings changed from the UI outlive a restart via this file, not the profile patch. */
@@ -582,8 +589,9 @@ function normalizeBase(config) {
     catchUpMaxConversations: Number(c.catchUpMaxConversations ?? 3),
     // T-486: how often to reconcile inbox against wake history, and how old an unread
     // message must be before it counts as 'nobody was woken for this'. 0 disables the timer.
-    unreadWatchdogMs: clampInterval(c.unreadWatchdogMs ?? 300000, 0, 3600000),
-    unreadOverdueMs: clampInterval(c.unreadOverdueMs ?? 1800000, 60000, 86400000),
+    // Resolved together in settings.mjs: 0 keeps meaning "disabled" here, which is why
+    // these two go through clampDuration rather than clampInterval (T-mwxcog4).
+    ...resolveUnreadWatchdog(c),
     // --- task receipts (0.5.1) -------------------------------------------------------
     // A task injected with meta.taskId gets exactly one receipt when its turn ends (or
     // when it never starts). queue notifies the requester (or receiptTo, via the receipt
@@ -876,7 +884,7 @@ export function apply(ctx, config) {
     wakeSuppressed: { busy: 0, cooldown: 0, cap: 0, trivial: 0 },
     wakeDeferred: { cooldown: 0, cap: 0, busy: 0 },
     wakeFailed: 0,
-    overdueUnread: { count: 0, oldestAgeMs: null, checkedAt: null, sample: [] },
+    overdueUnread: { count: 0, oldestAgeMs: null, checkedAt: null, attemptedAt: null, lastError: null, sample: [] },
     // T-490: mail that arrived with no delivery target. It is parked (read + queued) rather
     // than left unread, so this is the only signal that somebody has to bind a conversation.
     // `unboundPending` counts parked conversations, not messages, and it never clears itself.
@@ -3896,8 +3904,13 @@ export function apply(ctx, config) {
     hubEvery(() => void syncHistory(), Math.max(60_000, c.historySyncIntervalMs ?? 600_000))
     // T-486: the reconciliation nobody had. Unread mail old enough that a session should
     // already have been woken for it is surfaced on /mesh/status, not left to be discovered.
+    // T-mwmcxog4: the first pass used to borrow `catchUpDelayMs` ("how long after boot to
+    // replay missed history", default 10 minutes), so a working watchdog looked dead for ten
+    // minutes — a fix to the threshold still left the feature unobservable. The two questions
+    // are unrelated, and a second config key would only add another thing to wire wrong, so
+    // the first pass gets a constant.
     if (c.unreadWatchdogMs > 0) {
-      hubLater(() => void checkUnreadOverdue(), Math.max(5000, c.catchUpDelayMs))
+      hubLater(() => void checkUnreadOverdue(), UNREAD_WATCHDOG_FIRST_RUN_MS)
       hubEvery(() => void checkUnreadOverdue(), c.unreadWatchdogMs)
     }
     if (effectiveMode !== 'push') schedulePull(1200)
@@ -3921,6 +3934,8 @@ export function apply(ctx, config) {
         count: result.count,
         oldestAgeMs: result.oldestAgeMs,
         checkedAt: Date.now(),
+        attemptedAt: Date.now(),
+        lastError: null,
         sample: result.overdue.slice(0, 5),
       }
       if (result.count > 0) {
@@ -3929,6 +3944,13 @@ export function apply(ctx, config) {
       }
     } catch (error) {
       fileLog(`unread watchdog failed: ${error.message}`)
+      // The point of this watchdog is that nothing degrades quietly — a failed pass has to
+      // be readable from /mesh/status, not only from a log tail (T-mwxcog4).
+      state.overdueUnread = {
+        ...state.overdueUnread,
+        attemptedAt: Date.now(),
+        lastError: String(error?.message ?? error),
+      }
     }
   }
 
@@ -8395,6 +8417,10 @@ export function apply(ctx, config) {
               nextPollIn: nextPullAt ? Math.max(0, Math.round((nextPullAt - Date.now()) / 1000)) : null,
               caFingerprint: caFingerprint ? `${caFingerprint.slice(0, 16)}…` : null,
               hubConnected: hubReady,
+              // T-486/T-mwxcog4: the unread reconciliation view. It was computed and stored on
+              // state but never put on the wire, so ops-check could only ever say "not checked
+              // yet" and a working watchdog looked identical to a dead one.
+              overdueUnread: state.overdueUnread,
               // Task receipts: count waiting for turn/end, the latest settled one, and where
               // they go. The file path is a local path, never a credential.
               pendingTasks: pendingTasks.size,
