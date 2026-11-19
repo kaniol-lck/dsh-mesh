@@ -33,6 +33,36 @@ function worklogFixture(entries) {
 const GOOD = '- [P1] 好条目 —— 描述；验收：测试通过；状态：未开始；归属：docs；功能：文档；'
 const NO_FEATURE = '- [P1] 缺功能 —— 描述；验收：测试通过；状态：未开始；归属：docs；'
 const BAD = '- [P1] 坏条目 —— 只有描述'
+const PERIOD_FIELD = '- [P1] 句号后写验收 —— 描述。验收：测试通过；状态：未开始；归属：docs；功能：文档；'
+const DOING_NO_PROGRESS = '- [P1] 进行中缺进展 —— 描述；验收：测试通过；状态：进行中；归属：docs；功能：文档；'
+
+test('roadmap: 「。验收：」 explains the 「；」-only field separator', () => {
+  const dir = worklogFixture([PERIOD_FIELD])
+  const result = run(ROADMAP, ['--check', '--worklog-dir', path.join(dir, '.worklog'), '--out', path.join(dir, 'ROADMAP.md')], dir)
+  assert.equal(result.status, 1, result.stdout + result.stderr)
+  assert.match(result.stderr, /docs\.md:3: missing 验收：/)
+  assert.match(result.stderr, /必须出现在「；」之后/)
+  assert.match(result.stderr, /写在「。」后面/)
+})
+
+test('roadmap: well-formed entries get no field-position hint', () => {
+  const dir = worklogFixture([GOOD])
+  const worklogDir = path.join(dir, '.worklog')
+  const result = run(ROADMAP, ['--write', '--worklog-dir', worklogDir, '--out', path.join(dir, 'ROADMAP.md')], dir)
+  assert.equal(result.status, 0, result.stdout + result.stderr)
+  assert.doesNotMatch(result.stdout + result.stderr, /必须出现在「；」之后/)
+})
+
+test('roadmap: a demoted 「进行中」 names the missing field position', () => {
+  const dir = worklogFixture([DOING_NO_PROGRESS])
+  const worklogDir = path.join(dir, '.worklog')
+  const out = path.join(dir, 'ROADMAP.md')
+  assert.equal(run(ROADMAP, ['--write', '--worklog-dir', worklogDir, '--out', out], dir).status, 0)
+  const result = run(ROADMAP, ['--check', '--worklog-dir', worklogDir, '--out', out], dir)
+  assert.equal(result.status, 0, result.stdout + result.stderr)
+  assert.match(result.stdout, /docs\.md 行 3 「进行中」但缺进展/)
+  assert.match(result.stdout, /必须出现在「；」之后/)
+})
 
 test('roadmap: missing 验收/状态 exits 1 with file:line and "未写任何文件"', () => {
   const dir = worklogFixture([GOOD, BAD])

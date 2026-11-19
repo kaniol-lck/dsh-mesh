@@ -180,6 +180,21 @@ function parseHeader(line) {
   return match ? { session: match[1], updated: match[2] } : null
 }
 
+const FIELD_POSITION_RULE = '字段必须出现在「；」之后、段首，例如「…；验收：…；状态：…」'
+
+// A field only counts when it starts a 「；」-separated segment. The classic mistake is writing
+// 「。验收：」 (after a period, mid-description): the field silently folds into the previous
+// segment and the parser can only report a bare "missing 验收：". Name the separator we saw so
+// the reader does not have to go back to the spec to learn why.
+function fieldPositionHint(line, key) {
+  for (const separator of ['。', '，', ',', '.']) {
+    if (line.includes(`${separator}${key}：`)) {
+      return `${FIELD_POSITION_RULE}；本行把「${key}：」写在「${separator}」后面，解析器把它并入了上一段正文`
+    }
+  }
+  return FIELD_POSITION_RULE
+}
+
 function parseEntry(line, sessionName, file, lineNumber, errors, features, warnings) {
   const match = /^- \[(P[0-2])\] (.+)$/.exec(line)
   if (!match) {
@@ -228,8 +243,8 @@ function parseEntry(line, sessionName, file, lineNumber, errors, features, warni
     }
   }
   if (!title) problems.push('empty title')
-  if (!fields.acceptance) problems.push('missing 验收：')
-  if (!fields.status) problems.push('missing 状态：')
+  if (!fields.acceptance) problems.push(`missing 验收：（${fieldPositionHint(line, '验收')}）`)
+  if (!fields.status) problems.push(`missing 状态：（${fieldPositionHint(line, '状态')}）`)
   else if (!STATUSES.includes(fields.status)) problems.push(`invalid 状态 "${fields.status}" (expected ${STATUSES.join('|')})`)
   if (problems.length) {
     errors.push({ file, line: lineNumber, message: problems.join('; ') })
@@ -794,12 +809,24 @@ async function warnIfHtmlStale(htmlPath, hash) {
   if (problem) console.log(`WARN: ${htmlPath} 过期，跑 --write (${problem})`)
 }
 
+// Mirrors the parse-error hints above: a demoted 「进行中」 line almost always means the field
+// sits in the wrong place (or the progress stamp is malformed), so say which and show the shape.
+function liveReasonHint(reason) {
+  if (reason === '缺归属' || reason === '缺进展') {
+    return `${FIELD_POSITION_RULE}；进行中的条目还要带「归属：<角色>」和 14 天内的「进展：YYYY-MM-DD」`
+  }
+  if (reason === '进展日期无效') return '进展：应为 YYYY-MM-DD'
+  if (String(reason).startsWith('进展已过期')) return '更新「进展：YYYY-MM-DD」（14 天内有效）'
+  return ''
+}
+
 function warnIfDemotedInProgress(entries, today = new Date()) {
   for (const entry of entries) {
     if (entry.status !== '进行中') continue
     const live = isLiveInProgress(entry, today)
     if (live.ok) continue
-    console.log(`WARN: ${entry.file} 行 ${entry.line} 「进行中」但${live.reason}，按待办处理`)
+    const hint = liveReasonHint(live.reason)
+    console.log(`WARN: ${entry.file} 行 ${entry.line} 「进行中」但${live.reason}${hint ? `（${hint}）` : ''}，按待办处理`)
   }
 }
 
