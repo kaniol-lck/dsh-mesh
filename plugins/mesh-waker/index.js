@@ -6335,7 +6335,7 @@ export function apply(ctx, config) {
       fileLog(`mesh_dispatch: ${text.length} chars digest-queued session=${session.id} task=${taskId} requester=${requester || '-'}${meta.batchId ? ` batch=${meta.batchId}` : ''}`)
     } else {
     fileLog(
-      `mesh_dispatch: ${text.length} chars (delivered ${deliveredText.length}) -> ${session.id} (${session.title ?? 'no title'}) task=${taskId}${meta.batchId ? ` batch=${meta.batchId}` : ''}${thread ? ` thread=${thread}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession} header=${c.injectHeader}${explicitTarget ? ' explicit-target' : thread ? ' via-thread' : ''}`,
+      `mesh_dispatch: ${text.length} chars (delivered ${deliveredText.length}) -> ${session.id} (${session.title ?? 'no title'}) task=${taskId} mode=${deliveryMode}${meta.batchId ? ` batch=${meta.batchId}` : ''}${thread ? ` thread=${thread}` : ''} requester=${requester || '-'} caller=${callerSession || '-'} created=${createdSession} header=${c.injectHeader}${explicitTarget ? ' explicit-target' : thread ? ' via-thread' : ''}`,
     )
     }
     const effectiveWorkspacePath = createdWorkspacePath ?? sessionCwdOf(session.id) ?? null

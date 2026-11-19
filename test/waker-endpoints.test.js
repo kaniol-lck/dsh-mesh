@@ -3554,6 +3554,97 @@ async function main() {
     report('tasks: turn/end without a start settles without inventing startedAt', ok, `status=${task.status ?? '-'} startedAt=${task.startedAt === null ? 'null' : task.startedAt} durationMs=${task.durationMs ?? '-'} alive=${alive.status}`)
   })
 
+  // Delivery mode must survive on the row: without it an auditor cannot tell a steer
+  // correction from a queued follow-up after the fact (T-mwnpxik9). The field was silently
+  // commented out of recordTaskPending, so no existing test could see it disappear.
+  const taskRowsInRegistry = (h) => {
+    const root = path.join(h.home, '.dsh', 'mesh-waker')
+    const files = []
+    const walk = (dir) => {
+      let entries = []
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) walk(full)
+        else if (entry.name === 'tasks.jsonl') files.push(full)
+      }
+    }
+    walk(root)
+    return files.flatMap((file) => {
+      try {
+        return fs
+          .readFileSync(file, 'utf8')
+          .split('\n')
+          .filter((line) => line.trim())
+          .map((line) => JSON.parse(line))
+      } catch {
+        return []
+      }
+    })
+  }
+
+  await runCase('tasks: mesh_dispatch records the steer delivery mode on the row', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'mode-steer')
+    const logFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'waker-mode-log-')), 'waker.log')
+    const h = await boot({ seedSessions: [{ id: 'session-mode-steer', title: 'steer target', cwd }], config: { logFile } })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const result = await tool.execute(
+      { target: 'session-mode-steer', text: 'correct the running plan', taskId: 'T-MODE-STEER', mode: 'steer' },
+      { sessionId: 'session-mode-requester' },
+    )
+    const detail = await request(h.base, '/mesh/tasks/T-MODE-STEER')
+    const row = taskRowsInRegistry(h).find((entry) => entry.taskId === 'T-MODE-STEER')
+    const log = fs.readFileSync(logFile, 'utf8')
+    const logged = /task=T-MODE-STEER mode=steer/.test(log)
+    const ok = result?.ok === true && row?.mode === 'steer' && detail.json?.task?.mode === 'steer' && logged
+    report('tasks: mesh_dispatch records the steer delivery mode on the row', ok, `rowMode=${row?.mode ?? '-'} apiMode=${detail.json?.task?.mode ?? '-'} hasModeKey=${row ? 'mode' in row : false} logged=${logged}`)
+  })
+
+  await runCase('tasks: mesh_dispatch without a mode records queue on the row', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'mode-queue')
+    const h = await boot({ seedSessions: [{ id: 'session-mode-queue', title: 'queue target', cwd }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const result = await tool.execute(
+      { target: 'session-mode-queue', text: 'ordinary follow-up', taskId: 'T-MODE-QUEUE' },
+      { sessionId: 'session-mode-requester' },
+    )
+    const detail = await request(h.base, '/mesh/tasks/T-MODE-QUEUE')
+    const row = taskRowsInRegistry(h).find((entry) => entry.taskId === 'T-MODE-QUEUE')
+    const ok = result?.ok === true && row?.mode === 'queue' && detail.json?.task?.mode === 'queue'
+    report('tasks: mesh_dispatch without a mode records queue on the row', ok, `rowMode=${row?.mode ?? '-'} apiMode=${detail.json?.task?.mode ?? '-'} hasModeKey=${row ? 'mode' in row : false}`)
+  })
+
+  await runCase('tasks: a steer task keeps its mode after settling on the running turn', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'mode-turn')
+    const h = await boot({ seedSessions: [{ id: 'session-mode-turn', title: 'turn target', cwd }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    h.emit('session/event', { id: 'session-mode-turn' }, { type: 'turn/start', turn: 5 })
+    const steer = await tool.execute(
+      { target: 'session-mode-turn', text: '插队更正', taskId: 'T-MODE-TURN', mode: 'steer' },
+      { sessionId: 'session-mode-turn-req' },
+    )
+    const askedModes = h.state.prompts.filter((entry) => entry.sessionId === 'session-mode-turn').map((entry) => entry.mode)
+    h.emit('session/event', { id: 'session-mode-turn' }, { type: 'turn/end', turn: 5, reason: { kind: 'completed' } })
+    const settled = await waitFor(async () => {
+      const snapshot = await request(h.base, '/mesh/tasks/T-MODE-TURN')
+      return snapshot.json?.task?.status === 'settled' ? snapshot : null
+    }, 4000)
+    const receipt = await waitFor(() => readReceipts(h.receiptsPath).find((entry) => entry.taskId === 'T-MODE-TURN'), 4000)
+    const ok =
+      steer?.ok === true &&
+      askedModes[0] === 'steer' &&
+      settled?.json?.task?.mode === 'steer' &&
+      receipt?.turn === 5
+    report('tasks: a steer task keeps its mode after settling on the running turn', ok, `askedModes=${askedModes.join(',')} settled=${settled?.json?.task?.status ?? '-'} settledMode=${settled?.json?.task?.mode ?? '-'} receiptTurn=${receipt?.turn ?? '-'}`)
+  })
+
   // 113-117. Readable task titles: explicit meta.subject wins; inferred subjects are cleaned.
   await runCase('tasks: the subject cleaner prefers the emphasised title and drops wrappers', async () => {
     const { cleanTaskSubject } = await import(pathToFileURL(ENTRY).href)
@@ -3963,7 +4054,7 @@ async function main() {
       second?.targetSessionId === 'session-ops' &&
       first?.requester === 'session-coord' &&
       second?.requester === 'session-coord' &&
-      /-> session-ops \(mesh · ops\) task=T-TH-2 thread=TH-1/.test(log) &&
+      /-> session-ops \(mesh · ops\) task=T-TH-2 mode=queue thread=TH-1/.test(log) &&
       /via-thread/.test(log)
     report(
       'threads: a follow-up without target resolves from the thread binding',
