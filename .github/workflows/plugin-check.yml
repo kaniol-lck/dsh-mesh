@@ -50,6 +50,25 @@ jobs:
       - name: Tool contract guard
         run: node scripts/check-tool-contract.mjs --no-failures
 
+      # 生产文档不靠催（owner 2026-11-20）：工具参数只活在 schema 里、文档靠手抄，必然漂移。
+      # 2026-11-20 实测：`mesh_dispatch.mode`（steer 的派活入口）在任何文档里都不存在。
+      # 这两步一起工作：参考页由 schema 生成，门禁断言「文档 == schema」。
+      - name: Tool reference is generated from schema
+        run: node scripts/gen-tool-reference.mjs --check
+
+      - name: Tool docs match schema
+        run: node scripts/check-tool-docs.mjs
+
+      # 这两个检查早就存在，但一直没进 CI —— 存在但不拦，等于没有。
+      - name: Docs links
+        run: node scripts/check-docs-links.mjs
+
+      # 2026-11-20 接入：此前 4 篇签名写着 hub=^0.7.21 而实际已 0.8.1，因为这两个检查从未进 CI
+      # 所以没人知道。docs 核对内容并升签名后（edefdcd）才接成 --strict——先修内容再接门禁，
+      # 否则 CI 会常红，人就会开始习惯性忽略它。
+      - name: Docs drift (version signatures)
+        run: node scripts/check-docs-drift.mjs --strict
+
       # QA 行为层（L2）：真调创建入口看产出，见 qa/charter.md
       - name: QA behaviour probes
         run: node qa/run.mjs
