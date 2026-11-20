@@ -1,4 +1,4 @@
-<!-- drift: hub=^0.7.21 owner=hub -->
+<!-- drift: hub=^0.8.1 owner=hub -->
 # 典型环境与降级方式
 
 先认领你的环境，再看它能做到什么、会退化成什么样。所有示例用占位符：
@@ -29,6 +29,7 @@
 - **能做什么**：
   - 全部消息能力：收件箱、会话、黑板、blob（大文件中转）、审计；
   - 派活与回执、批次屏障；跨机交接（`skills/handoff` 的 bundle 走 blob）；
+  - 跨机任务账本（hub 0.8.0+）：派活落 `tasks` 表、claim 租约 + heartbeat、结算回执；失败转 `parked` 可重派，deadline 过期转 `expired`（见 `mesh-architecture.md`「跨机任务账本」）；
   - 开机补收：对方关过机也能收到离线期间的消息。
 - **降级成什么**：基本不降级；延迟取决于唤醒方式：
   - 有 `advertiseHost`（LAN 可达）→ push 唤醒，通常十几秒内起一轮；

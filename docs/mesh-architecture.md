@@ -1,5 +1,5 @@
-<!-- drift: waker=^0.8.0 hub=^0.7.21 owner=docs -->
-# dsh-mesh 架构（截至 0.7.15）
+<!-- drift: waker=^0.8.0 hub=^0.8.1 owner=docs -->
+# dsh-mesh 架构（截至 0.8.1）
 
 ## 拓扑
 
@@ -9,7 +9,7 @@ flowchart TB
     MCP["MCP Streamable HTTP"]
     REST["REST /api/*"]
     CONSOLE["控制台"]
-    DB[("SQLite：agents / messages / board / board_log / audit / blobs / mcp_sessions")]
+    DB[("SQLite：agents / messages / board / board_log / audit / blobs / mcp_sessions / tasks / receipts")]
     MCP --> DB
     REST --> DB
     CONSOLE --> DB
@@ -39,8 +39,9 @@ flowchart TB
 | 唤醒 | 落库后向接收方 `wake_url` 发 HMAC-SHA256 签名 POST（无正文） |
 | 审计 | `audit` 表记录鉴权与运维动作；高频公开端点不写入 |
 | 文件 | `blobs` 表 + 分块上传，默认 24h TTL |
+| 任务 | `tasks` + `receipts` 表：跨机派活的权威账本，claim 租约 / heartbeat / settle；deadline 过期转 `expired`、失败转 `parked`（0.8.0 起，见下文「跨机任务账本」） |
 
-**不管**：任务执行、权限分级（在各客户端）、复杂编排（见 `docs/comparison.md`）。
+**不管**：任务执行（只记账，执行在客户端）、权限分级（在各客户端）、复杂编排（见 `docs/comparison.md`）。
 
 ## 四条通道
 
@@ -51,14 +52,14 @@ flowchart TB
 | 唤醒 | "有新消息"信号 | 中枢 → HMAC POST → 客户端端口（push），或客户端轮询（pull） |
 | 文件 | 插件、脚本、文档、大文件 | 小文件走 git 仓库；大文件走 blob 接口 |
 
-## 接入与发现（0.7.15）
+## 接入与发现（0.7.15 起）
 
-`GET /api/bootstrap` 是**唯一免鉴权**端点，供新客户端「先发现、再自举」：
+`GET /api/bootstrap` 是**免 token** 端点（公开面还有 `GET /health` 与一次性设备码端点），供新客户端「先发现、再自举」：
 
 ```json
 {
   "service": "dsh-mesh",
-  "version": "0.7.15",
+  "version": "0.8.1",
   "protocol": 1,
   "tls": { "ca_pem": "-----BEGIN CERTIFICATE-----…", "ca_sha256": "…" },
   "endpoints": { "mcp": "/mcp", "api": "/api", "inbox": "/api/inbox", "enroll": "/api/enroll", "device_request": "/api/enroll/request", "device_token": "/api/enroll/token" },
@@ -83,7 +84,7 @@ flowchart TB
 
 - **`no_reply` 只用于「收尾条」**：表示「这是对某条消息的回复（`reply_to` 非空），不需要再唤醒对方」。`no_reply=true` 但 `reply_to` 为空时，中枢**忽略该标志并照常唤醒**，响应带 `no_reply_ignored: true` 与 `reason`；
 - **`silent`：落库但不唤醒**，用于「必须人来回、不希望触发 agent 自动处理」的通道（典型：审批请求）。`silent` 优先于 `no_reply`（响应带 `note`）；
-- **`interrupt`**：只用于更正/取消/阻塞，提示接收方 steer 当前回合而不是排队；`delivery` 可为 `queue|steer|branch`（建议性，接收方策略仍可覆盖）；
+- **`interrupt`**：只用于更正/取消/阻塞，提示接收方 steer 当前回合而不是排队；`delivery` 可为 `queue|steer|branch`（建议性，接收方策略仍可覆盖）。同一概念在 `mesh_dispatch` 与 `POST /mesh/inject` 上参数名是 `mode`——三个入口对照见 [`skills/mesh/SKILL.md`](../skills/mesh/SKILL.md) §16，工具参数以 [`tools-reference.md`](tools-reference.md) 为准；
 - **`important` / `pinned`**：免于消息 TTL 清理（默认 7 天）；
 - **`/api/inbox` 排序与游标**：`unread=0` 才返回已读；`order=asc|desc`（默认 `asc`）、`before=<epoch_ms>` 游标、`limit` 默认 20 最大 100；响应含 `has_more` / `next_before`。积压大时不要只看默认 ASC 首页——最新消息会在页外；
 - MCP `mesh_inbox` 同样接受 `order`；`unread_only=false` 时默认 `desc`。
@@ -105,6 +106,23 @@ stateDiagram-v2
   已读 --> [*]
 ```
 
+## 跨机任务账本（0.8.0+）
+
+跨机派活不再只是「发一条消息」：hub 用 `tasks` / `receipts` 两张表记一条可对账的任务行，`/api/tasks` 提供增删改查与租约。
+
+- **状态机**：`pending` → `claimed` → `settled`；deadline 过期转 `expired`；
+  租约过期会重试（`attempts` 计数），达到 3 次转 `parked`——**不丢单**，由发起方 `redispatch` 重置回 `pending`，或 `cancel` 结束；
+- **租约**：`POST /api/tasks/<id>/claim` 领取并拿 **10 分钟**租约（`lease_ms` 可调 1s–1h）；运行中 `heartbeat` 续租；
+  租约过期按重试处理；
+- **结算**：`POST /api/tasks/<id>/settle` 写回执，`status` 为 `completed|error|lost|partial`，`source` 区分
+  `declared`（客户端声明）与 `observed`（自动结算）；`summary` ≤300 字节，`artifacts` 为路径数组；重复结算幂等；
+- **读**：`GET /api/tasks?status=…` 只列自己（发起方或目标方）的任务；`GET /api/tasks/<id>` 取单条（含回执）；
+  任务正文存在 blob 里，可用 `GET /api/blobs?sha256=<64 hex>` 按 `text_ref` 反查；
+- **鉴权**：任务接口要求 token 身份，`MESH_AUTH_MODE=open` 下返回 403（任务必须绑定具体 agent）；
+  scope 映射见下文「鉴权模型」。
+
+同机多会话的派活仍走 waker 的 `/mesh/inject`，不经过 hub 任务表；任务表只服务跨机。
+
 ## 同步模型（pull 基线，push 加速）
 
 | 模式 | 链路 | 前提 |
@@ -114,6 +132,8 @@ stateDiagram-v2
 | **auto**（默认值） | pull 常开；有 `advertiseHost` 且注册成功时叠加 push，不可达静默回落 | 同上 |
 
 **设计原则：pull 是基线，push 是加速。** 双 NAT、无公网 IP、公司防火墙环境下「零入站」才能装完即用；push 只省轮询间隔，不能成为接入前提。延迟：pull 常态 30s、有消息后 5s、连续空轮询退到 60s；push 通常十几秒内。
+
+push 失败不再静默：`/api/status.wake_push_failures` 返回累计失败次数与最后一次失败（`agent` + HTTP 状态或错误）；接收方不可达时仍回退 pull。
 
 ```mermaid
 sequenceDiagram
@@ -139,8 +159,8 @@ sequenceDiagram
 | **admin** | `MESH_ADMIN_TOKEN`（或首启生成的 `data/admin.token`） | `/api/admin/*`：发/转/吊销 token、批准设备、改 scopes、审计查询 |
 | **view** | `MESH_VIEW_TOKEN`（未设时回落到 admin token） | 控制台只读：能看列表/审计，不能轮换、改 scopes、批准设备 |
 
-- **scopes**：`read`（收件箱/peers/status/board 读/blob 读）、`send`（发消息/pin）、`board`（写黑板）、`blob`（上传/提交/删除）；空 scopes = 历史全量；
-- **REST 与 MCP 两面都判权**：REST 在入口按路径映射 scope（`/api/send`→`send`，`/api/inbox`、`/api/peers`、`/api/status`、`/api/read`→`read`，`/api/board` 写→`board`，blob 写→`blob`）；MCP 工具按 `mesh_send`→`send`、`mesh_board_set`→`board`、`mesh_blob_*`→`blob` 判权。越权返回 `403` + `required_scope`；
+- **scopes**：`read`（收件箱/peers/status/board 读/blob 读/任务读）、`send`（发消息/pin/任务写）、`board`（写黑板）、`blob`（上传/提交/删除）；空 scopes = 历史全量；
+- **REST 与 MCP 两面都判权**：REST 在入口按路径映射 scope（`/api/send`→`send`，`/api/inbox`、`/api/peers`、`/api/status`、`/api/read`→`read`，`/api/board` 写→`board`，blob 写→`blob`，`/api/tasks` GET 与单条→`read`、POST 与 claim/heartbeat/settle/redispatch/cancel→`send`）；MCP 工具按 `mesh_send`→`send`、`mesh_board_set`→`board`、`mesh_blob_*`→`blob` 判权。越权返回 `403` + `required_scope`；
 - **身份只来自 token**：`X-Mesh-Agent` 等头只用于显示，不能用于冒充；
 - **token 只存 sha256**，明文只在签发时返回一次；轮换即旧 token 失效；
 - 失败鉴权按来源 IP 限速（只惩罚失败路径，好 token 立即放行）；

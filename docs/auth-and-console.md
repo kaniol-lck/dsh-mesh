@@ -1,7 +1,7 @@
-<!-- drift: hub=^0.7.21 owner=hub -->
+<!-- drift: hub=^0.8.1 owner=hub -->
 # 鉴权与控制台
 
-本文是 **dsh-mesh 的鉴权模型**与**网页控制台**的操作说明。适用于中枢 0.7.20（覆盖 0.7.3 起的控制台/鉴权能力，含 0.7.12 的 REST 判权与 0.7.16 的来源限制收紧）。
+本文是 **dsh-mesh 的鉴权模型**与**网页控制台**的操作说明。适用于中枢 0.8.1（覆盖 0.7.3 起的控制台/鉴权能力，含 0.7.12 的 REST 判权、0.7.16 的来源限制收紧与 0.8.x 的跨机任务账本）。
 
 ---
 
@@ -19,7 +19,7 @@
 - `token` 模式下 `X-Mesh-Agent` 头**一律忽略**，身份只由 token 决定，防止冒充；
 - 每次认证成/败都进 `audit` 表；失败按来源 IP 限流（只慢失败请求，不锁整网）；
 - wake secret 由中枢懒生成，节点用自己的 agent token 调 `GET /api/wake-secret` 取回并落盘（0600）；
-- `GET /api/bootstrap` 是**唯一**免鉴权端点：只返回端点信息与（可选）CA 公钥，按来源 IP 限速 60 次/分钟（超限 429）；**不含**任何 token / wake_secret / 内部路径，可安全公开。
+- 公开面有四个**免 token** 入口：`GET /api/bootstrap`（端点信息与可选 CA，按来源 IP 限速 60 次/分钟，超限 429）、`GET /health`（版本/会话/blob 计数等运行状态）、`POST /api/enroll`（要一次性注册码）、`POST /api/enroll/request` + `/api/enroll/token`（设备码配对）；它们都**不含**任何 token / wake_secret / 内部路径，可安全公开。
 
 ---
 
@@ -29,8 +29,8 @@
 
 | scope | 允许 |
 |---|---|
-| `read` | 读收件箱、会话、黑板、成员列表 |
-| `send` | `mesh_send` / `/api/send` |
+| `read` | 读收件箱、会话、黑板、成员列表；读任务账本（`GET /api/tasks…`） |
+| `send` | `mesh_send` / `/api/send`；写任务账本（建单、claim/heartbeat/settle/redispatch/cancel） |
 | `board` | 黑板写 |
 | `blob` | 文件上传/下载 |
 
@@ -42,9 +42,14 @@
 | REST 路径 | 需要的 scope |
 |---|---|
 | `/api/send`、`/api/message/<id>/pin` | `send` |
+| `/api/tasks`（POST）与 `/api/tasks/<id>/` 的 claim / heartbeat / settle / redispatch / cancel | `send`（0.8.0+） |
+| `/api/tasks`（GET）与 `/api/tasks/<id>` | `read`（0.8.0+） |
 | `/api/inbox`、`/api/peers`、`/api/status`、`/api/register`、`/api/read`、`/api/wake-secret`、`/api/board/log`、`/api/conversations`、`/api/conversation`、`/api/message`、`/api/pinned`、blob 读 | `read` |
 | `/api/board`（POST） | `board` |
 | `/api/blob/*` 写（init/chunk/commit/delete）、`/api/blob` | `blob` |
+
+- 任务账本只支持 token 身份：`MESH_AUTH_MODE=open` 时 `/api/tasks` 返回 `403 tasks require token auth`（任务必须绑定具体 agent）；open 模式只适合内网试用。
+- 任务单条查询与列表都只返回**自己参与**（发起或目标）的任务；别人的任务返回 `403` 或不出现在列表里。
 
 ## 3. IP 白名单与过期
 
@@ -175,6 +180,7 @@ token 只返回一次（同方式 A 第 4 步落地）。
 | `401 token expired` | 过了 `token_expires_at` | 轮换或重新 enroll |
 | `403 … allowlist` | 来源 IP 不在 `allowed_cidrs` | 改白名单或修正反代来源地址 |
 | `403 scope …` | 该节点缺对应 scope | 控制台勾选相应 scope |
+| `403 tasks require token auth` | `MESH_AUTH_MODE=open` 下不能用跨机任务账本 | 切到 `token` 模式，或同机派活走 `/mesh/inject` |
 | `403 admin role required` | 用只读令牌做管理操作 | 用 admin token 登录 |
 | `403 bad csrf token` | 管理写操作缺/错 CSRF | 用控制台页面操作，或带正确 `x-mesh-csrf` |
 | `console is not reachable from this address` | `MESH_CONSOLE_ALLOW` 不含该来源 | 调整 env 或从内网访问 |

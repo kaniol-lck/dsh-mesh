@@ -88,7 +88,8 @@
 
 - 寻址优先级：`session`（完整 id，可省略 `session-` 前缀）→ 精确标题 → 标题唯一子串；
   歧义或找不到返回 400 并提示用 `GET /mesh/sessions`；
-- `mode`：`queue`（默认，等当前回合结束）/ `steer`（打断当前回合）；
+- `mode`：`queue`（排队，默认，等当前回合结束）/ `steer`（插队进当前回合）；
+  同一概念在 `mesh_dispatch` 上叫 `mode`、在 `mesh_send` 上叫 `delivery`——三个入口的对照见 `skills/mesh/SKILL.md` §16，工具参数以 `docs/tools-reference.md` 为准；
 - 返回 `{"ok":true,"sessionId":"…","title":"…","mode":"queue"}`，并写入 waker 日志 `injected … into local session …`。
 
 ### `POST /mesh/sessions/archive`

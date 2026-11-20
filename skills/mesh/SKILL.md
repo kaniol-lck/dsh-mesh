@@ -319,11 +319,26 @@ dsh 启动约 12 秒后，插件自动扫一次未读并唤醒（跳过 `no_repl
 - **CLI / 脚本发信**：自动读环境变量 `DSH_SESSION_ID` 带上 `session` 即可（DSH 会话里已就绪）；
 - 远端回信到达时，waker 看到 origin_session 会把该对话**自动绑定**到发起会话（用户手动绑定优先）；
 - 绑定晚于消息也不丢：POST /mesh/bind {conversation, sessionId, deliver:true, backfill:12} 会把最近消息补投进会话；
-- **三种投递模式**：queue（排队，默认）/ steer（插队）/ ranch（fork 侧会话）。
+- **三种投递模式**：queue（排队，默认）/ steer（插队）/ branch（fork 侧会话）。
   接收方在 设置 → Mesh → 投递模式 设默认值；**发送方可以按消息指定**：mesh_send 带 delivery: queue|steer|branch。
   优先级：消息 delivery > interrupt:true（等同 steer）> 接收方默认；接收方可关闭「允许发送方指定」，插队仍受本机频率上限约束。
   侧会话标题 mesh · <主题> · 分支，12 小时内复用。
-- 已读消息不会自动重投——历史只能靠 ackfill 补，绑定时值得顺手带上。
+- **参数名别混**：`mesh_send` 叫 `delivery`，而 `mesh_dispatch` / `POST /mesh/inject` 叫 `mode`——对照表见 §16。
+- 已读消息不会自动重投——历史只能靠 backfill 补，绑定时值得顺手带上。
+
+## 16. steer 的三个入口（同一概念，三个参数名）
+
+「插队进当前回合」在三个入口叫法不同，**写错参数名等于没生效**。参数以 [`docs/tools-reference.md`](../../docs/tools-reference.md) 为准（该页由工具 schema 生成，别再手抄；独立安装的技能包不含仓库 docs，可到源码仓查看）：
+
+| 入口 | 参数 | 作用于 | 说明 |
+|---|---|---|---|
+| `mesh_dispatch` | `mode: 'steer'` | 本机会话派活 | 插队进当前回合；默认 `queue` |
+| `mesh_send` | `delivery: 'steer'` | 跨机消息 | 建议性，接收方策略可覆盖；`interrupt: true` 等同 steer |
+| `POST /mesh/inject` | `mode: 'steer'` | HTTP 直投本机会话 | 默认 `queue`；字段见 `docs/local-sessions.md` |
+
+- 只有 `mesh_send.delivery` 还接受 `branch`（分叉侧会话）；`mesh_dispatch.mode` 与 `/mesh/inject` 的 `mode` 只取 `queue|steer`。
+- `mesh_send` 的优先级：消息 `delivery` > `interrupt: true`（等同 steer）> 接收方默认；接收方可关闭「允许发送方指定」，插队仍受本机频率上限约束。
+- 查参数随时跑 `node scripts/gen-tool-reference.mjs --check`（本地仓），或直接看参考页——不要凭记忆写。
 
 ## 17. 多会话分工（任意项目可用）
 

@@ -1,4 +1,4 @@
-<!-- drift: waker=^0.8.0 hub=^0.7.21 owner=docs -->
+<!-- drift: waker=^0.8.0 hub=^0.8.1 owner=docs -->
 # 接入 dsh-mesh（一页纸）
 
 给**公网上的陌生人**：网络环境未知（很可能是双 NAT、没有公网 IP、公司防火墙），
@@ -6,7 +6,7 @@
 
 > 若 hub 使用**自签证书**（公网 TCP 透传场景），**必须按下面第 0 节配置 CA**；若 hub 使用公共 CA 签发的证书、或位于可信内网，则无需配置 CA。
 
-> 契约版本：hub 0.7.15 / waker 0.5.0 起（`/api/bootstrap` + `joinCode` 自举 + pull 默认）。
+> 契约版本：hub 0.8.1 / waker 0.8.0（本文流程自 hub 0.7.15 / waker 0.5.0 起成立；旧版本可用但缺 `wake_push_failures` 等新字段）。
 
 ---
 
@@ -92,7 +92,7 @@ python -c "import ssl,urllib.request; print(urllib.request.urlopen('https://<公
 ### 第 1 步：装插件（精确版本）
 
 ```bash
-dsh plugin add dsh-mesh-waker@0.5.0
+dsh plugin add dsh-mesh-waker@0.8.0
 ```
 
 协作技能单独发布：`npm i -g dsh-mesh-skills`（装到 `~/.dsh/skills`，见 [skills/README.md](../skills/README.md)）。
@@ -172,7 +172,8 @@ push 不可达时会**静默回落**到 pull，不会报错。
 
 - `/api/bootstrap` **免鉴权**，只返回端点信息与可选 CA 公钥，不含任何秘密（见 `docs/auth-and-console.md`）；
 - `ca_sha256` 是**指纹钉扎**：中枢返回的 CA 与你预期的不一致就中止，防止被中间人替换；
-- token 只写本机文件、不进 profile patch、不进日志/面板；`/api/enroll` 是**唯一**令牌出口；
+- token 只写本机文件、不进 profile patch、不进日志/面板；令牌只由中枢签发——注册码 `/api/enroll`、设备码 `/api/enroll/token`、或管理员 mint/轮换（见 `docs/auth-and-console.md` §5）；
+- 没有注册码时可用**设备码配对**：`POST /api/enroll/request` 拿 `user_code` → 人在控制台（或 `POST /api/admin/enroll/approve`）批准 → 轮询 `POST /api/enroll/token` 换 token（10 分钟、单次，`device_code` 只给节点）；
 - 注册码是一次性的，自举成功后即作废；token 丢失时重新生成注册码再来一次。
 
 ---
