@@ -60,7 +60,7 @@
 |---|---|---|---|
 | `target` | string |  | Session id / unique title substring (local dispatch), or a registered remote agent name such as "hermes" (hub dispatch). Required unless a known `thread` is given. There is no "send to myself": this machine’s own agent id is never a valid target — name the session instead. |
 | `text` | string | 是 | Task text, delivered verbatim after a one-line [TASK …] header (max 64 KiB). |
-| `workspacePath` | string |  | Absolute workspace path for a session created by createIfMissing (e.g. D:\projects\proj). Omit to inherit the caller session’s workspace. Refused when it points at a different workspace than the caller’s. |
+| `workspacePath` | string |  | Absolute workspace path for a session created by createIfMissing (e.g. <workspace>). Omit to inherit the caller session’s workspace. Refused when it points at a different workspace than the caller’s. |
 | `cwd` | string |  | Alias of workspacePath (absolute path). |
 | `thread` | string |  | Optional follow-up thread id (≤128 bytes, e.g. TH-1). A known thread lets you omit target and keeps binding follow-ups to the same session. |
 | `requester` | string |  | Session id or title that receives the receipt (the dispatcher). Usually set by the CLI; the tool handler also uses the caller session when the host exposes it. |

@@ -59,6 +59,21 @@ function typeLabel(spec) {
   return spec.type ?? 'any'
 }
 
+// schema 的 description 里可能出现某台机器的绝对路径（实测：`workspacePath` 的例子写死了
+// 一个盘符路径）。忠实搬进文档会被 `check-paths` 判红（它拦盘符绝对路径），而文档本身不该
+// 固化某台机器的路径。这里替换成占位符并**大声告警**，让源头被发现；正确修法是在
+// `lib/tools.mjs` 里把例子改成中性写法（归 waker，见 todo）。
+const ABS_PATH = /\b[A-Za-z]:\\[^\s)`"']*/g
+const sanitizedFields = []
+
+function neutralize(text, fieldName) {
+  const cleaned = String(text).replace(ABS_PATH, (hit) => {
+    sanitizedFields.push(`${fieldName}: ${hit}`)
+    return '<workspace>'
+  })
+  return cleaned
+}
+
 const lines = []
 // drift 签名必须是**生成物的一部分**：手工加一行会让「文件 == 生成结果」不再成立，
 // 于是 check-tool-docs 立刻判红（2026-11-20 踩过一次）。用 `*` 表示概念文档不随版本漂移，
@@ -77,7 +92,7 @@ lines.push('')
 for (const [exportName, tool] of toolExports.sort((a, b) => a[1].name.localeCompare(b[1].name))) {
   lines.push(`## \`${tool.name}\``)
   lines.push('')
-  const desc = String(tool.description ?? '').split('\n')[0].trim()
+  const desc = neutralize(String(tool.description ?? '').split('\n')[0].trim(), `${tool.name}.description`)
   if (desc) {
     lines.push(`> ${desc}`)
     lines.push('')
@@ -94,7 +109,7 @@ for (const [exportName, tool] of toolExports.sort((a, b) => a[1].name.localeComp
   lines.push('|---|---|---|---|')
   for (const name of names) {
     const spec = params[name] ?? {}
-    const d = String(spec.description ?? '').replace(/\s+/g, ' ').trim()
+    const d = neutralize(String(spec.description ?? '').replace(/\s+/g, ' ').trim(), `${tool.name}.${name}`)
     lines.push(`| \`${name}\` | ${typeLabel(spec)} | ${required.includes(name) ? '是' : ''} | ${d.replaceAll('|', '\\|')} |`)
   }
   lines.push('')
@@ -103,6 +118,12 @@ for (const [exportName, tool] of toolExports.sort((a, b) => a[1].name.localeComp
 }
 
 const text = lines.join('\n') + '\n'
+const UNIQUE_SANITIZED = [...new Set(sanitizedFields)]
+// 占位符替换必须有痕：默认静默替换会让人以为 schema 本来就这么写。
+if (UNIQUE_SANITIZED.length) {
+  console.error(`WARN 已把下列字段说明里的本机绝对路径替换为 <workspace>：${UNIQUE_SANITIZED.join('; ')}`)
+  console.error('     根治：在 plugins/mesh-waker/lib/tools.mjs 里改成中性写法（归 waker）。')
+}
 
 if (has('--stdout')) {
   process.stdout.write(text)
