@@ -32,7 +32,7 @@ export const MESH_DISPATCH_TOOL = {
     workspacePath: {
       type: 'string',
       description:
-        'Absolute workspace path for a session created by createIfMissing (e.g. D:\\projects\\proj). Omit to inherit the caller session\u2019s workspace. Refused when it points at a different workspace than the caller\u2019s.',
+        'Absolute workspace path for a session created by createIfMissing, e.g. /path/to/workspace (any platform-absolute form works, including a drive-qualified path on Windows). Omit to inherit the caller session\u2019s workspace. Refused when it points at a different workspace than the caller\u2019s.',
     },
     cwd: { type: 'string', description: 'Alias of workspacePath (absolute path).' },
     thread: {
