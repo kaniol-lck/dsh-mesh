@@ -6039,7 +6039,9 @@ async function main() {
 
   await runCase('workspaces: one realpath under two spellings collapses to one entry', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'same-repo')
-    const variant = `${cwd.toUpperCase()}${path.sep}`
+    // 两种拼写必须**在两个平台上都等价**：大小写只在不敏感文件系统上等价，POSIX 上
+    // /tmp/.../SAME-REPO 是另一个真实路径（且 /TMP 不可创建，CI 报 EACCES）。
+    const variant = process.platform === 'win32' ? `${cwd.toUpperCase()}${path.sep}` : `${cwd}${path.sep}.${path.sep}`
     const h = await boot({
       seedSessions: [
         { id: 'session-spell-a', title: 'worker a', cwd },
