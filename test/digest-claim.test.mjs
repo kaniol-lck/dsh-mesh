@@ -340,6 +340,7 @@ async function waitFor(predicate, timeoutMs = 8000, stepMs = 50) {
 
 async function startHarness({ sweepMs = 500 } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-digest-claim-'))
+  fs.mkdirSync(path.join(tmp, 'inbox'), { recursive: true })
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
   const home = path.join(tmp, 'home')
@@ -468,6 +469,7 @@ const dispatchTask = (h, id) =>
 
 test('advisory notice: writes status unclaimed to receipts.jsonl and delivers through the receipt channel', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-unclaimed-'))
+  fs.mkdirSync(path.join(tmp, 'inbox'), { recursive: true })
   try {
     const deliveries = []
     const notify = createUnclaimedNotice({

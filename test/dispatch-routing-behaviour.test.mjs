@@ -85,6 +85,7 @@ async function startFakeHub() {
 
 async function startHarness({ hubUrl }) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-dispatch-routing-'))
+  fs.mkdirSync(path.join(tmp, 'inbox'), { recursive: true })
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
   const home = path.join(tmp, 'home')

@@ -49,6 +49,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 /** Two sessions: a requester (coordinator-like) and a worker that settles tasks. */
 async function startHarness({ receiptDigest = 'on', digestIdleDebounceMs = 500, receiptNotifyWarnMs = 90000, logFile = '', receiptMode = 'queue' } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-receipt-digest-'))
+  fs.mkdirSync(path.join(tmp, 'inbox'), { recursive: true })
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
   const home = path.join(tmp, 'home')

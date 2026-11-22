@@ -47,6 +47,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 /** Minimal host: one seeded session, prompt capture and session/event listeners. */
 async function startHarness({ digestDelivery = 'on', digestIdleDebounceMs = 5000, digestNotifyWarnMs = 90000, autoTurnOnPrompt = false, logFile = '', seedSessions = [{ id: 'session-digest', title: 'digest worker' }] } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-digest-'))
+  fs.mkdirSync(path.join(tmp, 'inbox'), { recursive: true })
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
   const home = path.join(tmp, 'home')

@@ -49,6 +49,7 @@ async function request(base, route) {
 
 async function startHarness({ tasksSeed = [], receiptDigest = 'off' } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-lost-recovery-'))
+  fs.mkdirSync(path.join(tmp, 'inbox'), { recursive: true })
   const sessionsRoot = path.join(tmp, 'sessions')
   const tokenDir = path.join(tmp, 'state')
   const home = path.join(tmp, 'home')

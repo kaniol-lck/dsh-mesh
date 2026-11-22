@@ -150,6 +150,7 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   fs.mkdirSync(sessionsRoot, { recursive: true })
   fs.mkdirSync(tokenDir, { recursive: true })
   fs.mkdirSync(home, { recursive: true })
+  fs.mkdirSync(path.join(tmp, 'inbox'), { recursive: true })
 
   const seeded = seedSessions.map((seed) => {
     // A session's cwd normally exists — a dispatch into it must pass the new "cwd gone"
