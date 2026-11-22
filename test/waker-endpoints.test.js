@@ -151,7 +151,12 @@ async function startHarness({ seedSessions = [], conversations = null, config = 
   fs.mkdirSync(tokenDir, { recursive: true })
   fs.mkdirSync(home, { recursive: true })
 
-  const seeded = seedSessions.map((seed) => ({ ...seedSession(sessionsRoot, seed), cwd: seed.cwd ?? null }))
+  const seeded = seedSessions.map((seed) => {
+    // A session's cwd normally exists — a dispatch into it must pass the new "cwd gone"
+    // guard (T-mws1zens). Fixtures that need a deleted worktree pass cwdMissing: true.
+    if (seed.cwd && seed.cwdMissing !== true && path.isAbsolute(seed.cwd)) fs.mkdirSync(seed.cwd, { recursive: true })
+    return { ...seedSession(sessionsRoot, seed), cwd: seed.cwd ?? null }
+  })
   const sessionIndex = {}
   // Seed cwd when the case needs workspace-scoped behaviour (e.g. requester inference).
   for (const seed of seeded) sessionIndex[seed.id] = { mtime: seed.mtime, title: seed.title, cwd: seed.cwd }
@@ -6213,6 +6218,152 @@ async function main() {
     }
   })
 
+
+  // T-mws1zens: a dispatch into a session whose cwd was removed (git worktree remove) used to
+  // answer ok:true and file the task in the machine ledger, where nobody ever ran it.
+  await runCase('dispatch: a session whose cwd was deleted is refused and writes no row', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'cwd-gone-target')
+    const h = await boot({ seedSessions: [{ id: 'session-cwd-gone', title: 'gone worker', cwd, cwdMissing: true }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    let thrown = null
+    try {
+      await tool.execute({ target: 'session-cwd-gone', text: 'work in a deleted tree', taskId: 'T-CWD-GONE' }, { sessionId: 'session-cwd-caller' })
+    } catch (error) {
+      thrown = error
+    }
+    const injected = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { session: 'session-cwd-gone', text: 'same via HTTP', meta: { taskId: 'T-CWD-GONE-2' } },
+    })
+    const listed = await request(h.base, '/mesh/tasks')
+    const localFile = path.join(h.home, '.dsh', 'mesh-waker', 'local', 'tasks.jsonl')
+    const localRows = fs.existsSync(localFile) ? fs.readFileSync(localFile, 'utf8').split('\n').filter((line) => line.trim()).length : 0
+    const registryFile = path.join(h.home, '.dsh', 'mesh-waker', 'workspaces.json')
+    const registry = fs.existsSync(registryFile) ? JSON.parse(fs.readFileSync(registryFile, 'utf8')) : { workspaces: {} }
+    const ok =
+      Boolean(thrown) &&
+      /does not exist/.test(thrown.message) &&
+      thrown.message.includes(cwd) &&
+      /session-cwd-gone/.test(thrown.message) &&
+      /archive that session/i.test(thrown.message) &&
+      injected.status === 409 &&
+      injected.json?.ok === false &&
+      injected.json?.details?.reason === 'cwd-missing' &&
+      listed.json?.total === 0 &&
+      localRows === 0 &&
+      !registry.workspaces?.['cwd-gone-target']
+    report(
+      'dispatch: a session whose cwd was deleted is refused and writes no row',
+      ok,
+      `throw=${Boolean(thrown)} mentions=${Boolean(thrown && thrown.message.includes(cwd))} inject=${injected.status} rows=${listed.json?.total ?? '-'} localRows=${localRows} zombieSlug=${Boolean(registry.workspaces?.['cwd-gone-target'])}`,
+    )
+  })
+
+  await runCase('dispatch: a session with no recorded cwd still dispatches but warns', async (boot) => {
+    const h = await boot({ seedSessions: [{ id: 'session-cwd-unknown', title: 'unknown cwd worker' }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const result = await tool.execute({ target: 'session-cwd-unknown', text: 'no cwd recorded', taskId: 'T-CWD-UNK' }, { sessionId: 'session-cwd-caller' })
+    const injected = await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { session: 'session-cwd-unknown', text: 'same via HTTP', meta: { taskId: 'T-CWD-UNK-2' } },
+    })
+    const ok =
+      result?.ok === true &&
+      (result.warnings ?? []).some((warning) => /cwd/.test(warning)) &&
+      injected.status === 200 &&
+      /cwd/.test(injected.json?.cwdWarning ?? '')
+    report('dispatch: a session with no recorded cwd still dispatches but warns', ok, `warnings=${JSON.stringify(result?.warnings ?? [])} injectWarning=${JSON.stringify(injected.json?.cwdWarning ?? '')}`)
+  })
+
+  // T-mws1zens A2/A3: prune zombie workspaces (registry-only, conservative) and report cwdExists.
+  await runCase('workspaces: prune keeps UNC/members/ephemeral and removes only dead local cwds', async (boot) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'waker-ws-prune-'))
+    const aliveCwd = path.join(tmpRoot, 'prune-alive')
+    fs.mkdirSync(aliveCwd, { recursive: true })
+    const goneCwd = path.join(tmpRoot, 'prune-gone')
+    const occupiedCwd = path.join(tmpRoot, 'prune-occupied')
+    const ephemeralCwd = path.join(tmpRoot, 'prune-ephemeral')
+    const uncCwd = '\\\\offline-host\\share\\proj'
+    const registry = {
+      machine: 'm',
+      workspaces: {
+        'prune-alive': { cwd: aliveCwd, slug: 'prune-alive', roles: [] },
+        'prune-gone': { cwd: goneCwd, slug: 'prune-gone', roles: [] },
+        'prune-occupied': { cwd: occupiedCwd, slug: 'prune-occupied', workers: { docs: { sessionId: 'session-occupied-docs' } } },
+        'prune-network': { cwd: uncCwd, slug: 'prune-network', roles: [] },
+        'prune-ephemeral': { cwd: ephemeralCwd, slug: 'prune-ephemeral', ephemeral: true },
+      },
+    }
+    const writeRegistry = (home) => {
+      const dir = path.join(home, '.dsh', 'mesh-waker')
+      fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(path.join(dir, 'workspaces.json'), `${JSON.stringify(registry, null, 2)}\n`)
+    }
+    try {
+      // Each entry needs a live session: convergeWorkspaces() already drops a registry entry that
+      // has no sessions and no directory (the ephemeral rule). The real zombies survive precisely
+      // because their sessions are still alive, so the fixture must mirror that.
+      const seedSessions = [
+        { id: 'session-prune-alive', title: 'alive worker', cwd: aliveCwd },
+        { id: 'session-prune-ghost', title: 'ghost of a worktree', cwd: goneCwd, cwdMissing: true },
+        { id: 'session-prune-occupied', title: 'occupied worker', cwd: occupiedCwd, cwdMissing: true },
+        { id: 'session-prune-network', title: 'network worker', cwd: uncCwd, cwdMissing: true },
+        { id: 'session-prune-ephemeral', title: 'ephemeral worker', cwd: ephemeralCwd, cwdMissing: true },
+      ]
+      const first = await boot({ tmpRoot, seedSessions, prepareHome: writeRegistry })
+      const view = await request(first.base, '/mesh/workspaces')
+      const aliveEntry = view.json?.workspaces?.['prune-alive']
+      const goneView = view.json?.workspaces?.['prune-gone']
+      const networkView = view.json?.workspaces?.['prune-network']
+      const beforeBytes = fs.readFileSync(path.join(first.home, '.dsh', 'mesh-waker', 'workspaces.json'), 'utf8')
+      const dry = await request(first.base, '/mesh/workspaces/prune', { method: 'POST', body: {} })
+      const afterDryBytes = fs.readFileSync(path.join(first.home, '.dsh', 'mesh-waker', 'workspaces.json'), 'utf8')
+      const applied = await request(first.base, '/mesh/workspaces/prune', { method: 'POST', body: { apply: true } })
+      const registryAfter = registryOf(first)
+      const backupExists = Boolean(applied.json?.backup) && fs.existsSync(applied.json.backup)
+      const forced = await request(first.base, '/mesh/workspaces/prune', { method: 'POST', body: { apply: true, force: true } })
+      const registryForced = registryOf(first)
+      first.close()
+      // A restart must not resurrect what was pruned: the boot re-registers session cwds, and a
+      // deleted cwd must be refused by ensureWorkspace instead of minting a slug again.
+      const second = await boot({ tmpRoot, seedSessions })
+      const registrySecond = registryOf(second)
+      const secondSlugs = Object.keys(registrySecond.workspaces ?? {})
+      const ok =
+        aliveEntry?.cwdExists === true &&
+        goneView?.cwdExists === false &&
+        networkView?.cwdExists === null &&
+        /unc/i.test(networkView?.cwdExistsReason ?? '') &&
+        dry.json?.dryRun === true &&
+        beforeBytes === afterDryBytes &&
+        (dry.json?.stale ?? []).map((item) => item.slug).join(',') === 'prune-gone' &&
+        (dry.json?.skipped ?? []).some((item) => item.slug === 'prune-network' && item.reason.startsWith('unc:')) &&
+        (dry.json?.skipped ?? []).some((item) => item.slug === 'prune-occupied' && item.reason.startsWith('has-members:')) &&
+        (dry.json?.skipped ?? []).some((item) => item.slug === 'prune-ephemeral' && item.reason.startsWith('ephemeral:')) &&
+        applied.json?.applied === true &&
+        applied.json?.removed?.join(',') === 'prune-gone' &&
+        backupExists &&
+        !registryAfter.workspaces?.['prune-gone'] &&
+        Boolean(registryAfter.workspaces?.['prune-occupied']) &&
+        Boolean(registryAfter.workspaces?.['prune-network']) &&
+        forced.json?.removed?.join(',') === 'prune-occupied' &&
+        !registryForced.workspaces?.['prune-occupied'] &&
+        // Converge already dropped the ephemeral entry; prune never touches it either way.
+        !secondSlugs.includes('prune-gone') &&
+        !secondSlugs.includes('prune-occupied') &&
+        // The offline share must survive the restart: it was never pruned.
+        secondSlugs.includes('prune-network')
+      report(
+        'workspaces: prune keeps UNC/members/ephemeral and removes only dead local cwds',
+        ok,
+        `cwdExists=${aliveEntry?.cwdExists}/${goneView?.cwdExists}/${networkView?.cwdExists}x dry=${(dry.json?.stale ?? []).map((i) => i.slug).join(',')} skipped=${(dry.json?.skipped ?? []).map((i) => `${i.slug}:${String(i.reason).split(':')[0]}`).join(',')} removed=${(applied.json?.removed ?? []).join(',')} backup=${backupExists} afterRestart=${secondSlugs.join(',')}`,
+      )
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
 
   // 224-229. Role white list (T-295): only known role names reach `roles`; title fragments
   // are parked in `rolesUnrecognized`, cleanup is idempotent, and human roles survive it.

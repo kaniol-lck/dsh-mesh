@@ -4217,6 +4217,55 @@ export function apply(ctx, config) {
     return sanitizeSlug(slug) || slug
   }
 
+  /**
+   * Can this cwd still be used? A `git worktree remove` leaves the session record alive but its
+   * directory gone, and a dispatch into it silently lands in the machine-wide ledger and does
+   * nothing (T-mws1zens: 4 of 9 dispatches from a xiajiang lead session).
+   *
+   * `unc` and `unknown` are deliberately distinct from `missing`: a network path may be
+   * unreachable merely because the other machine is off, and a relative path is not ours to
+   * judge — neither may be treated as proof of deletion.
+   */
+  function cwdStateOf(cwd) {
+    const path = String(cwd ?? '').trim()
+    if (!path) return { state: 'unknown', path: null, reason: 'no cwd recorded' }
+    if (/^\\\\/.test(path)) return { state: 'unc', path, reason: 'network path (UNC); existence not checked' }
+    if (!isAbsolute(path)) return { state: 'unknown', path, reason: 'not an absolute path' }
+    try {
+      return existsSync(path)
+        ? { state: 'exists', path, reason: null }
+        : { state: 'missing', path, reason: 'directory does not exist' }
+    } catch (error) {
+      return { state: 'unknown', path, reason: `cannot stat: ${error.message}` }
+    }
+  }
+
+  /**
+   * Refuse to dispatch into a session whose working directory is gone. `warning` carries the
+   * softer cases (unknown/UNC) so they are never silent; the caller decides where to surface it.
+   */
+  function assertTargetCwdUsable(session) {
+    const cwd = session?.cwd ?? sessionCwdOf(session?.id) ?? null
+    const state = cwdStateOf(cwd)
+    if (state.state !== 'missing') {
+      const warning =
+        state.state === 'unc' || state.state === 'unknown'
+          ? `target session ${session?.id ?? '-'} cwd ${state.reason}${state.path ? ` (${state.path})` : ''}`
+          : null
+      return { ok: true, cwd: state.path, warning }
+    }
+    const title = session?.title ? ` "${session.title}"` : ''
+    const error = new Error(
+      `target session ${session?.id ?? '-'}${title} cannot work: its cwd ${state.path} does not exist ` +
+        '(the worktree was probably removed with `git worktree remove`). Refusing to dispatch — a task ' +
+        'there could never run. Options: archive that session and dispatch to the main-tree session of ' +
+        'the same project, or recreate the worktree first and then dispatch again.',
+    )
+    error.status = 409
+    error.details = { sessionId: session?.id ?? null, cwd: state.path, reason: 'cwd-missing' }
+    throw error
+  }
+
   /** Register a cwd once. Existing entries (and human edits) stay byte-identical. */
   function ensureWorkspace(cwd) {
     const path = String(cwd ?? '').trim()
@@ -4226,7 +4275,17 @@ export function apply(ctx, config) {
     refreshWorkspacesFromDisk()
     const keyPath = workspaceKeyPath(path)
     for (const [slug, value] of Object.entries(workspaces.workspaces)) {
+      // An existing entry always answers, even for a path that has since been deleted: reads
+      // must never rewrite or drop the registry (removal is POST /mesh/workspaces/prune).
       if (workspaceKeyPath(value.cwd) === keyPath) return canonicalSlugOf(slug, value)
+    }
+    // T-mws1zens: never invent a workspace for a directory that is gone. Registering it gave
+    // every deleted worktree a slug of its own (lv016 / lv013 / a1scan) that then looked like
+    // a real workspace nobody could ever work in.
+    const state = cwdStateOf(path)
+    if (state.state === 'missing') {
+      fileLog(`workspace not registered: ${path} does not exist (dispatch there is refused)`)
+      return null
     }
     const base = slugifyCwd(path)
     for (const [slug, value] of Object.entries(workspaces.workspaces)) {
@@ -4599,15 +4658,23 @@ export function apply(ctx, config) {
   }
 
   function routeForCwds(targetCwd, requesterCwd) {
+    // A requester cwd that no longer exists (or is unknown) yields no slug; the origin string
+    // must stay readable instead of saying "machine/null" (T-mws1zens).
+    const requesterSlug = requesterCwd ? ensureWorkspace(requesterCwd) : null
+    const originOfRequester = requesterSlug ? locationOf(requesterSlug) : `${workspaces.machine}/unknown`
     if (!targetCwd) {
-      const origin = requesterCwd ? locationOf(ensureWorkspace(requesterCwd)) : `${workspaces.machine}/unknown`
-      return { scope: 'machine', workspace: null, dir: localDir, origin, peers: [], scopeUncertain: true }
+      return { scope: 'machine', workspace: null, dir: localDir, origin: originOfRequester, peers: [], scopeUncertain: true }
     }
     const targetSlug = ensureWorkspace(targetCwd)
-    if (!requesterCwd) {
+    // T-mws1zens: a cwd that does not exist is not registered (ensureWorkspace refuses), so
+    // there is no workspace tier to put the row in. Keep it in the machine ledger and say the
+    // layer is uncertain instead of inventing a workspace whose directory is gone.
+    if (!targetSlug) {
+      return { scope: 'machine', workspace: null, dir: localDir, origin: originOfRequester, peers: [], scopeUncertain: true }
+    }
+    if (!requesterCwd || !requesterSlug) {
       return { scope: 'workspace', workspace: targetSlug, dir: wsDirFor(targetSlug), origin: locationOf(targetSlug), peers: [], scopeUncertain: true }
     }
-    const requesterSlug = ensureWorkspace(requesterCwd)
     if (requesterSlug === targetSlug) {
       return { scope: 'workspace', workspace: targetSlug, dir: wsDirFor(targetSlug), origin: locationOf(targetSlug), peers: [], scopeUncertain: false }
     }
@@ -6286,6 +6353,10 @@ export function apply(ctx, config) {
     const targetCwd = sessionCwdOf(session.id) ?? createdWorkspacePath ?? null
     const dispatchGit = readGitContext(targetCwd)
     const dispatchWarnings = []
+    // T-mws1zens: never accept a task for a directory that is already gone. Checked before
+    // anything is registered, so a refused dispatch leaves no task row behind.
+    const cwdCheck = assertTargetCwdUsable({ id: session.id, title: session.title, cwd: targetCwd })
+    if (cwdCheck.warning) dispatchWarnings.push(cwdCheck.warning)
     if (expectBranch && dispatchGit?.branch !== expectBranch) {
       dispatchWarnings.push(
         `branch mismatch: target ${session.id} is on ${dispatchGit?.branch ?? '(no git)'}, expected ${expectBranch}`,
@@ -7129,7 +7200,17 @@ export function apply(ctx, config) {
         view[slug] = { ...entry, workers }
       }
       // T-418: every workspace reports its advisory lock (null when free); reads stay unblocked.
-      for (const slug of Object.keys(view)) view[slug] = { ...view[slug], lock: workspaceLocks.lockFor(slug) }
+      // T-mws1zens: cwdExists lets ops-side checks report zombie workspaces without walking the
+      // disk themselves. `null` means "not checkable" (UNC share or no cwd) — never a fake false.
+      for (const slug of Object.keys(view)) {
+        const state = cwdStateOf(view[slug]?.cwd)
+        view[slug] = {
+          ...view[slug],
+          lock: workspaceLocks.lockFor(slug),
+          cwdExists: state.state === 'exists' ? true : state.state === 'missing' ? false : null,
+          cwdExistsReason: state.reason,
+        }
+      }
       res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
       res.end(
         JSON.stringify({
@@ -7329,6 +7410,108 @@ export function apply(ctx, config) {
         fileLog(`hub task ${taskId} recorded locally as a reference (scope=hub, no body)`)
         res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: true, taskId, scope: 'hub', textRef, hasInlineText: false }))
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(JSON.stringify({ ok: false, error: error.message }))
+      }
+      return
+    }
+
+    if (path === '/mesh/workspaces/prune' && req.method === 'POST') {
+      // T-mws1zens: remove registry entries whose cwd is gone (a removed git worktree leaves a
+      // session record and, before the guard, a workspace of its own). Registry-only: no files
+      // under ws/<slug>/ are deleted, and the write goes through removedWorkspaces so the next
+      // save cannot resurrect the entry.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      try {
+        const draft = await readJsonRequest(req)
+        const apply = draft.apply === true
+        const force = draft.force === true
+        refreshWorkspacesFromDisk()
+        const stale = []
+        const skipped = []
+        for (const [slug, entry] of Object.entries(workspaces.workspaces)) {
+          const cwd = String(entry.cwd ?? '')
+          const state = cwdStateOf(cwd)
+          const workers = Object.keys(entry.workers ?? {})
+          const coordinators = (entry.coordinators ?? []).map((member) => member.sessionId).filter(Boolean)
+          const base = {
+            slug,
+            cwd,
+            cwdState: state.state,
+            workerCount: workers.length,
+            workers,
+            coordinatorCount: coordinators.length,
+            coordinators,
+          }
+          if (entry.ephemeral === true) {
+            skipped.push({ ...base, reason: 'ephemeral: the registry marks it as a throwaway workspace' })
+            continue
+          }
+          if (state.state === 'unc') {
+            // An offline laptop makes existsSync false for a real share; never prune on that.
+            skipped.push({ ...base, reason: 'unc: network path, existence is not checked' })
+            continue
+          }
+          if (state.state === 'unknown') {
+            skipped.push({ ...base, reason: `unknown: ${state.reason}` })
+            continue
+          }
+          if (state.state === 'exists') continue
+          if ((workers.length || coordinators.length) && !force) {
+            skipped.push({
+              ...base,
+              reason: 'has-members: workers/coordinators are still registered; pass force:true to remove it anyway',
+            })
+            continue
+          }
+          stale.push({ ...base, reason: 'cwd-missing: the directory does not exist' })
+        }
+        let backup = null
+        const removed = []
+        if (apply && stale.length) {
+          const stamp = new Date()
+            .toLocaleString('sv-SE', { hour12: false })
+            .replace(/[-: ]/g, (ch) => (ch === ' ' ? '-' : ''))
+          backup = `${workspacesFile}.bak-prune-${stamp}`
+          try {
+            writeFileSync(backup, readFileSync(workspacesFile), { mode: 0o600 })
+          } catch (error) {
+            backup = null
+            throw new Error(`prune needs a backup before writing and could not create one: ${error.message}`)
+          }
+          for (const item of stale) {
+            delete workspaces.workspaces[item.slug]
+            removedWorkspaces.add(item.slug)
+            removed.push(item.slug)
+          }
+          if (!saveWorkspaces()) throw new Error('workspaces.json write failed; nothing was removed')
+          fileLog(`workspaces pruned: ${removed.join(',')}${backup ? ` (backup ${backup})` : ''}`)
+        }
+        res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+        res.end(
+          JSON.stringify({
+            ok: true,
+            // dryRun is the default: nothing is written unless the caller explicitly says apply.
+            dryRun: !apply,
+            applied: apply,
+            force,
+            // Would be removed (dry-run) / were removed (apply).
+            stale,
+            staleCount: stale.length,
+            // Inspected but deliberately kept, each with a reason.
+            skipped,
+            skippedCount: skipped.length,
+            removed,
+            removedCount: removed.length,
+            backup,
+            file: workspacesFile,
+          }),
+        )
       } catch (error) {
         res.writeHead(400, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify({ ok: false, error: error.message }))
@@ -8284,6 +8467,9 @@ export function apply(ctx, config) {
           String(draft.workspace ?? '').trim()
         let taskId = null
         let deliveredText = text
+        // T-mws1zens: same guard as mesh_dispatch — refuse before a task row exists, so a
+        // caller never sees ok:true for work that cannot run.
+        const injectCwdCheck = assertTargetCwdUsable(target)
         // T-418: a workspace lock held by another session parks the task instead of injecting.
         const injectLock = lockForSession(target.id)
         const injectWaitsForLock =
@@ -8336,6 +8522,8 @@ export function apply(ctx, config) {
               ? { waitingLock: { workspace: injectLock.workspace, ownerSessionId: injectLock.lock.ownerSessionId, expiresAt: injectLock.lock.expiresAt } }
               : {}),
             ...(taskId && pendingTasks.get(taskId)?.idWarning ? { warning: pendingTasks.get(taskId).idWarning } : {}),
+            // T-mws1zens: cwd unknown/UNC is not an error, but it is never silent either.
+            ...(injectCwdCheck.warning ? { cwdWarning: injectCwdCheck.warning } : {}),
           }),
         )
       } catch (error) {
@@ -8346,7 +8534,11 @@ export function apply(ctx, config) {
           JSON.stringify({
             ok: false,
             error: error.message,
-            ...(error?.details ? { conflict: error.details } : {}),
+            ...(error?.details && error.details.reason === 'cwd-missing'
+              ? { details: error.details }
+              : error?.details
+                ? { conflict: error.details }
+                : {}),
           }),
         )
       }

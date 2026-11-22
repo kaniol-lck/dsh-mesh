@@ -16,6 +16,9 @@
 
 - 任务行恢复记录投递模式（`mode: steer|queue`，T-mwnpxik9）：`recordTaskPending` 里这段代码曾被压成单行注释而从未执行（任务库 320 行命中 0 次），事后无法区分「插队更正」与「排队跟进」；现在任务行与 `/mesh/tasks` 都可见，`mesh_dispatch` 日志也带 `mode=`。
 - 工具说明不再固化平台专有路径（T-mwp3tahc）：`mesh_dispatch.workspacePath` 的描述原先把示例写成 Windows 盘符路径，生成到 `docs/tools-reference.md` 后被 `check-paths` 拦下，也不适合面向全平台的插件；改为 `/path/to/workspace` 的写法（并说明 Windows 可用盘符形式的绝对路径）。生成器不再需要 `<workspace>` 兜底。
+- 不再向「工作目录已不存在」的会话派活（T-mws1zens）：`git worktree remove` 之后会话仍在、cwd 已消失，派活会返回 `ok:true` 并把任务写进机器账本，谁也不会去跑（实测 9 单里 4 单如此，其中 3 单最后 `aborted`）。现在 `mesh_dispatch` 与 `/mesh/inject` 在写任务行**之前**校验目标 cwd，缺失则 409 并给出会话 id/标题、那个路径与「归档该会话或改派主树会话」的建议；cwd 未知/UNC 不可判定时不拒绝但**在响应里带 warning**，不再静默。`ensureWorkspace()` 也不再为不存在的目录新注册工作区（已有条目不删）。
+- 新增 `POST /mesh/workspaces/prune`（T-mws1zens，loopback）：清掉 cwd 已消失的僵尸工作区。**默认 dry-run**，`{apply:true}` 才写，写前把注册表备份成 `workspaces.json.bak-prune-<时间戳>`；保守判据——UNC 路径一律跳过（离线笔记本上的真实共享不能当删除）、`ephemeral` 跳过、有 `workers`/`coordinators` 成员的要求 `force:true`；每条都带 `reason`。
+- `GET /mesh/workspaces` 每条新增 `cwdExists`（true/false，不可判定为 `null`）与 `cwdExistsReason`（T-mws1zens）：运维侧不必自己扫盘就能发现僵尸工作区。
 - 修 claim 看门狗误报：startedAt 已落的行不再判 unclaimed（T-485 addendum，实测 XJ-SPAWN-01 一边输出 started=yes acked=yes 一边报 unclaimed）——startedAt 与 ackedAt 语义相反，前者证明任务已被接单；未开始的任务仍由该看门狗盯。- digest 任务未声明完成的看门狗（T-mwgtchp6）：`declaredOnly` 任务通知后超过 `digestClaimWarnMs`（默认 30min）未 `mesh_complete` 时记 WARN 并给派单方 advisory `unclaimed` 回执（不结算），2× 窗口标 `stalled` 保留行；`claimSweepMs` 控制扫描，重启后继续。`createTaskLifecycle` 的依赖补传 `taskRows`（漏传会让 host 因 `deps.taskRows is not iterable` 退出）。
 - 跨机任务消费（默认关闭）：开启后按自己的节奏拉取、认领、续租并结算对端派来的任务，正文按内容哈希取回，不落本地副本；`/mesh/status` 的 `tasksPoll` 报告开关、最近拉取时间与错误。
 - 跨机派活（`dsh-mesh-dispatch --transport hub --to <agent>`）：正文上传为 blob、任务落到 hub，本机只留一行引用（不含正文、不建会话）；`--dry-run` 零网络，hub 失败时退出码非 0 且不留引用行。
