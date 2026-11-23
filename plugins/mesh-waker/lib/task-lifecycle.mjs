@@ -266,7 +266,7 @@ export function createTaskLifecycle(deps) {
     return receipt
   }
 
-  function registerPendingTask(target, meta, mode = 'queue', text = '') {
+  function registerPendingTask(target, meta, mode = 'queue', text = '', options = {}) {
     const taskId = String(meta?.taskId ?? '').trim()
     // A namespaced cross-workspace id may carry one `<slug>/` prefix (T-301). `.`/`..`
     // segments are rejected so an id can never double as a path.
@@ -323,7 +323,12 @@ export function createTaskLifecycle(deps) {
     // Receipts go back to whoever dispatched the task; receiptTo is only the fallback.
     const requester = deps.receiptFlow.resolveRequester(meta?.requester, target)
     // LCA routing (T-282): same workspace -> ws/<slug>/, cross-workspace -> local/.
-    const route = deps.routeForCwds(target.cwd ?? deps.sessionCwdOf(target.id), requester.sessionId ? deps.sessionCwdOf(requester.sessionId) : null)
+    // T-mws1zens: a caller that already resolved the target's directory (createIfMissing just
+    // made it) passes it as `options.targetCwd`. Without that, `sessionCwdOf()` reads the host
+    // index, which does not know a session created moments ago, and the first task of a new
+    // session silently landed in local/ (scopeUncertain) while the response said nothing.
+    const targetCwd = options.targetCwd ?? target.cwd ?? deps.sessionCwdOf(target.id)
+    const route = deps.routeForCwds(targetCwd, requester.sessionId ? deps.sessionCwdOf(requester.sessionId) : null)
     // Same-layer uniqueness (T-301): findRecord only sees this workspace + local, so a
     // duplicate id in the same file is ambiguous and silently resolves to the last row.
     // A retry/re-dispatch to the SAME target keeps working; a different target is rejected.
@@ -399,7 +404,9 @@ export function createTaskLifecycle(deps) {
       // mesh_complete may settle it. Observed turn/end settlement is skipped entirely.
       declaredOnly: meta?.declaredOnly === true,
       // T-416: settlement compares the branch the worker ended on and stats declared files.
-      cwd: target.cwd ?? deps.sessionCwdOf(target.id) ?? null,
+      // T-mws1zens: the dispatch-resolved cwd wins, so a session created moments ago still has
+      // one (the host index has not indexed it yet).
+      cwd: targetCwd ?? null,
       expectBranch: meta?.expectBranch ? String(meta.expectBranch).slice(0, 200) : null,
       artifacts: Array.isArray(meta?.artifacts)
         ? meta.artifacts

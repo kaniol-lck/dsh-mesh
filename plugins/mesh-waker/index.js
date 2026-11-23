@@ -6397,7 +6397,10 @@ export function apply(ctx, config) {
     if (digestQueue && !waitForLock) meta.declaredOnly = true
     let taskId = null
     try {
-      taskId = lifecycle.registerPendingTask(session, meta, deliveryMode, text)
+      // T-mws1zens: pass the cwd we already resolved. A session created a moment ago is not in
+      // the host index yet, so letting the lifecycle ask `sessionCwdOf()` again made its first
+      // task land in local/ (scope=machine) while this response said nothing about it.
+      taskId = lifecycle.registerPendingTask(session, meta, deliveryMode, text, { targetCwd })
       // T-mws...（dogfood 2026-11-23）：**锁优先于 digest**。原先 `digestQueue` 分支排在
       // `waitForLock` 前面，于是 `digestDelivery:on` + `mode:queue` 的派单会直接进 digest
       // 调度、**完全跳过锁等待**，而返回体照旧带 `waitingLock` 与「task queued as
@@ -6432,8 +6435,18 @@ export function apply(ctx, config) {
     )
     }
     const effectiveWorkspacePath = createdWorkspacePath ?? sessionCwdOf(session.id) ?? null
+    // T-mws1zens: say where the task actually landed. The response used to name only the
+    // session's workspace, so a task filed in the machine-wide ledger looked like it was in
+    // the project's own ledger until someone opened the file.
+    const landedRow = taskId ? taskRows.get(taskId) ?? null : null
+    const ledgerScope = landedRow?.scope ?? null
     const warnings = [
       ...dispatchWarnings,
+      ...(landedRow?.scope === 'machine' && landedRow?.scopeUncertain === true
+        ? [
+            `task ${taskId} was filed in the machine-wide ledger (local/) because its workspace could not be resolved; set workspacePath explicitly or dispatch from a session in that workspace`,
+          ]
+        : []),
       ...(waitForLock
         ? [
             `workspace ${sessionLock.workspace} is locked by ${sessionLock.lock.ownerSessionId} until ${new Date(sessionLock.lock.expiresAt).toISOString()}; task queued as waiting-lock`,
@@ -6455,6 +6468,10 @@ export function apply(ctx, config) {
       // whether a new worker landed in the right workspace (T-402).
       workspacePath: effectiveWorkspacePath,
       workspace: workspaceSlugForPath(effectiveWorkspacePath),
+      // T-mws1zens: the ledger tier the row was really written to (workspace vs machine), so a
+      // caller never has to infer it from the session's workspace.
+      ledgerScope,
+      ledgerWorkspace: landedRow?.workspace ?? null,
       // Dispatch-time git snapshot (T-416): null when the cwd is not a git repo or git is
       // unavailable. The receipt carries the settled-time snapshot for comparison.
       git: dispatchGit,
@@ -6530,26 +6547,38 @@ export function apply(ctx, config) {
    * actually finishes the work, refusing the declaration leaves the board permanently wrong
    * (product in git, row lost). So a declared completion flips the row to settled, keeps the
    * original lost timestamp and notifies the dispatcher that nothing needs resending.
+   *
+   * T-mwtaoe4s generalizes it: `pending`/`started`/`waiting-lock` rows are the same shape
+   * (the row exists, the in-memory task does not). For those the note is "the runtime lost
+   * track of it" rather than "it was marked lost", and no lost/recovered timestamps are touched.
    */
-  function recoverLostTask(row, { requested, summary, detail, caller, answer = null, answerChars = 0, answerTruncated = false }) {
+  function settleRowByDeclaration(row, { requested, summary, detail, caller, answer = null, answerChars = 0, answerTruncated = false }) {
     const now = Date.now()
     const receiptStatus = COMPLETE_STATUS[requested]
-    const lostAt = Number(row.lostAt) || Number(row.settledAt) || null
+    const wasLost = row.status === 'lost'
+    const lostAt = wasLost ? Number(row.lostAt) || Number(row.settledAt) || null : null
+    const startedAt = Number(row.startedAt)
+    const createdAt = Number(row.createdAt)
+    const durationMs = Number.isFinite(startedAt) && startedAt > 0 ? Math.max(0, now - startedAt) : Number.isFinite(createdAt) ? Math.max(0, now - createdAt) : null
     taskRegistry.updateTaskRow(row.taskId, {
       status: 'settled',
       receiptStatus,
       reasonKind: requested,
-      reasonDetail: detail || 'declared after the task had been marked lost by a host restart',
-      recoveredAt: now,
-      lostAt,
+      reasonDetail:
+        detail ||
+        (wasLost ? 'declared after the task had been marked lost by a host restart' : `declared while the row was still ${row.status}`),
+      ...(wasLost ? { recoveredAt: now, lostAt } : { startedAt: Number.isFinite(startedAt) ? startedAt : createdAt ?? null }),
       settledAt: now,
+      durationMs,
       receiptSummary: summary,
       receiptRef: c.receiptFile,
       receiptAnswer: answer,
       receiptAnswerChars: answer ? answerChars : 0,
     })
     const updated = taskRows.get(row.taskId) ?? row
-    const note = '此前因宿主重启被标 lost，worker 已补交，无需重派'
+    const note = wasLost
+      ? '此前因宿主重启被标 lost，worker 已补交，无需重派'
+      : `任务行仍是 ${row.status}（运行时状态已丢失，宿主重启或插件重载），worker 声明完成，按声明结算`
     const receipt = buildReceipt({
       taskId: row.taskId,
       sessionId: row.targetSessionId ?? null,
@@ -6583,7 +6612,8 @@ export function apply(ctx, config) {
         fileLog(`recovered receipt delivery failed task=${row.taskId}: ${error?.message ?? error}`)
       })
     fileLog(
-      `mesh_complete ${row.taskId} recovered lost -> ${receiptStatus} by ${caller} (lostAt=${lostAt ?? '-'})`,
+      `mesh_complete ${row.taskId} settled ${row.status} -> ${receiptStatus} by ${caller}` +
+        (wasLost ? ` (lostAt=${lostAt ?? '-'})` : ''),
     )
     return receipt
   }
@@ -6609,6 +6639,15 @@ export function apply(ctx, config) {
     fileLog(`mesh_complete ${row.taskId} advisory sent: already ${row.status} by ${caller}`)
   }
 
+  /**
+   * Row statuses a declaration may still settle. `lost` was the first one (T-484); `pending`,
+   * `started` and `waiting-lock` are the same shape — the row exists but no in-memory task does,
+   * which happens whenever the host restarts or the plugin reloads mid-task. Refusing those with
+   * `alreadySettled:true` told the worker its work was already done, so it stopped (T-mwtaoe4s).
+   * Only genuinely terminal rows stay refused.
+   */
+  const DECLARABLE_ROW_STATUSES = new Set(['lost', 'pending', 'started', 'waiting-lock'])
+
   /** Settle a task because its target session declared the outcome (0.7.31). */
   function completeTaskDeclared(args = {}, extra = null) {
     const caller = callerSessionFrom(extra)
@@ -6626,16 +6665,22 @@ export function apply(ctx, config) {
       const summary = String(args.summary ?? '').slice(0, 300)
       const detail = String(args.detail ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)
       const declaredAnswer = normalizeAnswer(args.answer)
-      // T-484: lost means "no declaration arrived", not "the work did not happen".
-      if (row.status === 'lost') {
-        const receipt = recoverLostTask(row, { requested, summary, detail, caller, ...declaredAnswer })
+      // T-484/T-mwtaoe4s: a row that exists but has no in-memory task may still be settled by a
+      // declaration — `lost` is what a restart did to it, `pending`/`started`/`waiting-lock`
+      // mean the runtime lost track. Answering `alreadySettled` to any of them told the worker
+      // its work was already done, so it stopped and nobody ever recorded the outcome.
+      if (DECLARABLE_ROW_STATUSES.has(row.status)) {
+        const receipt = settleRowByDeclaration(row, { requested, summary, detail, caller, ...declaredAnswer })
         return {
           ok: true,
           taskId,
           status: requested,
           receiptStatus: receipt?.status ?? COMPLETE_STATUS[requested],
           source: 'declared',
+          // Kept for the lost path (T-484) so its wording stays intact; a pending row now also
+          // reports recovered:true because it too was recovered by declaration.
           recovered: true,
+          declaredRowStatus: row.status,
           summary: receipt?.summary ?? '',
         }
       }

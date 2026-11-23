@@ -119,6 +119,9 @@ export const DISPATCH_OUTPUT = {
       // T-402 fields: always present, null when unknown (declared so the contract is explicit).
       workspacePath: { oneOf: [{ type: 'string' }, { type: 'null' }] },
       workspace: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      // T-mws1zens: the ledger tier the task row was actually written to.
+      ledgerScope: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      ledgerWorkspace: { oneOf: [{ type: 'string' }, { type: 'null' }] },
       // Dispatch-time git snapshot (T-416); null when the target cwd is not a git repo.
       git: {
         oneOf: [
@@ -190,6 +193,9 @@ export const COMPLETE_OUTPUT = {
       receiptStatus: { type: 'string' },
       source: { type: 'string' },
       alreadySettled: { type: 'boolean' },
+      // T-mwtaoe4s: which row status a declaration just settled (lost/pending/started/waiting-lock).
+      recovered: { type: 'boolean' },
+      declaredRowStatus: { type: 'string' },
       summary: { type: 'string' },
       answerChars: { type: 'number' },
     },

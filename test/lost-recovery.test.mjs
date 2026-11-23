@@ -220,7 +220,7 @@ test('lost recovery: a declaration after a restart completes the row and notifie
     assert.equal(receipt?.status, 'completed')
     assert.equal(receipt?.source, 'declared')
     assert.match(String(receipt?.reasonDetail), /无需重派/)
-    assert.match(h.log(), /recovered lost -> completed/)
+    assert.match(h.log(), /recovered lost -> completed|settled lost -> completed/)
   } finally {
     h.close()
   }
@@ -296,6 +296,85 @@ test('lost recovery: only lost rows are recoverable; a stalled row keeps its sta
     assert.equal(row.json?.task?.status, 'stalled')
     assert.equal(row.json?.task?.recoveredAt ?? null, null)
     assert.ok(await waitFor(() => h.requesterPrompts().length > 0), 'the refusal is still announced')
+  } finally {
+    h.close()
+  }
+})
+
+// ── f. an unsettled row with no in-memory task is declarable, not "already settled" ──
+// T-mwtaoe4s (dogfood 2026-11-23): after a plugin reload or a crash the row is still
+// pending/started/waiting-lock on disk while pendingTasks is empty. Answering
+// alreadySettled:true told the worker its work was done, so it stopped and no outcome was
+// ever recorded.
+//
+// `waiting-lock` is seeded as-is: the boot reconcile does not touch it. For `pending` and
+// `started` the row carries a stale settledAt because that is exactly the shape a crashed run
+// leaves behind — the reconcile only claims rows with settledAt null, and those legitimately
+// become `lost` (covered above). Both shapes must be declarable.
+const NO_MEMORY_ROWS = [
+  { status: 'waiting-lock' },
+  { status: 'pending', settledAtOffset: -1_800_000 },
+  { status: 'started', settledAtOffset: -1_800_000, startedAtOffset: -3_600_000 },
+]
+
+for (const spec of NO_MEMORY_ROWS) {
+  const { status } = spec
+  test(`declared settle: a disk-only ${status} row is settled by mesh_complete, not refused (T-mwtaoe4s)`, async () => {
+    const now = Date.now()
+    const taskId = `T-${status}-1`
+    const h = await startHarness({
+      tasksSeed: [
+        lostRow(now, {
+          taskId,
+          status,
+          receiptStatus: null,
+          reasonKind: null,
+          reasonDetail: null,
+          settledAt: Number.isFinite(spec.settledAtOffset) ? now + spec.settledAtOffset : null,
+          ...(Number.isFinite(spec.startedAtOffset) ? { startedAt: now + spec.startedAtOffset } : {}),
+        }),
+      ],
+    })
+    try {
+      const before = h.receiptRows().length
+      const result = await complete(h, taskId)
+      assert.equal(result.ok, true)
+      assert.notEqual(result.alreadySettled, true, `a ${status} row must not be reported as already settled`)
+      assert.equal(result.recovered, true)
+      assert.equal(result.declaredRowStatus, status)
+      assert.equal(result.receiptStatus, 'completed')
+      const row = await h.request(h.base, `/mesh/tasks/${taskId}`)
+      assert.equal(row.json?.task?.status, 'settled')
+      assert.equal(row.json?.task?.receiptStatus, 'completed')
+      assert.ok(Number(row.json?.task?.settledAt) > 0, 'settledAt must be written')
+      // A non-lost row was never marked lost, so no lost/recovered timestamps are invented.
+      assert.equal(row.json?.task?.recoveredAt ?? null, null, 'a non-lost row must not claim recovery')
+      assert.equal(row.json?.task?.lostAt ?? null, null, 'a non-lost row must not claim a lost time')
+      assert.equal(h.receiptRows().length, before + 1, 'a real settlement writes exactly one receipt')
+      const receipt = h.receiptRows().find((entry) => entry.taskId === taskId)
+      assert.equal(receipt?.source, 'declared')
+      assert.match(h.log(), new RegExp(`settled ${status} -> completed`))
+      // The dispatcher hears about it — this is a completion, not a refusal advisory.
+      assert.ok(await waitFor(() => h.requesterPrompts().length > 0), 'the dispatcher must be notified')
+      assert.doesNotMatch(JSON.stringify(h.requesterPrompts()[0].content), /RECEIPT-ADVISORY/)
+    } finally {
+      h.close()
+    }
+  })
+}
+
+// The lost path must keep its own wording on top of the generalized one.
+test('declared settle: the lost path still says no resend is needed (T-484 preserved)', async () => {
+  const now = Date.now()
+  const h = await startHarness({ tasksSeed: [lostRow(now)] })
+  try {
+    const result = await complete(h, 'T-lost-1')
+    assert.equal(result.recovered, true)
+    assert.equal(result.declaredRowStatus, 'lost')
+    assert.match(String(result.summary), /无需重派/)
+    const row = await h.request(h.base, '/mesh/tasks/T-lost-1')
+    assert.ok(Number(row.json?.task?.recoveredAt) > 0)
+    assert.ok(Number(row.json?.task?.lostAt) > 0)
   } finally {
     h.close()
   }

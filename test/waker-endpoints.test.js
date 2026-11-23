@@ -1440,6 +1440,40 @@ async function main() {
     report('mesh_dispatch: tool metadata and schema', ok, `name=${MESH_DISPATCH_TOOL.name} required=${MESH_DISPATCH_TOOL.required.join(',')}`)
   })
 
+  // T-mwtaoe4s (dogfood 2026-11-23): a session created a moment ago is not in the host index
+  // yet, so the first task asked `sessionCwdOf()` and got null — the row landed in local/
+  // (machine ledger, scopeUncertain) while the response said nothing about it.
+  await runCase('dispatch: createIfMissing puts the first task in the new session workspace', async (boot) => {
+    const wsPath = path.join(os.tmpdir(), 'Projects', 'first-task-ws')
+    fs.mkdirSync(wsPath, { recursive: true })
+    const h = await boot({ seedSessions: [{ id: 'session-caller-first', title: 'caller', cwd: wsPath }] })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const result = await h.state.tools[0].execute(
+      { target: 'fresh worker', text: 'first task', taskId: 'T-FIRST-1', createIfMissing: true },
+      { sessionId: 'session-caller-first' },
+    )
+    const registry = path.join(h.home, '.dsh', 'mesh-waker')
+    const wsFile = path.join(registry, 'ws', 'first-task-ws', 'tasks.jsonl')
+    const localFile = path.join(registry, 'local', 'tasks.jsonl')
+    const wsRows = fs.existsSync(wsFile) ? fs.readFileSync(wsFile, 'utf8').split('\n').filter((line) => line.trim()).length : 0
+    const localRows = fs.existsSync(localFile) ? fs.readFileSync(localFile, 'utf8').split('\n').filter((line) => line.trim()).length : 0
+    const detail = await request(h.base, '/mesh/tasks/T-FIRST-1')
+    const ok =
+      result.ok === true &&
+      result.created === true &&
+      result.ledgerScope === 'workspace' &&
+      result.ledgerWorkspace === 'first-task-ws' &&
+      detail.json?.task?.scope === 'workspace' &&
+      detail.json?.task?.scopeUncertain !== true &&
+      wsRows === 1 &&
+      localRows === 0
+    report(
+      'dispatch: createIfMissing puts the first task in the new session workspace',
+      ok,
+      `ledgerScope=${result.ledgerScope ?? '-'} ledgerWorkspace=${result.ledgerWorkspace ?? '-'} taskScope=${detail.json?.task?.scope ?? '-'} uncertain=${detail.json?.task?.scopeUncertain ?? false} wsRows=${wsRows} localRows=${localRows}`,
+    )
+  })
+
   await runCase('mesh_dispatch: createIfMissing=false reports the option name', async (boot) => {
     const h = await boot({ seedSessions: [{ id: 'session-only', title: 'only one' }] })
     await waitFor(() => h.state.tools.length > 0, 5000)

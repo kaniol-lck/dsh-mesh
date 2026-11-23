@@ -464,6 +464,13 @@ mesh_complete({
 **幂等边界不变**：已 `settled` 的行再次声明仍被拒收（不降级、不写第二条回执），但拒收会向派单方发一条
 `[RECEIPT-ADVISORY] <id> already <status> — duplicate <status> declaration from <session> ignored`，不再只有日志。
 
+**未结算的行同样可被声明结算（T-mwtaoe4s）**：宿主重启或插件重载后，账本里可能还躺着
+`pending`/`started`/`waiting-lock` 的行，而 `pendingTasks` 已经空了。这类行以前会和终态一起回
+`alreadySettled:true` 并被丢弃——worker 以为活已完，成果再没人登记。现在它们与 `lost` 一样接受
+`mesh_complete`，真正写 `settled` + `receiptStatus` 并发回执；**不伪造** `lostAt`/`recoveredAt`
+（那两个只属于真的被标过 lost 的行），返回体带 `recovered:true` 与 `declaredRowStatus` 说明命中的是哪种行。
+真正终态（`settled`/`cancelled`/`stalled`）仍拒收并仍发 advisory。
+
 状态流转图（含恢复边）：
 
 ```text
@@ -471,7 +478,9 @@ pending ──turn/start──▶ started ──turn/end / mesh_complete──�
    │                      │
    ├──stall──▶ stalled    └──cancel──▶ cancelled
    │
-   └──restart──▶ lost ──mesh_complete(done|partial)──▶ settled  (recoveredAt, lostAt 保留)
+   ├──restart──▶ lost ──mesh_complete(done|partial)──▶ settled  (recoveredAt, lostAt 保留)
+   │
+   └──runtime forgot it (pending/started/waiting-lock) ──mesh_complete──▶ settled  (无 recoveredAt/lostAt)
 ```**`durationMs` 口径**：任务库的 `durationMs` 从 `startedAt` 算起（未被观测到开始的从 `createdAt` 算），回执里的 `durationMs` 仍从投递时算。`refs[]` 由派活方经 `meta.refs` 传入（只存字符串，waker 不解析 `.worklog`）。
 
 **面板**：任务面板在「Mesh 信箱」页面顶部标签「派活任务」里（与「信箱」并列）；设置页只保留一行跳转说明。**左右分栏**：左栏按批次聚合（组头 `B-xxx · done/total · 总耗时`，可折叠；无 batchId 归「未分组」置底），行内 `ID / 状态 / 耗时(人读) / 目标会话`；右栏为选中任务详情（创建→开始→结束时间线、正文全文、回执摘要、refs、打开会话/取消任务），空态「选择左侧任务查看详情」；窄屏（<900px）退化为上下布局。顶部统计 `pending/进行中/今日完成/停滞`，支持状态与目标会话过滤；右栏 tab 顶部还有一条「派活任务：N 条待办/进行中」入口摘要。入口名可用 `entryLabel` 配置（默认 `Mesh 信箱`）。
@@ -621,6 +630,8 @@ dsh-mesh-dispatch --transport hub --to dsh-peer-b --text "…" --dry-run
 
 **新建会话的工作区归属（未发布版起）**：createIfMissing 新会话默认继承**调用方会话的 cwd/工作区**；需要指定时用 workspacePath（别名 cwd，绝对路径）。拿不到调用方 cwd 又没传 workspacePath → 直接拒绝（不回退收件箱）；workspacePath 与调用方工作区不同 → 也直接拒绝，并给出三条出路（改派该区已有会话 target:<id> / 去掉 workspacePath 继承本区 / 到目标工作区的会话里发起）。返回体带 workspacePath 与实际 workspace slug，便于确认落在哪里。
 
+**返回体还报「任务落在哪一层」（T-mwtaoe4s）**：`ledgerScope`（`workspace`/`machine`）与 `ledgerWorkspace` 是任务行**实际写入的账本层**，与 `workspace`（会话所在工作区）不是一回事——之前两者不一致时响应不说，于是「会话在工作区里、任务却进了 `local/`」看不出来。现在任务行真的落进机器账本（`scope=machine` 且 `scopeUncertain=true`）时还会附一条 warning 说明原因与出路。
+
 **共享工作树的边界（未发布）**：`mesh_dispatch` 只**回读**目标工作区的 git 信息（分支/HEAD/是否脏）并校验 `expectBranch`、`artifacts`，**不创建 worktree、不切换分支、不加树锁、不把派生产物写回主工作区**——这些属于工作流/约定层，由协调会话与 owner 决定。
 
 工具描述里明确写了：投递后**不要轮询等待**，插件会在回合结束时写回执；要「全部完成再叫我」就用同一个 `batchId`。
@@ -629,7 +640,7 @@ dsh-mesh-dispatch --transport hub --to dsh-peer-b --text "…" --dry-run
 
 **worker 侧线程工具（0.7.23，`mesh_thread`）**：`action=list`（`scope=mine|all`）看绑定；`action=subscribe, thread=TH-1` 把**调用方会话**绑到该线程（已被别的会话占用 → 拒绝并报占用者，不抢）；`action=release, thread=TH-1` 只有当前绑定者能解绑，解绑后该线程从 `threads.json` 移除——未来不带 `target` 的派活会报 `unknown thread`，即「交回协调」语义。调用方会话来自宿主传入的 caller（`extra.agent.id`/`sessionId`），拿不到就明确报错，不猜默认会话。同一逻辑也暴露为 loopback HTTP：`POST /mesh/threads/subscribe`、`POST /mesh/threads/release`（body `{thread, sessionId}`）；`GET /mesh/threads` 每条新增 `subscribedBy`（`dispatch`/`self`）与 `taskIds[]`。
 
-**worker 侧完成声明（0.7.31，`mesh_complete`）**：被派活的会话可主动声明结果——`mesh_complete({taskId, status: 'done'|'partial'|'blocked', summary?, detail?})`。命中**属于调用方会话的在飞任务**才结算：`done→completed`、`partial→partial`、`blocked→failed`（`detail` 成为回执 `reasonDetail`），`summary` 用会话自己写的（≤300 字，只落 `receipts.jsonl`），回执 `source=declared`；未知 taskId、别人的任务、已结算任务都明确报错（已结算返回 `alreadySettled:true`，不重复投递）。未声明的任务仍按 `turn/end` 自动结算，回执 `source=observed`。HTTP 侧：`POST /mesh/tasks/complete`（body `{taskId, status, summary?, detail?, sessionId}`）。
+**worker 侧完成声明（0.7.31，`mesh_complete`）**：被派活的会话可主动声明结果——`mesh_complete({taskId, status: 'done'|'partial'|'blocked', summary?, detail?})`。命中**属于调用方会话的在飞任务**才结算：`done→completed`、`partial→partial`、`blocked→failed`（`detail` 成为回执 `reasonDetail`），`summary` 用会话自己写的（≤300 字，只落 `receipts.jsonl`），回执 `source=declared`；未知 taskId、别人的任务、已结算任务都明确报错（已结算返回 `alreadySettled:true`，不重复投递）。**「已结算」只指真正的终态**：`lost`/`pending`/`started`/`waiting-lock` 这类未结算行仍可被声明结算（返回 `recovered:true` 与 `declaredRowStatus`），因为它们代表「运行时把这条丢了」，不是「活已经做完」。未声明的任务仍按 `turn/end` 自动结算，回执 `source=observed`。HTTP 侧：`POST /mesh/tasks/complete`（body `{taskId, status, summary?, detail?, sessionId}`）。
 
 **自查工具是否注册成功**：`GET /mesh/status` 的 `tools` 字段给出 `{dispatch, ask, thread, complete}` 四个布尔值，失败原因在 `toolsError`（例如 `host exposes no tools service`）。工具注册会等待宿主 tools 服务就绪（最多重试 5 次、每次 500ms），每次成功/失败都写一行到 waker 日志；模型说「工具未注册」时先看这些字段，不要猜。
 

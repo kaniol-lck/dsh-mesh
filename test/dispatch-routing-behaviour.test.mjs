@@ -191,8 +191,26 @@ async function startHarness({ hubUrl }) {
     process.env.MESH_WAKER_SESSIONS_ROOT = previousEnv.MESH_WAKER_SESSIONS_ROOT
     fs.rmSync(tmp, { recursive: true, force: true })
   }
-  await sleep(150)
-  return { state, tool, close, sessionsRoot }
+  // selfName arrives from the async /api/register response. A fixed sleep(150) was enough when
+  // this file ran alone but not under the full suite's load, where dispatch then saw selfName
+  // null and fell through to "session not found" (T-mwtaoe4s run). Wait for the fact instead.
+  const base = `http://127.0.0.1:${port}`
+  const registered = await (async () => {
+    const deadline = Date.now() + 8000
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(`${base}/mesh/history/conversations`)
+        const body = await res.json()
+        if (body?.self) return true
+      } catch {
+        /* listener not ready yet */
+      }
+      await sleep(50)
+    }
+    return false
+  })()
+  if (!registered) throw new Error('the plugin never learned its hub agent name (selfName)')
+  return { state, tool, close, sessionsRoot, base }
 }
 
 test('dispatch to this machine\'s own agent id refuses and points at the local route', async () => {
