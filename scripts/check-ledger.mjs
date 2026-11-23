@@ -124,6 +124,92 @@ function ledgerText() {
   return parts.join('\n')
 }
 
+/**
+ * 每条账本的**归属角色**（README 的「归属：」slug → todo 文件名）。
+ *
+ * 为什么需要（2026-11-23 L2-20261123-01）：本脚本原先只做全文子串匹配，于是
+ * 「谁在诊断里提到这个哈希」就等于「谁记了账」。实测 `2933fc8` 是 docs 的活，
+ * 却只出现在 `todo/l2.md` 的诊断行里 —— gate 判绿，而真正该记账的 `docs.md` 命中 0。
+ * 同类已第 3 次（11-18 L2 诊断误绿、11-20 散文凑绿、11-23 再次）。
+ *
+ * 判据分层（不搞一刀切，否则会把「L1 代记」这类合法实践判红）：
+ *   - 命中**归属角色**的 todo，或命中 `WORKLOG.md` / `dispatch/queue.md` → 记账成立
+ *   - 只命中**别的角色**的 todo → 记账不成立，但降级 WARN 并点名（可能是诊断文本）
+ *   - 哪儿都没有 → 保持 FAIL
+ */
+const OWNER_PREFIXES = [
+  ['plugins/mesh-waker/', 'waker'],
+  ['hub/', 'hub'],
+  ['plugins/mesh-approval/', 'hub'],
+  ['scripts/', 'docs'],
+  ['test/', 'docs'],
+  ['skills/', 'docs'],
+]
+
+export function ownerFor(files) {
+  const hits = []
+  for (const [prefix, slug] of OWNER_PREFIXES) {
+    if (files.some((file) => file.startsWith(prefix))) hits.push(slug)
+  }
+  return hits.length ? [...new Set(hits)] : []
+}
+
+/** todo/<slug>.md 的正文，按 slug 索引；用于「是不是记在了自己名下」。 */
+function todoTextByRole() {
+  const map = new Map()
+  const todoDir = path.join(WORKLOG, 'todo')
+  if (!existsSync(todoDir)) return map
+  for (const entry of readdirSync(todoDir)) {
+    if (!entry.endsWith('.md')) continue
+    map.set(entry.replace(/\.md$/, ''), readFileSync(path.join(todoDir, entry), 'utf8'))
+  }
+  return map
+}
+
+/** WORKLOG + queue 属于「叙事账本」，任何角色都可记，命中即成立。 */
+function narrativeText() {
+  const parts = []
+  for (const rel of ['WORKLOG.md', 'dispatch/queue.md']) {
+    const file = path.join(WORKLOG, rel)
+    if (existsSync(file)) parts.push(readFileSync(file, 'utf8'))
+  }
+  return parts.join('\n')
+}
+
+/**
+ * 叙事账本（WORKLOG / queue）里，这个提交是否被**按记账格式**写过。
+ *
+ * 背景（2026-11-23 L2-20261123-01）：本脚本原先只做全文子串匹配，于是「谁在诊断里
+ * 提到这个哈希」就等于「谁记了账」——L2 把自己的诊断写进 todo/l2.md 与 WORKLOG
+ * 之后，gate 就假绿了，而真正该记账的 docs.md 命中 0。同类第 3 次。
+ *
+ * **走过的弯路（留作教训，别再试）**：想靠「假红/自曝/诊断」这类**语气词**区分
+ * 记账与谈论，试了三版都失败——整行否决会误伤 Long 的记账行；只看哈希附近 60 字会漏
+ * （措辞在下一句）；`验收证据 + commit` 又会被「要求补进验收证据」这种**批评记账缺失**
+ * 的句子命中。语气词既误伤也漏判，不可靠。
+ *
+ * 所以只认**结构**：记账有几条固定写法，其余一律不算记账（降级 WARN，由人判断）。
+ * 宁可让人看一眼 WARN，也不让 gate 假装绿。
+ */
+const NARRATIVE_ACCOUNTING = [
+  /commit\s+`?[0-9a-f]{7,40}/, // commit <hash>
+  /CI success\s*@\s*`?[0-9a-f]{7,40}/, // CI success @ <hash>
+  /已?\s*push[^。；\n]{0,30}[0-9a-f]{7,40}/, // 已 push <hash> / push a..b
+  /验收(?:证据)?[:：][^。\n]{0,40}[0-9a-f]{7,40}/, // 验收：…<hash>
+]
+
+function narrativeAccounts(text, short, full) {
+  return text.split(/\r?\n/).some((line) => {
+    if (!line.includes(short) && !line.includes(full)) return false
+    return NARRATIVE_ACCOUNTING.some((re) => re.test(line))
+  })
+}
+
+/** 某角色 todo 里是否把它当作账记过。todo 行天然是「条目」，不做语气区分。 */
+function todoAccounts(text, short, full) {
+  return text.includes(short) || text.includes(full)
+}
+
 function readBaseline() {
   if (!existsSync(BASELINE)) return { exempt: [], since: null }
   try {
@@ -195,15 +281,30 @@ function main() {
   const baseline = readBaseline()
   const today = new Date().toISOString().slice(0, 10)
   const exempt = new Set(baseline.exempt)
-  const ledger = ledgerText()
 
   const commits = recentCommits(options.days)
   const candidates = commits.filter((commit) => inCodeScope(commit.files))
+  const byRole = todoTextByRole()
+  const narrative = narrativeText()
   const unaccounted = []
+  const weakAccounted = []
   for (const commit of candidates) {
     if (exempt.has(commit.short) || exempt.has(commit.full)) continue
     if (baseline.since && commit.date && commit.date < baseline.since) continue
-    if (ledger.includes(commit.short) || ledger.includes(commit.full)) continue
+    const hitTodo = (text) => todoAccounts(text, commit.short, commit.full)
+    const owners = ownerFor(commit.files)
+    const inNarrative = narrativeAccounts(narrative, commit.short, commit.full)
+    const inOwnTodo = owners.some((slug) => hitTodo(byRole.get(slug) ?? ''))
+    if (inNarrative || inOwnTodo) continue
+    const otherRoles = [...byRole.entries()]
+      .filter(([slug, text]) => !owners.includes(slug) && hitTodo(text))
+      .map(([slug]) => slug)
+    if (otherRoles.length) {
+      // 只出现在别人的 todo 里：可能是诊断文本，也可能是 L1 代记。降级 WARN 不判红，
+      // 但要点名——让记账人自己判断「这算不算记在了该记的地方」。
+      weakAccounted.push({ ...commit, owners, otherRoles })
+      continue
+    }
     unaccounted.push(commit)
   }
 
@@ -228,6 +329,12 @@ function main() {
     exempt: baseline.exempt.length,
     since: baseline.since,
     unaccounted: unaccounted.map((commit) => ({ hash: commit.short, subject: commit.subject })),
+    weakAccounted: weakAccounted.map((commit) => ({
+      hash: commit.short,
+      subject: commit.subject,
+      owners: commit.owners,
+      mentionedIn: commit.otherRoles,
+    })),
     triage: {
       since: TRIAGE_SINCE,
       missingStamp: triage.missing,
@@ -243,6 +350,12 @@ function main() {
     for (const commit of unaccounted) console.log(`  UNLEDGERED ${commit.short} ${commit.subject}`)
     if (!unaccounted.length) console.log('OK 所有代码提交都在账本里')
     else console.log('hint: 在 .worklog/todo/<角色>.md 或 dispatch/queue.md 引用短哈希；历史遗留可 --update-baseline')
+    // 只命中别的角色 todo：可能是诊断文本而非记账。不判红，但点名，防「假绿」。
+    for (const commit of weakAccounted) {
+      console.log(
+        `  WEAK ${commit.short} 归属=${commit.owners.join('/') || '?'} 但只在 ${commit.otherRoles.join(',')} 的 todo 里出现 —— 确认这是记账而不是诊断文本`,
+      )
+    }
     console.log(`triage: ${TRIAGE_SINCE} 起已完结单缺初筛戳 ${triage.missing.length}`)
     for (const item of triage.missing) console.log(`  MISSING ${item.taskId}（queue.md:${item.line}）—— 先跑 progress-watch --task ${item.taskId}`)
     for (const item of triage.reviewed) console.log(`  REVIEWED ${item.taskId}（queue.md:${item.line}）needsReview=true（带红结论收单，已知悉）`)
