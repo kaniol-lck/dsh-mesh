@@ -177,37 +177,42 @@ function narrativeText() {
 }
 
 /**
- * 叙事账本（WORKLOG / queue）里，这个提交是否被**按记账格式**写过。
+ * 这个哈希是否**以自己的名义**被记账了。
  *
- * 背景（2026-11-23 L2-20261123-01）：本脚本原先只做全文子串匹配，于是「谁在诊断里
- * 提到这个哈希」就等于「谁记了账」——L2 把自己的诊断写进 todo/l2.md 与 WORKLOG
- * 之后，gate 就假绿了，而真正该记账的 docs.md 命中 0。同类第 3 次。
+ * 背景（2026-11-23 L2-20261123-01/02）：本脚本原先只做全文子串匹配，于是「谁在诊断里
+ * 提到这个哈希」就等于「谁记了账」——L2 把自己的诊断写进 todo/l2.md 与 WORKLOG 之后，
+ * gate 就假绿了，而真正该记账的 docs.md 命中 0。**这是自指的**：写一句「2933fc8 未记账」
+ * 本身就让门禁通过。同类第 3 次（11-18、11-20、11-23）。
  *
- * **走过的弯路（留作教训，别再试）**：想靠「假红/自曝/诊断」这类**语气词**区分
- * 记账与谈论，试了三版都失败——整行否决会误伤 Long 的记账行；只看哈希附近 60 字会漏
- * （措辞在下一句）；`验收证据 + commit` 又会被「要求补进验收证据」这种**批评记账缺失**
- * 的句子命中。语气词既误伤也漏判，不可靠。
+ * **走过的弯路（留作教训，别再试）**：
+ *   ① 用「假红/自曝/诊断」等**语气词**整行否决 → 误伤正常的记账行（长段落里顺带提到别的假红）；
+ *   ② 只看哈希附近 60 字 → 漏，因为措辞可能放在下一句；
+ *   ③ 接受「有 `验收证据`/`commit` 就算」→ 会被「要求补进验收证据」这种**批评记账缺失**的句子命中；
+ *   ④ todo 用全文 `includes()` → 批评引用与真记账写在同一行时，前者搭后者的便车通过。
+ *   前三条是**语气**不可靠；第④条是**粒度**错了。
  *
- * 所以只认**结构**：记账有几条固定写法，其余一律不算记账（降级 WARN，由人判断）。
- * 宁可让人看一眼 WARN，也不让 gate 假装绿。
+ * 结论：只认结构，且必须**锚定到这个哈希本身**——标记要紧挨着它，不能因为同一行里记了
+ * 别的提交就放行。其余提及一律不算记账（降级 WARN，由人看一眼），宁可 WARN 也不假装绿。
  */
-const NARRATIVE_ACCOUNTING = [
-  /commit\s+`?[0-9a-f]{7,40}/, // commit <hash>
-  /CI success\s*@\s*`?[0-9a-f]{7,40}/, // CI success @ <hash>
-  /已?\s*push[^。；\n]{0,30}[0-9a-f]{7,40}/, // 已 push <hash> / push a..b
-  /验收(?:证据)?[:：][^。\n]{0,40}[0-9a-f]{7,40}/, // 验收：…<hash>
-]
-
-function narrativeAccounts(text, short, full) {
-  return text.split(/\r?\n/).some((line) => {
-    if (!line.includes(short) && !line.includes(full)) return false
-    return NARRATIVE_ACCOUNTING.some((re) => re.test(line))
-  })
+function accountsFor(text, short, full) {
+  const forms = [...new Set([short, full])].map((h) => h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  return text.split(/\r?\n/).some((line) =>
+    forms.some((h) => {
+      if (!line.includes(h)) return false
+      // 标记必须紧挨着这个哈希（允许反引号、空格、区间写法 a..b、@ 等少量噪声）
+      return new RegExp(`(?:commit|CI success @|已\\s*push|验收(?:证据)?[:：]|[0-9a-f]{7,40}\\.\\.)\\s*\`?${h}`).test(line)
+    }),
+  )
 }
 
-/** 某角色 todo 里是否把它当作账记过。todo 行天然是「条目」，不做语气区分。 */
+/** 叙事账本（WORKLOG / queue）：按同一判据，锚定到该哈希。 */
+function narrativeAccounts(text, short, full) {
+  return accountsFor(text, short, full)
+}
+
+/** 某角色 todo：同样锚定到该哈希（不能因同行记了别的提交而放行）。 */
 function todoAccounts(text, short, full) {
-  return text.includes(short) || text.includes(full)
+  return accountsFor(text, short, full)
 }
 
 function readBaseline() {
@@ -291,18 +296,20 @@ function main() {
   for (const commit of candidates) {
     if (exempt.has(commit.short) || exempt.has(commit.full)) continue
     if (baseline.since && commit.date && commit.date < baseline.since) continue
-    const hitTodo = (text) => todoAccounts(text, commit.short, commit.full)
     const owners = ownerFor(commit.files)
     const inNarrative = narrativeAccounts(narrative, commit.short, commit.full)
-    const inOwnTodo = owners.some((slug) => hitTodo(byRole.get(slug) ?? ''))
+    const inOwnTodo = owners.some((slug) => todoAccounts(byRole.get(slug) ?? '', commit.short, commit.full))
     if (inNarrative || inOwnTodo) continue
-    const otherRoles = [...byRole.entries()]
-      .filter(([slug, text]) => !owners.includes(slug) && hitTodo(text))
+
+    // 没按规范记账。但「有人提到过」与「根本没人提」是两件事，不能混成一个红：
+    //   - 有人提到（任一 todo 或叙事里出现）→ WARN 并点名，交由人判断（L1 代记是合法实践）
+    //   - 完全没人提 → FAIL
+    const mentionedIn = [...byRole.entries()]
+      .filter(([, text]) => text.includes(commit.short) || text.includes(commit.full))
       .map(([slug]) => slug)
-    if (otherRoles.length) {
-      // 只出现在别人的 todo 里：可能是诊断文本，也可能是 L1 代记。降级 WARN 不判红，
-      // 但要点名——让记账人自己判断「这算不算记在了该记的地方」。
-      weakAccounted.push({ ...commit, owners, otherRoles })
+    const inNarrativeLoose = narrative.includes(commit.short) || narrative.includes(commit.full)
+    if (mentionedIn.length || inNarrativeLoose) {
+      weakAccounted.push({ ...commit, owners, otherRoles: mentionedIn, inNarrative: inNarrativeLoose })
       continue
     }
     unaccounted.push(commit)
