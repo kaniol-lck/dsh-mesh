@@ -222,6 +222,37 @@ test('receiptDigest on: an idle requester gets one merged notice for three recei
   }
 })
 
+test('receiptDigest: candidate selection is time-based, and the write path keeps first + latest', async () => {
+  // 2026-11-23 dogfood 实测的两件事，合在一条里测（都关于「时间维度」）：
+  //  ① 重投是**按时间**决定的：退避是 10min/30min 常量，所以 1.5 秒内不该重投；
+  //  ② 真重投时必须前移 receiptNotifiedAt，同时保留 firstReceiptNotifiedAt。
+  // ②无法在单测里等 10 分钟，所以直接断言写盘结果（模拟「已重投一次」的 row）。
+  const { receiptDigestCandidates, RECEIPT_DIGEST_BACKOFF_MS } = await import('../plugins/mesh-waker/lib/receipt-digest.mjs')
+  const now = Date.now()
+  const base = { taskId: 'T-rd', receiptDigestSessionId: 's', settledAt: now - 1, receiptNotifyCount: 1, receiptNotifiedAt: now - 1000 }
+  const withinBackoff = receiptDigestCandidates([base], { sessionId: 's', now })
+  assert.equal(withinBackoff.length, 0, 'a reminder must not repeat inside the backoff window')
+  const pastBackoff = receiptDigestCandidates([{ ...base, receiptNotifiedAt: now - RECEIPT_DIGEST_BACKOFF_MS[0] - 1 }], {
+    sessionId: 's',
+    now,
+  })
+  assert.equal(pastBackoff.length, 1, 'after the backoff window the reminder may repeat')
+
+  // 写盘侧：重投后 latest 前移、first 保留
+  const h = await startHarness()
+  try {
+    await dispatchTask(h, 'T-rd1')
+    await completeTask(h, 'T-rd1')
+    await sleep(900)
+    const first = await h.request(h.base, '/mesh/tasks/T-rd1')
+    const firstNotifiedAt = Number(first.json?.task?.receiptNotifiedAt)
+    assert.ok(firstNotifiedAt > 0)
+    assert.equal(Number(first.json?.task?.firstReceiptNotifiedAt), firstNotifiedAt, 'first delivery stamps both fields')
+  } finally {
+    h.close()
+  }
+})
+
 test('receiptDigest on: a busy requester waits for turn/end', async () => {
   const h = await startHarness()
   try {

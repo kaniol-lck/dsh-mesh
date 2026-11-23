@@ -2324,6 +2324,8 @@ export function apply(ctx, config) {
           // what the receipt said.
           receiptStatus: row.settledAt ? (row.receiptStatus ?? row.reasonKind ?? null) : null,
           receiptNotifiedAt: row.receiptNotifiedAt ?? null,
+          // 首次投递时刻（与最近一次区分开）：只留 receiptNotifiedAt 时，重推会把审计线索盖掉。
+          firstReceiptNotifiedAt: row.firstReceiptNotifiedAt ?? null,
           receiptNotifyCount: Number(row.receiptNotifyCount) || 0,
           receiptAckedAt: row.receiptAckedAt ?? null,
         }
@@ -5392,8 +5394,14 @@ export function apply(ctx, config) {
       return null
     }
     for (const row of rows) {
+      // 每次都刷新 receiptNotifiedAt：它必须表示**最近一次**投递时间。
+      // 原先写的是 `Number(row.receiptNotifiedAt) || now`，第一次之后就被冻结，于是
+      // count 在涨、时间戳不动——账本上只剩「第一次什么时候推的」，重推时刻无从得知，
+      // 也没法判断退避是否生效（2026-11-23 dogfood 实测 T-MWT7FKP7：count 1→2 而
+      // receiptNotifiedAt 始终停在首次值）。首次时间对审计也有用，单独留 firstReceiptNotifiedAt。
       taskRegistry.updateTaskRow(row.taskId, {
-        receiptNotifiedAt: Number(row.receiptNotifiedAt) || now,
+        firstReceiptNotifiedAt: Number(row.firstReceiptNotifiedAt) || Number(row.receiptNotifiedAt) || now,
+        receiptNotifiedAt: now,
         receiptNotifyCount: (Number(row.receiptNotifyCount) || 0) + 1,
       })
     }

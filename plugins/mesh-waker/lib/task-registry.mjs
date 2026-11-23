@@ -234,6 +234,9 @@ export function createTaskRegistry(deps) {
       claimDismissedBy: row.claimDismissedBy ?? null,
       receiptDigestSessionId: row.receiptDigestSessionId ?? null,
       receiptNotifiedAt: row.receiptNotifiedAt ?? null,
+      // 首次投递与最近一次分开记：只留 receiptNotifiedAt 时，重投会覆盖审计线索，
+      // 而冻结时间戳又让「重复提醒」与「延迟的首次提醒」无法区分（2026-11-23 dogfood，T-MWT7FKP7）。
+      firstReceiptNotifiedAt: row.firstReceiptNotifiedAt ?? null,
       receiptNotifyCount: Number(row.receiptNotifyCount) || 0,
       receiptAckedAt: row.receiptAckedAt ?? null,
       receiptAckBy: row.receiptAckBy ?? null,
