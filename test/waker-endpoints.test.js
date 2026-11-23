@@ -8809,6 +8809,47 @@ async function main() {
     )
   })
 
+  // 2026-11-23 dogfood 实测的缺陷：digestDelivery:on + mode:queue 的派单原先绕过工作区锁
+  // ——任务直接进 digest 调度并在锁内被投递执行，而返回体照旧带 waitingLock 与「queued as
+  // waiting-lock」的 warning，调用方据此以为 worktree 没被并发触碰。锁必须优先于 digest：
+  // digest 只决定**投递时机**，不能凌驾并发保护。
+  await runCase('lock: digestDelivery never bypasses the workspace lock', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'lock-ws-digest')
+    const h = await boot({
+      config: { workspaceLockTtlMs: 60000, digestDelivery: 'on', digestIdleDebounceMs: 50 },
+      seedSessions: [
+        { id: 'session-lock-holder-d', title: 'holder d', cwd },
+        { id: 'session-lock-worker-d', title: 'worker d', cwd },
+        { id: 'session-lock-dispatch-d', title: 'dispatch d', cwd },
+      ],
+    })
+    await waitFor(() => h.state.tools.length > 0, 5000)
+    const lockTool = h.state.tools.find((entry) => entry.name === 'mesh_lock')
+    const dispatchTool = h.state.tools.find((entry) => entry.name === 'mesh_dispatch')
+    const acquired = await lockTool.execute({ action: 'acquire' }, { sessionId: 'session-lock-holder-d' })
+    const queued = await dispatchTool.execute(
+      { target: 'session-lock-worker-d', text: 'digest while locked', taskId: 'T-lock-digest' },
+      { sessionId: 'session-lock-dispatch-d' },
+    )
+    const row = await request(h.base, '/mesh/tasks/T-lock-digest')
+    // 关键断言：锁期内既不投递、也不宣称进了 digest
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    const promptsWhileLocked = h.state.prompts.length
+    const ok =
+      acquired.ok === true &&
+      queued.ok === true &&
+      queued.waitingLock?.workspace === acquired.workspace &&
+      queued.digestQueued !== true &&
+      promptsWhileLocked === 0 &&
+      row.json?.task?.status === 'waiting-lock'
+    report(
+      'lock: digestDelivery never bypasses the workspace lock',
+      ok,
+      `waitingLock=${queued.waitingLock?.workspace ?? '-'} digestQueued=${queued.digestQueued ?? '-'} promptsWhileLocked=${promptsWhileLocked} rowStatus=${row.json?.task?.status ?? '-'}`,
+    )
+    await lockTool.execute({ action: 'release' }, { sessionId: 'session-lock-holder-d' })
+  })
+
   await runCase('lock: an expired lock releases the queue automatically', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'lock-ws-c')
     const h = await boot({

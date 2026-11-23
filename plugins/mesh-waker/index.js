@@ -6380,19 +6380,28 @@ export function apply(ctx, config) {
     const deliveryMode = args.mode === 'steer' ? 'steer' : 'queue'
     // T-460: digest only changes *queue* delivery; steer keeps injecting immediately.
     const digestQueue = c.digestDelivery === 'on' && deliveryMode === 'queue'
-    if (digestQueue) meta.declaredOnly = true
     // T-418: a workspace lock from someone else parks the task instead of racing the worktree.
     const sessionLock = lockForSession(session.id)
     const waitForLock = Boolean(sessionLock) && !lockExempt(sessionLock.lock, callerSession, requester)
+    // declaredOnly 只在**真的会走 digest 调度**时才成立：被锁挂起的任务不是 declared-only，
+    // 它会在释放锁后真正投递（原先在锁判定之前无条件置 true，锁等待的任务也被标成
+    // 「仅声明」，与它随后的实际投递矛盾）。
+    if (digestQueue && !waitForLock) meta.declaredOnly = true
     let taskId = null
     try {
       taskId = lifecycle.registerPendingTask(session, meta, deliveryMode, text)
-      if (digestQueue) {
+      // T-mws...（dogfood 2026-11-23）：**锁优先于 digest**。原先 `digestQueue` 分支排在
+      // `waitForLock` 前面，于是 `digestDelivery:on` + `mode:queue` 的派单会直接进 digest
+      // 调度、**完全跳过锁等待**，而返回体照旧带 `waitingLock` 与「task queued as
+      // waiting-lock」的 warning —— 调用方据此以为 worktree 没被并发触碰，实际任务已经
+      // 投出去并且 7 秒就跑完了（锁 38 秒后才释放）。字段说排队、事实没排队。
+      // digest 只是「投递时机」的优化，不能凌驾于并发保护之上。
+      if (waitForLock) {
+        lifecycle.deferForLock(taskId, { text: deliveredText, mode: deliveryMode, workspace: sessionLock.workspace })
+      } else if (digestQueue) {
         // T-459/T-460/T-462: board only; an idle session is notified after the debounce, a
         // busy one after its next turn/end. Nothing is injected right now.
         scheduleIdleDigest(session.id)
-      } else if (waitForLock) {
-        lifecycle.deferForLock(taskId, { text: deliveredText, mode: deliveryMode, workspace: sessionLock.workspace })
       } else {
         await promptWithResume(session.id, deliveredText + roleCardText(session), deliveryMode)
       }
@@ -6401,7 +6410,12 @@ export function apply(ctx, config) {
       throw error
     }
     if (thread) threadFlow.bindThread(thread, session, taskId)
-    if (digestQueue) {
+    if (waitForLock) {
+      // 被锁挂起：既不能说自己「delivered」，也不该记成 digest-queued。
+      fileLog(
+        `mesh_dispatch: ${text.length} chars waiting-lock session=${session.id} task=${taskId} workspace=${sessionLock.workspace} owner=${sessionLock.lock.ownerSessionId} requester=${requester || '-'}`,
+      )
+    } else if (digestQueue) {
       // Board only: nothing was delivered, so the line must not claim it was.
       fileLog(`mesh_dispatch: ${text.length} chars digest-queued session=${session.id} task=${taskId} requester=${requester || '-'}${meta.batchId ? ` batch=${meta.batchId}` : ''}`)
     } else {
@@ -6436,7 +6450,9 @@ export function apply(ctx, config) {
       // Dispatch-time git snapshot (T-416): null when the cwd is not a git repo or git is
       // unavailable. The receipt carries the settled-time snapshot for comparison.
       git: dispatchGit,
-      ...(digestQueue ? { digestQueued: true } : {}),
+      // digestQueued 只在**真的走 digest 调度**时出现；被锁挂起时它是 false（任务没进
+      // digest，而是等在锁队列里），否则调用方会同时看到「排队等锁」与「已进 digest」两个矛盾的承诺。
+      ...(digestQueue && !waitForLock ? { digestQueued: true } : {}),
       ...(waitForLock
         ? {
             waitingLock: {
