@@ -57,6 +57,8 @@ const RULES = [
   { id: 'mesh-ask-timeout', re: /mesh_ask.*timeout|aborted due to timeout/, need: ['mesh_ask'] },
   { id: 'tool-aborted', re: /tool call aborted/, need: ['tool call aborted'] },
   { id: 'fetch-failed', re: /fetch failed|web fetch failed/, need: ['fetch failed'] },
+  { id: 'read-offset-out-of-range', re: /offset \d+ is out of range/, need: ['offset N is out of range'] },
+  { id: 'job-id-stale', re: /unknown job|wait aborted/, need: ['unknown job'] },
 ]
 
 const argv = process.argv.slice(2)

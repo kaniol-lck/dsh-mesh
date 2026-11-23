@@ -2,7 +2,7 @@
 # 工具契约（高频失败的对策）
 
 > 技能讲**流程**，本页讲**契约**：每次写文件、跑命令、调工具都要守的硬规则。
-> 维护：2026-11-17 · 复查周期 120 天 · 由 `node scripts/check-tool-contract.mjs` 检查（章节、时效、失败台账覆盖）。
+> 维护：2026-11-23 · 复查周期 120 天 · 由 `node scripts/check-tool-contract.mjs` 检查（章节、时效、失败台账覆盖）。
 > 判据：失败台账的 top 签名必须在本页 §4 有对应行；出现新的高频失败 → 先补本页，再改习惯。
 
 ## 1. 写文件（edit / write）
@@ -40,8 +40,7 @@
 
 | 报错 | 下一步 |
 |---|---|
-| `old_string was not found` | 重新 `read`，逐字复制；长文件改整行替换 |
-| `old_string matched N times` | 扩大上下文，或 `replace_all: true` |
+| `old_string was not found` / `old_string matched N times` | 重新 `read` 逐字复制；仍不唯一就扩大上下文或 `replace_all: true` |
 | `old_string and new_string must differ` | 内容已一致，不要再调 |
 | `without reading it first` | 先 `read` 再 `write` |
 | `cannot resolve ... parent path segment is not a directory` | 检查父目录；别写到文件路径下 |
@@ -55,6 +54,8 @@
 | `mesh_ask ... timeout` | 缩短问题/选项，或改成直接提问 |
 | `tool call aborted` | 改后台作业，或缩短命令 |
 | `fetch failed` / `web fetch failed` | 换通路（curl / node / IWR），同一 URL 不原样重试第 3 次 |
+| `offset N is out of range` | 文件比预期短：先 `read` 全文拿真实行数，再定 offset；不按记忆的旧行号继续加 |
+| `unknown job <id>` / `wait aborted` | job id 只在当前会话有效；隔夜或换会话后用 `job_list` 复查，失效就放弃重跑 |
 
 ## 5. 维护
 
