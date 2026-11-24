@@ -123,11 +123,48 @@ export function createTaskLifecycle(deps) {
    */
   let claimSweepTimer = null
 
+  /**
+   * `stalled` used to be a one-way door (L2-20261124-03): the sweep wrote it and nothing ever
+   * wrote it back, so a task the worker had already picked up stayed "stuck" forever — and
+   * because `stalled` is treated as terminal by the cancel paths, it could never be closed by
+   * anyone. 5 of the 7 stalled rows on this machine had `startedAt` or `ackedAt`, i.e. the
+   * worker had in fact claimed them.
+   *
+   * So the sweep now also looks backwards: a stalled row that shows evidence of being claimed
+   * (started or acked) and is not settled goes back to `pending` with `resumedAt`. `stalledAt`
+   * is kept on purpose — `claimState()` treats it as "already escalated", which is exactly why
+   * the resumed row does not immediately stall again on the next sweep.
+   */
+  function resumeClaimedStalls(now) {
+    const resumed = []
+    for (const [taskId, row] of deps.taskRows) {
+      if (row.status !== 'stalled') continue
+      // Settled rows are history: the two historical cases (T4F-20261101-11 / T-278) must stay
+      // untouched, and a real not-started settlement also carries settledAt.
+      if (row.settledAt) continue
+      const started = Number(row.startedAt) > 0
+      const acked = Number(row.ackedAt) > 0
+      if (!started && !acked) continue
+      deps.taskRegistry.updateTaskRow(taskId, { status: 'pending', resumedAt: now })
+      deps.fileLog(
+        `digest task resumed task=${taskId} session=${row.targetSessionId} reason=${started ? 'started' : 'acked'} stalledAt=${row.stalledAt ?? '-'}`,
+      )
+      resumed.push(taskId)
+    }
+    return resumed
+  }
+
   function claimSweep() {
     const windowMs = Number(deps.config.digestClaimWarnMs)
     if (!Number.isFinite(windowMs) || windowMs <= 0) return
     const now = Date.now()
+    // Resume first: a row that was claimed must leave `stalled` before this pass decides what
+    // to warn about, otherwise the same sweep would keep reporting it as stuck.
+    resumeClaimedStalls(now)
     for (const [taskId, row] of deps.taskRows) {
+      // Only `pending` needs watching: `claimState` already returns CLAIM_OK once the row shows
+      // `startedAt`, so a started digest row adds nothing here. A stalled row that was in fact
+      // claimed is handled above by resumeClaimedStalls().
       if (row.status !== 'pending' || !row.declaredOnly) continue
       const task = deps.pendingTasks.get(taskId) ?? null
       const claimStatus = claimState(row, {
@@ -584,12 +621,11 @@ export function createTaskLifecycle(deps) {
             )
           }
           task.startedAt = now
-          // A digest task stays "pending" on the board: startedAt is evidence the worker is
-          // running, never a licence to settle it (T-459 keeps settlement declared-only).
-          deps.taskRegistry.updateTaskRow(
-            taskId,
-            task.declaredOnly ? { startedAt: now } : { status: 'started', startedAt: now },
-          )
+          // A digest task is also `started` once the worker opens a turn for it: `startedAt`
+          // alone left the status field saying `pending`, so "was this picked up at all?" could
+          // only be answered by inspecting a field (L2-20261124-03). Settlement stays
+          // declared-only (T-459) — the status describes reality, it grants no licence to settle.
+          deps.taskRegistry.updateTaskRow(taskId, { status: 'started', startedAt: now })
           deps.fileLog(`task ${taskId} started turn=${turn} baselineTurn=${task.baselineTurn}`)
         }
         for (const task of deps.pendingTasks.values()) {

@@ -297,10 +297,96 @@ test('declaredOnly: a turn records startedAt but its end never settles the task'
   flow.handleSessionEvent({ id: WORKER }, { type: 'turn/start', turn: 1 })
   flow.handleSessionEvent({ id: WORKER }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
   assert.ok(Number(taskRows.get('T-claim-start').startedAt) > 0, 'turn/start is evidence the worker began')
-  assert.equal(taskRows.get('T-claim-start').status, 'pending', 'observed settlement must not close a digest task')
+  // L2-20261124-03: the status field must say `started` too. Leaving it at `pending` meant
+  // "was this ever picked up?" could only be answered by reading a timestamp.
+  assert.equal(taskRows.get('T-claim-start').status, 'started', 'the status field must not contradict the worker')
   assert.match(logs.join('\n'), /task T-claim-start started turn=1/)
   assert.equal(pending.get('T-claim-start').settled, false)
   void target
+})
+
+// ── L2-20261124-03: `stalled` must not be a one-way door ─────────────────────
+test('claim sweep: a stalled row the worker had claimed is resumed to pending', () => {
+  const { flow, logs, taskRows } = makeLifecycle()
+  const stalledAt = Date.now() - WINDOW
+  taskRows.set(
+    'T-stall-started',
+    staleRow({
+      taskId: 'T-stall-started',
+      status: 'stalled',
+      stalledAt,
+      startedAt: Date.now() - WINDOW,
+      claimWarnedAt: Date.now() - WINDOW * 2,
+      notifiedAt: Date.now() - WINDOW * 3,
+    }),
+  )
+  taskRows.set(
+    'T-stall-acked',
+    staleRow({
+      taskId: 'T-stall-acked',
+      status: 'stalled',
+      stalledAt,
+      ackedAt: Date.now() - WINDOW,
+      claimWarnedAt: Date.now() - WINDOW * 2,
+      notifiedAt: Date.now() - WINDOW * 3,
+    }),
+  )
+  flow.claimSweep()
+  for (const taskId of ['T-stall-started', 'T-stall-acked']) {
+    const row = taskRows.get(taskId)
+    assert.equal(row.status, 'pending', `${taskId} must leave stalled`)
+    assert.ok(Number(row.resumedAt) > 0, `${taskId} must record resumedAt`)
+    assert.equal(row.stalledAt, stalledAt, `${taskId} keeps stalledAt as history`)
+  }
+  assert.match(logs.join('\n'), /digest task resumed task=T-stall-started .*reason=started/)
+  assert.match(logs.join('\n'), /digest task resumed task=T-stall-acked .*reason=acked/)
+
+  // The whole point: a resumed row must not be re-stalled by the next sweep.
+  const logCount = logs.length
+  flow.claimSweep()
+  for (const taskId of ['T-stall-started', 'T-stall-acked']) {
+    assert.equal(taskRows.get(taskId).status, 'pending', `${taskId} must not be re-stalled`)
+  }
+  assert.doesNotMatch(logs.slice(logCount).join('\n'), /digest task resumed/, 'resuming is a one-shot')
+})
+
+test('claim sweep: a stalled row without claim evidence stays stalled', () => {
+  const { flow, logs, taskRows } = makeLifecycle()
+  taskRows.set(
+    'T-stall-cold',
+    staleRow({
+      taskId: 'T-stall-cold',
+      status: 'stalled',
+      stalledAt: Date.now() - WINDOW,
+      claimWarnedAt: Date.now() - WINDOW * 2,
+      notifiedAt: Date.now() - WINDOW * 3,
+    }),
+  )
+  flow.claimSweep()
+  assert.equal(taskRows.get('T-stall-cold').status, 'stalled')
+  assert.equal(taskRows.get('T-stall-cold').resumedAt ?? null, null)
+  assert.doesNotMatch(logs.join('\n'), /digest task resumed/)
+})
+
+test('claim sweep: a settled stalled row is history and is never resumed', () => {
+  const { flow, logs, taskRows } = makeLifecycle()
+  // Shape of T-278 / T4F-20261101-11: settled long ago, still carrying the old stalled status.
+  taskRows.set(
+    'T-stall-history',
+    staleRow({
+      taskId: 'T-stall-history',
+      status: 'stalled',
+      stalledAt: Date.now() - WINDOW * 10,
+      settledAt: Date.now() - WINDOW * 9,
+      startedAt: Date.now() - WINDOW * 11,
+      ackedAt: Date.now() - WINDOW * 11,
+    }),
+  )
+  flow.claimSweep()
+  const row = taskRows.get('T-stall-history')
+  assert.equal(row.status, 'stalled', 'settled history must not be rewritten')
+  assert.equal(row.resumedAt ?? null, null)
+  assert.doesNotMatch(logs.join('\n'), /digest task resumed/)
 })
 
 // ── 3. end to end: the advisory really reaches the dispatcher ─────────────────
@@ -597,7 +683,10 @@ test('advisory: a declared digest task raises no alarm and writes no unclaimed r
     h.emit(WORKER, 'turn/end', 1, { reason: { kind: 'completed' } })
     await sleep(300)
     const row = await h.request(h.base, '/mesh/tasks/T-claim-ok')
-    assert.equal(row.json?.task?.status, 'pending', 'turn/end must not settle a digest task')
+    // L2-20261124-03: a digest task is `started` once the worker opens a turn — the status must
+    // describe reality. What must NOT happen is settlement: turn/end never closes it.
+    assert.equal(row.json?.task?.status, 'started', 'turn/end must not settle a digest task')
+    assert.equal(row.json?.task?.settledAt ?? null, null, 'a digest task has no settlement yet')
     assert.ok(Number(row.json?.task?.startedAt) > 0, 'turn/start records startedAt')
     await h.tool('mesh_complete').execute({ taskId: 'T-claim-ok', status: 'done', summary: 'ok' }, { sessionId: WORKER })
     await sleep(900)

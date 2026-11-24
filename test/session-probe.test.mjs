@@ -16,15 +16,30 @@ const WORKER = 'session-sp-worker'
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+// Bind a high candidate port and retry when it is taken, instead of taking whatever listen(0)
+// hands out. On this box the ephemeral range (1024-15000) overlaps undici's blocked-port list
+// (5060/5061/6000/6665-6669, ...), so `listen(0)` occasionally yields a port that every later
+// fetch() rejects with "bad port" — the same class of flake the waker-endpoints harness fixed
+// in T-299. This file hit it once while running the full suite (L2-20261124-03 round).
 async function freePort() {
-  return await new Promise((resolve, reject) => {
-    const server = net.createServer()
-    server.on('error', reject)
-    server.listen(0, '127.0.0.1', () => {
-      const { port } = server.address()
-      server.close(() => resolve(port))
+  const attempt = (port) =>
+    new Promise((resolvePort, reject) => {
+      const probe = net.createServer()
+      probe.on('error', reject)
+      probe.listen(port, '127.0.0.1', () => {
+        const { port: actual } = probe.address()
+        probe.close(() => resolvePort(actual))
+      })
     })
-  })
+  for (let index = 0; index < 20; index += 1) {
+    const candidate = 20000 + Math.floor(Math.random() * 12000)
+    try {
+      return await attempt(candidate)
+    } catch {
+      /* taken: try another candidate */
+    }
+  }
+  return await attempt(0)
 }
 
 async function request(base, route, { method = 'GET', body } = {}) {

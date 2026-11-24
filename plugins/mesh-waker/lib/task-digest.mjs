@@ -22,7 +22,12 @@ export function isDigestCandidate(row, { sessionId, now = Date.now() } = {}) {
   if (!row || typeof row !== 'object') return false
   if (!sessionId || row.targetSessionId !== sessionId) return false
   if (row.settledAt) return false
-  if (String(row.status ?? '') !== 'pending') return false
+  // A digest task now also reaches `started` when the worker opens a turn (L2-20261124-03 made
+  // the status honest). It still has not been acked or declared, so it must stay listable —
+  // otherwise beginning work would silently remove the task from every digest.
+  const status = String(row.status ?? '')
+  const isOpenDigest = row.declaredOnly === true ? status === 'pending' || status === 'started' : status === 'pending'
+  if (!isOpenDigest) return false
   // T-460: only queue deliveries are digested; a steer task is injected immediately and must
   // never be listed again (rows written before the field existed default to queue).
   if (row.mode && String(row.mode) !== 'queue') return false

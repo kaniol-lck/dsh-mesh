@@ -409,7 +409,9 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 **工作区锁（未发布，owner 2026-11-12 定 B 案）**：同一 workspace 里「会改 git」的任务应当串行。`POST /mesh/workspace/lock`（或 `mesh_lock({action:"acquire"})`）按 workspace 取一把 **advisory 锁**；持锁期间向该 workspace 的派活**照常登记任务与回执，但不投递 prompt**，任务行状态为 `waiting-lock`（等锁不消耗 baselineTurn、不会误判 `not-started`）；锁释放或过期后由 sweeper 自动投递一次。锁被他人持有时 `acquire` 返回 409（带持有人与到期时间），**不抢、不猜**；同会话重复 `acquire` 幂等续期。锁**只在进程内**：重启后 `GET /mesh/workspace/lock` 为空（日志 `workspace locks: cleared on start`）。**边界**：插件不创建 worktree、不切换分支、不跨机同步锁、不阻止任何读操作；`workspaceLockTtlMs` 控制默认 TTL。
 
-**状态流转（0.7.14 起含 `started`，0.7.26 起含 `lost`）**：派活写 `pending` → 目标会话的 `turn/start` 且该 turn 归属此任务时写 `started`（含 `startedAt`）→ 结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`；目标 workspace 被他人持锁时写 `waiting-lock`（锁释放后回到 `pending` 并投递，等锁期间不消耗 turn、不触发 `not-started`）。**宿主重启**后启动对账会把上一进程遗留的 `pending/started`（`settledAt=null`）标成 `lost` 并补发一条 `lost` 回执（摘要 `session restarted before this task finished; resend if still needed`），已结束的行不动。取消/停滞可以发生在 `pending` 或 `started`。
+**状态流转（0.7.14 起含 `started`，0.7.26 起含 `lost`）**：派活写 `pending` → 目标会话的 `turn/start` 且该 turn 归属此任务时写 `started`（含 `startedAt`；**digest 任务同样如此**，结算仍走 declared-only）→ 结算写 `settled`（补 `settledAt/durationMs/receiptRef/receiptSummary`）；超时未动写 `stalled`（即回执的 `not-started`）；`DELETE` 或批次取消写 `cancelled`；目标 workspace 被他人持锁时写 `waiting-lock`（锁释放后回到 `pending` 并投递，等锁期间不消耗 turn、不触发 `not-started`）。**宿主重启**后启动对账会把上一进程遗留的 `pending/started`（`settledAt=null`）标成 `lost` 并补发一条 `lost` 回执（摘要 `session restarted before this task finished; resend if still needed`），已结束的行不动。取消/停滞可以发生在 `pending` 或 `started`。
+
+**`stalled` 可自愈（L2-20261124-03）**：`stalled` 曾经是单向门——看门狗只写不读，而取消接口把它当终态，于是「已被接单却显示卡住」的行既不会自愈也关不掉。现在 `claimSweep()` 每轮先做一次正向检查：`stalled` 且（`startedAt > 0` 或 `ackedAt > 0`）且**未结算** → 恢复 `pending` 并记 `resumedAt`（日志 `digest task resumed … reason=started|acked`），`stalledAt` 保留为历史；恢复后的行不会再被下一轮标回（`claimState` 把 `stalledAt` 视为「已升级过」）。**已 settled 的 stalled 行是历史，永不改写**（那是真卡住后被人关掉的记录）。
 
 **咨询类任务的答案交付（T-487）**：只回答、不改代码的任务，「产物就是答案」，而 `mesh_complete` 的 `summary` 上限 300 字装不下它。
 现在 `mesh_complete` 多了可选 `answer`：
@@ -477,6 +479,8 @@ mesh_complete({
 pending ──turn/start──▶ started ──turn/end / mesh_complete──▶ settled
    │                      │
    ├──stall──▶ stalled    └──cancel──▶ cancelled
+   │             │
+   │             └──resumed (startedAt/ackedAt 存在且未结算)──▶ pending  (resumedAt, stalledAt 保留)
    │
    ├──restart──▶ lost ──mesh_complete(done|partial)──▶ settled  (recoveredAt, lostAt 保留)
    │

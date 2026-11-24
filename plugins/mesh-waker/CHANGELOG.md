@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- `stalled` 不再是单向门（L2-20261124-03，L2 自己就是受害者：19:51 派给 L1 的单被看门狗判 stalled，21:38 认领后状态永远停在 stalled，`verify-task` 至今判 FAIL）。根因：`claimSweep()` 只写 `stalled`，全仓无任何写回路径，而取消接口把 `stalled` 与 `settled`/`cancelled` 并列当终态——于是「已被接单却显示卡住」的行既不会自愈也关不掉（全机 7 条 stalled 里 5 条已有 `startedAt`/`ackedAt`）。现在 sweep 先做一次正向检查：`stalled` 且（`startedAt > 0` 或 `ackedAt > 0`）且未结算 → 恢复 `pending` + 记 `resumedAt`，日志 `digest task resumed … reason=started|acked`；`stalledAt` 保留为历史，`claimState` 视它「已升级过」，因此恢复后的行不会被下一轮立刻标回。已 settled 的 stalled 行（历史遗留）不动。
+- digest 任务的 `started` 状态此前只写 `startedAt`、不写 `status`（L2-20261124-03）：状态字段说 `pending`，而「这条到底有没有被接」只能靠字段猜。现在打开回合即写 `status: 'started'`，**结算仍是 declared-only**（T-459 不变）；同时对齐 digest 候选判定——`declaredOnly` 的 `started` 行仍留在 digest 里（否则一开始干活就静默从摘要中消失）。
 - 任务行恢复记录投递模式（`mode: steer|queue`，T-mwnpxik9）：`recordTaskPending` 里这段代码曾被压成单行注释而从未执行（任务库 320 行命中 0 次），事后无法区分「插队更正」与「排队跟进」；现在任务行与 `/mesh/tasks` 都可见，`mesh_dispatch` 日志也带 `mode=`。
 - 工具说明不再固化平台专有路径（T-mwp3tahc）：`mesh_dispatch.workspacePath` 的描述原先把示例写成 Windows 盘符路径，生成到 `docs/tools-reference.md` 后被 `check-paths` 拦下，也不适合面向全平台的插件；改为 `/path/to/workspace` 的写法（并说明 Windows 可用盘符形式的绝对路径）。生成器不再需要 `<workspace>` 兜底。
 - 不再向「工作目录已不存在」的会话派活（T-mws1zens）：`git worktree remove` 之后会话仍在、cwd 已消失，派活会返回 `ok:true` 并把任务写进机器账本，谁也不会去跑（实测 9 单里 4 单如此，其中 3 单最后 `aborted`）。现在 `mesh_dispatch` 与 `/mesh/inject` 在写任务行**之前**校验目标 cwd，缺失则 409 并给出会话 id/标题、那个路径与「归档该会话或改派主树会话」的建议；cwd 未知/UNC 不可判定时不拒绝但**在响应里带 warning**，不再静默。`ensureWorkspace()` 也不再为不存在的目录新注册工作区（已有条目不删）。
