@@ -108,6 +108,46 @@ export function primaryOf(coordinators) {
 }
 
 /**
+ * Who legitimately receives a receipt for this workspace entry (T-mwwdyc7i)?
+ *
+ * Identity comes from the registry, never from a session title. A member qualifies only when it
+ * is approved AND still holds a live claim: `permanent`, or a lease that has not expired. The
+ * title-based inference this replaces woke a long-dead session (`session-7fa21aa4`, title
+ * `mesh · 协调`) on every unattributed receipt — the exact failure `.worklog/WORKLOG.md:594`
+ * recorded for `coord-scope` on 2026-11-19, four days before it recurred here.
+ *
+ * Returns one of:
+ *   { kind: 'one',    sessionId, why }   — exactly one live primary claim
+ *   { kind: 'ambiguous', candidates }    — several live primary claims, or several live claims
+ *                                          with no primary: never guess
+ *   { kind: 'none',   why }              — no live claim at all
+ */
+export function liveRequesterOf(entry, { now = Date.now() } = {}) {
+  const members = Array.isArray(entry?.coordinators) ? entry.coordinators : []
+  const live = members.filter(
+    (member) =>
+      member &&
+      member.sessionId &&
+      member.status === 'approved' &&
+      (member.permanent === true || !Number.isFinite(member.leaseUntil) || member.leaseUntil > now),
+  )
+  if (!live.length) {
+    // A legacy entry (only the scalar `coordinator`) is still a real registration, but it
+    // carries no lease: it is only trusted when nothing else contradicts it, which the caller
+    // decides by reading the session record.
+    const legacy = typeof entry?.coordinator === 'string' && entry.coordinator ? entry.coordinator : null
+    return legacy ? { kind: 'one', sessionId: legacy, why: 'legacy-scalar' } : { kind: 'none', why: 'no-claim' }
+  }
+  const primaries = live.filter((member) => member.isPrimary === true)
+  if (primaries.length === 1) return { kind: 'one', sessionId: primaries[0].sessionId, why: 'primary' }
+  if (primaries.length > 1) {
+    return { kind: 'ambiguous', candidates: primaries.map((member) => member.sessionId), why: 'multiple-primaries' }
+  }
+  if (live.length === 1) return { kind: 'one', sessionId: live[0].sessionId, why: 'sole-approved' }
+  return { kind: 'ambiguous', candidates: live.map((member) => member.sessionId), why: 'no-primary' }
+}
+
+/**
  * Recompute isPrimary flags and keep the legacy `coordinator` field equal to the primary
  * sessionId. Returns { primary, changedLegacyCoordinator }.
  */

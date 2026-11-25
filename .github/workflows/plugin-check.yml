@@ -47,6 +47,13 @@ jobs:
       - name: Path/topology guard
         run: node scripts/check-paths.mjs
 
+      # 标题不是身份（owner 已纠正两次）。2026-11-19 只修了 coord-scope 一个脚本，
+      # 同一个正则 4 天后在 receipt-flow 原样发作（老会话被反复唤醒）——一处一修、没有门禁，
+      # 同一类必然复发。这一步就是那道门禁：把标题变成判断的调用点必须显式声明
+      # accounting / display / fallback，否则 CI 红。
+      - name: Title is never an identity
+        run: node scripts/check-no-title-identity.mjs
+
       - name: Tool contract guard
         run: node scripts/check-tool-contract.mjs --no-failures
 

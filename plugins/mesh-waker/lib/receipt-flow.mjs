@@ -2,6 +2,7 @@
 // imported without loading the plugin. Every dependency arrives through `deps`; the only
 // module-level imports are the two pure helpers it needs.
 import { isCoordinatorTitle } from './session.mjs'
+import { liveRequesterOf } from './coordinators.mjs'
 import { buildReceipt } from './receipt.mjs'
 
 /**
@@ -30,10 +31,15 @@ import { buildReceipt } from './receipt.mjs'
  */
 export function createReceiptFlow(deps) {
   /**
-   * Resolve a requester id/title once. When the dispatcher named nobody, infer a coordinator
-   * from the *target's* cwd (exactly one `· 协调` / `· coordinator` session there). The global
-   * receiptTo is deliberately not consulted: one waker can serve several workspaces, and a
-   * receipt must never cross into another project's coordinator (T-255).
+   * Resolve a requester id/title once. When the dispatcher named nobody, infer the coordinator
+   * of the *target's* workspace. The global receiptTo is deliberately not consulted: one waker
+   * can serve several workspaces, and a receipt must never cross into another project's
+   * coordinator (T-255).
+   *
+   * T-mwwdyc7i: identity comes from the workspace registry (`coordinators[]` + live lease), never
+   * from a session title. The title path below is a *last resort*, is logged as deprecated, and
+   * cannot fire when the registry has a live claim — a long-dead session whose title still says
+   * `mesh · 协调` used to receive every unattributed receipt (same class as WORKLOG:594).
    */
   function inferRequesterFromWorkspace(target) {
     const cwd = String(target?.cwd ?? '').trim()
@@ -44,6 +50,30 @@ export function createReceiptFlow(deps) {
     } catch {
       return { kind: 'none' }
     }
+    const liveById = new Map(sessions.filter((session) => !session.archived).map((session) => [session.id, session]))
+
+    // 1) Registry first: the truth about who leads this cwd.
+    let entry = null
+    try {
+      entry = deps.getWorkspaceEntry?.(cwd) ?? null
+    } catch (error) {
+      deps.fileLog(`workspace lookup failed for ${cwd}: ${error?.message ?? error}`)
+      entry = null
+    }
+    if (entry) {
+      const live = liveRequesterOf(entry, { now: Date.now() })
+      if (live.kind === 'one') {
+        const session = liveById.get(live.sessionId) ?? { id: live.sessionId, cwd, title: null }
+        return { kind: 'one', session, source: 'registry', why: live.why }
+      }
+      if (live.kind === 'ambiguous') {
+        // The registry itself says "several lead here": never guess, not even with titles.
+        return { kind: 'ambiguous', candidates: live.candidates.map((id) => liveById.get(id) ?? { id }), cwd, source: 'registry', why: live.why }
+      }
+      // live.kind === 'none': no live claim. Fall through to the deprecated title path.
+    }
+
+    // 2) Deprecated: title matching, only when the registry has nothing to say.
     const matches = sessions.filter(
       (session) =>
         session.id !== target.id &&
@@ -51,7 +81,7 @@ export function createReceiptFlow(deps) {
         String(session.cwd ?? '').trim() === cwd &&
         isCoordinatorTitle(session.title),
     )
-    if (matches.length === 1) return { kind: 'one', session: matches[0] }
+    if (matches.length === 1) return { kind: 'one', session: matches[0], source: 'title-fallback' }
     if (matches.length > 1) {
       // Numbered coordinators are normal (mesh · 协调 2). A clearly newer one wins; only
       // equal/unknown activity keeps the "ambiguous, do not guess" behaviour (T-287).
@@ -59,10 +89,10 @@ export function createReceiptFlow(deps) {
       const newest = Number(matches[0].last_active ?? 0)
       const runnerUp = Number(matches[1].last_active ?? 0)
       if (Number.isFinite(newest) && Number.isFinite(runnerUp) && newest > runnerUp) {
-        return { kind: 'one', session: matches[0], pickedLatest: true }
+        return { kind: 'one', session: matches[0], pickedLatest: true, source: 'title-fallback' }
       }
     }
-    return { kind: matches.length === 0 ? 'none' : 'ambiguous', candidates: matches, cwd }
+    return { kind: matches.length === 0 ? 'none' : 'ambiguous', candidates: matches, cwd, source: 'title-fallback' }
   }
 
   function resolveRequester(raw, target = null) {
@@ -70,14 +100,22 @@ export function createReceiptFlow(deps) {
     if (!requester) {
       const inferred = inferRequesterFromWorkspace(target)
       if (inferred.kind === 'one') {
-        deps.fileLog(
-          `requester inferred from workspace: ${inferred.session.title} (${inferred.session.id})${inferred.pickedLatest ? ' [newest of several coordinators]' : ''}`,
-        )
+        if (inferred.source === 'registry') {
+          deps.fileLog(
+            `requester inferred from workspace: ${inferred.session.title ?? '(no title)'} (${inferred.session.id}) source=registry why=${inferred.why}`,
+          )
+        } else {
+          deps.fileLog(
+            `WARN requester inferred from workspace by TITLE (deprecated, source=title-fallback): ${inferred.session.title} (${inferred.session.id})` +
+              `${inferred.pickedLatest ? ' [newest of several coordinators]' : ''} — the registry has no live coordinator claim for this workspace; ` +
+              'titles are not identity, approve a coordinator so this fallback is never needed',
+          )
+        }
         return { requester: inferred.session.title || inferred.session.id, sessionId: inferred.session.id, inferred: true }
       }
       if (inferred.kind === 'ambiguous') {
         deps.fileLog(
-          `requester inference ambiguous: ${inferred.candidates.length} coordinator sessions share cwd ${inferred.cwd}; receipt stays file-only`,
+          `requester inference ambiguous (source=${inferred.source}${inferred.why ? ` why=${inferred.why}` : ''}): ${inferred.candidates.length} candidates share cwd ${inferred.cwd}; receipt stays file-only`,
         )
       }
       return { requester: null, sessionId: null, inferred: false }

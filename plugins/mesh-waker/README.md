@@ -345,7 +345,16 @@ npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task --receipt
 
 回执字段：`taskId / sessionId / turn / status / reasonKind / reasonDetail / injectedAt / endedAt / durationMs / summary / receiptMode / baselineTurn / settledTurn / injectedDuringTurn`（声明式结算另可带 `answer` / `answerChars` / `answerTruncated`，T-487 咨询答复）；派活时另可带 `git`（结算时刻快照 `{cwd, branch, head, dirty}`，非 git 工作区为 `null`）、`artifacts`（派生产物清单，见上）与 `warnings`（例如 `expectBranch` 不一致）；`mesh_dispatch` 的**返回体**带派发时刻的 `git` 快照与 `warnings`，便于在任务开跑前就发现分支不对。`status` ∈ `completed | aborted | blocked | error | max-tokens | interrupted | forked | not-started`；`reasonDetail` 放 `error.code` 或 abort 原因。`baselineTurn`/`settledTurn` 是结算诊断：`queue` 注入发生在回合进行中时 `baselineTurn` 等于该回合，只有更晚回合的 `turn/end` 才会结算（`settledTurn > baselineTurn`），`steer` 则同一回合即可。注入给接收方的通知首行是 `[RECEIPT] <taskId> <status> <durationMs>ms`；**0.7.28 起默认只有这一行**（摘要留在文件/面板/API，避免回执被当成回信对刷）。`status ∈ {error, lost}` 时附一行 `reasonDetail`（≤120 字）。**要摘要有两个开关（0.8.1 起）**：全局配置 `receiptNoticeSummary: true`，或单次派活 `receiptSummary: true`（工具参数 / `meta.receiptSummary` / CLI `--receipt-summary`）——后者让跨工作区的派活方不必改对端配置也能索要摘要。批次聚合通知同样尊重这两个开关：任一成员 opt-in 即整批带摘要，成员摘要缩进两格、失败项仍带 `← 失败`；**批次 body 总长上限 = min(`maxInlineBytes`, 8 KiB)**，超限按顺序截断并在末尾追加 `…（摘要已截断，详见 GET /mesh/tasks/<id>）`；单条摘要与批次成员摘要都按 `receiptSummaryChars`（默认 300）截断。**取详情的三条现成途径**：`GET /mesh/tasks/<id>` 的 `receiptSummary`、`receipts.jsonl` 的 `summary`（批次记录在 `tasks[].summary`）、面板「派活任务」右栏。
 
-**回执投递给谁（0.7.7 / 0.7.24 收紧）**：优先投给**派活方**（requester），否则 `receiptTo`，都没有才只写文件。0.7.24 起 file 模式也会在 waker 日志留一行 `receipt <id> <status> → file only (requester=有/无, receiptTo=有/无)`；两者都缺时额外写 `WARN … nobody was notified`。requester 缺失时按**目标会话的 cwd** 推断同工作区唯一的协调会话（标题以 `· 协调`/`· coordinator` 结尾）：恰好 1 个才用，0 个或多个不猜（日志写 `requester inference ambiguous`）；**不会**拿全局 `receiptTo` 跨工作区兜底。
+**回执投递给谁（0.7.7 / 0.7.24 收紧 / T-mwwdyc7i 改判据）**：优先投给**派活方**（requester），否则 `receiptTo`，都没有才只写文件。0.7.24 起 file 模式也会在 waker 日志留一行 `receipt <id> <status> → file only (requester=有/无, receiptTo=有/无)`；两者都缺时额外写 `WARN … nobody was notified`。
+
+requester 缺失时按**目标会话的 cwd** 推断，判据分两层（T-mwwdyc7i）：
+
+1. **注册表真源**（首选）：`workspaces.json` 里该 cwd 条目的 `coordinators[]`，取 `status=approved` 且（`permanent=true` 或 `leaseUntil > now`）的成员。恰好一个 → 用它，日志 `requester inferred from workspace: <title> (<id>) source=registry why=primary|sole-approved|legacy-scalar`；**多个都合格 → 不猜**，保持 `ambiguous` + file-only（`source=registry why=multiple-primaries|no-primary`）。活跃时间不再用来挑赢家。
+2. **标题退化**（仅当注册表没有任何有效声明）：同 cwd 下未归档、标题以 `· 协调`/`· coordinator` 结尾的会话，恰好 1 个才用；**且必定打 `WARN … by TITLE (deprecated, source=title-fallback)`**，日志里写明「titles are not identity」。0 个或多个 → `requester inference ambiguous (source=title-fallback)`，不猜。
+
+**为什么**：标题是用户随时可改的显示文本，不是身份。`.worklog/WORKLOG.md:594`（2026-11-19）记过一次同类事故（`coord-scope` 按标题选会话，改名后恒报 0 越界），当时只修了那一个脚本；4 天后同一个正则在这里发作——旧会话 `session-7fa21aa4`（标题 `mesh · 协调`、未归档）成了仓库根下唯一「协调」标题会话，所有未署名回执全推给它。门禁 `scripts/check-no-title-identity.mjs` 就是为此加的：把标题变成判断的调用点必须显式声明 `accounting`/`display`/`fallback`，否则 CI 红。
+
+`roles` 与 `GET /mesh/session/identity` 的 `role` 同理降级为显示/兼容：条目已有显式 `roles` 时以它为准，标题推导只进 `rolesUnrecognized`；`role` 优先读 `workers[role].sessionId`，并带 `roleSource`（`registry`/`registry-ambiguous`/`title-fallback`/`none`）说明来源。
 
 1. `requester`（`/mesh/inject` 的 body 字段或 `mesh_dispatch` 的工具参数，CLI `--requester` 会带）解析成功 → 只投给该会话；`mesh_dispatch` 被模型调用时若宿主把调用方 session 传给 handler（`_extra`/第二参数），自动用它；
 2. requester 解析失败 → 记录 `lastError`（`requester not resolved … falling back to receiptTo`）后回退 `receiptTo`；

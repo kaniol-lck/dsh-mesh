@@ -2706,11 +2706,25 @@ export function apply(ctx, config) {
       : !Array.isArray(entry.coordinators)
         ? (entry.coordinator ?? null)
         : null
+    // T-mwwdyc7i: `role` is display/compat only. The registry is the source of truth —
+    // `workers[role].sessionId` is an explicit registration, so it wins over anything the
+    // title happens to say. Title derivation is the last resort and is marked as such, so a
+    // consumer can tell "registered" from "guessed" without reading the title itself.
     const role = (() => {
+      const registered = []
+      for (const [candidateSlug, workspaceEntry] of Object.entries(workspaces.workspaces ?? {})) {
+        const workers = workspaceEntry?.workers && typeof workspaceEntry.workers === 'object' ? workspaceEntry.workers : {}
+        for (const [workerRole, worker] of Object.entries(workers)) {
+          if (worker?.sessionId === sessionId) registered.push({ slug: candidateSlug, role: workerRole })
+        }
+      }
+      if (registered.length === 1) return { role: registered[0].role, source: 'registry' }
+      if (registered.length > 1) return { role: null, source: 'registry-ambiguous' }
       try {
-        return classifyRoleCandidates([session.title]).roles[0] ?? null
+        const derived = classifyRoleCandidates([session.title]).roles[0] ?? null
+        return derived ? { role: derived, source: 'title-fallback' } : { role: null, source: 'none' }
       } catch {
-        return null
+        return { role: null, source: 'none' }
       }
     })()
     return {
@@ -2727,7 +2741,8 @@ export function apply(ctx, config) {
       coordinatorStatus,
       isPrimary,
       coordinatorSessionId,
-      role,
+      role: role.role,
+      roleSource: role.source,
     }
   }
 
@@ -4554,7 +4569,24 @@ export function apply(ctx, config) {
         const expired = expireCoordinators(claimedMembers, { now: Date.now(), pendingTtlMs: c.coordinatorPendingTtlMs })
         entry.coordinators = claimedMembers
         const beforeCoordinator = entry.coordinator ?? null
-        const { primary } = syncPrimary(entry)
+        // T-mwwdyc7i: only *repair* the primary when the registry disagrees with itself in a
+        // way that has one right answer (zero or several primaries over exactly one live claim).
+        // With several live claims and no flagged primary, deriving a winner from `claimedAt`
+        // silently elected one of them — the "somebody else chose for me" failure this task is
+        // about. Left untouched, liveRequesterOf() reports `no-primary` and the receipt stays
+        // file-only, which is the honest answer.
+        const approvedLive = claimedMembers.filter(
+          (member) =>
+            member.status === 'approved' &&
+            (member.permanent === true || !Number.isFinite(member.leaseUntil) || member.leaseUntil > Date.now()),
+        )
+        const flagged = approvedLive.filter((member) => member.isPrimary === true)
+        const { primary } =
+          flagged.length === 1
+            ? { primary: flagged[0] }
+            : approvedLive.length <= 1
+              ? syncPrimary(entry)
+              : { primary: null }
         if (expired || beforeCoordinator !== (entry.coordinator ?? null)) changed = true
         if (expired) fileLog(`workspace ${slug} coordinators expired (primary=${primary?.sessionId ?? 'none'})`)
       } else {
@@ -4583,22 +4615,54 @@ export function apply(ctx, config) {
       // a title fragment: it is parked in rolesUnrecognized instead of roles. Roles a human
       // wrote stay: anything not derivable from the current titles is kept as-is, so cleanup
       // can never delete a hand-written value (T-286's constraint).
+      //
+      // T-mwwdyc7i: title derivation is display/compat only. When the entry already carries an
+      // explicit `roles` list, that list is the truth and this pass must not overwrite it with
+      // whatever the current titles happen to look like — it only records, separately, which
+      // title-derived roles are NOT registered (`rolesUnrecognized`), so the divergence stays
+      // visible instead of being silently applied.
       const { roles: knownRoles, unrecognized } = classifyRoleCandidates(list.map((session) => session.title))
-      const derived = new Set([...knownRoles, ...unrecognized])
+      const registeredFromWorkers = new Set(
+        Object.entries(entry.workers && typeof entry.workers === 'object' ? entry.workers : {})
+          .filter(([, worker]) => worker && typeof worker === 'object' && (worker.sessionId || worker.role))
+          .map(([workerRole]) => workerRole),
+      )
       const existingRoles = Array.isArray(entry.roles) ? entry.roles.map(String) : []
-      const manualRoles = existingRoles.filter((role) => !derived.has(role))
-      const nextRoles = [...manualRoles]
-      for (const role of knownRoles) if (!nextRoles.includes(role)) nextRoles.push(role)
-      const removed = existingRoles.filter((role) => derived.has(role) && !knownRoles.includes(role))
-      if (removed.length) fileLog(`workspaces: roles cleaned ${removed.length} → unrecognized`)
+      const hasExplicitRoles = existingRoles.length > 0
+      const derived = new Set([...knownRoles, ...unrecognized])
+      let nextRoles
+      let unrecognizedNext
+      if (hasExplicitRoles) {
+        // Registry first: the explicit list is the truth, so title-derived KNOWN roles are never
+        // merged in (that is title-as-identity). What stays allowed is hygiene: a value that is
+        // both non-whitelisted AND derivable from a current title was written by the old
+        // auto-derivation, not by a human, so it moves to rolesUnrecognized. A hand-written role
+        // that no title implies is kept (T-286).
+        const cleaned = existingRoles.filter((role) => !derived.has(role) || knownRoles.includes(role))
+        nextRoles = [...new Set([...cleaned, ...registeredFromWorkers])]
+        const removed = existingRoles.filter((role) => !nextRoles.includes(role))
+        if (removed.length) fileLog(`workspaces: roles cleaned ${removed.length} → unrecognized`)
+        const dropped = knownRoles.filter((role) => !nextRoles.includes(role))
+        if (dropped.length) {
+          fileLog(`workspaces: ${slug} title-derived roles ${dropped.join(',')} not applied (roles are registry-explicit)`)
+        }
+        unrecognizedNext = [...new Set([...unrecognized, ...dropped])]
+      } else {
+        const manualRoles = existingRoles.filter((role) => !derived.has(role))
+        nextRoles = [...manualRoles]
+        for (const role of knownRoles) if (!nextRoles.includes(role)) nextRoles.push(role)
+        const removed = existingRoles.filter((role) => derived.has(role) && !knownRoles.includes(role))
+        if (removed.length) fileLog(`workspaces: roles cleaned ${removed.length} → unrecognized`)
+        unrecognizedNext = unrecognized
+      }
       if (JSON.stringify(nextRoles) !== JSON.stringify(existingRoles)) {
         if (nextRoles.length) entry.roles = nextRoles
         else delete entry.roles
         changed = true
       }
       const previousUnrecognized = Array.isArray(entry.rolesUnrecognized) ? entry.rolesUnrecognized.map(String) : []
-      if (JSON.stringify(unrecognized) !== JSON.stringify(previousUnrecognized)) {
-        if (unrecognized.length) entry.rolesUnrecognized = unrecognized
+      if (JSON.stringify(unrecognizedNext) !== JSON.stringify(previousUnrecognized)) {
+        if (unrecognizedNext.length) entry.rolesUnrecognized = unrecognizedNext
         else delete entry.rolesUnrecognized
         changed = true
       }
@@ -5129,6 +5193,15 @@ export function apply(ctx, config) {
     fileLog,
     // 列举本机会话（requester 推断）
     listLocalSessions,
+    // T-mwwdyc7i: the workspace registry entry for a cwd. Identity comes from here (approval +
+    // live lease), never from a session title — see WORKLOG:594 and receipt-flow's fallback.
+    getWorkspaceEntry: (cwd) => {
+      const wanted = workspaceKeyPath(cwd)
+      if (!wanted) return null
+      refreshWorkspacesFromDisk()
+      const hit = Object.entries(workspaces.workspaces).find(([, entry]) => workspaceKeyPath(entry.cwd) === wanted)
+      return hit ? { slug: hit[0], ...hit[1] } : null
+    },
     // 按 id / 标题解析本机会话
     resolveLocalSession,
     // 真正投递（queue / steer）

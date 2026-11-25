@@ -228,7 +228,11 @@ test('claim sweep (b): an acked row declared inside the window never warns', () 
   assert.equal(notices.length, 0)
 })
 
-test('claim sweep (c): an acked row past twice the window is marked stalled and kept', () => {
+// T-mwurolzr overturns the old premise of case (c): a row the worker SIGNED FOR is not
+// "unclaimed". T-mwumb28l was acked at 12:37 and marked stalled at 13:36, so the watchdog was
+// calling a claimed task unseen. An acked row now gets `unfulfilledAt` + a distinct reason
+// instead of `stalled`, and the wording differs from the unclaimed case.
+test('claim sweep (c): an acked row past twice the window is unfulfilled, never stalled', () => {
   const { flow, logs, notices, taskRows } = makeLifecycle()
   taskRows.set(
     'T-acked-stall',
@@ -240,10 +244,82 @@ test('claim sweep (c): an acked row past twice the window is marked stalled and 
     }),
   )
   flow.claimSweep()
-  assert.match(logs.join('\n'), /WARN digest task stalled task=T-acked-stall/)
-  assert.equal(taskRows.get('T-acked-stall').status, 'stalled')
-  assert.equal(taskRows.get('T-acked-stall').taskId, 'T-acked-stall')
+  const row = taskRows.get('T-acked-stall')
+  assert.equal(row.status, 'pending', 'a signed-for task must not be recorded as unseen')
+  assert.equal(row.stalledAt ?? null, null, 'no stall timestamp on an acked row')
+  assert.equal(row.stalledReason, 'acked-not-settled')
+  assert.ok(Number(row.unfulfilledAt) > 0, 'the acked-but-undelivered case gets its own marker')
+  assert.match(logs.join('\n'), /WARN digest task unfulfilled task=T-acked-stall .*reason=acked-not-settled/)
+  assert.doesNotMatch(logs.join('\n'), /digest task stalled task=T-acked-stall/)
   assert.equal(notices.length, 0)
+
+  // One report per row: the next sweep does not repeat it.
+  const logCount = logs.length
+  flow.claimSweep()
+  assert.equal(logs.length, logCount, 'the unfulfilled notice is logged once')
+})
+
+// The real T-mwumb28l shape: acked BEFORE the stall, started AFTER it. The row must come back
+// and must be reported with the "signed for but not delivered" reason, not "late claim".
+test('claim sweep: acked-before-stall (T-mwumb28l shape) resumes with its own reason', () => {
+  const { flow, logs, taskRows } = makeLifecycle()
+  const now = Date.now()
+  taskRows.set(
+    'T-mwumb28l',
+    staleRow({
+      taskId: 'T-mwumb28l',
+      status: 'stalled',
+      notifiedAt: now - WINDOW * 4,
+      ackedAt: now - WINDOW * 3,
+      stalledAt: now - WINDOW * 2,
+      startedAt: now - WINDOW,
+      claimWarnedAt: now - WINDOW * 3,
+    }),
+  )
+  flow.claimSweep()
+  const row = taskRows.get('T-mwumb28l')
+  assert.equal(row.status, 'pending', 'the row must leave stalled')
+  assert.equal(row.resumedReason, 'started-after-stall', 'a start after the stall is a late claim')
+  assert.match(logs.join('\n'), /digest task resumed task=T-mwumb28l .*reason=started-after-stall/)
+})
+
+test('claim sweep: acked-before-stall without a later start resumes as acked-not-delivered', () => {
+  const { flow, logs, taskRows } = makeLifecycle()
+  const now = Date.now()
+  // T-mwl3yqbp shape: acked, never started, marked stalled much later.
+  taskRows.set(
+    'T-mwl3yqbp',
+    staleRow({
+      taskId: 'T-mwl3yqbp',
+      status: 'stalled',
+      notifiedAt: now - WINDOW * 5,
+      ackedAt: now - WINDOW * 4,
+      stalledAt: now - WINDOW,
+      claimWarnedAt: now - WINDOW * 4,
+    }),
+  )
+  flow.claimSweep()
+  const row = taskRows.get('T-mwl3yqbp')
+  assert.equal(row.status, 'pending')
+  assert.equal(row.resumedReason, 'acked-not-delivered')
+  assert.match(logs.join('\n'), /digest task resumed task=T-mwl3yqbp .*reason=acked-not-delivered/)
+})
+
+test('claim sweep: a truly untouched row still stalls (tier 3 unchanged)', () => {
+  const { flow, logs, taskRows } = makeLifecycle()
+  taskRows.set(
+    'T-untouched',
+    staleRow({
+      taskId: 'T-untouched',
+      notifiedAt: Date.now() - WINDOW * 3,
+      claimWarnedAt: Date.now() - WINDOW * 2,
+    }),
+  )
+  flow.claimSweep()
+  const row = taskRows.get('T-untouched')
+  assert.equal(row.status, 'stalled')
+  assert.equal(row.stalledReason, 'unclaimed')
+  assert.match(logs.join('\n'), /digest task stalled task=T-untouched .*reason=unclaimed/)
 })
 
 test('claim sweep (d): a settled row never warns even if every other marker is old', () => {
@@ -315,7 +391,8 @@ test('claim sweep: a stalled row the worker had claimed is resumed to pending', 
       taskId: 'T-stall-started',
       status: 'stalled',
       stalledAt,
-      startedAt: Date.now() - WINDOW,
+      // Started AFTER the stall: a late claim (L2-20261124-01 shape).
+      startedAt: Date.now() - WINDOW / 2,
       claimWarnedAt: Date.now() - WINDOW * 2,
       notifiedAt: Date.now() - WINDOW * 3,
     }),
@@ -326,7 +403,8 @@ test('claim sweep: a stalled row the worker had claimed is resumed to pending', 
       taskId: 'T-stall-acked',
       status: 'stalled',
       stalledAt,
-      ackedAt: Date.now() - WINDOW,
+      // Acked BEFORE the stall: signed for, never delivered (T-mwumb28l shape).
+      ackedAt: Date.now() - WINDOW * 2,
       claimWarnedAt: Date.now() - WINDOW * 2,
       notifiedAt: Date.now() - WINDOW * 3,
     }),
@@ -338,8 +416,10 @@ test('claim sweep: a stalled row the worker had claimed is resumed to pending', 
     assert.ok(Number(row.resumedAt) > 0, `${taskId} must record resumedAt`)
     assert.equal(row.stalledAt, stalledAt, `${taskId} keeps stalledAt as history`)
   }
-  assert.match(logs.join('\n'), /digest task resumed task=T-stall-started .*reason=started/)
-  assert.match(logs.join('\n'), /digest task resumed task=T-stall-acked .*reason=acked/)
+  assert.equal(taskRows.get('T-stall-started').resumedReason, 'started-after-stall')
+  assert.equal(taskRows.get('T-stall-acked').resumedReason, 'acked-not-delivered')
+  assert.match(logs.join('\n'), /digest task resumed task=T-stall-started .*reason=started-after-stall/)
+  assert.match(logs.join('\n'), /digest task resumed task=T-stall-acked .*reason=acked-not-delivered/)
 
   // The whole point: a resumed row must not be re-stalled by the next sweep.
   const logCount = logs.length

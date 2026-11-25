@@ -4458,8 +4458,10 @@ async function main() {
     const ok =
       stored.json?.task?.requester === 'pilot · 协调' &&
       stored.json?.task?.requester !== null &&
-      /requester inferred from workspace: pilot · 协调/.test(log)
-    report('receipt: a missing requester is inferred from the unique coordinator in the same cwd', ok, `requester=${JSON.stringify(stored.json?.task?.requester ?? null)} inferredLine=${/requester inferred/.test(log)}`)
+      // T-mwwdyc7i: titles are no longer identity, so this now goes through the last-resort
+      // path and must say so out loud. The registry has no approved claim for this cwd here.
+      /WARN requester inferred from workspace by TITLE \(deprecated, source=title-fallback\): pilot · 协调/.test(log)
+    report('receipt: a missing requester is inferred from the unique coordinator in the same cwd', ok, `requester=${JSON.stringify(stored.json?.task?.requester ?? null)} deprecated=${/source=title-fallback/.test(log)}`)
   })
 
   await runCase('receipt: two coordinators in the same cwd stay ambiguous and are not guessed', async (boot) => {
@@ -4488,9 +4490,9 @@ async function main() {
     const log = threadLog(logFile)
     const ok =
       stored.json?.task?.requester === null &&
-      /requester inference ambiguous: 2 coordinator sessions share cwd/.test(log) &&
+      /requester inference ambiguous \(source=title-fallback\): 2 candidates share cwd/.test(log) &&
       /nobody was notified/.test(log)
-    report('receipt: two coordinators in the same cwd stay ambiguous and are not guessed', ok, `requester=${String(stored.json?.task?.requester)} ambiguous=${/requester inference ambiguous: 2/.test(log)} warn=${/nobody was notified/.test(log)}`)
+    report('receipt: two coordinators in the same cwd stay ambiguous and are not guessed', ok, `requester=${String(stored.json?.task?.requester)} ambiguous=${/requester inference ambiguous/.test(log)} warn=${/nobody was notified/.test(log)}`)
   })
 
   await runCase('receipt: a reused taskId is flagged on the row and in the log', async (boot) => {
@@ -4666,7 +4668,7 @@ async function main() {
       5000,
     )
     const log = threadLog(logFile)
-    const ok = Boolean(delivered) && /requester inferred from workspace: orphan · 协调/.test(log)
+    const ok = Boolean(delivered) && /WARN requester inferred from workspace by TITLE \(deprecated, source=title-fallback\): orphan · 协调/.test(log)
     report('restart: a requester-less orphan uses the unique coordinator from its cwd', ok, `deliveredTo=${delivered?.sessionId ?? '-'} inferred=${/requester inferred/.test(log)}`)
   })
 
@@ -4693,7 +4695,7 @@ async function main() {
     const receipts = orphanReceipts(h).filter((receipt) => receipt.taskId === 'T-ORPH-AMB')
     const ok =
       lost?.json?.task?.status === 'lost' &&
-      /requester inference ambiguous: 2 coordinator sessions share cwd/.test(log) &&
+      /requester inference ambiguous \(source=title-fallback\): 2 candidates share cwd/.test(log) &&
       // No requester survives inference -> the lost receipt falls back to file-only + WARN.
       /receipt T-ORPH-AMB lost → file only \(requester=无/.test(log) &&
       /nobody was notified/.test(log) &&
@@ -6475,9 +6477,15 @@ async function main() {
     }
   })
 
-  await runCase('roles: a human role survives alongside inferred roles', async (boot) => {
+  // T-mwwdyc7i changes the contract this case used to assert. It used to require that a title
+  // (`mesh · waker`) be merged INTO an explicit roles list; that is title-as-identity, and it is
+  // how a renamed session used to rewrite the registry. The hand-written role must still survive
+  // (T-286), and the title-derived one must now stay out — reported instead of applied.
+  await runCase('roles: an explicit roles list is not overwritten by title derivation', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'roles-human')
+    const logFile = path.join(os.tmpdir(), `waker-roles-human-${process.pid}-${Date.now()}.log`)
     const h = await boot({
+      config: { logFile },
       seedSessions: [{ id: 'session-waker', title: 'mesh · waker', cwd }],
       prepareHome: (home) => {
         const registryDir = path.join(home, '.dsh', 'mesh-waker')
@@ -6489,8 +6497,16 @@ async function main() {
       },
     })
     const entry = registryOf(h).workspaces?.['roles-human']
-    const ok = JSON.stringify(entry?.roles) === JSON.stringify(['custom-role', 'waker'])
-    report('roles: a human role survives alongside inferred roles', ok, `roles=${JSON.stringify(entry?.roles ?? [])}`)
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok =
+      JSON.stringify(entry?.roles) === JSON.stringify(['custom-role']) &&
+      JSON.stringify(entry?.rolesUnrecognized) === JSON.stringify(['waker']) &&
+      /title-derived roles waker not applied \(roles are registry-explicit\)/.test(log)
+    report(
+      'roles: an explicit roles list is not overwritten by title derivation',
+      ok,
+      `roles=${JSON.stringify(entry?.roles ?? [])} unrecognized=${JSON.stringify(entry?.rolesUnrecognized ?? [])} logged=${/not applied/.test(log)}`,
+    )
   })
 
   await runCase('roles: cleanup is idempotent across restarts', async (boot) => {
@@ -6602,6 +6618,217 @@ async function main() {
     report('coordinator: a legacy scalar is not rewritten by titles', ok, `coordinator=${entry?.coordinator ?? '-'} rewritten=${/coordinator session-coord3-old ->/.test(log)}`)
   })
 
+  // ── T-mwwdyc7i: the registry is the identity source; titles are a deprecated last resort ──
+  // The real incident: session-7fa21aa4 (title `mesh · 协调`) kept receiving every unattributed
+  // receipt because it was the only unarchived title-ish session in the repo root. A registered
+  // approval must win over that, and the title path must say so when it is used.
+  const registryWithCoordinator = (cwd, coordinators) => ({
+    machine: 'm',
+    workspaces: { 'reg-ws': { cwd, coordinators, roles: [] } },
+  })
+  const approvedMember = (sessionId, overrides = {}) => ({
+    sessionId,
+    status: 'approved',
+    isPrimary: true,
+    claimedAt: Date.now() - 60_000,
+    approvedBy: 'owner',
+    requestedAt: Date.now() - 120_000,
+    permanent: true,
+    leaseUntil: null,
+    ...overrides,
+  })
+
+  await runCase('receipt: the registry coordinator wins over a title-matching session', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'reg-wins-repo')
+    const logFile = path.join(os.tmpdir(), `waker-regwin-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile, receiptMode: 'queue' },
+      seedSessions: [
+        { id: 'session-reg-target', title: 'worker', cwd },
+        // B: looks like a coordinator, is NOT registered. The old code picked this one.
+        { id: 'session-reg-imposter', title: 'mesh · 协调', cwd },
+        // A: registered primary.
+        { id: 'session-reg-real', title: 'reg lead', cwd },
+      ],
+      prepareHome: (home) => {
+        const dir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(
+          path.join(dir, 'workspaces.json'),
+          `${JSON.stringify(registryWithCoordinator(cwd, [approvedMember('session-reg-real')]), null, 2)}\n`,
+        )
+      },
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'registry wins', meta: { taskId: 'T-REG-WIN' } },
+    })
+    h.emit('session/event', { id: 'session-reg-target' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-reg-target' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-reg-real'), 4000)
+    const toImposter = h.state.prompts.some((prompt) => prompt.sessionId === 'session-reg-imposter')
+    const row = await request(h.base, '/mesh/tasks/T-REG-WIN')
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok =
+      Boolean(delivered) &&
+      !toImposter &&
+      row.json?.task?.requester === 'reg lead' &&
+      /requester inferred from workspace: reg lead \(session-reg-real\) source=registry why=primary/.test(log) &&
+      !/source=title-fallback/.test(log)
+    report(
+      'receipt: the registry coordinator wins over a title-matching session',
+      ok,
+      `deliveredTo=${delivered ? 'session-reg-real' : '-'} imposter=${toImposter} requester=${JSON.stringify(row.json?.task?.requester ?? null)} registry=${/source=registry/.test(log)}`,
+    )
+  })
+
+  await runCase('receipt: an expired lease falls back to the title path and says so', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'reg-expired-repo')
+    const logFile = path.join(os.tmpdir(), `waker-regexp-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile, receiptMode: 'queue' },
+      seedSessions: [
+        { id: 'session-exp-target', title: 'worker', cwd },
+        { id: 'session-exp-coord', title: 'mesh · 协调', cwd },
+      ],
+      prepareHome: (home) => {
+        const dir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(
+          path.join(dir, 'workspaces.json'),
+          `${JSON.stringify(
+            registryWithCoordinator(cwd, [
+              approvedMember('session-exp-gone', { isPrimary: true, permanent: false, leaseUntil: Date.now() - 60_000 }),
+            ]),
+            null,
+            2,
+          )}\n`,
+        )
+      },
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'expired lease', meta: { taskId: 'T-REG-EXP' } },
+    })
+    h.emit('session/event', { id: 'session-exp-target' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-exp-target' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-exp-coord'), 4000)
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok =
+      Boolean(delivered) &&
+      /WARN requester inferred from workspace by TITLE \(deprecated, source=title-fallback\): mesh · 协调 \(session-exp-coord\)/.test(log) &&
+      /titles are not identity/.test(log)
+    report(
+      'receipt: an expired lease falls back to the title path and says so',
+      ok,
+      `deliveredTo=${delivered ? 'session-exp-coord' : '-'} deprecatedWarn=${/titles are not identity/.test(log)}`,
+    )
+  })
+
+  await runCase('receipt: several live claims without a primary stay ambiguous and are not guessed', async (boot) => {
+    const cwd = path.join(os.tmpdir(), 'Projects', 'reg-amb-repo')
+    const logFile = path.join(os.tmpdir(), `waker-regamb-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      config: { logFile, receiptMode: 'queue' },
+      seedSessions: [
+        { id: 'session-ramb-target', title: 'worker', cwd },
+        { id: 'session-ramb-a', title: 'mesh · 协调', cwd },
+        { id: 'session-ramb-b', title: 'mesh · 协调 2', cwd },
+      ],
+      prepareHome: (home) => {
+        const dir = path.join(home, '.dsh', 'mesh-waker')
+        fs.mkdirSync(dir, { recursive: true })
+        // Two approved, permanent claims and NO primary flag: the loader re-derives isPrimary
+        // from claimedAt, so seeding two primaries cannot survive a round trip. What must not
+        // happen is picking one of them by recency — the registry says "several", not "this one".
+        fs.writeFileSync(
+          path.join(dir, 'workspaces.json'),
+          `${JSON.stringify(
+            registryWithCoordinator(cwd, [
+              approvedMember('session-ramb-a', { isPrimary: false, claimedAt: Date.now() - 200_000 }),
+              approvedMember('session-ramb-b', { isPrimary: false, claimedAt: Date.now() - 100_000 }),
+            ]),
+            null,
+            2,
+          )}\n`,
+        )
+      },
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: { title: 'worker', text: 'two claims', meta: { taskId: 'T-REG-AMB' } },
+    })
+    h.emit('session/event', { id: 'session-ramb-target' }, { type: 'turn/start', turn: 1 })
+    h.emit('session/event', { id: 'session-ramb-target' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
+    await sleep(600)
+    const toA = h.state.prompts.some((prompt) => prompt.sessionId === 'session-ramb-a')
+    const toB = h.state.prompts.some((prompt) => prompt.sessionId === 'session-ramb-b')
+    const row = await request(h.base, '/mesh/tasks/T-REG-AMB')
+    const log = fs.readFileSync(logFile, 'utf8')
+    const ok =
+      !toA &&
+      !toB &&
+      row.json?.task?.requester === null &&
+      /requester inference ambiguous \(source=registry why=no-primary\)/.test(log) &&
+      /receipt stays file-only/.test(log)
+    report(
+      'receipt: several live claims without a primary stay ambiguous and are not guessed',
+      ok,
+      `toA=${toA} toB=${toB} requester=${String(row.json?.task?.requester)} registryAmbiguous=${/why=no-primary/.test(log)}`,
+    )
+  })
+
+  await runCase('coordinator: liveRequesterOf refuses to pick among several live claims', async () => {
+    const { liveRequesterOf } = await import(pathToFileURL(path.join(REPO, 'plugins', 'mesh-waker', 'lib', 'coordinators.mjs')).href)
+    const now = Date.now()
+    // Two members both flagged primary: the pure helper must report ambiguity, never a winner.
+    const twoPrimaries = liveRequesterOf(
+      {
+        coordinators: [
+          { sessionId: 'session-x', status: 'approved', isPrimary: true, permanent: true, leaseUntil: null },
+          { sessionId: 'session-y', status: 'approved', isPrimary: true, permanent: true, leaseUntil: null },
+        ],
+      },
+      { now },
+    )
+    // No primary flag but two live claims: also ambiguous (do not fall back to recency).
+    const noPrimary = liveRequesterOf(
+      {
+        coordinators: [
+          { sessionId: 'session-x', status: 'approved', isPrimary: false, permanent: true, leaseUntil: null },
+          { sessionId: 'session-y', status: 'approved', isPrimary: false, permanent: true, leaseUntil: null },
+        ],
+      },
+      { now },
+    )
+    // One live primary plus one expired: the live one wins.
+    const oneLive = liveRequesterOf(
+      {
+        coordinators: [
+          { sessionId: 'session-live', status: 'approved', isPrimary: true, permanent: true, leaseUntil: null },
+          { sessionId: 'session-dead', status: 'approved', isPrimary: false, permanent: false, leaseUntil: now - 1000 },
+        ],
+      },
+      { now },
+    )
+    // Nothing live, no legacy scalar: none.
+    const none = liveRequesterOf({ coordinators: [] }, { now })
+    const ok =
+      twoPrimaries.kind === 'ambiguous' &&
+      twoPrimaries.why === 'multiple-primaries' &&
+      noPrimary.kind === 'ambiguous' &&
+      noPrimary.why === 'no-primary' &&
+      oneLive.kind === 'one' &&
+      oneLive.sessionId === 'session-live' &&
+      oneLive.why === 'primary' &&
+      none.kind === 'none'
+    report(
+      'coordinator: liveRequesterOf refuses to pick among several live claims',
+      ok,
+      `twoPrimaries=${twoPrimaries.kind}/${twoPrimaries.why} noPrimary=${noPrimary.kind}/${noPrimary.why} oneLive=${oneLive.kind}/${oneLive.why} none=${none.kind}`,
+    )
+  })
+
   await runCase('coordinator: requester inference reaches the numbered coordinator', async (boot) => {
     const cwd = path.join(os.tmpdir(), 'Projects', 'coord4-repo')
     const logFile = path.join(os.tmpdir(), `waker-coord4-${process.pid}-${Date.now()}.log`)
@@ -6620,7 +6847,7 @@ async function main() {
     h.emit('session/event', { id: 'session-coord4-worker' }, { type: 'turn/end', turn: 1, reason: { kind: 'completed' } })
     const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-coord4'), 4000)
     const log = fs.readFileSync(logFile, 'utf8')
-    const ok = Boolean(delivered) && /requester inferred from workspace: mesh · 协调 2 \(session-coord4\)/.test(log)
+    const ok = Boolean(delivered) && /WARN requester inferred from workspace by TITLE \(deprecated, source=title-fallback\): mesh · 协调 2 \(session-coord4\)/.test(log)
     report('coordinator: requester inference reaches the numbered coordinator', ok, `deliveredTo=${delivered ? 'session-coord4' : '-'} inferred=${/requester inferred/.test(log)}`)
   })
 
@@ -6647,7 +6874,7 @@ async function main() {
     const prompts = h.state.prompts.filter(
       (prompt) => prompt.sessionId === 'session-coord5-a' || prompt.sessionId === 'session-coord5-b',
     )
-    const ok = settles.length === 1 && prompts.length === 0 && /requester inference ambiguous: 2 coordinator sessions/.test(log)
+    const ok = settles.length === 1 && prompts.length === 0 && /requester inference ambiguous \(source=title-fallback\): 2 candidates/.test(log)
     report('coordinator: indistinguishable candidates stay ambiguous', ok, `receipts=${settles.length} prompts=${prompts.length} ambiguous=${/inference ambiguous/.test(log)}`)
   })
 

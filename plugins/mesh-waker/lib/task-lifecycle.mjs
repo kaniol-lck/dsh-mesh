@@ -130,10 +130,16 @@ export function createTaskLifecycle(deps) {
    * anyone. 5 of the 7 stalled rows on this machine had `startedAt` or `ackedAt`, i.e. the
    * worker had in fact claimed them.
    *
-   * So the sweep now also looks backwards: a stalled row that shows evidence of being claimed
-   * (started or acked) and is not settled goes back to `pending` with `resumedAt`. `stalledAt`
-   * is kept on purpose — `claimState()` treats it as "already escalated", which is exactly why
-   * the resumed row does not immediately stall again on the next sweep.
+   * The criteria are tiered because "claimed" has two different shapes (T-mwurolzr):
+   *
+   *   1. `startedAt > stalledAt` — the worker began *after* the alarm: a late claim, resume.
+   *   2. `ackedAt > 0` (and no start after the stall) — the row was *already signed for* when the
+   *      sweep called it "nobody claimed it" (T-mwumb28l: acked 12:37, stalled 12:36+59m). That
+   *      is "claimed but not delivered", not "unseen"; resume it too, with its own reason.
+   *   3. neither — genuinely announced-and-never-touched, stays stalled.
+   *
+   * `stalledAt` is kept on purpose — `claimState()` treats it as "already escalated", which is
+   * exactly why a resumed row is not immediately stalled again on the next sweep.
    */
   function resumeClaimedStalls(now) {
     const resumed = []
@@ -142,12 +148,16 @@ export function createTaskLifecycle(deps) {
       // Settled rows are history: the two historical cases (T4F-20261101-11 / T-278) must stay
       // untouched, and a real not-started settlement also carries settledAt.
       if (row.settledAt) continue
-      const started = Number(row.startedAt) > 0
-      const acked = Number(row.ackedAt) > 0
-      if (!started && !acked) continue
-      deps.taskRegistry.updateTaskRow(taskId, { status: 'pending', resumedAt: now })
+      const stalledAt = Number(row.stalledAt) || 0
+      const startedAt = Number(row.startedAt) || 0
+      const ackedAt = Number(row.ackedAt) || 0
+      let reason = null
+      if (startedAt > 0 && startedAt > stalledAt) reason = 'started-after-stall'
+      else if (ackedAt > 0) reason = 'acked-not-delivered'
+      if (!reason) continue
+      deps.taskRegistry.updateTaskRow(taskId, { status: 'pending', resumedAt: now, resumedReason: reason })
       deps.fileLog(
-        `digest task resumed task=${taskId} session=${row.targetSessionId} reason=${started ? 'started' : 'acked'} stalledAt=${row.stalledAt ?? '-'}`,
+        `digest task resumed task=${taskId} session=${row.targetSessionId} reason=${reason} stalledAt=${row.stalledAt ?? '-'} startedAt=${startedAt || '-'} ackedAt=${ackedAt || '-'}`,
       )
       resumed.push(taskId)
     }
@@ -189,9 +199,22 @@ export function createTaskLifecycle(deps) {
           deps.fileLog(`digest claim advisory failed task=${taskId}: ${error?.message ?? error}`)
         }
       } else {
-        // Twice the window and still nothing: say so on the board, keep the row for triage.
-        deps.taskRegistry.updateTaskRow(taskId, { status: 'stalled', stalledAt: now })
-        deps.fileLog(`WARN digest task stalled task=${taskId} session=${row.targetSessionId} waited=${waited}ms`)
+        // Twice the window and still nothing. Two very different situations share this point
+        // (T-mwurolzr): a row the worker never touched, and one it signed for and then did not
+        // deliver (T-mwumb28l: acked 12:37, stalled 13:36). Only the first is "unclaimed"; the
+        // second must not be recorded as if nobody had seen it.
+        const ackedAt = Number(row.ackedAt) || 0
+        if (ackedAt > 0) {
+          if (Number(row.unfulfilledAt) > 0) continue
+          deps.taskRegistry.updateTaskRow(taskId, { unfulfilledAt: now, stalledReason: 'acked-not-settled' })
+          deps.fileLog(
+            `WARN digest task unfulfilled task=${taskId} session=${row.targetSessionId} waited=${waited}ms reason=acked-not-settled ackedAt=${ackedAt} — signed for but never declared; not a stall`,
+          )
+          continue
+        }
+        // Genuinely announced and never touched: mark it stalled so triage can see it.
+        deps.taskRegistry.updateTaskRow(taskId, { status: 'stalled', stalledAt: now, stalledReason: 'unclaimed' })
+        deps.fileLog(`WARN digest task stalled task=${taskId} session=${row.targetSessionId} waited=${waited}ms reason=unclaimed`)
       }
     }
   }
