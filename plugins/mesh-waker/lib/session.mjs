@@ -97,6 +97,7 @@ export const ROLE_UNRECOGNIZED_MAX = 20
  */
 export function titleRoleCandidate(title) {
   const text = String(title ?? '')
+  // title-identity-allowed: definition — a coordinator title owns no role; this IS the parser
   if (isCoordinatorTitle(text)) return null
   const match = /·\s*([^\s·]+)\s*$/.exec(text)
   return match ? match[1] : null
@@ -110,6 +111,7 @@ export function classifyRoleCandidates(titles, roleNames = ROLE_NAMES) {
   const known = new Set()
   const unknown = new Set()
   for (const title of titles ?? []) {
+    // title-identity-allowed: definition — this function IS the single title parser (T-295)
     const candidate = titleRoleCandidate(title)
     if (!candidate) continue
     if (roleNames.includes(candidate)) known.add(candidate)

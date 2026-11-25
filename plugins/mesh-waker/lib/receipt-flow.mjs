@@ -79,6 +79,7 @@ export function createReceiptFlow(deps) {
         session.id !== target.id &&
         !session.archived &&
         String(session.cwd ?? '').trim() === cwd &&
+        // title-identity-allowed: fallback — reached only after the registry reported no live claim, logged as source=title-fallback
         isCoordinatorTitle(session.title),
     )
     if (matches.length === 1) return { kind: 'one', session: matches[0], source: 'title-fallback' }

@@ -352,7 +352,9 @@ requester 缺失时按**目标会话的 cwd** 推断，判据分两层（T-mwwdy
 1. **注册表真源**（首选）：`workspaces.json` 里该 cwd 条目的 `coordinators[]`，取 `status=approved` 且（`permanent=true` 或 `leaseUntil > now`）的成员。恰好一个 → 用它，日志 `requester inferred from workspace: <title> (<id>) source=registry why=primary|sole-approved|legacy-scalar`；**多个都合格 → 不猜**，保持 `ambiguous` + file-only（`source=registry why=multiple-primaries|no-primary`）。活跃时间不再用来挑赢家。
 2. **标题退化**（仅当注册表没有任何有效声明）：同 cwd 下未归档、标题以 `· 协调`/`· coordinator` 结尾的会话，恰好 1 个才用；**且必定打 `WARN … by TITLE (deprecated, source=title-fallback)`**，日志里写明「titles are not identity」。0 个或多个 → `requester inference ambiguous (source=title-fallback)`，不猜。
 
-**为什么**：标题是用户随时可改的显示文本，不是身份。`.worklog/WORKLOG.md:594`（2026-11-19）记过一次同类事故（`coord-scope` 按标题选会话，改名后恒报 0 越界），当时只修了那一个脚本；4 天后同一个正则在这里发作——旧会话 `session-7fa21aa4`（标题 `mesh · 协调`、未归档）成了仓库根下唯一「协调」标题会话，所有未署名回执全推给它。门禁 `scripts/check-no-title-identity.mjs` 就是为此加的：把标题变成判断的调用点必须显式声明 `accounting`/`display`/`fallback`，否则 CI 红。
+**为什么**：标题是用户随时可改的显示文本，不是身份。`.worklog/WORKLOG.md:594`（2026-11-19）记过一次同类事故（`coord-scope` 按标题选会话，改名后恒报 0 越界），当时只修了那一个脚本；4 天后同一个正则在这里发作——旧会话 `session-7fa21aa4`（标题 `mesh · 协调`、未归档）成了仓库根下唯一「协调」标题会话，所有未署名回执全推给它。门禁 `scripts/check-no-title-identity.mjs` 就是为此加的：把标题变成判断的调用点必须在**调用行本身或紧邻上一行**写 `// title-identity-allowed: <理由>`，否则 CI 红。
+
+判据是**行级**的（T-mwwfvvzw 返工）：定义行（`export function isCoordinatorTitle(`）与 `export { … }` 列表自动放行，其余调用点没有就近理由就红——**没有**文件级豁免，也**不**再「函数体内任意位置出现 fallback 就放行」（首版正是这两条导致 `index.js` 从未被扫描、三种插针全部漏报）。行号漂移会红，逼人维护。门禁自带 11 例测试 `test/check-no-title-identity.test.mjs`。
 
 `roles` 与 `GET /mesh/session/identity` 的 `role` 同理降级为显示/兼容：条目已有显式 `roles` 时以它为准，标题推导只进 `rolesUnrecognized`；`role` 优先读 `workers[role].sessionId`，并带 `roleSource`（`registry`/`registry-ambiguous`/`title-fallback`/`none`）说明来源。
 

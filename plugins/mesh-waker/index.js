@@ -2721,6 +2721,7 @@ export function apply(ctx, config) {
       if (registered.length === 1) return { role: registered[0].role, source: 'registry' }
       if (registered.length > 1) return { role: null, source: 'registry-ambiguous' }
       try {
+        // title-identity-allowed: display — `role` is reporting only (never routing/settlement), reported as source=title-fallback
         const derived = classifyRoleCandidates([session.title]).roles[0] ?? null
         return derived ? { role: derived, source: 'title-fallback' } : { role: null, source: 'none' }
       } catch {
@@ -4621,6 +4622,7 @@ export function apply(ctx, config) {
       // whatever the current titles happen to look like — it only records, separately, which
       // title-derived roles are NOT registered (`rolesUnrecognized`), so the divergence stays
       // visible instead of being silently applied.
+      // title-identity-allowed: display — feeds rolesUnrecognized/roles cleanup, never identity or routing
       const { roles: knownRoles, unrecognized } = classifyRoleCandidates(list.map((session) => session.title))
       const registeredFromWorkers = new Set(
         Object.entries(entry.workers && typeof entry.workers === 'object' ? entry.workers : {})
