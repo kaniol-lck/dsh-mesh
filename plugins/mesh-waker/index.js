@@ -664,6 +664,12 @@ function normalizeBase(config) {
     // How often the claim sweep looks at digest tasks (a sweep, not a per-task timer, so a
     // restart picks up the rows it loaded).
     claimSweepMs: clampInterval(c.claimSweepMs, 15_000, 500, 600_000),
+    // T-mwxjfvwn: a restart cannot tell "session died" from "session just hasn't spoken since we
+    // came back". So orphan rows are NOT judged at boot; they are held for a grace window and
+    // only marked lost if the session never shows a sign of life in that window. This has to be
+    // long enough to cover a turn that is mid-flight at restart. The floor is 500ms so tests can
+    // exercise both phases without waiting five minutes.
+    restartGraceMs: clampInterval(c.restartGraceMs, 300_000, 500, 3_600_000),
     // The receipt digest answers a different deadline (a dispatcher waiting on a completion),
     // so it gets its own key instead of sharing the task-digest window (T-476).
     receiptNotifyWarnMs: clampInterval(c.receiptNotifyWarnMs, 90_000, 1000, 600_000),
@@ -6016,6 +6022,16 @@ export function apply(ctx, config) {
         pendingTasks.set(taskId, task)
         const timer = setTimeout(() => {
           receiptTimers.delete(timer)
+          // T-mwxjfvwn: a restored batch task is not automatically dead. The plugin restarting
+          // says nothing about the session — T-MWXHO5U1 was declared lost while still running.
+          // Ask first; only a session that is gone, archived, or quiet gets the lost verdict.
+          const liveness = receiptFlow.sessionAlive(row.sessionId)
+          if (liveness.alive || !liveness.known) {
+            fileLog(
+              `batch ${batchId} task ${taskId} kept pending after restart (session ${row.sessionId}: ${liveness.reason}); restart reconciliation owns the verdict`,
+            )
+            return
+          }
           lifecycle.settleTask(taskId, task, {
             turn: null,
             status: 'lost',
@@ -7115,10 +7131,23 @@ export function apply(ctx, config) {
   }
   // Migrate inline bodies before anything reads or rewrites rows (idempotent, T-277).
   compactTaskTexts()
-  // Once per process: pending/started rows from a previous host process can never settle.
+  // Once per process: pending/started rows from a previous host process have no in-memory
+  // handle, but that alone does not prove the task is dead — the DSH session is persisted and
+  // may still be working (T-mwxjfvwn). reconcileOrphanTasks() only writes `lost` when the
+  // session is gone or archived; everything else is held for the grace window below, because at
+  // boot a persisted session reports live=false / lastActivityAt=null until it emits again.
   void receiptFlow.reconcileOrphanTasks().catch((error) => {
     fileLog(`restart reconciliation failed: ${error && error.message ? error.message : error}`)
   })
+  // Second phase: judge the held rows once the grace window has passed. By then "still no sign
+  // of life" is evidence instead of the absence of it. One-shot, never a recurring sweep.
+  const restartRecheckTimer = setTimeout(() => {
+    void receiptFlow.recheckDeferredTasks().catch((error) => {
+      fileLog(`restart recheck failed: ${error && error.message ? error.message : error}`)
+    })
+  }, c.restartGraceMs)
+  restartRecheckTimer.unref?.()
+  receiptTimers.add(restartRecheckTimer)
   restoreBatches()
   autoBindTopics()
   batchSweepTimer = setInterval(sweepBatches, Math.max(1000, Math.min(30000, Math.floor(c.waitLongMs / 2))))

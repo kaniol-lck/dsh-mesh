@@ -213,6 +213,7 @@ export function createTaskLifecycle(deps) {
           continue
         }
         // Genuinely announced and never touched: mark it stalled so triage can see it.
+        // death-allowed: not a restart verdict — claimState() read the row's own markers
         deps.taskRegistry.updateTaskRow(taskId, { status: 'stalled', stalledAt: now, stalledReason: 'unclaimed' })
         deps.fileLog(`WARN digest task stalled task=${taskId} session=${row.targetSessionId} waited=${waited}ms reason=unclaimed`)
       }

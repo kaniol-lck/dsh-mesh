@@ -54,6 +54,11 @@ jobs:
       - name: Title is never an identity
         run: node scripts/check-no-title-identity.mjs
 
+      # 内存里没有 ≠ 任务死了。2026-11-26 T-MWXHO5U1 被判 lost 时会话还活着 5 分半，
+      # 回执却写着「resend if still needed」——把「本进程忘了」当成「任务没了」。
+      - name: Memory is not the session
+        run: node scripts/check-no-memory-only-death.mjs
+
       - name: Tool contract guard
         run: node scripts/check-tool-contract.mjs --no-failures
 

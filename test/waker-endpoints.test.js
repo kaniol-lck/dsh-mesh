@@ -4590,11 +4590,17 @@ async function main() {
     }
   }
 
-  await runCase('restart: pending and started orphans both become lost and get receipts', async (boot) => {
+  await runCase('restart: pending and started orphans whose session is gone both become lost', async (boot) => {
     const logFile = fileLogFile()
+    // T-mwxjfvwn: a row whose session still EXISTS is now held for the restart grace window
+    // instead of being declared lost at boot — that is the T-MWXHO5U1 fix. A row whose session
+    // is gone has no such ambiguity, so these point at an absent session.
     const h = await boot({
       seedSessions: [{ id: 'session-orphan-target', title: 'orphan target' }],
-      tasksSeed: [seedOrphan('T-ORPH-P', { status: 'pending' }), seedOrphan('T-ORPH-S', { status: 'started', startedAt: Date.now() - 30 * 1000 })],
+      tasksSeed: [
+        seedOrphan('T-ORPH-P', { status: 'pending', targetSessionId: 'session-orphan-gone' }),
+        seedOrphan('T-ORPH-S', { status: 'started', startedAt: Date.now() - 30 * 1000, targetSessionId: 'session-orphan-gone' }),
+      ],
       config: { logFile, receiptMode: 'file' },
     })
     const pending = await waitFor(async () => {
@@ -4616,7 +4622,7 @@ async function main() {
       /task T-ORPH-P marked lost after restart/.test(log) &&
       /task T-ORPH-S marked lost after restart/.test(log)
     report(
-      'restart: pending and started orphans both become lost and get receipts',
+      'restart: pending and started orphans whose session is gone both become lost',
       ok,
       `pending=${pending?.json?.task?.status}/${String(pending?.json?.task?.settledAt)} started=${started?.json?.task?.status} receipts=${receipts.length}`,
     )
@@ -4661,6 +4667,9 @@ async function main() {
         { id: 'session-orph-coord', title: 'orphan · 协调', cwd },
       ],
       tasksSeed: [seedOrphan('T-ORPH-INFER', { status: 'pending' })],
+      // T-mwxjfvwn: an archived session is still judged lost immediately (it cannot finish),
+      // and it keeps its cwd, so the requester-inference path under test is unchanged.
+      archivedIds: ['session-orphan-target'],
       config: { logFile, receiptMode: 'queue', receiptTo: '' },
     })
     const delivered = await waitFor(
@@ -4684,6 +4693,7 @@ async function main() {
         { id: 'session-orph-b', title: 'orphan · coordinator', cwd, mtime: sameTime },
       ],
       tasksSeed: [seedOrphan('T-ORPH-AMB', { status: 'pending' })],
+      archivedIds: ['session-orphan-target'],
       config: { logFile, receiptMode: 'queue', receiptTo: '' },
     })
     const lost = await waitFor(async () => {

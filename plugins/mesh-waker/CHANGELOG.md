@@ -14,6 +14,16 @@
 
 ### Fixed
 
+- **重启不再等于任务死了**（T-mwxjfvwn，owner 2026-11-26 直接问「会话还没结束，只是出现了请求重试就投递了 lost 回执？」；同类第 3 次）：`reconcileOrphanTasks()` 用一条事实判死——「本进程内存里没有这行」——但那说的是**内存**，不是**任务**。DSH 会话是持久化的，重启后它还在、还能继续干活。`T-MWXHO5U1` 在 12:30:02 被判 `lost`，会话 12:35:39 仍在活动，回执却写着「session restarted before this task finished; resend if still needed」——一句假话，换来一次真实的重派。
+  - **实测前提**（不是推理）：重启那一刻，持久化会话报告 `live=false`、`turnOpen=false`、`lastActivityAt=null`，要等它被恢复并发出第一个事件才有信号。所以「启动时用 live 判死」本身也不成立，改成两阶段：
+  - **boot 阶段**只判有证据的：会话不存在 / 已归档 → `lost`（照旧）；会话 `live` / `turnOpen` / 本次启动后有活动 / 建单后有活动 → `defer`（回 `pending`，记 `deferredAt` + `deferredReason: 'session-alive-after-restart'`，**不发回执**）；其余 → **hold**（`deferredReason: 'awaiting-restart-grace'`），**不判死**。
+  - **recheck 阶段**（`restartGraceMs`，默认 5 分钟，一次性不循环）：到点后仍无任何生命迹象才算证据，判 `lost` 并发回执；期间恢复的则清掉 deferred 字段留在 `pending`。
+  - **探针失败**（`listLocalSessions()` 抛错）→ 整轮跳过 + `WARN`，**一行都不判**。从失败的探针推出「死了」是同一个错误换了件衣服。
+- **有证据地复活历史误判**（T-mwxjfvwn）：`lost` + `reasonDetail === 'host restart'` + 会话 `live` + **`lastActivityAt > settledAt`**（被判死之后还活过）→ 回 `pending` + `resurrectedAt`/`resurrectedReason: 'session-active-after-lost'`。`lastActivityAt > lostAt` 是硬条件，达不到的一律不动；非 `host restart` 的 `lost` 不参与。11-25 从 `stalled` 恢复、11-26 又被判 `lost` 的 5 条属于这一类。
+- **批次恢复同源缺陷**（T-mwxjfvwn，由新门禁抓出）：`restoreBatches()` 重启后把每个开放批次任务直接 `settleTask(..., status: 'lost')`。现在先问 `sessionAlive()`，活着或探针不可知就保留 `pending` 并记日志，交给 restart reconciliation 判。
+- 新增门禁 `scripts/check-no-memory-only-death.mjs`（T-mwxjfvwn）：写 `status: 'lost'|'stalled'` 的行级判定，若同一函数内没有活性证据（`live`/`turnOpen`/`lastActivityAt`/`probeSessions`…）且判定行本身或紧邻上一行没有 `death-allowed: <理由>` → 红。**无文件级豁免**；注释不算证据（词边界匹配，且检查前剥离注释）；`buildReceipt({status:'lost'})` 是描述而非判定，不计入。已接入 `.github/workflows/plugin-check.yml`。**红检 5/5**（函数内判死 / 顶层判死 / 有别的变量但无活性探测 / 空理由标记 / 标记隔两行），并自带 9 例测试 `test/check-no-memory-only-death.test.mjs`。
+- 任务行新增 `deferredAt` / `deferredReason` / `resurrectedAt` / `resurrectedReason` 四个字段并暴露到 `/mesh/tasks`（T-mwxjfvwn）：重启后「为什么这行还是 pending」不必翻日志。
+- 新增配置 `restartGraceMs`（默认 300000，clamp 500–3600000）：重启后判定孤儿任务的宽限期。
 - **标题不再当身份**（T-mwwdyc7i，owner 已纠正两次）：`inferRequesterFromWorkspace()` 原先按「同 cwd 下标题像协调的会话」推断派单方。`.worklog/WORKLOG.md:594`（11-19）已记过 `coord-scope` 犯同一个错并只修了那一个脚本；4 天后同一正则在这里原样发作——旧会话 `session-7fa21aa4`（标题 `mesh · 协调`、未归档）成了仓库根下唯一「协调」标题会话，于是**所有未署名回执全推给它**。现在先读注册表真源（`coordinators[]` 里 `status=approved` 且 `permanent` 或 `leaseUntil` 未过期）；注册表说「多个都合格」就保持 `ambiguous` + file-only，不按活跃时间挑一个；只有注册表**没有任何有效声明**时才退到标题匹配，且打 `WARN … by TITLE (deprecated, source=title-fallback)`。日志显式区分 `source=registry` / `source=title-fallback`。
 - 顺带修掉一处同源的隐式选择：启动对账里的 `syncPrimary()` 会在「多个 live 声明但没有 primary」时按 `claimedAt` 强行推一个赢家，等于替调用方选了人。现在只有「恰好一个 primary」或「至多一个 live 声明」时才推导；多声明无 primary 时保持原样，由 `liveRequesterOf()` 如实回答 `no-primary`。
 - `roles` / `role` 降级为显示与兼容（T-mwwdyc7i）：`classifyRoleCandidates` 的标题推导不再覆盖注册表。条目已有显式 `roles` 时以它为准，标题推导出的角色只进 `rolesUnrecognized` 并在日志里说明「not applied」；`GET /mesh/session/identity` 的 `role` 改为优先读 `workers[role].sessionId`，并新增 `roleSource`（`registry`/`registry-ambiguous`/`title-fallback`/`none`）说明这个值是怎么来的。

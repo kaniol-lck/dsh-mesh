@@ -228,6 +228,13 @@ export function createTaskRegistry(deps) {
       // T-484: a lost row that got a late declaration keeps both timestamps.
       recoveredAt: row.recoveredAt ?? null,
       lostAt: row.lostAt ?? null,
+      // T-mwxjfvwn: restart reconciliation no longer judges a task dead just because the new
+      // process has no memory of it. These fields say what it decided and why, so "why is this
+      // row still pending after a restart" is answerable from the API alone.
+      deferredAt: row.deferredAt ?? null,
+      deferredReason: row.deferredReason ?? null,
+      resurrectedAt: row.resurrectedAt ?? null,
+      resurrectedReason: row.resurrectedReason ?? null,
       // T-485: the claim watchdog state, so "why is nobody warning me" is answerable.
       claimWarnedAt: row.claimWarnedAt ?? null,
       claimDismissedAt: row.claimDismissedAt ?? null,

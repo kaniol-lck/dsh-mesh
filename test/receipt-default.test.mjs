@@ -301,7 +301,10 @@ test('receipt migration: an orphan row with a digest target is delivered as queu
       {
         taskId: 'T-orphan-digest',
         status: 'pending',
-        targetSessionId: WORKER,
+        // T-mwxjfvwn: a row whose session still exists is now held for the restart grace window
+        // instead of being declared lost at boot, so this case points at a session that is
+        // genuinely gone — the verdict is then immediate and the migration is what is under test.
+        targetSessionId: 'session-rd-gone',
         requester: REQ,
         requesterSessionId: REQ,
         receiptMode: 'file',
