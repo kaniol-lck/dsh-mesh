@@ -10,7 +10,7 @@
 
 ## `mesh_ack`
 
-> Mark tasks as acknowledged on the board: no receipt, no injection, no waiting — it only stops future digests for those tasks. Acking is NOT completion: the task still needs mesh_complete, and an ack does NOT stop the unclaimed-task watchdog (T-485) — that alarm exists precisely for the announced-but-never-declared window after an ack. Defaults to tasks of the calling session; force:true lets a coordinator ack another session’s tasks (risk: the worker stops being reminded). dismissClaim:true is a different action: the requesting side explicitly stops watching a task, so the watchdog never warns about it (the target session cannot dismiss its own task). At most 50 ids per call; returns {acked, skipped:[{id, reason}]} with reason one of not-found | not-mine | already-acked | settled (dismissClaim returns {dismissed, skipped} with reason dismiss-is-requester-side).
+> Mark TASKS as acknowledged on the board: no receipt, no injection, no waiting — it only stops future digests for those tasks. This is task sign-off, NOT "message read": the hub has its own mesh_ack with the same name that marks inbox MESSAGES read, and the two do not affect each other. Acking is NOT completion: the task still needs mesh_complete, and an ack does NOT stop the unclaimed-task watchdog (T-485) — that alarm exists precisely for the announced-but-never-declared window after an ack. Defaults to tasks of the calling session; force:true lets a coordinator ack another session’s tasks (risk: the worker stops being reminded). dismissClaim:true is a different action: the requesting side explicitly stops watching a task, so the watchdog never warns about it (the target session cannot dismiss its own task). At most 50 ids per call; returns {acked, skipped:[{id, reason}]} with reason one of not-found | not-mine | already-acked | settled (dismissClaim returns {dismissed, skipped} with reason dismiss-is-requester-side).
 
 | 参数 | 类型 / 取值 | 必填 | 说明 |
 |---|---|---|---|
@@ -42,7 +42,7 @@
 
 ## `mesh_complete`
 
-> Declare the outcome of a task dispatched to THIS session. status done|partial|blocked settles the task immediately with source=declared; summary is your own ≤300-char summary for the receipt file. For a consultation — a task whose deliverable IS the answer — pass the full text as answer: it is stored in the receipt and served as receiptAnswer by GET /mesh/tasks/<id>, while the notice the dispatcher receives carries the summary plus one line saying where to read the whole answer. answer is optional and bounded (20k chars; beyond that it is cut and flagged answerTruncated). Unknown tasks, tasks of other sessions, and already-settled tasks are rejected (already-settled returns alreadySettled:true). Tasks that never call this still settle from turn/end with source=observed.
+> Declare the outcome of a task dispatched to THIS session. status done|partial|blocked settles the task immediately with source=declared; summary is your own ≤300-char summary for the receipt file. For a consultation — a task whose deliverable IS the answer — pass the full text as answer: it is stored in the receipt and served as receiptAnswer by GET /mesh/tasks/<id>, while the notice the dispatcher receives carries the summary plus one line saying where to read the whole answer. answer is optional and bounded (20k chars; beyond that it is cut and flagged answerTruncated). Unknown tasks, tasks of other sessions, and already-settled tasks are rejected (already-settled returns alreadySettled:true). Tasks that never call this still settle from turn/end with source=observed. Use it to REPORT ON A TASK, not as a chat channel: do not manufacture a task with mesh_dispatch just to say one sentence, and do not write progress narration into summary/detail — there is no local note primitive yet, so if you only need to tell the dispatcher something, say so plainly in your turn instead of inventing a task.
 
 | 参数 | 类型 / 取值 | 必填 | 说明 |
 |---|---|---|---|
@@ -88,7 +88,7 @@
 
 ## `mesh_tasks`
 
-> List tasks dispatched to this session (or an explicit session). status=unacked (default) lists tasks that are unacked and not closed, so it is the board a digest points at: open tasks plus settled tasks whose receipt is still unacked (receiptDigest); status=all lists every task of the session. include=text adds each task body, and a body whose file is gone comes back with textMissing:true instead of failing. count is the number of returned rows and unackedCount is how many of those rows are unacked — both computed from the same list.
+> List tasks dispatched to this session (or an explicit session). status=unacked (default) lists tasks that are unacked and not closed, so it is the board a digest points at: open tasks plus settled tasks whose receipt is still unacked (receiptDigest); status=all lists every task of the session. Every row carries requester (the dispatcher session id — the address to reply to), requesterTitle (null when that session is gone or archived) and targetSessionId, so "who sent me this?" is answered here instead of by asking a human. include=text adds each task body, and a body whose file is gone comes back with textMissing:true instead of failing. count is the number of returned rows and unackedCount is how many of those rows are unacked — both computed from the same list.
 
 | 参数 | 类型 / 取值 | 必填 | 说明 |
 |---|---|---|---|

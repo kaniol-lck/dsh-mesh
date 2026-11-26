@@ -14,6 +14,9 @@
 
 ### Fixed
 
+- **worker 不再需要问人「我该回给哪个会话」**（T-mwxn99u7，owner 2026-11-26 两问）：`mesh_tasks` 工具自己的投影白名单漏了身份字段——任务行一直存着 `requester`，`lib/task-registry.mjs` 的 `taskRowForApi` 也一直输出它，只有 `meshTasks()` 那份投影把它丢了。收件方只能看到「目标是我」（`targetTitle`），看不到「谁派的」，于是只能回去问 owner。现在每行都带 `requester`（回信的地址）、`requesterTitle`（给人看的标题，会话已归档/不存在时为 `null`，**不编造、不抛错**）与 `targetSessionId`（审计时两端可比对）；字段名与 `taskRowForApi` 保持一致，两套投影不会再各说各话。整页只列一次会话表并复用，不是每行查一遍；会话列举失败时降级为全 `null` 并记日志，绝不让一整块任务板因为解析标题失败而消失。
+- 注入头加了**一行**回信指引（T-mwxn99u7）：`FROM` 只说了谁派单，没说怎么回，于是 worker 要么猜，要么被 `mesh_` 前缀骗去用 hub 的 `mesh_send`（本地会话根本不在 hub 里，发不出去）。现在 `[TASK …]` 行之后多一行 `REPLY:`，用**真实 taskId** 指出回信 = `mesh_complete({taskId:'…'})`（回执直接投给派单方）、查看自己的单用 `mesh_tasks`，并明确写「不要用 `mesh_send`／`mesh_inbox`——那是跨机 hub agent 通道，本地会话不在其中」。只加一行：注入正文越长，worker 越容易略过真正的工作内容。无 taskId 的 `POST /mesh/inject` 也有一行同等指引（不给 `mesh_complete` 假承诺）。
+- 三处工具描述补边界说明（T-mwxn99u7）：`mesh_tasks` 说明返回含 `requester`；`mesh_ack` 写明它是**任务签收**、与 hub 那个同名的「消息已读」是两回事；`mesh_complete` 写明不要为说一句话去造任务、也不要把进度叙事塞进 summary/detail（本地便条原语尚未提供，如实说明而不是承诺一个不存在的工具）。`docs/tools-reference.md` 已由 `gen-tool-reference.mjs` 重新生成。
 - **重启不再等于任务死了**（T-mwxjfvwn，owner 2026-11-26 直接问「会话还没结束，只是出现了请求重试就投递了 lost 回执？」；同类第 3 次）：`reconcileOrphanTasks()` 用一条事实判死——「本进程内存里没有这行」——但那说的是**内存**，不是**任务**。DSH 会话是持久化的，重启后它还在、还能继续干活。`T-MWXHO5U1` 在 12:30:02 被判 `lost`，会话 12:35:39 仍在活动，回执却写着「session restarted before this task finished; resend if still needed」——一句假话，换来一次真实的重派。
   - **实测前提**（不是推理）：重启那一刻，持久化会话报告 `live=false`、`turnOpen=false`、`lastActivityAt=null`，要等它被恢复并发出第一个事件才有信号。所以「启动时用 live 判死」本身也不成立，改成两阶段：
   - **判活只认三条**（T-mwxmcynk 收窄）：`live === true`、`turnOpen === true`、`lastActivityAt > processStartedAt`（**本进程启动之后**仍有活动）。首版还有一条 `lastActivityAt > row.createdAt`，被退回——它几乎恒真，而且描述的正是**重启之前**发生的事，恰是重启无法与「任务已死」区分的那类证据；留着它会让所有安静行永久判活、复查路径变成死代码（`T-mwxmcynk` 实测：宽限期后仍安静的行永远 `pending`、不发回执）。

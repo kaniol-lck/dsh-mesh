@@ -2302,6 +2302,24 @@ export function apply(ctx, config) {
     const include = args.include === 'text' ? 'text' : 'meta'
     const status = args.status === 'all' ? 'all' : 'unacked'
     const limit = Math.min(100, Math.max(1, Number(args.limit) || 20))
+
+    // Resolve requester titles ONCE for the whole page (T-mwxn99u7): one session listing serves
+    // every row, and an archived/unknown requester yields null instead of failing the call — a
+    // missing title must never cost the worker its whole board.
+    const sessionTitles = (() => {
+      try {
+        return new Map(listLocalSessions().map((session) => [session.id, session.title ?? null]))
+      } catch (error) {
+        fileLog(`mesh_tasks: session listing failed, requesterTitle falls back to null: ${error?.message ?? error}`)
+        return new Map()
+      }
+    })()
+    const requesterTitleOf = (requesterId) => {
+      const id = String(requesterId ?? '').trim()
+      if (!id) return null
+      return sessionTitles.get(id) ?? null
+    }
+
     const rows = [...taskRows.values()]
       .filter((row) => row.targetSessionId === sessionId || row.receiptDigestSessionId === sessionId)
       .filter((row) => {
@@ -2314,10 +2332,20 @@ export function apply(ctx, config) {
       .sort((left, right) => Number(left.createdAt ?? 0) - Number(right.createdAt ?? 0))
       .slice(0, limit)
       .map((row) => {
+        // T-mwxn99u7: a worker asked "who sent me this?" had no way to answer from the tool, so
+        // it went back to the coordinator to ask — the exact friction owner reported. The row
+        // always carried `requester`; only this projection dropped it. Field names match
+        // taskRowForApi() in lib/task-registry.mjs so the two projections cannot drift apart
+        // (AGENTS.md §4: one contract, one spelling).
         const base = {
           taskId: row.taskId,
           subject: row.subject ?? null,
           status: row.status ?? null,
+          // Who sent it. `requester` is the id the reply must address; the title is for humans.
+          requester: row.requester ?? null,
+          requesterTitle: requesterTitleOf(row.requester),
+          // Who it was delivered to, so an audit can compare both ends without guessing.
+          targetSessionId: row.targetSessionId ?? null,
           acked: Boolean(row.ackedAt),
           ackedAt: row.ackedAt ?? null,
           ackBy: row.ackBy ?? null,

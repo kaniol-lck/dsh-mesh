@@ -54,6 +54,12 @@ export function normalizeThread(value) {
  * One machine-readable header line prepended to an injected prompt, so the receiving session
  * knows which task/batch it is running without guessing from prose. The body after the blank
  * line stays byte-for-byte unchanged.
+ *
+ * T-mwxn99u7: `FROM` says who sent the task but not how to answer. Workers therefore reached for
+ * the hub's `mesh_send` (which cannot address a local session at all) or went back to the owner
+ * to ask which session to reply to — the friction owner reported. One extra line names the tools
+ * that actually work. Deliberately ONE line: the longer the preamble, the likelier the worker
+ * skims past the actual work.
  */
 export function withTaskHeader(text, { taskId, batchId, requester, thread, origin, now = new Date() } = {}) {
   const pad = (value) => String(value).padStart(2, '0')
@@ -67,7 +73,12 @@ export function withTaskHeader(text, { taskId, batchId, requester, thread, origi
   // `requester` is who should receive the receipt. A caller that has none (plain /mesh/inject,
   // CLI, curl) still knows where it came from: show that instead of a bare `unknown` (T-415).
   const from = requester || (origin ? `unknown(${origin})` : 'unknown')
-  return `[TASK ${task} · THREAD ${threadLabel} · BATCH ${batch} · FROM ${from}] ${stamp}\n\n${text}`
+  const hubWarning = '不要用 mesh_send／mesh_inbox（跨机 hub agent 通道，本地会话不在其中）'
+  const reply =
+    task === '-'
+      ? `REPLY: mesh_tasks 查看派给自己的单（含 requester，即回信对象）· ${hubWarning}`
+      : `REPLY: 回信＝mesh_complete({taskId:'${task}'})（交付结果并终结本单，回执直接投给 ${from}）· mesh_tasks 查看派给自己的单 · ${hubWarning}`
+  return `[TASK ${task} · THREAD ${threadLabel} · BATCH ${batch} · FROM ${from}] ${stamp}\n${reply}\n\n${text}`
 }
 
 /**

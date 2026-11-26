@@ -3341,12 +3341,98 @@ async function main() {
     const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-hdr'), 4000)
     const text = promptText(delivered ?? {})
     const header = '[TASK T-hdr · THREAD - · BATCH B-hdr · FROM worker] '
+    // T-mwxn99u7: the preamble is now TWO lines — the [TASK …] line plus one REPLY line saying
+    // how to answer and which tools cannot reach a local session. The body still starts after
+    // exactly one blank line, and is byte-for-byte unchanged.
+    const lines = text.split('\n')
+    const replyLine = lines[1] ?? ''
+    const preambleLines = text.split('\n\n')[0].split('\n')
+    const body = text.split('\n\n').slice(1).join('\n\n')
     const ok =
       text.startsWith(header) &&
-      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+-]\d{2}:\d{2}\n\n/.test(text.slice(header.length)) &&
-      text.endsWith(original) &&
-      text.slice(text.length - original.length) === original
-    report('inject: a [TASK …] header names the task and keeps the body verbatim', ok, `firstLine=${JSON.stringify(text.split('\n')[0])} verbatim=${text.endsWith(original)}`)
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+-]\d{2}:\d{2}$/.test(lines[0].slice(header.length)) &&
+      preambleLines.length === 2 &&
+      replyLine.startsWith('REPLY: ') &&
+      replyLine.includes("mesh_complete({taskId:'T-hdr'})") &&
+      replyLine.includes('mesh_tasks') &&
+      replyLine.includes('mesh_send') &&
+      replyLine.includes('mesh_inbox') &&
+      !replyLine.includes('<taskId>') &&
+      body === original &&
+      text.endsWith(original)
+    report('inject: a [TASK …] header names the task and keeps the body verbatim', ok, `firstLine=${JSON.stringify(lines[0])} reply=${replyLine.startsWith('REPLY: ')} preambleLines=${preambleLines.length} verbatim=${text.endsWith(original)}`)
+  })
+
+  // ── T-mwxn99u7: mesh_tasks must say who sent the task ───────────────────────
+  // Owner asked why a worker has to ask a human "which session do I reply to". The row always
+  // carried `requester`; only the tool's projection dropped it.
+  await runCase('tasks: mesh_tasks exposes requester, requesterTitle and targetSessionId', async (boot) => {
+    const h = await boot({
+      seedSessions: [
+        { id: 'session-who-worker', title: 'who worker' },
+        // A real, resolvable requester, so requesterTitle is exercised rather than left null.
+        { id: 'session-who-req', title: 'L1 综合管理' },
+      ],
+    })
+    await request(h.base, '/mesh/inject', {
+      method: 'POST',
+      body: {
+        title: 'who worker',
+        text: 'who sent this',
+        meta: { taskId: 'T-who' },
+        requester: 'session-who-req',
+      },
+    })
+    await waitFor(() => h.state.prompts.some((prompt) => prompt.sessionId === 'session-who-worker'), 4000)
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_tasks')
+    const board = await tool.execute({ session: 'session-who-worker', status: 'all' }, { sessionId: 'session-who-worker' })
+    const row = board?.tasks?.find((task) => task.taskId === 'T-who')
+    const ok =
+      Boolean(row) &&
+      'requester' in row &&
+      'requesterTitle' in row &&
+      'targetSessionId' in row &&
+      row.requester === 'session-who-req' &&
+      row.requesterTitle === 'L1 综合管理' &&
+      row.targetSessionId === 'session-who-worker'
+    report(
+      'tasks: mesh_tasks exposes requester, requesterTitle and targetSessionId',
+      ok,
+      `requester=${JSON.stringify(row?.requester ?? null)} requesterTitle=${JSON.stringify(row?.requesterTitle ?? null)} targetSessionId=${JSON.stringify(row?.targetSessionId ?? null)}`,
+    )
+  })
+
+  // A requester that no longer exists (or was archived) must not break the whole board: the
+  // title is null, the call still succeeds.
+  await runCase('tasks: an unresolvable requester yields requesterTitle=null instead of failing', async (boot) => {
+    const now = Date.now()
+    const h = await boot({
+      seedSessions: [{ id: 'session-ghost-worker', title: 'ghost worker' }],
+      archivedIds: ['session-ghost-requester'],
+      tasksSeed: [
+        {
+          taskId: 'T-ghost',
+          status: 'pending',
+          targetSessionId: 'session-ghost-worker',
+          targetTitle: 'ghost worker',
+          requester: 'session-ghost-requester',
+          requesterSessionId: 'session-ghost-requester',
+          receiptMode: 'file',
+          subject: 'requester is archived',
+          createdAt: now - 60_000,
+          settledAt: null,
+        },
+      ],
+    })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_tasks')
+    const board = await tool.execute({ session: 'session-ghost-worker', status: 'all' }, { sessionId: 'session-ghost-worker' })
+    const row = board?.tasks?.find((task) => task.taskId === 'T-ghost')
+    const ok = board?.ok === true && Boolean(row) && row.requester === 'session-ghost-requester' && row.requesterTitle === null
+    report(
+      'tasks: an unresolvable requester yields requesterTitle=null instead of failing',
+      ok,
+      `ok=${board?.ok} requester=${JSON.stringify(row?.requester ?? null)} requesterTitle=${JSON.stringify(row?.requesterTitle ?? null)}`,
+    )
   })
 
   await runCase('inject: injectHeader=false delivers the body byte-identically', async (boot) => {
