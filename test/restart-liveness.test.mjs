@@ -232,11 +232,13 @@ test('restart: a live session keeps its task out of `lost` and writes no lost re
   const now = Date.now()
   const h = await startHarness({
     tasksSeed: [orphanRow(now)],
-    // The host resumed this session: it is live and its activity is after this boot.
+    // The host resumed this session: it is live, so both the boot verdict and the grace recheck
+    // must leave it alone.
     liveSessions: [WORKER],
+    restartGraceMs: 700,
   })
   try {
-    await sleep(400)
+    await sleep(300)
     const row = await h.taskRow('T-orphan-1')
     assert.notEqual(row?.status, 'lost', `a live session must not be declared dead (row=${JSON.stringify(row?.status)})`)
     assert.equal(row?.status, 'pending')
@@ -244,6 +246,12 @@ test('restart: a live session keeps its task out of `lost` and writes no lost re
     assert.equal(row?.deferredReason, 'session-alive-after-restart')
     assert.equal(row?.settledAt ?? null, null, 'no settlement timestamp on a deferred row')
     assert.match(h.log(), /restart reconciliation: deferred T-orphan-1 \(session still live\)/)
+
+    // Past the grace window the recheck looks again: still live, so still pending.
+    await sleep(1200)
+    const afterGrace = await h.taskRow('T-orphan-1')
+    assert.equal(afterGrace?.status, 'pending', 'the recheck must not kill a live session')
+    assert.match(h.log(), /T-orphan-1 is alive after the grace window; staying pending/)
     assert.equal(
       h.receiptRows().filter((receipt) => receipt.taskId === 'T-orphan-1' && receipt.status === 'lost').length,
       0,
@@ -344,6 +352,120 @@ test('restart: a failing session probe judges nothing and says so', async () => 
   assert.match(logs.join('\n'), /WARN restart reconciliation skipped: session probe failed \(session index unreadable\)/)
 })
 
+// ── D2. the narrowing this task asked for (T-mwxmcynk) ───────────────────────
+// Driven at module level: `lastActivityAt` comes from the in-memory event ledger, which only
+// ever records "now". To reproduce "the session was active 10 minutes ago" the probe itself has
+// to answer with a past timestamp, so the verdict functions are exercised through stub deps.
+function makeStubFlow({ sessions, rows, logs = [], receipts = [] }) {
+  return import(pathToFileURL(path.join(REPO, 'plugins', 'mesh-waker', 'lib', 'receipt-flow.mjs')).href).then(
+    ({ createReceiptFlow }) =>
+      createReceiptFlow({
+        state: {},
+        config: { receiptTo: '', wakeSecret: '', receiptSummaryChars: 200, restartGraceMs: 300_000 },
+        log: { warn() {} },
+        fileLog: (line) => logs.push(line),
+        listLocalSessions: () => sessions,
+        resolveLocalSession: () => ({ id: REQ }),
+        promptWithResume: async () => {},
+        receiptDigest: { enabled: false },
+        receiptBody: () => 'body',
+        writeReceiptFile: (receipt) => receipts.push(receipt),
+        dirForRow: () => '',
+        updateTaskRow: (taskId, patch) => Object.assign(rows.get(taskId), patch),
+        taskRows: rows,
+        getLastReceipt: () => null,
+        setLastReceipt: () => {},
+      }),
+  )
+}
+
+const stubRow = (now, overrides = {}) => ({
+  taskId: 'T-stub',
+  status: 'started',
+  targetSessionId: WORKER,
+  targetTitle: 'rl worker',
+  requester: REQ,
+  requesterSessionId: REQ,
+  receiptMode: 'queue',
+  createdAt: now - 7_200_000,
+  startedAt: now - 7_000_000,
+  settledAt: null,
+  ...overrides,
+})
+
+test('restart: activity BEFORE this process started is not evidence, even if it is after createdAt', async () => {
+  // The rule that was removed: `lastActivityAt > row.createdAt`. It is nearly always true, and
+  // what it describes happened BEFORE the restart — exactly the evidence a restart cannot
+  // distinguish from a dead task. It kept every quiet row alive forever, so the recheck path
+  // was dead code and quiet rows leaked.
+  const now = Date.now()
+  const rows = new Map([['T-old-activity', stubRow(now, { taskId: 'T-old-activity' })]])
+  const logs = []
+  const receipts = []
+  const flow = await makeStubFlow({
+    rows,
+    logs,
+    receipts,
+    sessions: [
+      {
+        id: WORKER,
+        live: false,
+        turnOpen: false,
+        archived: false,
+        // Active 10 minutes ago: AFTER createdAt (2h ago), BEFORE this process started.
+        lastActivityAt: now - 600_000,
+      },
+    ],
+  })
+
+  const boot = await flow.reconcileOrphanTasks()
+  assert.equal(rows.get('T-old-activity').status, 'pending')
+  assert.equal(boot.deferred, 0, 'pre-boot activity must not be treated as "alive"')
+  assert.equal(boot.held, 1, 'it is held, awaiting the grace window')
+  assert.equal(rows.get('T-old-activity').deferredReason, 'awaiting-restart-grace')
+
+  const recheck = await flow.recheckDeferredTasks()
+  assert.equal(recheck.checked, 1, 'the held row is really re-examined')
+  assert.equal(recheck.lost, 1, 'and judged dead once the window passes')
+  assert.equal(rows.get('T-old-activity').status, 'lost')
+  assert.equal(receipts.filter((receipt) => receipt.taskId === 'T-old-activity' && receipt.status === 'lost').length, 1)
+})
+
+test('restart: activity AFTER this process started is evidence and spares the row', async () => {
+  // The other half of the same rule: post-boot activity is the signal a restart cannot fake.
+  const now = Date.now()
+  const rows = new Map([['T-new-activity', stubRow(now, { taskId: 'T-new-activity' })]])
+  const receipts = []
+  const flow = await makeStubFlow({
+    rows,
+    receipts,
+    sessions: [{ id: WORKER, live: false, turnOpen: false, archived: false, lastActivityAt: Date.now() + 60_000 }],
+  })
+  await flow.reconcileOrphanTasks()
+  assert.equal(rows.get('T-new-activity').deferredReason, 'session-alive-after-restart')
+  const recheck = await flow.recheckDeferredTasks()
+  assert.equal(recheck.alive, 1)
+  assert.equal(rows.get('T-new-activity').status, 'pending')
+  assert.equal(receipts.length, 0)
+})
+
+test('restart: a live session at the grace recheck stays pending (G)', async () => {
+  const now = Date.now()
+  const h = await startHarness({
+    tasksSeed: [orphanRow(now, { taskId: 'T-live-g' })],
+    liveSessions: [WORKER],
+    restartGraceMs: 700,
+  })
+  try {
+    await sleep(1200)
+    const row = await h.taskRow('T-live-g')
+    assert.equal(row?.status, 'pending', 'a live session must survive the recheck')
+    assert.equal(h.receiptRows().filter((receipt) => receipt.taskId === 'T-live-g').length, 0, 'and get no receipt')
+  } finally {
+    h.close()
+  }
+})
+
 // ── D. the grace window decides, and it is one-shot ──────────────────────────
 test('restart: a quiet session is held at boot and only judged after the grace window', async () => {
   const now = Date.now()
@@ -404,15 +526,17 @@ test('restart: a deferred row is not re-stalled by the claim sweep', async () =>
       }),
     ],
     liveSessions: [WORKER],
-    restartGraceMs: 200,
+    // The row is deferred at boot and re-judged at the grace window; both must keep it alive.
+    restartGraceMs: 700,
   })
   try {
-    await sleep(1400) // several claimSweep passes at claimSweepMs=500
+    await sleep(1600) // boot + grace recheck + several claimSweep passes at claimSweepMs=500
     const row = await h.taskRow('T-resumed')
     assert.notEqual(row?.status, 'stalled', 'the claim sweep must not re-stall a claimed row')
     assert.notEqual(row?.status, 'lost', 'and restart reconciliation must not kill it either')
     assert.equal(row?.status, 'pending')
-    assert.equal(row?.deferredReason, 'session-alive-after-restart')
+    assert.equal(row?.deferredAt ?? null, null, 'the recheck released it once it proved alive')
+    assert.match(h.log(), /T-resumed is alive after the grace window; staying pending/)
     assert.doesNotMatch(h.log(), /digest task stalled task=T-resumed/, 'no re-stall after the resume')
   } finally {
     h.close()

@@ -424,8 +424,10 @@ batch 聚合通知（以及 batch alert）投给该 batch 的**第一个 request
 
 现在是**两阶段**：
 
-1. **启动**只判有证据的：会话不存在 / 已归档 → `lost`；会话 `live`、`turnOpen`、本次启动后有活动、或建单后有活动 → `defer`（回 `pending`，记 `deferredAt` + `deferredReason: 'session-alive-after-restart'`，**不发回执**）；其余 → **hold**（`deferredReason: 'awaiting-restart-grace'`），不判死。
-2. **`restartGraceMs`（默认 5 分钟）之后**再判一次：仍无任何生命迹象才算证据，判 `lost` 并发回执；期间恢复的清掉 deferred 字段留在 `pending`。
+1. **启动**只判有证据的：会话不存在 / 已归档 → `lost`；**判活只认三条**——`live === true`、`turnOpen === true`、`lastActivityAt > processStartedAt`（**本进程启动之后**仍有活动）→ `defer`（回 `pending`，记 `deferredAt` + `deferredReason: 'session-alive-after-restart'`，**不发回执**）；其余 → **hold**（`deferredReason: 'awaiting-restart-grace'`），不判死。
+2. **`restartGraceMs`（默认 5 分钟）之后**再判一次：仍无任何生命迹象才算证据，判 `lost` 并发回执；期间恢复的清掉 deferred 字段留在 `pending`。**两种启动结论都进复查**，否则被 `defer` 的行写一次就再没人看。
+
+> **判活不能用「建单之后有活动」**（T-mwxmcynk 收窄）：`lastActivityAt > row.createdAt` 几乎恒真，且它描述的正是**重启之前**发生的事——恰是重启无法与「任务已死」区分的那类证据。留着它会让所有安静行永久判活、复查路径变成死代码。重启伪造不出来的只有「本进程启动之后的活动」。
 
 探针（`listLocalSessions()`）抛错时**整轮跳过**并 `WARN`，一行都不判。历史误判的 `lost` 行会被有证据地复活：`reasonDetail: 'host restart'` + 会话 `live` + **`lastActivityAt > settledAt`**（被判死之后还活过）→ 回 `pending` + `resurrectedAt`；达不到这个条件的一律不动。取消/停滞可以发生在 `pending` 或 `started`。
 

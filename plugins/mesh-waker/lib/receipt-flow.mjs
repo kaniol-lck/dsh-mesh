@@ -251,31 +251,37 @@ export function createReceiptFlow(deps) {
     }
   }
 
-  /** True when the session shows a sign of life that a restart could not fake. */
-  function sessionLooksAlive(session, row, processStartedAt) {
+  /**
+   * True when the session shows a sign of life that a restart could NOT fake.
+   *
+   * `lastActivityAt > processStartedAt` is the only time-based test that qualifies: it says the
+   * session did something AFTER this process came up. An earlier rule also accepted
+   * `lastActivityAt > row.createdAt`, which is nearly always true and — crucially — describes
+   * something that happened BEFORE the restart, so it is exactly the kind of evidence a restart
+   * cannot distinguish from a dead task. It made every row look alive forever and turned the
+   * recheck path into dead code (T-mwxmcynk).
+   */
+  function sessionLooksAlive(session, processStartedAt) {
     if (!session || session.archived === true) return false
     if (session.live === true) return true
     if (session.turnOpen === true) return true
     const lastActivityAt = Number(session.lastActivityAt) || 0
-    if (lastActivityAt > processStartedAt) return true
-    const createdAt = Number(row.createdAt) || 0
-    if (createdAt > 0 && lastActivityAt > createdAt) return true
-    return false
+    return lastActivityAt > processStartedAt
   }
 
   /** boot phase: 'lost' | 'defer' | 'hold' */
-  function bootVerdict(row, session, processStartedAt) {
+  function bootVerdict(session, processStartedAt) {
     if (!session) return 'lost' // gone: the row really is orphaned
     if (session.archived === true) return 'lost'
-    if (sessionLooksAlive(session, row, processStartedAt)) return 'defer'
+    if (sessionLooksAlive(session, processStartedAt)) return 'defer'
     // The session exists but is quiet. At boot that is indistinguishable from "has not been
     // resumed yet", so hold it instead of inventing a verdict.
     return 'hold'
   }
 
   /** recheck phase: 'lost' | 'alive' */
-  function recheckVerdict(row, session, processStartedAt) {
-    if (sessionLooksAlive(session, row, processStartedAt)) return 'alive'
+  function recheckVerdict(session, processStartedAt) {
+    if (sessionLooksAlive(session, processStartedAt)) return 'alive'
     return 'lost'
   }
 
@@ -354,7 +360,7 @@ export function createReceiptFlow(deps) {
     let lost = 0
     for (const row of orphans) {
       const session = probe.byId.get(row.targetSessionId) ?? null
-      const verdict = bootVerdict(row, session, processStartedAt)
+      const verdict = bootVerdict(session, processStartedAt)
       if (verdict !== 'lost') {
         // Keep `startedAt`/`ackedAt`: they are the evidence that the work was claimed, and
         // claimState() treats them as CLAIM_OK, so the claim sweep will not re-stall it.
@@ -390,6 +396,21 @@ export function createReceiptFlow(deps) {
    *     empty immediately after a restart. Waiting for the grace window is what makes the
    *     comparison `lastActivityAt > settledAt` meaningful.
    */
+  /**
+   * Recheck phase, after `restartGraceMs`.
+   *
+   * Three jobs, all of which need evidence that does not exist at boot:
+   *
+   * 1) Judge the rows held at boot (`awaiting-restart-grace`). By now "the session never came
+   *    back" IS evidence rather than the absence of it, so silence becomes a real `lost`.
+   * 2) Re-judge the rows DEFERRED at boot (`session-alive-after-restart`). Without this they
+   *    would be written once and never looked at again — the same "quiet row leaks forever"
+   *    shape this whole task is about, just with a different first verdict (T-mwxmcynk).
+   * 3) Undo historical false `lost` rows (T-MWXHO5U1's 5 predecessors). This also has to run
+   *    here and not at boot: `lastActivityAt` comes from the in-memory event ledger, which is
+   *    empty immediately after a restart. Waiting for the grace window is what makes the
+   *    comparison `lastActivityAt > settledAt` meaningful.
+   */
   async function recheckDeferredTasks() {
     const probe = probeSessions()
     if (!probe.ok) {
@@ -401,16 +422,19 @@ export function createReceiptFlow(deps) {
     const processStartedAt = Date.now() - Math.round(process.uptime() * 1000)
     const resurrected = resurrectFalseLost(probe.byId)
 
-    const held = [...deps.taskRows.values()].filter(
-      (row) => row.status === 'pending' && row.deferredReason === 'awaiting-restart-grace',
+    // Both restart verdicts, because both are "we have not decided yet" markers.
+    const pendingVerdicts = [...deps.taskRows.values()].filter(
+      (row) =>
+        row.status === 'pending' &&
+        (row.deferredReason === 'awaiting-restart-grace' || row.deferredReason === 'session-alive-after-restart'),
     )
-    if (held.length === 0) return { checked: 0, lost: 0, alive: 0, resurrected, skipped: false }
+    if (pendingVerdicts.length === 0) return { checked: 0, lost: 0, alive: 0, resurrected, skipped: false }
 
     let lost = 0
     let alive = 0
-    for (const row of held) {
+    for (const row of pendingVerdicts) {
       const session = probe.byId.get(row.targetSessionId) ?? null
-      if (recheckVerdict(row, session, processStartedAt) === 'alive') {
+      if (recheckVerdict(session, processStartedAt) === 'alive') {
         deps.updateTaskRow(row.taskId, { deferredAt: null, deferredReason: null })
         deps.fileLog(`restart reconciliation: ${row.taskId} is alive after the grace window; staying pending`)
         alive += 1
@@ -422,7 +446,7 @@ export function createReceiptFlow(deps) {
       )
       await markRowLost(row, session)
     }
-    return { checked: held.length, lost, alive, resurrected, skipped: false }
+    return { checked: pendingVerdicts.length, lost, alive, resurrected, skipped: false }
   }
 
   /**

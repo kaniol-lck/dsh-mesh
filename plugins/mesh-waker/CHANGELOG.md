@@ -16,8 +16,9 @@
 
 - **重启不再等于任务死了**（T-mwxjfvwn，owner 2026-11-26 直接问「会话还没结束，只是出现了请求重试就投递了 lost 回执？」；同类第 3 次）：`reconcileOrphanTasks()` 用一条事实判死——「本进程内存里没有这行」——但那说的是**内存**，不是**任务**。DSH 会话是持久化的，重启后它还在、还能继续干活。`T-MWXHO5U1` 在 12:30:02 被判 `lost`，会话 12:35:39 仍在活动，回执却写着「session restarted before this task finished; resend if still needed」——一句假话，换来一次真实的重派。
   - **实测前提**（不是推理）：重启那一刻，持久化会话报告 `live=false`、`turnOpen=false`、`lastActivityAt=null`，要等它被恢复并发出第一个事件才有信号。所以「启动时用 live 判死」本身也不成立，改成两阶段：
-  - **boot 阶段**只判有证据的：会话不存在 / 已归档 → `lost`（照旧）；会话 `live` / `turnOpen` / 本次启动后有活动 / 建单后有活动 → `defer`（回 `pending`，记 `deferredAt` + `deferredReason: 'session-alive-after-restart'`，**不发回执**）；其余 → **hold**（`deferredReason: 'awaiting-restart-grace'`），**不判死**。
-  - **recheck 阶段**（`restartGraceMs`，默认 5 分钟，一次性不循环）：到点后仍无任何生命迹象才算证据，判 `lost` 并发回执；期间恢复的则清掉 deferred 字段留在 `pending`。
+  - **判活只认三条**（T-mwxmcynk 收窄）：`live === true`、`turnOpen === true`、`lastActivityAt > processStartedAt`（**本进程启动之后**仍有活动）。首版还有一条 `lastActivityAt > row.createdAt`，被退回——它几乎恒真，而且描述的正是**重启之前**发生的事，恰是重启无法与「任务已死」区分的那类证据；留着它会让所有安静行永久判活、复查路径变成死代码（`T-mwxmcynk` 实测：宽限期后仍安静的行永远 `pending`、不发回执）。
+  - **boot 阶段**只判有证据的：会话不存在 / 已归档 → `lost`（照旧）；判活三条命中 → `defer`（回 `pending`，记 `deferredAt` + `deferredReason: 'session-alive-after-restart'`，**不发回执**）；其余 → **hold**（`deferredReason: 'awaiting-restart-grace'`），**不判死**。
+  - **recheck 阶段**（`restartGraceMs`，默认 5 分钟，一次性不循环）：到点后仍无任何生命迹象才算证据，判 `lost` 并发回执；期间恢复的则清掉 deferred 字段留在 `pending`。**两种 boot 结论都会进复查**（`awaiting-restart-grace` 与 `session-alive-after-restart`）——首版只复查前者，被 `defer` 的行写一次就再没人看，属同一类「安静行泄漏」。
   - **探针失败**（`listLocalSessions()` 抛错）→ 整轮跳过 + `WARN`，**一行都不判**。从失败的探针推出「死了」是同一个错误换了件衣服。
 - **有证据地复活历史误判**（T-mwxjfvwn）：`lost` + `reasonDetail === 'host restart'` + 会话 `live` + **`lastActivityAt > settledAt`**（被判死之后还活过）→ 回 `pending` + `resurrectedAt`/`resurrectedReason: 'session-active-after-lost'`。`lastActivityAt > lostAt` 是硬条件，达不到的一律不动；非 `host restart` 的 `lost` 不参与。11-25 从 `stalled` 恢复、11-26 又被判 `lost` 的 5 条属于这一类。
 - **批次恢复同源缺陷**（T-mwxjfvwn，由新门禁抓出）：`restoreBatches()` 重启后把每个开放批次任务直接 `settleTask(..., status: 'lost')`。现在先问 `sessionAlive()`，活着或探针不可知就保留 `pending` 并记日志，交给 restart reconciliation 判。
