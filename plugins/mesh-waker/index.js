@@ -6695,9 +6695,14 @@ export function apply(ctx, config) {
       receiptAnswerChars: answer ? answerChars : 0,
     })
     const updated = taskRows.get(row.taskId) ?? row
+    // The note must name what actually happened, or the dispatcher reads a false story
+    // (T-mwxn99u7): a `not-started` row is an advisory that fired too early — the runtime did
+    // NOT lose the task, so saying "运行时状态已丢失" would be fiction.
     const note = wasLost
       ? '此前因宿主重启被标 lost，worker 已补交，无需重派'
-      : `任务行仍是 ${row.status}（运行时状态已丢失，宿主重启或插件重载），worker 声明完成，按声明结算`
+      : row.receiptStatus === 'not-started'
+        ? `任务行曾被判 not-started（等待 turn/start 超时，属咨询性告警，非终态），worker 后续仍在推进并声明完成；按声明结算`
+        : `任务行仍是 ${row.status}（运行时状态已丢失，宿主重启或插件重载），worker 声明完成，按声明结算`
     const receipt = buildReceipt({
       taskId: row.taskId,
       sessionId: row.targetSessionId ?? null,
@@ -6788,7 +6793,14 @@ export function apply(ctx, config) {
       // declaration — `lost` is what a restart did to it, `pending`/`started`/`waiting-lock`
       // mean the runtime lost track. Answering `alreadySettled` to any of them told the worker
       // its work was already done, so it stopped and nobody ever recorded the outcome.
-      if (DECLARABLE_ROW_STATUSES.has(row.status)) {
+      //
+      // T-mwxn99u7: a row whose receiptStatus is `not-started` is ALSO declarable, whatever its
+      // status says. `not-started` is an advisory ("no turn/start seen yet"), not a verdict on
+      // the work — settleTask() records it as `status: 'stalled'` WITH a settledAt, which then
+      // looked terminal and refused the declaration. Live case: this very task was marked
+      // not-started while running, and mesh_complete answered alreadySettled:true, so the
+      // outcome could not be recorded at all.
+      if (DECLARABLE_ROW_STATUSES.has(row.status) || row.receiptStatus === 'not-started') {
         const receipt = settleRowByDeclaration(row, { requested, summary, detail, caller, ...declaredAnswer })
         return {
           ok: true,

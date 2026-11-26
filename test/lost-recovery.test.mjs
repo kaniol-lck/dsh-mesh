@@ -379,3 +379,69 @@ test('declared settle: the lost path still says no resend is needed (T-484 prese
     h.close()
   }
 })
+
+// ── g. an advisory not-started row is declarable too (T-mwxn99u7) ────────────
+// Live incident: this very session's task was marked `not-started` by the stall timer while it
+// was in fact running. settleTask() writes that advisory as `status: 'stalled'` WITH a
+// settledAt, so mesh_complete answered alreadySettled:true and the finished work could not be
+// recorded at all. `not-started` is an advisory, never a verdict on the work.
+test('declared settle: a not-started advisory row is settled by mesh_complete, not refused (T-mwxn99u7)', async () => {
+  const now = Date.now()
+  const h = await startHarness({
+    tasksSeed: [
+      lostRow(now, {
+        taskId: 'T-notstarted-1',
+        status: 'stalled',
+        // Exactly the shape settleTask() leaves: settledAt set, receipt says not-started.
+        settledAt: now - 1_800_000,
+        receiptStatus: 'not-started',
+        reasonKind: 'not-started',
+        reasonDetail: 'no turn/start within 600000ms',
+      }),
+    ],
+  })
+  try {
+    const before = h.receiptRows().length
+    const result = await complete(h, 'T-notstarted-1')
+    assert.equal(result.ok, true)
+    assert.notEqual(result.alreadySettled, true, 'an advisory must not block the declaration')
+    assert.equal(result.recovered, true)
+    assert.equal(result.declaredRowStatus, 'stalled')
+    assert.equal(result.receiptStatus, 'completed')
+    const row = await h.request(h.base, '/mesh/tasks/T-notstarted-1')
+    assert.equal(row.json?.task?.status, 'settled')
+    assert.equal(row.json?.task?.receiptStatus, 'completed')
+    assert.equal(h.receiptRows().length, before + 1)
+    // The note must tell the truth: the runtime did not lose this task, the advisory fired early.
+    assert.match(String(result.summary), /not-started/)
+    assert.doesNotMatch(String(result.summary), /运行时状态已丢失/, 'the advisory is not a lost runtime')
+    assert.match(h.log(), /settled stalled -> completed/)
+  } finally {
+    h.close()
+  }
+})
+
+// A genuinely terminal row must STILL be refused after the widening.
+test('declared settle: a settled row is still refused (no regression from the widening)', async () => {
+  const now = Date.now()
+  const h = await startHarness({
+    tasksSeed: [
+      lostRow(now, {
+        taskId: 'T-terminal-1',
+        status: 'settled',
+        settledAt: now - 1000,
+        receiptStatus: 'completed',
+        reasonKind: 'completed',
+        reasonDetail: null,
+      }),
+    ],
+  })
+  try {
+    const before = h.receiptRows().length
+    const result = await complete(h, 'T-terminal-1')
+    assert.equal(result.alreadySettled, true, 'a completed row must not be re-settled')
+    assert.equal(h.receiptRows().length, before, 'and must not write a second receipt')
+  } finally {
+    h.close()
+  }
+})
