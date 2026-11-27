@@ -3146,6 +3146,106 @@ async function main() {
     report('receipt: without a requester the receiptTo fallback still works', ok, `deliveredTo=${status.json?.lastReceipt?.deliveredTo ?? '-'}`)
   })
 
+  // ── T-mwxx12b8: a declared settlement on a DISK row must reach its requester ──
+  // The incident: three xiajiang completions were delivered to session-7fa21aa4 (`mesh · 协调`,
+  // a stale session from another workspace) instead of session-9127441f (the real dispatcher).
+  // index.js read `row.requesterSessionId`, a field task ROWS never carry — only in-memory task
+  // objects do — so it was always null, the digest branch was skipped, and deliverNotice fell
+  // back to config.receiptTo. The cases above exercise the in-memory path and therefore never
+  // caught it; these seed the row on disk and go through settleRowByDeclaration.
+  const diskRow = (taskId, requester) => {
+    const now = Date.now()
+    return {
+      taskId,
+      status: 'pending',
+      targetSessionId: 'session-worker',
+      targetTitle: 'worker',
+      requester,
+      receiptMode: 'queue',
+      subject: `disk row ${taskId}`,
+      createdAt: now - 600_000,
+      settledAt: now - 300_000,
+    }
+  }
+
+  await runCase('receipt: a disk row settled by declaration reaches its requester, not receiptTo', async (boot) => {
+    const h = await boot({
+      seedSessions: receiptSeeds,
+      config: receiptConfig,
+      tasksSeed: [diskRow('T-disk-req', 'session-orch')],
+    })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_complete')
+    const result = await tool.execute({ taskId: 'T-disk-req', status: 'done', summary: 'done' }, { sessionId: 'session-worker' })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-orch'), 4000)
+    await sleep(200)
+    const holderPrompts = h.state.prompts.filter((prompt) => prompt.sessionId === 'session-holder').length
+    const ok = result?.ok === true && Boolean(delivered) && holderPrompts === 0
+    report(
+      'receipt: a disk row settled by declaration reaches its requester, not receiptTo',
+      ok,
+      `ok=${result?.ok} orch=${h.state.prompts.filter((p) => p.sessionId === 'session-orch').length} holder=${holderPrompts}`,
+    )
+  })
+
+  await runCase('receipt: a disk row whose requester is a title still reaches that session', async (boot) => {
+    const h = await boot({
+      seedSessions: receiptSeeds,
+      config: receiptConfig,
+      // `requester` given as a TITLE: resolveRequesterSessionId must resolve id-or-title.
+      tasksSeed: [diskRow('T-disk-title', 'orchestrator')],
+    })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_complete')
+    await tool.execute({ taskId: 'T-disk-title', status: 'done', summary: 'done' }, { sessionId: 'session-worker' })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-orch'), 4000)
+    await sleep(200)
+    const holderPrompts = h.state.prompts.filter((prompt) => prompt.sessionId === 'session-holder').length
+    const ok = Boolean(delivered) && holderPrompts === 0
+    report(
+      'receipt: a disk row whose requester is a title still reaches that session',
+      ok,
+      `orch=${h.state.prompts.filter((p) => p.sessionId === 'session-orch').length} holder=${holderPrompts}`,
+    )
+  })
+
+  await runCase('receipt: a disk row with an unresolvable requester falls back without throwing', async (boot) => {
+    const h = await boot({
+      seedSessions: receiptSeeds,
+      config: receiptConfig,
+      tasksSeed: [diskRow('T-disk-ghost', 'ghost session')],
+    })
+    const tool = h.state.tools.find((entry) => entry.name === 'mesh_complete')
+    // Must not throw: an unresolvable requester degrades to the receiptTo fallback.
+    const result = await tool.execute({ taskId: 'T-disk-ghost', status: 'done', summary: 'done' }, { sessionId: 'session-worker' })
+    const delivered = await waitFor(() => h.state.prompts.find((prompt) => prompt.sessionId === 'session-holder'), 4000)
+    const ok = result?.ok === true && Boolean(delivered)
+    report(
+      'receipt: a disk row with an unresolvable requester falls back without throwing',
+      ok,
+      `ok=${result?.ok} holder=${h.state.prompts.filter((p) => p.sessionId === 'session-holder').length}`,
+    )
+  })
+
+  // The boot counter at index.js used the same phantom field, so it always logged 0 and hid the
+  // migration backlog. It must now count the rows that genuinely lack a digest target.
+  await runCase('receipt: the boot migration counter counts rows with a requester but no digest target', async (boot) => {
+    const logFile = path.join(os.tmpdir(), `waker-migration-count-${process.pid}-${Date.now()}.log`)
+    const h = await boot({
+      seedSessions: receiptSeeds,
+      config: { ...receiptConfig, logFile },
+      tasksSeed: [diskRow('T-count-1', 'session-orch'), diskRow('T-count-2', 'session-orch')],
+    })
+    await sleep(200)
+    const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : ''
+    const match = /receipt-digest migration: (\d+) settled row\(s\) without a receipt-digest target/.exec(log)
+    const counted = Number(match?.[1] ?? -1)
+    const ok = counted >= 2
+    report(
+      'receipt: the boot migration counter counts rows with a requester but no digest target',
+      ok,
+      `counted=${counted} (was always 0 before the fix)`,
+    )
+  })
+
   await runCase('receipt: batch aggregate goes to the batch requester', async (boot) => {
     const h = await boot({ seedSessions: receiptSeeds, config: receiptConfig })
     for (const target of ['worker', 'orchestrator']) {

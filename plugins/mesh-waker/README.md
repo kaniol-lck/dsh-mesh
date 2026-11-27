@@ -347,6 +347,8 @@ npx dsh-mesh-dispatch --title "<session-title>" --file task.txt --task --receipt
 
 **回执投递给谁（0.7.7 / 0.7.24 收紧 / T-mwwdyc7i 改判据）**：优先投给**派活方**（requester），否则 `receiptTo`，都没有才只写文件。0.7.24 起 file 模式也会在 waker 日志留一行 `receipt <id> <status> → file only (requester=有/无, receiptTo=有/无)`；两者都缺时额外写 `WARN … nobody was notified`。
 
+**磁盘行只有 `requester`，没有 `requesterSessionId`**（T-mwxx12b8）：这是两种形状，别混。内存任务对象（`pendingTasks`，由 `registerPendingTask` 构造）带 `requesterSessionId`；磁盘任务行从来只有 `requester`（实测本机 766 行、750 有 `requester`、**0** 有 `requesterSessionId`）。所以任何拿**行**投递回执的地方都必须 `resolveRequesterSessionId(row.requester)`（该函数同时处理「id」与「标题」，解析不到返回 `null` 不抛），照 `routeForSessions()` 的用法。曾经 `settleRowByDeclaration()` 读 `updated.requesterSessionId` 恒为 null，导致回执跳过 digest、落到 `config.receiptTo`——虾酱 3 条完工回执全部投给了一个不相干的历史会话。
+
 requester 缺失时按**目标会话的 cwd** 推断，判据分两层（T-mwwdyc7i）：
 
 1. **注册表真源**（首选）：`workspaces.json` 里该 cwd 条目的 `coordinators[]`，取 `status=approved` 且（`permanent=true` 或 `leaseUntil > now`）的成员。恰好一个 → 用它，日志 `requester inferred from workspace: <title> (<id>) source=registry why=primary|sole-approved|legacy-scalar`；**多个都合格 → 不猜**，保持 `ambiguous` + file-only（`source=registry why=multiple-primaries|no-primary`）。活跃时间不再用来挑赢家。

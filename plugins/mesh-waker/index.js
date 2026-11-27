@@ -6729,7 +6729,14 @@ export function apply(ctx, config) {
     void receiptFlow
       .deliverReceipt(receipt, {
         requester: updated.requester ?? null,
-        requesterSessionId: updated.requesterSessionId ?? null,
+        // T-mwxx12b8: task rows carry `requester`, never `requesterSessionId` — that field
+        // only exists on in-memory task objects. Reading it here always produced null, so
+        // deliverReceipt() skipped the digest branch and deliverNotice() fell back to
+        // config.receiptTo. Three xiajiang receipts went to a stale `mesh · 协调` session
+        // (session-7fa21aa4) instead of their dispatcher (session-9127441f…) that way.
+        // resolveRequesterSessionId() already handles "id or title" and returns null on failure,
+        // exactly as routeForSessions() uses it (index.js:4798).
+        requesterSessionId: resolveRequesterSessionId(updated.requester),
         requesterInferred: false,
       })
       .catch((error) => {
@@ -6747,13 +6754,16 @@ export function apply(ctx, config) {
    * advisory instead — clearly marked so it is not mistaken for a second receipt.
    */
   function notifyRefusedDeclaration(row, { requested, caller }) {
-    const mode = row.requesterSessionId ? 'queue' : 'file'
+    // T-mwxx12b8: `row` is a disk row, so `row.requesterSessionId` was always undefined and this
+    // advisory was forced to file mode even when the dispatcher was perfectly resolvable.
+    const requesterSessionId = resolveRequesterSessionId(row.requester)
+    const mode = requesterSessionId ? 'queue' : 'file'
     const text =
       `[RECEIPT-ADVISORY] ${row.taskId} already ${row.receiptStatus ?? row.status}` +
       ` — duplicate ${requested} declaration from ${caller} ignored; nothing changed`
     try {
       void receiptFlow
-        .deliverNotice(mode, text, `receipt ${row.taskId} duplicate-declaration`, row.requesterSessionId ?? '')
+        .deliverNotice(mode, text, `receipt ${row.taskId} duplicate-declaration`, requesterSessionId ?? '')
         .catch((error) => {
           fileLog(`refused-declaration advisory failed task=${row.taskId}: ${error?.message ?? error}`)
         })
@@ -7156,7 +7166,9 @@ export function apply(ctx, config) {
   // makes the migration visible instead of silently swallowed.
   {
     const silent = [...taskRows.values()].filter(
-      (row) => row.settledAt && !row.receiptDigestSessionId && !row.receiptAckedAt && row.requesterSessionId,
+      // T-mwxx12b8: disk rows have `requester`, not `requesterSessionId`; the old predicate was
+      // falsy for every row, so this counter reported 0 forever and hid the migration backlog.
+      (row) => row.settledAt && !row.receiptDigestSessionId && !row.receiptAckedAt && resolveRequesterSessionId(row.requester),
     ).length
     fileLog(`receipt-digest migration: ${silent} settled row(s) without a receipt-digest target`)
   }

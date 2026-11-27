@@ -267,7 +267,10 @@ test('receipt migration: boot counts settled rows that never had a digest target
         taskId: 'T-mwhpo5yh',
         status: 'settled',
         targetSessionId: WORKER,
-        requesterSessionId: REQ,
+        // Real task rows carry `requester`; `requesterSessionId` has never existed on disk
+        // (766 rows scanned 2026-11-27, zero hits). This fixture used to seed the phantom field,
+        // so it "passed" while the counter read a field no real row has (T-mwxx12b8).
+        requester: REQ,
         settledAt: now - 1000,
         receiptMode: 'file',
         createdAt: now - 7200000,
@@ -276,7 +279,7 @@ test('receipt migration: boot counts settled rows that never had a digest target
         taskId: 'T-migrated',
         status: 'settled',
         targetSessionId: WORKER,
-        requesterSessionId: REQ,
+        requester: REQ,
         settledAt: now - 1000,
         receiptMode: 'file',
         receiptDigestSessionId: REQ,

@@ -32,6 +32,24 @@ const GONE = 'session-rl-gone'
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+/**
+ * Poll until `predicate` is truthy (T-mwxx12b8).
+ *
+ * The grace-window cases used a fixed `sleep(...)` sized to the window. That holds when the file
+ * runs alone but not under the full suite's load, where the timer can fire later than the sleep
+ * and the assertion sees the pre-recheck state — the intermittent failure the coordinator saw
+ * once as 263/264. Waiting for the observable fact instead of the clock removes the race.
+ */
+async function waitFor(predicate, { timeoutMs = 8000, intervalMs = 50 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const value = await predicate()
+    if (value) return value
+    if (Date.now() >= deadline) return null
+    await sleep(intervalMs)
+  }
+}
+
 async function freePort() {
   return await new Promise((resolve, reject) => {
     const server = net.createServer()
@@ -477,9 +495,12 @@ test('restart: a quiet session is held at boot and only judged after the grace w
     assert.equal(early?.deferredReason, 'awaiting-restart-grace')
     assert.match(h.log(), /restart reconciliation: held T-orphan-hold/)
 
-    await sleep(1200) // past the grace window
-    const late = await h.taskRow('T-orphan-hold')
-    assert.equal(late?.status, 'lost', 'after the grace window, silence is evidence')
+    // Wait for the recheck to rule, not for a fixed slice of wall clock.
+    const judged = await waitFor(async () => {
+      const row = await h.taskRow('T-orphan-hold')
+      return row?.status === 'lost' ? row : null
+    })
+    assert.ok(judged, 'the grace recheck must judge the held row within the timeout')
     assert.match(h.log(), /grace expired for T-orphan-hold/)
     assert.equal(h.receiptRows().filter((receipt) => receipt.taskId === 'T-orphan-hold' && receipt.status === 'lost').length, 1)
   } finally {
@@ -495,10 +516,13 @@ test('restart: a session that speaks during the grace window is spared', async (
     assert.equal(early?.status, 'pending')
     // The session resumes before the grace window expires.
     h.emitActivity(WORKER)
-    await sleep(1500)
+    const released = await waitFor(async () => {
+      const row = await h.taskRow('T-orphan-spared')
+      return row?.deferredAt === null || row?.deferredAt === undefined ? row : null
+    })
+    assert.ok(released, 'the recheck must clear the deferral within the timeout')
     const late = await h.taskRow('T-orphan-spared')
     assert.equal(late?.status, 'pending', 'the session came back inside the window')
-    assert.equal(late?.deferredAt ?? null, null, 'the deferral is cleared once it is alive')
     assert.match(h.log(), /is alive after the grace window; staying pending/)
     assert.equal(h.receiptRows().filter((receipt) => receipt.taskId === 'T-orphan-spared').length, 0)
   } finally {
@@ -530,12 +554,17 @@ test('restart: a deferred row is not re-stalled by the claim sweep', async () =>
     restartGraceMs: 700,
   })
   try {
-    await sleep(1600) // boot + grace recheck + several claimSweep passes at claimSweepMs=500
+    // Wait for the recheck to actually release the deferral, not for a fixed number of ms: under
+    // the full suite's load the timer fires later than a fixed sleep would assume.
+    const released = await waitFor(async () => {
+      const row = await h.taskRow('T-resumed')
+      return row?.deferredAt === null || row?.deferredAt === undefined ? row : null
+    })
+    assert.ok(released, 'the recheck must release the deferral within the timeout')
     const row = await h.taskRow('T-resumed')
     assert.notEqual(row?.status, 'stalled', 'the claim sweep must not re-stall a claimed row')
     assert.notEqual(row?.status, 'lost', 'and restart reconciliation must not kill it either')
     assert.equal(row?.status, 'pending')
-    assert.equal(row?.deferredAt ?? null, null, 'the recheck released it once it proved alive')
     assert.match(h.log(), /T-resumed is alive after the grace window; staying pending/)
     assert.doesNotMatch(h.log(), /digest task stalled task=T-resumed/, 'no re-stall after the resume')
   } finally {
