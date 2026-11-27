@@ -1,5 +1,14 @@
 name: hub smoke
 
+# 2026-11-28：加 `schedule` 与 `workflow_dispatch`。
+#
+# 起因（owner 指出「ci 天天是红的你也没发现」）：本 workflow 原来只认 `hub/**` 变更，
+# 2026-11-17 那次 `check-paths` 失败之后，10 天没再跑过任何一次 —— GitHub 上就一直挂着
+# 一个红叉，既是**陈旧结论**（那个违规后来被修了），又让「CI 全绿」这个判断方法失灵：
+# 只看最新一条 run 时，几乎每次都跑的 `plugin check` 永远排在前面，把这条红挡死。
+#
+# 每天跑一次 + 可手动触发，保证它的结论最多陈旧 24 小时；配合
+# `.worklog/bin/check-ci.mjs`（按 workflow 分组取最新一次）就不会再被挡住。
 on:
   push:
     paths:
@@ -8,6 +17,10 @@ on:
   pull_request:
     paths:
       - "hub/**"
+  schedule:
+    # 每天 20:17 UTC（本地 04:17）——低峰，且与 plugin check 的推送触发错开
+    - cron: "17 20 * * *"
+  workflow_dispatch:
 
 jobs:
   smoke:
