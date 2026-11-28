@@ -2,7 +2,31 @@
 
 本项目从 0.1.0 开始记录。格式参考 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循 SemVer。
 
-> 最新发布：`0.2.1`。
+> 最新发布：`0.3.0`。
+
+## [0.3.0] - 2026-11-28
+
+### Fixed
+
+- **本包此前从未真正发布过**：`0.2.0`/`0.2.1`/`0.2.2` 都只写了 CHANGELOG，`npm view dsh-mesh-skills` 一直是 **404**。
+  所以「发版后同步技能到各机器」这条约定**在源头就是空转的**——没有发布物可同步。这次是 npm 上的第一个版本。
+  （发现于 owner 2026-11-28 问「协作技能同步给 nas dsh 了吗」，顺带查出本机 `~/.dsh/skills/mesh` 也停在 11-18。）
+
+- registry 上除 `0.3.0` 外还有一个 **`0.0.0-stage`**：那是 npm 在发布过程中自动创建的占位版本
+  （`description: "Temporary package placeholder for staged publishing"`），不是本包的内容，`latest` 指向 `0.3.0`。
+  别被 `npm view dsh-mesh-skills versions` 里的两个版本号误导。
+  （我自己就误判过：发布后 25 秒查 registry 读到陈旧缓存，以为「被 staged 暂存」；**查 registry 必须带 cache-buster**。）
+
+### Added
+
+- `skills/mesh/SKILL.md` §16「steer 的三个入口」：同一个「插队进当前回合」概念在三个入口参数名不同——
+  `mesh_dispatch` 是 `mode`、`mesh_send` 是 `delivery`、`POST /mesh/inject` 是 `mode`。**写错参数名等于没生效**，
+  且只有 `mesh_send.delivery` 还接受 `branch`。参数以 `docs/tools-reference.md` 为准，不要凭记忆写。
+
+### Changed
+
+- `mesh` 技能：跨机发消息的边界措辞改为「不要发给自己」（原「`to` 只填机器级 agent 名」），
+  与工具契约守卫的用词一致；修正三处 `branch` / `backfill` 的转义残缺。
 
 ## [0.2.2] - 2026-11-17
 
