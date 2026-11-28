@@ -1,4 +1,4 @@
-<!-- drift: waker=^0.8.0 hub=^0.8.1 owner=docs -->
+<!-- drift: waker=^0.9.0 hub=^0.8.1 owner=docs -->
 # 接入 dsh-mesh（一页纸）
 
 给**公网上的陌生人**：网络环境未知（很可能是双 NAT、没有公网 IP、公司防火墙），
@@ -6,7 +6,7 @@
 
 > 若 hub 使用**自签证书**（公网 TCP 透传场景），**必须按下面第 0 节配置 CA**；若 hub 使用公共 CA 签发的证书、或位于可信内网，则无需配置 CA。
 
-> 契约版本：hub 0.8.1 / waker 0.8.0（本文流程自 hub 0.7.15 / waker 0.5.0 起成立；旧版本可用但缺 `wake_push_failures` 等新字段）。
+> 契约版本：hub 0.8.1 / waker 0.9.0（本文流程自 hub 0.7.15 / waker 0.5.0 起成立；hub < 0.8.1 没有 `wake_push_failures` 等新字段）。
 
 ---
 
@@ -92,7 +92,7 @@ python -c "import ssl,urllib.request; print(urllib.request.urlopen('https://<公
 ### 第 1 步：装插件（精确版本）
 
 ```bash
-dsh plugin add dsh-mesh-waker@0.8.0
+dsh plugin add dsh-mesh-waker@0.9.0
 ```
 
 协作技能单独发布：`npm i -g dsh-mesh-skills`（装到 `~/.dsh/skills`，见 [skills/README.md](../skills/README.md)）。
@@ -198,6 +198,8 @@ push 不可达时会**静默回落**到 pull，不会报错。
 - **没有直连**：大文件走中枢的 blob 通道中转，不建立点对点连接。
 - **消息语义**：`no_reply` 只用于收尾条（`reply_to` 非空），`silent` 表示落库不唤醒（审批类场景），
   细节见 `docs/auth-and-console.md` 与 `docs/mesh-architecture.md` 的「消息语义」。
+- **入站消息落到哪**：带 `conversation` 的消息若还没绑定会话，默认**自动建一个**（建在收件箱工作区，标题取对话名）并绑定，同一对话后续消息复用该会话；每小时上限 `unboundAutoCreateMaxPerHour`（默认 6），超出、未配置收件箱工作区、或把 `unboundDeliveryMode` 设为 `park` 时，消息标记已读并进入停放队列（`unbound.jsonl`），等绑定后再重放。
+- **投错地方 / 改绑**：用 `mesh_rebind({conversation, to?, replay?})` 把入站对话改绑到指定会话（不传 `to` 就绑到调用方会话）；`replay:true` 顺带把停放的积压投过去。参数见 [`tools-reference.md`](tools-reference.md)。
 - **隔离**：只能看到自己参与的会话与自己可见的 blob；越权会得到 403，不是静默过滤。
 
 ---

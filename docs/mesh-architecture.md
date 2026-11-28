@@ -1,4 +1,4 @@
-<!-- drift: waker=^0.8.0 hub=^0.8.1 owner=docs -->
+<!-- drift: waker=^0.9.0 hub=^0.8.1 owner=docs -->
 # dsh-mesh 架构（截至 0.8.1）
 
 ## 拓扑
