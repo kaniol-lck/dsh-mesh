@@ -4435,10 +4435,13 @@ export function apply(ctx, config) {
 
     // Patch only the two projection keys; `entry` is otherwise the raw parsed object, so every
     // other field is re-serialized exactly as it came off disk.
+    const sourceUpdatedAtStored = normalizeSourceUpdatedAt(sourceUpdatedAt)
     entry.roleSessions = normalized
     entry.roleProjection = {
       source: 'team.json',
-      sourceUpdatedAt: Number.isFinite(Number(sourceUpdatedAt)) ? Number(sourceUpdatedAt) : 0,
+      // Stored verbatim (or null): the gate on the repo side compares this against team.json's
+      // own `updatedAt`, so any numeric massaging here breaks that comparison.
+      sourceUpdatedAt: sourceUpdatedAtStored,
       pushedAt: at,
       pushedBy: pushedBy ? String(pushedBy) : null,
       unresolved,
@@ -4464,21 +4467,24 @@ export function apply(ctx, config) {
 
     if (unresolved.length) {
       fileLog(
-        `WARN role projection ${slug}: ${unresolved.length} session(s) unresolved (${unresolved.join(', ')}) roles=${Object.keys(normalized).length} by=${pushedBy ?? '-'} reason=${reason ?? '-'}`,
+        `WARN role projection ${slug}: ${unresolved.length} session(s) unresolved (${unresolved.join(', ')}) roles=${Object.keys(normalized).length} by=${pushedBy ?? '-'} reason=${reason ?? '-'} sourceUpdatedAt=${sourceUpdatedAtStored ?? '-'}`,
       )
     } else {
       fileLog(
-        `role projection ${slug}: roles=${Object.keys(normalized).length} sourceUpdatedAt=${sourceUpdatedAt ?? 0} by=${pushedBy ?? '-'} reason=${reason ?? '-'}`,
+        `role projection ${slug}: roles=${Object.keys(normalized).length} sourceUpdatedAt=${sourceUpdatedAtStored ?? '-'} by=${pushedBy ?? '-'} reason=${reason ?? '-'}`,
       )
     }
     return {
       ok: true,
       status: 200,
-      body: { ok: true, workspace: slug, roles: Object.keys(normalized).length, sourceUpdatedAt: Number(sourceUpdatedAt) || 0, unresolved },
+      // Echo the stored form, not the raw input: a caller can then assert that what it sent is
+      // what this machine kept, including the null case.
+      body: { ok: true, workspace: slug, roles: Object.keys(normalized).length, sourceUpdatedAt: sourceUpdatedAtStored, unresolved },
     }
   }
 
-  /** Normalize one registry entry (shared by the loader and the on-demand reader). */  function normalizeWorkspaceEntry(value) {
+  /** Normalize one registry entry (shared by the loader and the on-demand reader). */
+  function normalizeWorkspaceEntry(value) {
     const workers = {}
     if (value.workers && typeof value.workers === 'object') {
       for (const [role, worker] of Object.entries(value.workers)) {
@@ -4544,11 +4550,42 @@ export function apply(ctx, config) {
       if (!sessionId) continue
       out[sanitizeSlug(role)] = {
         sessionId,
+        // `since` is a MILLISECOND NUMBER by contract (rotate-session sends
+        // `Date.parse(active.since) || 0`), so it round-trips as a number: push 1763000000000 and
+        // GET returns 1763000000000. Absent stays 0 here rather than null because a "role held
+        // since epoch 0" is meaningless-but-harmless, whereas a null would force every reader to
+        // branch. Deliberately NOT the same rule as sourceUpdatedAt: that one is an opaque date
+        // string and numeric massaging destroys it (T-mwzwrgg5).
         since: Number.isFinite(Number(row.since)) ? Number(row.since) : 0,
         pushedAt: Number.isFinite(Number(row.pushedAt)) ? Number(row.pushedAt) : 0,
       }
     }
     return Object.keys(out).length ? out : null
+  }
+
+  /**
+   * `sourceUpdatedAt` is an OPAQUE STRING, never a number (T-mwzwrgg5).
+   *
+   * The value travels from `team.json.updatedAt`, which is a human-readable date like
+   * "2026-11-19". Coercing it numerically produced NaN, which `Number.isFinite` then turned into
+   * 0 — so every real push stored `sourceUpdatedAt: 0`, and the repo-side gate comparing the
+   * projection against `team.json` compared "0" with "2026-11-19" and could never agree. The type
+   * was never pinned down by the contract, so both sides assumed a different one; this function
+   * is the single place that decides it.
+   *
+   * Rules: store the caller's value verbatim as a string; absent, null or empty becomes null.
+   * No Number(), no parseInt, no timestamp conversion — the caller's format is the caller's
+   * business, and this side only needs equality.
+   */
+  function normalizeSourceUpdatedAt(value) {
+    if (value === undefined || value === null) return null
+    if (typeof value === 'number') {
+      // A numeric caller is accepted rather than rejected, but converted through the same string
+      // path so a round-trip is still lossless: 1795000002000 comes back as "1795000002000".
+      return Number.isFinite(value) ? String(value) : null
+    }
+    const text = String(value)
+    return text.trim() === '' ? null : text
   }
 
   /** Normalize `roleProjection` (T-mwzvjvwz): provenance of the last accepted push. */
@@ -4557,7 +4594,9 @@ export function apply(ctx, config) {
     const num = (input) => (Number.isFinite(Number(input)) ? Number(input) : 0)
     return {
       source: String(value.source ?? 'team.json'),
-      sourceUpdatedAt: num(value.sourceUpdatedAt),
+      // Read-through of the same rule, so a value written by an older build (0) is repaired to
+      // null on the next read instead of being compared as "0".
+      sourceUpdatedAt: normalizeSourceUpdatedAt(value.sourceUpdatedAt),
       pushedAt: num(value.pushedAt),
       pushedBy: value.pushedBy ? String(value.pushedBy) : null,
       // A session id that does not resolve to a live session is kept here rather than rejected:
@@ -8004,7 +8043,7 @@ export function apply(ctx, config) {
           // Always objects, never null: a consumer comparing projections should not have to
           // branch on "no projection yet" before reading a field.
           roleSessions: entry.roleSessions ?? {},
-          roleProjection: entry.roleProjection ?? { source: 'team.json', sourceUpdatedAt: 0, pushedAt: 0, pushedBy: null, unresolved: [] },
+          roleProjection: entry.roleProjection ?? { source: 'team.json', sourceUpdatedAt: null, pushedAt: 0, pushedBy: null, unresolved: [] },
         }),
       )
       return
@@ -9533,7 +9572,10 @@ export function apply(ctx, config) {
                 const roles = entry?.roleSessions && typeof entry.roleSessions === 'object' ? Object.keys(entry.roleSessions).length : 0
                 return {
                   workspace: slug,
-                  sourceUpdatedAt: Number(projection?.sourceUpdatedAt) || 0,
+                  // Verbatim string (or null), because the gate compares this against
+                  // team.json.updatedAt, which is a date like "2026-11-19" — numeric massaging
+                  // here is exactly the bug T-mwzwrgg5 fixed.
+                  sourceUpdatedAt: normalizeSourceUpdatedAt(projection?.sourceUpdatedAt),
                   pushedAt: Number(projection?.pushedAt) || 0,
                   roles,
                   unresolved: Array.isArray(projection?.unresolved) ? projection.unresolved.length : 0,

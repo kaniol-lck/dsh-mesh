@@ -328,7 +328,7 @@ test('roles: a push is stored on the workspace entry and answers 200', async () 
       body: JSON.stringify({
         workspace: 'ws-alpha',
         roleSessions: { waker: { sessionId: LIVE_NEW, since: 1795000001000 } },
-        sourceUpdatedAt: 1795000002000,
+        sourceUpdatedAt: '1795000002000',
         pushedBy: 'session-rotate',
         reason: 'rotation',
       }),
@@ -338,7 +338,7 @@ test('roles: a push is stored on the workspace entry and answers 200', async () 
     assert.equal(body.ok, true)
     assert.equal(body.workspace, 'ws-alpha')
     assert.equal(body.roles, 1)
-    assert.equal(body.sourceUpdatedAt, 1795000002000)
+    assert.equal(body.sourceUpdatedAt, '1795000002000')
 
     const raw = h.workspacesRaw()
     const entry = raw.workspaces['ws-alpha']
@@ -346,7 +346,7 @@ test('roles: a push is stored on the workspace entry and answers 200', async () 
     assert.equal(entry.roleSessions.waker.since, 1795000001000)
     assert.ok(entry.roleSessions.waker.pushedAt > 0)
     assert.equal(entry.roleProjection.source, 'team.json')
-    assert.equal(entry.roleProjection.sourceUpdatedAt, 1795000002000)
+    assert.equal(entry.roleProjection.sourceUpdatedAt, '1795000002000')
     assert.equal(entry.roleProjection.pushedBy, 'session-rotate')
     assert.deepEqual(entry.roleProjection.unresolved, [])
 
@@ -355,7 +355,7 @@ test('roles: a push is stored on the workspace entry and answers 200', async () 
     assert.equal(read.ok, true)
     assert.equal(read.workspace, 'ws-alpha')
     assert.equal(read.roleSessions.waker.sessionId, LIVE_NEW)
-    assert.equal(read.roleProjection.sourceUpdatedAt, 1795000002000)
+    assert.equal(read.roleProjection.sourceUpdatedAt, '1795000002000')
   } finally {
     h.close()
   }
@@ -420,7 +420,7 @@ test('roles: a session this machine cannot see is accepted but flagged unresolve
       body: JSON.stringify({
         workspace: 'ws-alpha',
         roleSessions: { waker: { sessionId: 'session-ghost-1' }, l1: { sessionId: 'session-ghost-2' } },
-        sourceUpdatedAt: 1795000003000,
+        sourceUpdatedAt: '1795000003000',
         pushedBy: 'session-rotate',
       }),
     })
@@ -436,7 +436,7 @@ test('roles: a session this machine cannot see is accepted but flagged unresolve
     const status = await (await fetch(`${h.base}/mesh/status`)).json()
     assert.equal(status.roleProjection.unresolved, 2, '/mesh/status must surface the count for the gate')
     assert.equal(status.roleProjection.roles, 2)
-    assert.equal(status.roleProjection.sourceUpdatedAt, 1795000003000)
+    assert.equal(status.roleProjection.sourceUpdatedAt, '1795000003000')
   } finally {
     h.close()
   }
@@ -453,7 +453,7 @@ test('roles: a push leaves every other field of the entry byte-identical', async
       body: JSON.stringify({
         workspace: 'ws-alpha',
         roleSessions: { waker: { sessionId: CONVERSATION_OWNER } },
-        sourceUpdatedAt: 1795000004000,
+        sourceUpdatedAt: '1795000004000',
       }),
     })
     const after = h.workspacesRaw().workspaces['ws-alpha']
@@ -589,9 +589,9 @@ test('roles: two concurrent pushes for different workspaces both land', async ()
     const raw = h.workspacesRaw()
     // Neither update was lost to the other.
     assert.equal(raw.workspaces['ws-alpha'].roleSessions.waker.sessionId, CONVERSATION_OWNER)
-    assert.equal(raw.workspaces['ws-alpha'].roleProjection.sourceUpdatedAt, 111)
+    assert.equal(raw.workspaces['ws-alpha'].roleProjection.sourceUpdatedAt, '111')
     assert.equal(raw.workspaces['ws-beta'].roleSessions.l2.sessionId, LIVE_NEW)
-    assert.equal(raw.workspaces['ws-beta'].roleProjection.sourceUpdatedAt, 222)
+    assert.equal(raw.workspaces['ws-beta'].roleProjection.sourceUpdatedAt, '222')
   } finally {
     h.close()
   }
@@ -616,11 +616,122 @@ test('roles: mesh_rebind can attach a deliverRole and status always reports the 
     // With no projection pushed at all, status still carries all five fields (all zero/null).
     const status = await (await fetch(`${h.base}/mesh/status`)).json()
     assert.ok('roleProjection' in status, 'the field must exist even with no projection')
-    assert.equal(status.roleProjection.sourceUpdatedAt, 0)
+    assert.equal(status.roleProjection.sourceUpdatedAt, null)
     assert.equal(status.roleProjection.pushedAt, 0)
     assert.equal(status.roleProjection.roles, 0)
     assert.equal(status.roleProjection.unresolved, 0)
     assert.equal(typeof status.roleHandoffs, 'number')
+  } finally {
+    h.close()
+  }
+})
+
+// ── T-mwzwrgg5: `sourceUpdatedAt` is an opaque STRING, never a number ────────
+// The bug this pins: team.json.updatedAt is a human-readable date ("2026-11-19"), the contract
+// never said whether the field was a timestamp or that date, and this side coerced it with
+// Number() — which is NaN for a date — so every real push stored 0. The repo-side gate compared
+// "0" with "2026-11-19" and could never agree. The type is now pinned here, and the reverse
+// assertion below is what makes a future Number() regression impossible to miss.
+
+test('roles: sourceUpdatedAt round-trips a DATE STRING unchanged and is never coerced to 0', async () => {
+  const h = await startHarness({ workspacesSeed: seedRegistry(), liveSessions: [LIVE_NEW, CONVERSATION_OWNER] })
+  try {
+    // Exactly what rotate-session sends: team.json.updatedAt ?? null.
+    const sent = '2026-11-19'
+    const res = await fetch(`${h.base}/mesh/roles`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspace: 'ws-alpha', roleSessions: { waker: { sessionId: LIVE_NEW, since: 1763000000000 } }, sourceUpdatedAt: sent, pushedBy: 'session-rotate' }),
+    })
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    // The echo is the string itself — the reverse assertion: 0 or "0" would fail here.
+    assert.equal(body.sourceUpdatedAt, sent)
+    assert.notEqual(body.sourceUpdatedAt, 0)
+    assert.notEqual(body.sourceUpdatedAt, '0')
+
+    // On disk: same string, not a number.
+    const stored = h.workspacesRaw().workspaces['ws-alpha'].roleProjection.sourceUpdatedAt
+    assert.equal(stored, sent)
+    assert.equal(typeof stored, 'string')
+
+    // GET returns it unchanged.
+    const read = await (await fetch(`${h.base}/mesh/roles?workspace=ws-alpha`)).json()
+    assert.equal(read.roleProjection.sourceUpdatedAt, sent)
+    assert.equal(typeof read.roleProjection.sourceUpdatedAt, 'string')
+
+    // /mesh/status returns it unchanged too — this is the value the gate compares.
+    const status = await (await fetch(`${h.base}/mesh/status`)).json()
+    assert.equal(status.roleProjection.sourceUpdatedAt, sent)
+    assert.equal(typeof status.roleProjection.sourceUpdatedAt, 'string')
+
+    // And `since` (a real millisecond number) survived as a number, unchanged.
+    assert.equal(read.roleSessions.waker.since, 1763000000000)
+    assert.equal(typeof read.roleSessions.waker.since, 'number')
+  } finally {
+    h.close()
+  }
+})
+
+test('roles: an absent or null sourceUpdatedAt is stored as null, never 0 or "null"', async () => {
+  const h = await startHarness({ workspacesSeed: seedRegistry(), liveSessions: [LIVE_NEW, CONVERSATION_OWNER] })
+  try {
+    // Case 1: explicit null.
+    const nullPush = await fetch(`${h.base}/mesh/roles`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspace: 'ws-alpha', roleSessions: { waker: { sessionId: LIVE_NEW } }, sourceUpdatedAt: null }),
+    })
+    assert.equal(nullPush.status, 200)
+    assert.equal((await nullPush.json()).sourceUpdatedAt, null)
+    const storedNull = h.workspacesRaw().workspaces['ws-alpha'].roleProjection.sourceUpdatedAt
+    assert.equal(storedNull, null, 'null must not become 0')
+    assert.notEqual(storedNull, 'null', 'and must not become the string "null"')
+    assert.equal(typeof storedNull, 'object', 'null is typeof object in JS; a string here would be a bug')
+
+    // Case 2: field omitted entirely.
+    const omitted = await fetch(`${h.base}/mesh/roles`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspace: 'ws-alpha', roleSessions: { waker: { sessionId: LIVE_NEW } } }),
+    })
+    assert.equal(omitted.status, 200)
+    assert.equal((await omitted.json()).sourceUpdatedAt, null)
+    assert.equal(h.workspacesRaw().workspaces['ws-alpha'].roleProjection.sourceUpdatedAt, null)
+
+    // Case 3: empty string is treated as absent rather than stored as "".
+    const blank = await fetch(`${h.base}/mesh/roles`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspace: 'ws-alpha', roleSessions: { waker: { sessionId: LIVE_NEW } }, sourceUpdatedAt: '   ' }),
+    })
+    assert.equal((await blank.json()).sourceUpdatedAt, null)
+    assert.equal(h.workspacesRaw().workspaces['ws-alpha'].roleProjection.sourceUpdatedAt, null)
+
+    // GET and status agree.
+    const read = await (await fetch(`${h.base}/mesh/roles?workspace=ws-alpha`)).json()
+    assert.equal(read.roleProjection.sourceUpdatedAt, null)
+    const status = await (await fetch(`${h.base}/mesh/status`)).json()
+    assert.equal(status.roleProjection.sourceUpdatedAt, null)
+  } finally {
+    h.close()
+  }
+})
+
+test('roles: a numeric sourceUpdatedAt is preserved losslessly as its string form', async () => {
+  // A numeric caller is not rejected, but it goes through the same string path, so what comes back
+  // compares equal to what was sent once both sides stringify — which is what the gate does.
+  const h = await startHarness({ workspacesSeed: seedRegistry(), liveSessions: [LIVE_NEW, CONVERSATION_OWNER] })
+  try {
+    const sent = 1795000002001
+    const res = await fetch(`${h.base}/mesh/roles`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspace: 'ws-alpha', roleSessions: { waker: { sessionId: LIVE_NEW } }, sourceUpdatedAt: sent }),
+    })
+    assert.equal((await res.json()).sourceUpdatedAt, String(sent))
+    const read = await (await fetch(`${h.base}/mesh/roles?workspace=ws-alpha`)).json()
+    assert.equal(String(read.roleProjection.sourceUpdatedAt), String(sent))
   } finally {
     h.close()
   }
