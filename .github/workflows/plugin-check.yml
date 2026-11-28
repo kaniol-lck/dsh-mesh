@@ -85,6 +85,13 @@ jobs:
       - name: QA behaviour probes
         run: node qa/run.mjs
 
+      # 技能同步（2026-11-28）：`skills/` 是可独立发布的包，但一直只校验
+      # package.json ↔ CHANGELOG 内部一致，**没人管装出去的副本**——实测本机落后 4 天、
+      # NAS 上连目录都没有，而 0.2.x 三个版本从未真正 publish。
+      # CI 里 `~/.dsh/skills` 不存在 → 脚本给 WARN 且 exit 0（不假通过、也不误报）。
+      - name: Skills synced to this machine
+        run: node scripts/check-skills-synced.mjs
+
       - name: No duplicate tool implementations
         run: node scripts/check-duplicates.mjs
 
