@@ -125,6 +125,9 @@ dsh plugin --profile web add dsh-mesh-waker
 | `catchUpMaxConversations` | `3` | 一次补收最多覆盖几个会话 |
 | `cooldownMs` | `1500` | 同一会话两轮之间的最小间隔 |
 | `conversationCooldownMs` | `60000` | 同一 conversation 的冷却窗口 |
+| `unboundDeliveryMode` | `auto-create` | 未绑定 conversation 的处置：`auto-create`（在收件箱工作区建一个会话并绑定，同对话复用）或 `park`（标已读、进 `unbound.jsonl` 等人工绑定） |
+| `unboundAutoCreateMaxPerHour` | `6` | 每小时最多自动建几个会话；超限退回 park 并 WARN。计数持久化在 `unbound-auto-create.json`，重启不清零 |
+| `restartGraceMs` | `300000` | 重启后判定「确实没活过」的宽限期：期间不判 `lost`，期满仍无生命迹象才发回执 |
 
 ### 限速与节流
 

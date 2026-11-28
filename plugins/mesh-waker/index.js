@@ -912,6 +912,13 @@ export function apply(ctx, config) {
     unboundAutoCreated: 0,
     unboundAutoCreatedLastHour: 0,
     lastAutoCreated: null,
+    // T-mwzvjvwz: how many times a dead delivery target was replaced by the workspace's current
+    // holder of its role. This is the counter that proves "session relay" actually happened,
+    // rather than the mail having been parked or dropped.
+    roleHandoffs: 0,
+    // The last role-based rebound, so an operator sees which conversation moved where without
+    // reading the log: { conversation, role, from, to, at } or null.
+    lastRoleHandoff: null,
     lastOutcome: null,
     // Pull mode (contract section 4): when the last poll finished, how long the current
     // cadence is, and when the next one fires (the status route reports the countdown).
@@ -3211,6 +3218,66 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Resolve a role to the session that currently holds it in the relevant workspace
+   * (T-mwzvjvwz).
+   *
+   * Which workspace? Deliberately narrow, in order:
+   *   1. the workspace the conversation was bound in (deliverToAuto.workspacePath), because the
+   *      dialogue belongs there;
+   *   2. this process's own workspace (workspacePath / sessionCwd);
+   *   3. only if neither matches and exactly ONE workspace declares that role, that one.
+   * Anything else returns null and the caller parks. Guessing would deliver mail into a stranger's
+   * session, which is exactly what the park branch exists to prevent.
+   *
+   * Returns a sessionId only when the projection names one AND it is live right now. A stale
+   * projection is normal (rotate-session may not have pushed yet, or the session died since), and
+   * a dead id is not a delivery target.
+   */
+  function roleSessionFor(role, entry) {
+    const wanted = sanitizeSlug(String(role ?? '').trim())
+    if (!wanted) return null
+    try {
+      refreshWorkspacesFromDisk()
+      const all = workspaces.workspaces ?? {}
+
+      const candidates = []
+      const autoPath = entry?.deliverToAuto?.workspacePath ?? null
+      if (autoPath) {
+        for (const [slug, value] of Object.entries(all)) {
+          if (value?.cwd && resolve(String(value.cwd)) === resolve(String(autoPath))) candidates.push(slug)
+        }
+      }
+      const ownCwd = c.workspacePath || c.sessionCwd || null
+      if (ownCwd) {
+        for (const [slug, value] of Object.entries(all)) {
+          if (value?.cwd && resolve(String(value.cwd)) === resolve(String(ownCwd))) candidates.push(slug)
+        }
+      }
+      const declaring = Object.entries(all)
+        .filter(([, value]) => value?.roleSessions?.[wanted]?.sessionId)
+        .map(([slug]) => slug)
+
+      let chosen = candidates.find((slug) => all[slug]?.roleSessions?.[wanted]?.sessionId) ?? null
+      if (!chosen && declaring.length === 1) chosen = declaring[0]
+      if (!chosen) {
+        fileLog(
+          'role ' + wanted + ': no workspace resolves it (candidates=' + (candidates.join(',') || '-') + ' declaring=' + (declaring.join(',') || '-') + ')',
+        )
+        return null
+      }
+      const sessionId = all[chosen].roleSessions[wanted].sessionId
+      if (!isLive(sessionId)) {
+        fileLog('role ' + wanted + ': workspace ' + chosen + ' points at ' + sessionId + ', which is not live; parking')
+        return null
+      }
+      return sessionId
+    } catch (error) {
+      fileLog('role ' + wanted + ': resolution failed (' + error.message + ')')
+      return null
+    }
+  }
+
+  /**
    * Create one session in an explicit workspace and name it (T-mwzfxyb7).
    *
    * Shared by the dead-origin replacement (T-364) and the unbound auto-create path: both need
@@ -3358,6 +3425,43 @@ export function apply(ctx, config) {
         saveConversations()
       }
     }
+    // ── Role relay (T-mwzvjvwz) ──────────────────────────────────────────────
+    // A conversation may name a ROLE instead of a fixed session (`deliverRole`). When the bound
+    // session is gone, the mail follows the role to whoever holds it now instead of falling back
+    // to an inbox or being parked. This is the "session relay" owner asked for: rotation changes
+    // who holds `waker`, and mail addressed to `waker` should reach the new holder.
+    //
+    // Order matters and is fixed by the contract: a live deliverTo always wins (nothing changes
+    // for existing bindings); the role is only consulted when the target is dead; and when a role
+    // is named but cannot be resolved the mail is PARKED, never delivered to an inbox and never
+    // handed to auto-create — silently doing either would put a conversation in a session its
+    // owner did not choose.
+    if (entry.deliverRole && (!entry.deliverTo || !isLive(entry.deliverTo))) {
+      const from = entry.deliverTo ?? null
+      const resolved = roleSessionFor(entry.deliverRole, entry)
+      if (resolved) {
+        entry.deliverTo = resolved
+        entry.deliverToAuto = null
+        saveConversations()
+        state.roleHandoffs += 1
+        state.lastRoleHandoff = { conversation, role: entry.deliverRole, from, to: resolved, at: Date.now() }
+        fileLog(`conversation=${conversation} rebound old=${from ?? '-'} new=${resolved} by role=${entry.deliverRole}`)
+      } else {
+        const parked = await parkUnbound(conversation, meta, messages)
+        state.lastDeferredReason = 'role-unresolved'
+        state.lastDeferredAt = Date.now()
+        state.lastDeferredConversation = conversation
+        if (!parked) {
+          fileLog(`conversation=${conversation} target=deferred reason=role-unresolved-park-failed role=${entry.deliverRole}`)
+          return { outcome: 'deferred', reason: 'role-unresolved-park-failed' }
+        }
+        fileLog(
+          `conversation=${conversation} target=parked reason=role-unresolved role=${entry.deliverRole} messages=${messages.length} pending=${state.unboundPending}`,
+        )
+        return { outcome: 'parked', reason: 'role-unresolved', messages: messages.length }
+      }
+    }
+
     // Delivery target (T-426): only an explicit binding may receive a conversation. deliverTo is
     // the delivery binding; panelSessionId is what /mesh/bind records for the panel.
     //
@@ -4278,8 +4382,103 @@ export function apply(ctx, config) {
     }
   }
 
-  /** Normalize one registry entry (shared by the loader and the on-demand reader). */
-  function normalizeWorkspaceEntry(value) {
+  /**
+   * Accept a role projection push from `rotate-session` (T-mwzvjvwz).
+   *
+   * Operates on the RAW file, not on `workspaces`/`normalizeWorkspaceEntry`: the requirement is
+   * that a push leaves every other field of that entry byte-identical, and the normalizer is a
+   * whitelist that would rewrite them. Read-patch-write is synchronous, so two concurrent pushes
+   * for different workspaces cannot interleave and lose each other's update (Node runs the handler
+   * body without yielding, and the write is temp-file + rename).
+   *
+   * Returns { ok, status, body } so the route can answer without a second guess.
+   */
+  function pushRoleProjection({ workspace, roleSessions, sourceUpdatedAt, pushedBy, reason }) {
+    const slug = sanitizeSlug(String(workspace ?? '').trim())
+    if (!slug) return { ok: false, status: 400, body: { error: 'workspace is required' } }
+    const normalized = normalizeRoleSessions(roleSessions)
+    if (!normalized) return { ok: false, status: 400, body: { error: 'roleSessions must be an object of { sessionId } rows' } }
+
+    let raw = null
+    try {
+      raw = JSON.parse(readFileSync(workspacesFile, 'utf8'))
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        fileLog(`role projection push failed to read ${workspacesFile}: ${error.message}`)
+        return { ok: false, status: 500, body: { error: `cannot read workspaces.json: ${error.message}` } }
+      }
+      raw = { machine: workspaces.machine ?? '', workspaces: {} }
+    }
+    if (!raw || typeof raw !== 'object') raw = { machine: workspaces.machine ?? '', workspaces: {} }
+    if (!raw.workspaces || typeof raw.workspaces !== 'object') raw.workspaces = {}
+    const entry = raw.workspaces[slug]
+    if (!entry || typeof entry !== 'object') {
+      // Never invent a workspace: a typo in the slug would silently create a phantom entry that
+      // every later reader treats as real.
+      return { ok: false, status: 409, body: { error: `unknown workspace ${JSON.stringify(slug)}` } }
+    }
+
+    const at = Date.now()
+    // A session id counts as unresolved when it does not name a session this plugin can see.
+    // It is still recorded: the push is a statement about another workspace's intent, and
+    // dropping it would leave no trace that a role points at something dead.
+    const unresolved = []
+    for (const [role, row] of Object.entries(normalized)) {
+      // Stamp each accepted row with when it landed. The caller's "since" is a claim about when
+      // the role changed hands; "pushedAt" is when this machine heard about it. Conflating them
+      // would make a stale re-send look like a fresh rotation. The body carries only sessionId
+      // and since, so this has to be filled in here — copying it from the request left every
+      // stored row at 0.
+      row.pushedAt = at
+      if (!isLive(row.sessionId)) unresolved.push(row.sessionId)
+    }
+
+    // Patch only the two projection keys; `entry` is otherwise the raw parsed object, so every
+    // other field is re-serialized exactly as it came off disk.
+    entry.roleSessions = normalized
+    entry.roleProjection = {
+      source: 'team.json',
+      sourceUpdatedAt: Number.isFinite(Number(sourceUpdatedAt)) ? Number(sourceUpdatedAt) : 0,
+      pushedAt: at,
+      pushedBy: pushedBy ? String(pushedBy) : null,
+      unresolved,
+    }
+
+    try {
+      mkdirSync(dirname(workspacesFile), { recursive: true })
+      const temp = `${workspacesFile}.roles.tmp`
+      writeFileSync(temp, `${JSON.stringify(raw, null, 2)}\n`, { mode: 0o600 })
+      renameSync(temp, workspacesFile)
+    } catch (error) {
+      // A silent failure here would be the worst outcome: the pusher would believe the projection
+      // landed. The caller gets a non-2xx and the log says why.
+      fileLog(`role projection push to ${workspacesFile} failed: ${error.message}`)
+      return { ok: false, status: 500, body: { error: `cannot write workspaces.json: ${error.message}` } }
+    }
+
+    // Keep this process's view in step without dropping fields the normalizer does not model.
+    const fresh = readWorkspacesFromDisk()
+    workspaces.machine = fresh.machine
+    workspaces.workspaces = fresh.workspaces
+    dirtyWorkspaces.clear()
+
+    if (unresolved.length) {
+      fileLog(
+        `WARN role projection ${slug}: ${unresolved.length} session(s) unresolved (${unresolved.join(', ')}) roles=${Object.keys(normalized).length} by=${pushedBy ?? '-'} reason=${reason ?? '-'}`,
+      )
+    } else {
+      fileLog(
+        `role projection ${slug}: roles=${Object.keys(normalized).length} sourceUpdatedAt=${sourceUpdatedAt ?? 0} by=${pushedBy ?? '-'} reason=${reason ?? '-'}`,
+      )
+    }
+    return {
+      ok: true,
+      status: 200,
+      body: { ok: true, workspace: slug, roles: Object.keys(normalized).length, sourceUpdatedAt: Number(sourceUpdatedAt) || 0, unresolved },
+    }
+  }
+
+  /** Normalize one registry entry (shared by the loader and the on-demand reader). */  function normalizeWorkspaceEntry(value) {
     const workers = {}
     if (value.workers && typeof value.workers === 'object') {
       for (const [role, worker] of Object.entries(value.workers)) {
@@ -4322,6 +4521,49 @@ export function apply(ctx, config) {
       ...(coordinators.length ? { coordinators } : {}),
       ...(typeof value.slug === 'string' && value.slug ? { slug: String(value.slug) } : {}),
       ...(value.ephemeral === true ? { ephemeral: true } : {}),
+      // T-mwzvjvwz: the role → current-session projection pushed by rotate-session. This is a
+      // whitelist, so without these two lines a push would be written and then silently dropped
+      // on the next read — the worst possible failure for a projection (it would look applied).
+      ...(normalizeRoleSessions(value.roleSessions) ? { roleSessions: normalizeRoleSessions(value.roleSessions) } : {}),
+      ...(normalizeRoleProjection(value.roleProjection) ? { roleProjection: normalizeRoleProjection(value.roleProjection) } : {}),
+    }
+  }
+
+  /**
+   * Normalize the `roleSessions` map (T-mwzvjvwz): `{ role: { sessionId, since, pushedAt } }`.
+   *
+   * Returns null for a shape that carries nothing, so an entry without a projection stays
+   * byte-identical on disk instead of gaining empty objects.
+   */
+  function normalizeRoleSessions(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    const out = {}
+    for (const [role, row] of Object.entries(value)) {
+      if (!row || typeof row !== 'object') continue
+      const sessionId = String(row.sessionId ?? '').trim()
+      if (!sessionId) continue
+      out[sanitizeSlug(role)] = {
+        sessionId,
+        since: Number.isFinite(Number(row.since)) ? Number(row.since) : 0,
+        pushedAt: Number.isFinite(Number(row.pushedAt)) ? Number(row.pushedAt) : 0,
+      }
+    }
+    return Object.keys(out).length ? out : null
+  }
+
+  /** Normalize `roleProjection` (T-mwzvjvwz): provenance of the last accepted push. */
+  function normalizeRoleProjection(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    const num = (input) => (Number.isFinite(Number(input)) ? Number(input) : 0)
+    return {
+      source: String(value.source ?? 'team.json'),
+      sourceUpdatedAt: num(value.sourceUpdatedAt),
+      pushedAt: num(value.pushedAt),
+      pushedBy: value.pushedBy ? String(value.pushedBy) : null,
+      // A session id that does not resolve to a live session is kept here rather than rejected:
+      // the projection is a claim about another workspace, and refusing it would lose the only
+      // record that someone tried to point a role at a session this machine cannot see.
+      unresolved: Array.isArray(value.unresolved) ? value.unresolved.map(String).slice(0, 50) : [],
     }
   }
 
@@ -6791,6 +7033,9 @@ export function apply(ctx, config) {
       conversations[conversation] = entry
     }
     const previous = entry.deliverTo || entry.panelSessionId || null
+    const roleWanted = String(args.deliverRole ?? '').trim()
+    if (roleWanted) entry.deliverRole = sanitizeSlug(roleWanted)
+    else if (args.deliverRole === null || args.deliverRole === '') delete entry.deliverRole
     entry.deliverTo = targetId
     entry.panelSessionId = null
     // A manual rebind must not inherit the previous auto-create metadata (its workspace/title
@@ -6821,6 +7066,8 @@ export function apply(ctx, config) {
       replayed,
       cleared,
       pendingUnbound: state.unboundPending,
+      // Echo the role so a caller can confirm it stuck (T-mwzvjvwz); null means "no role".
+      deliverRole: entry.deliverRole ?? null,
     }
   }
 
@@ -7724,6 +7971,85 @@ export function apply(ctx, config) {
           source: 'file',
         }),
       )
+      return
+    }
+
+    if (path === '/mesh/roles' && req.method === 'GET') {
+      // Read the role projection for one workspace (T-mwzvjvwz). Loopback because it names
+      // sessions, and sessions are local: another machine has no business enumerating them.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const roleQuery = new URL(req.url ?? '/', 'http://localhost').searchParams
+      const slug = sanitizeSlug(String(roleQuery.get('workspace') ?? '').trim())
+      if (!slug) {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'workspace is required' }))
+        return
+      }
+      refreshWorkspacesFromDisk()
+      const entry = workspaces.workspaces[slug]
+      if (!entry) {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: `unknown workspace ${JSON.stringify(slug)}` }))
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(
+        JSON.stringify({
+          ok: true,
+          workspace: slug,
+          // Always objects, never null: a consumer comparing projections should not have to
+          // branch on "no projection yet" before reading a field.
+          roleSessions: entry.roleSessions ?? {},
+          roleProjection: entry.roleProjection ?? { source: 'team.json', sourceUpdatedAt: 0, pushedAt: 0, pushedBy: null, unresolved: [] },
+        }),
+      )
+      return
+    }
+
+    if (path === '/mesh/roles' && req.method === 'POST') {
+      // Accept the role → session projection from rotate-session (T-mwzvjvwz). waker is the only
+      // writer of workspaces.json, so the repo-side script announces instead of editing ~/.dsh.
+      if (!fromLoopback(req)) {
+        res.writeHead(403, { 'content-type': 'application/json' })
+        res.end('{"error":"loopback only"}')
+        return
+      }
+      const chunks = []
+      let size = 0
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size > MAX_BODY) {
+          res.writeHead(413).end()
+          return
+        }
+        chunks.push(chunk)
+      }
+      let draft = null
+      try {
+        draft = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+      } catch (error) {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: `invalid JSON: ${error.message}` }))
+        return
+      }
+      if (!draft || typeof draft !== 'object' || Array.isArray(draft)) {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: 'body must be a JSON object' }))
+        return
+      }
+      const result = pushRoleProjection({
+        workspace: draft.workspace,
+        roleSessions: draft.roleSessions,
+        sourceUpdatedAt: draft.sourceUpdatedAt,
+        pushedBy: draft.pushedBy,
+        reason: draft.reason,
+      })
+      res.writeHead(result.status, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
+      res.end(JSON.stringify(result.body))
       return
     }
 
@@ -9190,6 +9516,29 @@ export function apply(ctx, config) {
               // Effective limits and optional-seam state, so operators never have to guess.
               limits: { maxInlineBytes: c.maxInlineBytes },
               seams: { approval: seams.approval, questions: seams.questions },
+              // T-mwzvjvwz: the role projection for THIS workspace, in the shape the gate
+              // compares. All zeros when nothing has been pushed yet; the field itself is always
+              // present so "no projection" and "field missing" stay distinguishable.
+              roleProjection: (() => {
+                const own = c.workspacePath || c.sessionCwd || null
+                let slug = null
+                for (const [candidate, value] of Object.entries(workspaces.workspaces ?? {})) {
+                  if (own && value?.cwd && resolve(String(value.cwd)) === resolve(String(own))) {
+                    slug = candidate
+                    break
+                  }
+                }
+                const entry = slug ? workspaces.workspaces[slug] : null
+                const projection = entry?.roleProjection ?? null
+                const roles = entry?.roleSessions && typeof entry.roleSessions === 'object' ? Object.keys(entry.roleSessions).length : 0
+                return {
+                  workspace: slug,
+                  sourceUpdatedAt: Number(projection?.sourceUpdatedAt) || 0,
+                  pushedAt: Number(projection?.pushedAt) || 0,
+                  roles,
+                  unresolved: Array.isArray(projection?.unresolved) ? projection.unresolved.length : 0,
+                }
+              })(),
               ...state,
               throttled: throttleSummary(),
               historyCached: history.size,

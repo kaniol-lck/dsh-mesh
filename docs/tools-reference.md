@@ -88,13 +88,14 @@
 
 ## `mesh_rebind`
 
-> Point an inbound conversation at a session. conversation is the hub conversation id from the inbound message. With no to, it binds to the CALLING session — use that when this session was auto-created for a conversation that belongs elsewhere. With to, it binds to that session id or title (unresolvable is an error, never a silent no-op). replay:true also delivers the conversation backlog parked in unbound.jsonl into the new target and clears it, then marks those messages read. Rebinding a conversation that already points at a live session is allowed (the caller may know better) but is always logged with old→new and the caller. Boundary: mesh_thread manages TASK threads; mesh_rebind manages where INBOUND conversations are delivered.
+> Point an inbound conversation at a session. conversation is the hub conversation id from the inbound message. With no to, it binds to the CALLING session — use that when this session was auto-created for a conversation that belongs elsewhere. With to, it binds to that session id or title (unresolvable is an error, never a silent no-op). replay:true also delivers the conversation backlog parked in unbound.jsonl into the new target and clears it, then marks those messages read. deliverRole names a role instead of a session (for example waker): when the bound session dies the conversation follows whoever holds that role now, per the workspace role projection pushed by rotate-session. Rebinding a conversation that already points at a live session is allowed (the caller may know better) but is always logged with old→new and the caller. Boundary: mesh_thread manages TASK threads; mesh_rebind manages where INBOUND conversations are delivered.
 
 | 参数 | 类型 / 取值 | 必填 | 说明 |
 |---|---|---|---|
 | `conversation` | string | 是 | Hub conversation id (the value the inbound message carried). |
 | `to` | string |  | Target session id or title. Omit to bind to the calling session. |
 | `replay` | boolean |  | After binding, deliver the parked backlog for this conversation into the target and clear it. |
+| `deliverRole` | string |  | Role this conversation follows when its session dies (e.g. waker). Empty string clears it. |
 
 ## `mesh_tasks`
 
