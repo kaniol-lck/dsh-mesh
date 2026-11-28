@@ -151,6 +151,8 @@ async function startHarness({ hubUrl, logFile }) {
     hubUrl,
     workspacePath: path.join(tmp, 'inbox'),
     sessionCwd: path.join(tmp, 'inbox'),
+    // T-mwzfxyb7: this file exists to exercise the park branch, which is no longer the default.
+    unboundDeliveryMode: 'park',
     catchUpOnStart: false,
     catchUpDelayMs: 600000,
     historySyncIntervalMs: 3600000,

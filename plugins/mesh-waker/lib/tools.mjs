@@ -259,6 +259,47 @@ export const THREAD_OUTPUT = {
   render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
 }
 
+
+/**
+ * Rebind an inbound conversation's delivery target (T-mwzfxyb7).
+ *
+ * Distinct from mesh_thread on purpose: a thread groups TASK work ("the same line of work"), while
+ * a conversation is the hub-side dialogue id that inbound mail arrives under. Rebinding a
+ * conversation redirects where its mail lands; it does not touch tasks at all.
+ *
+ * Calling it with no `to` binds the conversation to the calling session — the self-takeover path
+ * for a session that was auto-created for a conversation which really belongs elsewhere.
+ */
+export const MESH_REBIND_TOOL = {
+  name: 'mesh_rebind',
+  description:
+    'Point an inbound conversation at a session. conversation is the hub conversation id from the inbound message. With no to, it binds to the CALLING session — use that when this session was auto-created for a conversation that belongs elsewhere. With to, it binds to that session id or title (unresolvable is an error, never a silent no-op). replay:true also delivers the conversation backlog parked in unbound.jsonl into the new target and clears it, then marks those messages read. Rebinding a conversation that already points at a live session is allowed (the caller may know better) but is always logged with old→new and the caller. Boundary: mesh_thread manages TASK threads; mesh_rebind manages where INBOUND conversations are delivered.',
+  parameters: {
+    conversation: { type: 'string', required: true, description: 'Hub conversation id (the value the inbound message carried).' },
+    to: { type: 'string', description: 'Target session id or title. Omit to bind to the calling session.' },
+    replay: { type: 'boolean', description: 'After binding, deliver the parked backlog for this conversation into the target and clear it.' },
+  },
+  required: ['conversation'],
+}
+
+export const REBIND_OUTPUT = {
+  schema: {
+    type: 'object',
+    properties: {
+      ok: { type: 'boolean' },
+      conversation: { type: 'string' },
+      sessionId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      previousSessionId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      rebound: { type: 'boolean' },
+      replayed: { type: 'number' },
+      cleared: { type: 'number' },
+      pendingUnbound: { type: 'number' },
+    },
+    required: ['ok', 'conversation', 'sessionId'],
+  },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+}
+
 /**
  * Stop the turn behind a dispatched task (T-403). This is NOT session deletion: the session
  * stays alive so it can receive the next task. Deleting a session remains /mesh/sessions/delete.

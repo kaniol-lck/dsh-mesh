@@ -836,7 +836,13 @@ MIT
 
 ## 跨机消息绑定（`/mesh/bind`）
 
-这条路径**只服务跨机来件**：hub 把消息 ping 给 waker，若该 `conversation` 有 `deliverTo`（或面板绑定 `panelSessionId`），waker 直接把 wake prompt 投进那个会话（默认 `mode: 'queue'`，像用户打字一样排队）。**未绑定的 conversation 不再自动新建「Mesh 收件箱」会话、也不消费消息**：消息保持 unread 等人工 `/mesh/bind`，日志写 `conversation=<c> target=deferred reason=unbound`；已有绑定则写 `target=<sessionId> reason=bound`。这保证「开机后 4 条消息各建一个 inbox 会话并被标记已读」不会再发生。
+这条路径**只服务跨机来件**：hub 把消息 ping 给 waker，若该 `conversation` 有 `deliverTo`（或面板绑定 `panelSessionId`），waker 直接把 wake prompt 投进那个会话（默认 `mode: 'queue'`，像用户打字一样排队）。**未绑定的 conversation 会新建一个会话并绑上**（`unboundDeliveryMode` 默认 `'auto-create'`，T-mwzfxyb7）：会话建在收件箱工作区（`workspacePath`/`sessionCwd`）、标题取对话名、绑定并记 `deliverToAuto`，日志写 `conversation=<c> target=auto-created session=<id> reason=unbound`；同一对话后续消息复用该会话。没有配置收件箱工作区时**直接 park，不猜路径**。每小时最多建 `unboundAutoCreateMaxPerHour`（默认 6）个，超限退回 park 并 `WARN`；计数持久化，重启不清零。
+
+> **为什么曾经不这么做，现在又做了**：T-426 当年禁掉自动建会话是**止血**——投递失败会清掉绑定，对话变「未绑定」，下一步就掉进新建的收件箱会话，每次重试炸一个（19 个收件箱会话，12 个在同一天）。那一步已修好（投递失败**保留绑定**、标 deferred、留未读），病根没了，owner 2026-11-28 决定恢复，并保留 per-hour 上限防爆。升级**不重放**历史积压（否则一次性炸一批），重放只走 `mesh_rebind({replay:true})`。
+
+`'park'` 仍可用（显式配置），行为回到 T-490：标已读 + 进 `unbound.jsonl` 队列，日志写 `target=parked reason=unbound`；已有绑定则写 `target=<sessionId> reason=bound`。
+
+**改绑**：`mesh_rebind({conversation, to?, replay?})`。不传 `to` 绑到调用方会话（自动建出来的会话可以自己说「这不该投我」）；传 `to` 绑到指定会话，解析不到报错。改绑已绑定到活会话的对话允许，但一定记 `old→new` 与调用方。
 
 > **本机会话之间不要用这套。** 同机派活走 `/mesh/inject`（命令行：`npx dsh-mesh-dispatch --title "<session-title>" --file task.txt`，需要唤醒时加 `--wake`）——毫秒级、离线可用，不必让消息绕中枢一圈。
 

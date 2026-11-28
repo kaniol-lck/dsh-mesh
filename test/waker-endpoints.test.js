@@ -2236,7 +2236,8 @@ async function main() {
     })
     let h = null
     try {
-      h = await boot({ config: { logFile, hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 } })
+      // T-mwzfxyb7: auto-create is the default now; this case pins the park branch it tests.
+      h = await boot({ config: { logFile, hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000, unboundDeliveryMode: 'park' } })
       const decision = await waitFor(() => {
         if (!fs.existsSync(logFile)) return null
         const text = fs.readFileSync(logFile, 'utf8')
@@ -9434,7 +9435,8 @@ async function main() {
       h = await boot({
         seedSessions: [{ id: 'session-legacy-inbox-2', title: 'legacy inbox 2' }],
         conversations: { [conversation]: { sessionId: 'session-legacy-inbox-2', createdAt, wakes: 3, title: 'old inbox' } },
-        config: { logFile, hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 },
+        // T-mwzfxyb7: auto-create is the default now; this case pins the park branch it tests.
+        config: { logFile, hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000, unboundDeliveryMode: 'park' },
       })
       const decision = await waitFor(() => {
         if (!fs.existsSync(logFile)) return null
@@ -9474,7 +9476,8 @@ async function main() {
     try {
       h = await boot({
         seedSessions: [{ id: 'session-bind-target', title: 'bind target' }],
-        config: { logFile, hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000 },
+        // T-mwzfxyb7: park first, then bind — auto-create would already have delivered it.
+        config: { logFile, hubUrl: fake.url, pollIntervalMs: 5000, pollBusyIntervalMs: 1000, pollIdleIntervalMs: 5000, unboundDeliveryMode: 'park' },
       })
       const deferred = await waitFor(() => {
         if (!fs.existsSync(logFile)) return null

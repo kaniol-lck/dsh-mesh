@@ -28,7 +28,7 @@ import { zstdDecompressSync } from 'node:zlib'
 // ── Pure helpers moved to lib/ (T-292); re-exported below so external imports are stable.
 import { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
 import { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, buildBatchReceipt } from './lib/receipt.mjs'
-import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, MESH_TASKS_TOOL, TASKS_OUTPUT, MESH_ACK_TOOL, ACK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
+import { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_REBIND_TOOL, REBIND_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, MESH_TASKS_TOOL, TASKS_OUTPUT, MESH_ACK_TOOL, ACK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
 import { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, classifyRoleCandidates, ROLE_UNRECOGNIZED_MAX } from './lib/session.mjs'
 import { resolveTaskText, storeTaskText, compactTaskRows } from './lib/tasks.mjs'
 import { LOG_MAX_BYTES_DEFAULT, clampInterval, resolveUnreadWatchdog, normalizeSha } from './lib/settings.mjs'
@@ -51,7 +51,7 @@ import { normalizeCoordinators, coordinatorsView, expireCoordinators, syncPrimar
 // Re-export the same symbols from lib/ so `import ... from index.js` keeps working.
 export { truncateText, truncateUtf8, previewText, inlineBodyText, humanDuration, durationToMs, cleanTaskSubject, resolveTaskSubject, messageText } from './lib/text.mjs'
 export { classifyTurnEnd, buildReceipt, receiptNoticeText, deriveLivenessState, buildBatchReceipt } from './lib/receipt.mjs'
-export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, MESH_TASKS_TOOL, TASKS_OUTPUT, MESH_ACK_TOOL, ACK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
+export { MESH_DISPATCH_TOOL, MESH_ASK_TOOL, DISPATCH_OUTPUT, ASK_OUTPUT, MESH_COMPLETE_TOOL, COMPLETE_OUTPUT, MESH_THREAD_TOOL, THREAD_OUTPUT, MESH_REBIND_TOOL, REBIND_OUTPUT, MESH_CANCEL_TOOL, CANCEL_OUTPUT, MESH_LOCK_TOOL, LOCK_OUTPUT, MESH_TASKS_TOOL, TASKS_OUTPUT, MESH_ACK_TOOL, ACK_OUTPUT, validateToolSchema, buildDispatchMeta } from './lib/tools.mjs'
 export { hubConsoleUrlFor, SESSION_PAGE_DEFAULT, SESSION_PAGE_MAX, paginateSessions, normalizeThread, withTaskHeader, isCoordinatorTitle, ROLE_NAMES, ROLE_UNRECOGNIZED_MAX, titleRoleCandidate, classifyRoleCandidates } from './lib/session.mjs'
 export { createReceiptFlow } from './lib/receipt-flow.mjs'
 export { createThreads } from './lib/threads.mjs'
@@ -670,6 +670,16 @@ function normalizeBase(config) {
     // long enough to cover a turn that is mid-flight at restart. The floor is 500ms so tests can
     // exercise both phases without waiting five minutes.
     restartGraceMs: clampInterval(c.restartGraceMs, 300_000, 500, 3_600_000),
+    // T-mwzfxyb7 (owner 2026-11-28): an inbound conversation with no delivery binding used to be
+    // parked forever. T-426 introduced that as a stopgap because a FAILED delivery cleared the
+    // binding, the conversation became unbound, and the next step created a fresh inbox session —
+    // every retry spawned another session. That first step is fixed now (a failed delivery keeps
+    // its binding), so one session per unbound conversation is safe again. 'auto-create' is the
+    // default; 'park' restores the T-426 behaviour for anyone who wants it.
+    unboundDeliveryMode: c.unboundDeliveryMode === 'park' ? 'park' : 'auto-create',
+    // A ceiling so a loop — or a sender on the LAN — cannot spawn sessions faster than a human can
+    // react. Counted over a rolling hour and persisted, so a crash loop cannot reset the count.
+    unboundAutoCreateMaxPerHour: clampInterval(c.unboundAutoCreateMaxPerHour, 6, 1, 100),
     // The receipt digest answers a different deadline (a dispatcher waiting on a completion),
     // so it gets its own key instead of sharing the task-digest window (T-476).
     receiptNotifyWarnMs: clampInterval(c.receiptNotifyWarnMs, 90_000, 1000, 600_000),
@@ -895,6 +905,13 @@ export function apply(ctx, config) {
     // than left unread, so this is the only signal that somebody has to bind a conversation.
     // `unboundPending` counts parked conversations, not messages, and it never clears itself.
     unboundPending: 0,
+    // T-mwzfxyb7: the auto-create counterpart of the line above. `unboundAutoCreated` is the
+    // cumulative count, `unboundAutoCreatedLastHour` is the rolling-window count the ceiling is
+    // measured against, and `lastAutoCreated` says which conversation spawned which session so an
+    // operator can trace a surprise session back to its mail without reading logs.
+    unboundAutoCreated: 0,
+    unboundAutoCreatedLastHour: 0,
+    lastAutoCreated: null,
     lastOutcome: null,
     // Pull mode (contract section 4): when the last poll finished, how long the current
     // cadence is, and when the next one fires (the status route reports the countdown).
@@ -1135,6 +1152,73 @@ export function apply(ctx, config) {
   // without the mail quietly disappearing (T-426's concern).
   const UNBOUND_PATH = c.tokenFile ? join(dirname(c.tokenFile), 'unbound.jsonl') : join(tmpdir(), 'mesh-waker-unbound.jsonl')
   const UNBOUND_MAX_ROWS = 500
+
+  // T-mwzfxyb7: the auto-create ledger. Its own file, not `state`, because the per-hour ceiling
+  // must survive a restart — an in-memory counter resets on exactly the event (a crash loop) most
+  // likely to trip it.
+  const AUTO_CREATE_PATH = c.tokenFile
+    ? join(dirname(c.tokenFile), 'unbound-auto-create.json')
+    : join(tmpdir(), 'mesh-waker-unbound-auto-create.json')
+  const AUTO_CREATE_WINDOW_MS = 60 * 60 * 1000
+
+  function loadAutoCreateStats() {
+    try {
+      const raw = JSON.parse(readFileSync(AUTO_CREATE_PATH, 'utf8'))
+      return {
+        total: Number(raw?.total) || 0,
+        times: Array.isArray(raw?.times) ? raw.times.map(Number).filter((at) => Number.isFinite(at) && at > 0) : [],
+        last: raw?.last && typeof raw.last === 'object' ? raw.last : null,
+      }
+    } catch {
+      return { total: 0, times: [], last: null }
+    }
+  }
+
+  function saveAutoCreateStats(stats) {
+    try {
+      mkdirSync(dirname(AUTO_CREATE_PATH), { recursive: true })
+      writeFileSync(AUTO_CREATE_PATH, JSON.stringify(stats, null, 2))
+    } catch (error) {
+      fileLog(`saving unbound auto-create ledger failed: ${error.message}`)
+    }
+  }
+
+  /**
+   * Refresh the rolling window and mirror it onto `/mesh/status`. Pruning happens on every read so
+   * a quiet hour makes room for new creations without anything having to schedule a timer.
+   */
+  function refreshAutoCreateState() {
+    const stats = loadAutoCreateStats()
+    const cutoff = Date.now() - AUTO_CREATE_WINDOW_MS
+    const recent = stats.times.filter((at) => at > cutoff)
+    if (recent.length !== stats.times.length) {
+      stats.times = recent
+      saveAutoCreateStats(stats)
+    }
+    state.unboundAutoCreated = stats.total
+    state.unboundAutoCreatedLastHour = recent.length
+    if (stats.last) state.lastAutoCreated = stats.last
+    return { stats, recent }
+  }
+
+  /** True when this hour still has room for another auto-created session. */
+  function autoCreateWithinCeiling() {
+    const { recent } = refreshAutoCreateState()
+    return recent.length < c.unboundAutoCreateMaxPerHour
+  }
+
+  function recordAutoCreate(conversation, sessionId) {
+    const { stats, recent } = refreshAutoCreateState()
+    const at = Date.now()
+    stats.total += 1
+    stats.times = [...recent, at]
+    stats.last = { conversation, sessionId, at }
+    saveAutoCreateStats(stats)
+    state.unboundAutoCreated = stats.total
+    state.unboundAutoCreatedLastHour = stats.times.length
+    state.lastAutoCreated = stats.last
+  }
+
   const TRIVIAL_RE = /^(ping|pong|ack|acknowledged|ok|okay|roger|received|thanks?|thx|收到|好的|好|谢谢|了解|明白|已阅)[。.!！?？,，\s]*$/i
   let throttleLedger = (() => {
     try {
@@ -3127,14 +3211,15 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Create a replacement session for an auto-bound conversation whose origin session died
-   * (T-364). The workspace is passed explicitly — the host otherwise mounts the default one
-   * silently — and the echo in the create result is checked instead of reading the registry
-   * (which lags several seconds behind).
+   * Create one session in an explicit workspace and name it (T-mwzfxyb7).
+   *
+   * Shared by the dead-origin replacement (T-364) and the unbound auto-create path: both need
+   * exactly this, and a second copy would drift. The workspace is passed explicitly — the host
+   * otherwise mounts the default one silently — and the echo in the create result is checked
+   * instead of reading the registry (which lags several seconds behind). Returns the new
+   * sessionId, or null when creation failed (never throws).
    */
-  async function recreateOriginSession(entry) {
-    const workspacePath = entry.deliverToAuto?.workspacePath || c.workspacePath || c.sessionCwd || undefined
-    const title = entry.deliverToAuto?.title || entry.title || 'mesh 会话'
+  async function createSessionInWorkspace({ workspacePath, title, logTag = 'session' }) {
     try {
       let workspaceId = null
       if (workspacePath) {
@@ -3146,7 +3231,7 @@ export function apply(ctx, config) {
             workspaceId = createdWorkspace?.id ?? null
           }
         } catch (error) {
-          fileLog(`replacement session: workspace resolve failed (${error.message})`)
+          fileLog(`${logTag}: workspace resolve failed (${error.message})`)
         }
       }
       const created = await ctx.sessionController.create(
@@ -3157,19 +3242,29 @@ export function apply(ctx, config) {
       identityPending.set(sessionId, { cwd: workspacePath ?? null })
       const echoed = created?.workspacePath ?? created?.cwd ?? null
       if (workspacePath && echoed && String(echoed) !== String(workspacePath)) {
-        fileLog(`WARN replacement session ${sessionId} workspace echo ${echoed} != ${workspacePath}`)
+        fileLog(`WARN ${logTag} ${sessionId} workspace echo ${echoed} != ${workspacePath}`)
       }
       try {
         await ctx.sessionController.rename({ sessionId, title })
       } catch (error) {
-        fileLog(`replacement session rename failed: ${error.message}`)
+        fileLog(`${logTag} rename failed: ${error.message}`)
       }
-      fileLog(`created replacement session ${sessionId} for dead origin (workspace=${workspacePath ?? '-'} title="${title}")`)
+      fileLog(`created ${logTag} ${sessionId} (workspace=${workspacePath ?? '-'} title="${title}")`)
       return sessionId
     } catch (error) {
-      fileLog(`replacement session creation failed: ${error.message}`)
+      fileLog(`${logTag} creation failed: ${error.message}`)
       return null
     }
+  }
+
+  /**
+   * Create a replacement session for an auto-bound conversation whose origin session died
+   * (T-364). Runs in the conversation's own workspace so the dialogue continues there.
+   */
+  async function recreateOriginSession(entry) {
+    const workspacePath = entry.deliverToAuto?.workspacePath || c.workspacePath || c.sessionCwd || undefined
+    const title = entry.deliverToAuto?.title || entry.title || 'mesh 会话'
+    return await createSessionInWorkspace({ workspacePath, title, logTag: 'replacement session' })
   }
 
   /**
@@ -3264,13 +3359,31 @@ export function apply(ctx, config) {
       }
     }
     // Delivery target (T-426): only an explicit binding may receive a conversation. deliverTo is
-    // the delivery binding; panelSessionId is what /mesh/bind records for the panel. An unbound
-    // conversation is never given a new inbox session and its messages stay unread.
+    // the delivery binding; panelSessionId is what /mesh/bind records for the panel.
+    //
+    // T-mwzfxyb7 changed the second half of that rule: an unbound conversation is no longer
+    // parked unconditionally. With `unboundDeliveryMode: 'auto-create'` (the default) it gets one
+    // session of its own in the inbox workspace and is bound to it — which is what T-426 removed,
+    // and what owner asked to restore now that a failed delivery no longer clears a binding.
     const boundTarget = entry.deliverTo || entry.panelSessionId || null
-    if (boundTarget) {
-      const target = boundTarget
+
+    /**
+     * Deliver to one specific session. The bound path and the auto-created path differ only in
+     * how they got the target and how they log it, so both go through here.
+     */
+    const deliverToTarget = async (target, { via }) => {
       try {
         const built = await buildContent(meta, messages)
+        // A session this feature just created is told, in one line, why it exists and how to hand
+        // the conversation off if it is the wrong recipient (T-mwzfxyb7 decision 3).
+        if (via === 'unbound' && built.parts?.[0]?.type === 'text') {
+          built.parts[0] = {
+            ...built.parts[0],
+            text:
+              `（本会话由 conversation "${conversation}" 自动创建；若该对话应投到别处，用 ` +
+              `mesh_rebind({conversation:"${conversation}"}) 改绑。）\n\n${built.parts[0].text}`,
+          }
+        }
         applyTrustPolicy(target, trustFor(meta.sender))
         const requested = requestedDeliveryMode(messages)
         const wanted = requested ?? (steerModeFor(target, messages) === 'steer' ? 'steer' : c.boundDeliveryMode)
@@ -3287,7 +3400,7 @@ export function apply(ctx, config) {
           state.conversations = Object.keys(conversations).length
           recordTopicDelivery(conversation)
           fileLog(`delivered ${messages.length} msg into branch session ${branch} (${conversation}) mode=branch`)
-          fileLog(`conversation=${conversation} target=${branch} reason=bound messages=${messages.length} mode=branch`)
+          fileLog(`conversation=${conversation} target=${branch} reason=${via} messages=${messages.length} mode=branch`)
           return { outcome: 'delivered', target: branch, mode: 'branch' }
         }
         await promptWithResume(target, built.parts, mode)
@@ -3298,17 +3411,48 @@ export function apply(ctx, config) {
         state.sessionId = target
         state.conversations = Object.keys(conversations).length
         recordTopicDelivery(conversation)
-        fileLog(`delivered ${messages.length} msg into bound session ${target} (${conversation}) mode=${mode}`)
-        fileLog(`conversation=${conversation} target=${target} reason=bound messages=${messages.length} mode=${mode}`)
+        const label = via === 'unbound' ? 'auto-created' : 'bound'
+        fileLog(`delivered ${messages.length} msg into ${label} session ${target} (${conversation}) mode=${mode}`)
+        fileLog(`conversation=${conversation} target=${via === 'unbound' ? 'auto-created session=' + target : target} reason=${via} messages=${messages.length} mode=${mode}`)
         return { outcome: 'delivered', target, mode }
       } catch (error) {
         // Keep the binding: clearing it here is what let an unbound conversation fall through to
         // a freshly created inbox session (T-426). The messages stay unread for a retry/bind.
-        state.lastError = `delivery to bound session ${target} failed: ${error.message}`
+        state.lastError = `delivery to ${via === 'unbound' ? 'auto-created' : 'bound'} session ${target} failed: ${error.message}`
         fileLog(`conversation=${conversation} target=deferred reason=delivery-failed session=${target} error=${error.message}`)
         return { outcome: 'failed', reason: 'delivery-failed', target }
       }
     }
+
+    if (boundTarget) return await deliverToTarget(boundTarget, { via: 'bound' })
+
+    // Unbound: auto-create one session for this conversation (T-mwzfxyb7), unless the operator
+    // turned that off, there is no inbox workspace to put it in, or this hour's ceiling is spent.
+    if (c.unboundDeliveryMode === 'auto-create') {
+      const workspacePath = entry.deliverToAuto?.workspacePath || c.workspacePath || c.sessionCwd || null
+      if (!workspacePath) {
+        // No configured workspace: parking is the honest answer. Guessing a directory would put
+        // the session somewhere the operator did not choose.
+        fileLog(`WARN unbound auto-create skipped for ${conversation}: no workspacePath/sessionCwd configured`)
+      } else if (!autoCreateWithinCeiling()) {
+        fileLog(
+          `WARN unbound auto-create capped conversation=${conversation} created_last_hour=${state.unboundAutoCreatedLastHour} limit=${c.unboundAutoCreateMaxPerHour}; falling back to park`,
+        )
+      } else {
+        const title = Array.from(String(entry.title || conversation)).slice(0, 60).join('')
+        const sessionId = await createSessionInWorkspace({ workspacePath, title, logTag: 'unbound session' })
+        if (sessionId) {
+          entry.deliverTo = sessionId
+          entry.deliverToAuto = { workspacePath, title, autoCreatedBy: 'unbound' }
+          saveConversations()
+          recordAutoCreate(conversation, sessionId)
+          fileLog(`conversation=${conversation} target=auto-created session=${sessionId} reason=unbound workspace=${workspacePath} title="${title}"`)
+          return await deliverToTarget(sessionId, { via: 'unbound' })
+        }
+        fileLog(`WARN unbound auto-create failed for ${conversation}; falling back to park`)
+      }
+    }
+
     // T-490 (replaces T-426's "leave it unread forever"): an unbound conversation has no
     // delivery target, but leaving the mail unread made it an infinite loop — pull re-claimed
     // the same messages every 5s, each round deferred without delivering, and nothing ever
@@ -6610,6 +6754,116 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * Rebind an inbound conversation's delivery target, optionally replaying its parked backlog
+   * (T-mwzfxyb7).
+   *
+   * This is the agent-side escape hatch owner asked for: a session that was auto-created for a
+   * conversation it should not own can hand the conversation to the right session — or, if the
+   * conversation is genuinely its own, bind it to itself. Rebinding an already-bound conversation
+   * is allowed on purpose (the caller may know better than the automatic choice), but it is never
+   * silent: the old and new targets and the caller go to the log and to /mesh/status.
+   */
+  async function meshRebind(args = {}, extra = null) {
+    const conversation = String(args.conversation ?? '').trim()
+    if (!conversation) throw new Error('conversation is required')
+    const caller = callerSessionFrom(extra)
+    const wanted = String(args.to ?? '').trim()
+    // No `to`: bind to the calling session — the "this mail is mine, bind it" path.
+    if (!wanted && !caller) {
+      throw new Error('mesh_rebind needs `to`, or a calling session to bind to (the host did not pass one)')
+    }
+    let targetId = wanted || caller
+    if (wanted) {
+      // Resolve `to` strictly: a typo must be an error, not a silent no-op that leaves the
+      // conversation pointing at the old session.
+      try {
+        targetId = resolveLocalSession({ session: wanted, title: wanted }).id
+      } catch (error) {
+        throw new Error(`mesh_rebind target "${wanted}" not found: ${error.message}`)
+      }
+    }
+    if (!targetId) throw new Error('mesh_rebind could not resolve a target session')
+
+    let entry = conversations[conversation]
+    if (!entry) {
+      entry = { sessionId: null, createdAt: 0, wakes: 0, title: null }
+      conversations[conversation] = entry
+    }
+    const previous = entry.deliverTo || entry.panelSessionId || null
+    entry.deliverTo = targetId
+    entry.panelSessionId = null
+    // A manual rebind must not inherit the previous auto-create metadata (its workspace/title
+    // belong to the other session), or a later recovery would recreate the wrong thing.
+    entry.deliverToAuto = { workspacePath: entry.deliverToAuto?.workspacePath ?? null, title: entry.title ?? null, boundBy: caller ?? 'manual' }
+    entry.createdAt = entry.createdAt || Date.now()
+    saveConversations()
+    fileLog(
+      `conversation=${conversation} target=rebound session=${targetId} reason=rebind previous=${previous ?? '-'} by=${caller ?? '-'}`,
+    )
+
+    let replayed = 0
+    let cleared = 0
+    if (args.replay === true) {
+      const result = await replayUnboundConversation(conversation, targetId)
+      replayed = result.replayed
+      cleared = result.cleared
+      if (result.error) {
+        fileLog(`WARN replay of ${conversation} into ${targetId} failed: ${result.error}; backlog kept`)
+      }
+    }
+    return {
+      ok: true,
+      conversation,
+      sessionId: targetId,
+      previousSessionId: previous,
+      rebound: true,
+      replayed,
+      cleared,
+      pendingUnbound: state.unboundPending,
+    }
+  }
+
+  /**
+   * Deliver a conversation's parked backlog into `sessionId`, then drop those rows from
+   * unbound.jsonl and mark the messages read (T-mwzfxyb7).
+   *
+   * The queue stores references, not bodies — the hub still holds the mail — so the actual text
+   * comes from backfillConversation(). If that fetch fails the rows are KEPT: clearing the only
+   * pointer to mail that was never delivered would lose it, which is the exact failure T-426 was
+   * trying to prevent.
+   */
+  async function replayUnboundConversation(conversation, sessionId) {
+    const rows = readUnboundQueue().filter((row) => row?.conversation === conversation)
+    if (!rows.length) return { replayed: 0, cleared: 0 }
+    let injected = 0
+    try {
+      injected = await backfillConversation(conversation, sessionId)
+    } catch (error) {
+      return { replayed: 0, cleared: 0, error: error.message }
+    }
+    const ids = rows.flatMap((row) => (Array.isArray(row.messages) ? row.messages.map((m) => m?.id) : [])).filter(Boolean)
+    if (ids.length) {
+      try {
+        await markRead(ids.map((id) => ({ id })))
+      } catch (error) {
+        fileLog(`replay of ${conversation}: markRead failed (${error.message}); the queue rows still go`)
+      }
+    }
+    const kept = readUnboundQueue().filter((row) => row?.conversation !== conversation)
+    try {
+      writeFileSync(UNBOUND_PATH, kept.length ? `${kept.map((row) => JSON.stringify(row)).join('\n')}\n` : '')
+    } catch (error) {
+      fileLog(`replay of ${conversation}: rewriting the unbound queue failed (${error.message})`)
+      return { replayed: injected, cleared: 0, error: error.message }
+    }
+    state.unboundPending = countUnboundConversations()
+    fileLog(
+      `conversation=${conversation} target=replayed session=${sessionId} messages=${injected} rows=${rows.length} pending=${state.unboundPending}`,
+    )
+    return { replayed: injected, cleared: rows.length }
+  }
+
   /** Worker-side thread actions: list / subscribe / release (T-254). */
   async function meshThreadAction(args = {}, extra = null) {
     const action = String(args.action ?? '').trim()
@@ -6926,6 +7180,7 @@ export function apply(ctx, config) {
     dispatch: { ok: false, error: null },
     ask: { ok: false, error: null },
     thread: { ok: false, error: null },
+    rebind: { ok: false, error: null },
     complete: { ok: false, error: null },
     cancel: { ok: false, error: null },
     lock: { ok: false, error: null },
@@ -7038,6 +7293,16 @@ export function apply(ctx, config) {
       execute: (args, extra) => meshThreadAction(args, extra),
     })
     installModelTool(threadDefinition, 'thread')
+
+    const rebindDefinition = await buildToolDefinition({
+      name: MESH_REBIND_TOOL.name,
+      description: MESH_REBIND_TOOL.description,
+      parameters: MESH_REBIND_TOOL.parameters,
+      required: MESH_REBIND_TOOL.required,
+      output: REBIND_OUTPUT,
+      execute: (args, extra) => meshRebind(args, extra),
+    })
+    installModelTool(rebindDefinition, 'rebind')
 
     const cancelDefinition = await buildToolDefinition({
       name: MESH_CANCEL_TOOL.name,
@@ -7180,6 +7445,15 @@ export function apply(ctx, config) {
   state.unboundPending = new Set(readUnboundQueue().map((row) => row?.conversation).filter(Boolean)).size
   if (state.unboundPending > 0) {
     fileLog(`${state.unboundPending} conversation(s) parked with no delivery target — bind with POST /mesh/bind`)
+  }
+  // T-mwzfxyb7: load the auto-create ledger so /mesh/status and the hourly ceiling survive a
+  // restart. This deliberately does NOT replay the parked backlog: an upgrade must not spawn one
+  // session per historical conversation at once. Replay is explicit (mesh_rebind({replay:true})).
+  {
+    const { recent } = refreshAutoCreateState()
+    fileLog(
+      `unbound auto-create: cumulative=${state.unboundAutoCreated ?? 0} last_hour=${recent.length} limit=${c.unboundAutoCreateMaxPerHour} mode=${c.unboundDeliveryMode}`,
+    )
   }
   // Migrate inline bodies before anything reads or rewrites rows (idempotent, T-277).
   compactTaskTexts()
@@ -8893,6 +9167,7 @@ export function apply(ctx, config) {
                 dispatch: toolState.dispatch.ok,
                 ask: toolState.ask.ok,
                 thread: toolState.thread.ok,
+                rebind: toolState.rebind.ok,
                 complete: toolState.complete.ok,
                 cancel: toolState.cancel.ok,
                 lock: toolState.lock.ok,
@@ -8903,6 +9178,7 @@ export function apply(ctx, config) {
                 toolState.dispatch.error ??
                 toolState.ask.error ??
                 toolState.thread.error ??
+                toolState.rebind.error ??
                 toolState.complete.error ??
                 toolState.cancel.error ??
                 toolState.lock.error ??

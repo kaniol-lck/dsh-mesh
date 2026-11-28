@@ -86,6 +86,16 @@
 | `ttlMs` | number |  | Lock lifetime in ms (default workspaceLockTtlMs, clamped 10s–1h). |
 | `reason` | string |  | Why the workspace is locked (visible to waiters). |
 
+## `mesh_rebind`
+
+> Point an inbound conversation at a session. conversation is the hub conversation id from the inbound message. With no to, it binds to the CALLING session — use that when this session was auto-created for a conversation that belongs elsewhere. With to, it binds to that session id or title (unresolvable is an error, never a silent no-op). replay:true also delivers the conversation backlog parked in unbound.jsonl into the new target and clears it, then marks those messages read. Rebinding a conversation that already points at a live session is allowed (the caller may know better) but is always logged with old→new and the caller. Boundary: mesh_thread manages TASK threads; mesh_rebind manages where INBOUND conversations are delivered.
+
+| 参数 | 类型 / 取值 | 必填 | 说明 |
+|---|---|---|---|
+| `conversation` | string | 是 | Hub conversation id (the value the inbound message carried). |
+| `to` | string |  | Target session id or title. Omit to bind to the calling session. |
+| `replay` | boolean |  | After binding, deliver the parked backlog for this conversation into the target and clear it. |
+
 ## `mesh_tasks`
 
 > List tasks dispatched to this session (or an explicit session). status=unacked (default) lists tasks that are unacked and not closed, so it is the board a digest points at: open tasks plus settled tasks whose receipt is still unacked (receiptDigest); status=all lists every task of the session. Every row carries requester (the dispatcher session id — the address to reply to), requesterTitle (null when that session is gone or archived) and targetSessionId, so "who sent me this?" is answered here instead of by asking a human. include=text adds each task body, and a body whose file is gone comes back with textMissing:true instead of failing. count is the number of returned rows and unackedCount is how many of those rows are unacked — both computed from the same list.
