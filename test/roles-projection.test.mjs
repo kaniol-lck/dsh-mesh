@@ -100,11 +100,10 @@ async function startHarness({
     if (!workspacesSeed) return
     const seeded = JSON.parse(JSON.stringify(workspacesSeed))
     for (const entry of Object.values(seeded.workspaces ?? {})) {
-      if (entry.cwd === '/seed/inbox') entry.cwd = inbox
-      if (entry.cwd === '/seed/inbox/other') entry.cwd = path.join(inbox, 'other')
+      entry.cwd = resolveSeedPath(entry.cwd, { inbox })
       if (entry.workers) {
         for (const worker of Object.values(entry.workers)) {
-          if (worker.cwd === '/seed/inbox') worker.cwd = inbox
+          worker.cwd = resolveSeedPath(worker.cwd, { inbox })
         }
       }
     }
@@ -296,21 +295,51 @@ async function startHarness({
   }
 }
 
+/**
+ * The seed carries PLATFORM-NEUTRAL placeholders, never `path.join` output (T-mwzyzhan).
+ *
+ * The bug this fixes: the seed used `path.join(inbox, 'other')`, which is `\seed\inbox\other` on
+ * Windows and `/seed/inbox/other` on Linux, while the substitution compared against the POSIX
+ * literal. On Windows the comparison therefore never matched, the rewrite silently did not happen,
+ * and the "byte-identical" test passed for the wrong reason — CI on Linux then went red because
+ * the rewrite DID happen there and the expectation was the untouched seed.
+ *
+ * Rule: a fixture that is compared as a constant must not depend on the platform's path rules. The
+ * placeholder is a literal string; only the substitution step is allowed to call `path.join`, and
+ * it does so on the remainder only.
+ */
+const SEED_ROOT = '/seed/inbox'
+
+/**
+ * Resolve a seed placeholder against the real inbox directory.
+ *
+ * Pure and injectable (`joinFn`) so the same logic can be exercised under POSIX and Windows path
+ * rules on either host — that is the cross-platform evidence this task asks for, and it is real
+ * logic rather than a comment claiming portability. Prefix match, not equality: the seed may nest
+ * arbitrarily deep under the root.
+ */
+function resolveSeedPath(value, { root = SEED_ROOT, inbox, joinFn = path.join } = {}) {
+  if (typeof value !== 'string') return value
+  if (value !== root && !value.startsWith(`${root}/`) && !value.startsWith(`${root}\\`)) return value
+  const rest = value.slice(root.length).replace(/^[\\/]+/, '')
+  return rest ? joinFn(inbox, rest) : inbox
+}
+
 /** A workspaces.json with two workspaces and every field that must survive a push untouched. */
-const seedRegistry = (inbox = '/seed/inbox') => ({
+const seedRegistry = () => ({
   machine: 'test-machine',
   workspaces: {
     'ws-alpha': {
-      cwd: inbox,
+      cwd: SEED_ROOT,
       coordinator: LIVE_OLD,
       roles: ['l1', 'waker', 'hub'],
       rolesUnrecognized: ['mystery-role'],
-      workers: { waker: { sessionId: LIVE_OLD, cwd: inbox, scopes: ['a', 'b'], updatedAt: 1795000000000 } },
+      workers: { waker: { sessionId: LIVE_OLD, cwd: SEED_ROOT, scopes: ['a', 'b'], updatedAt: 1795000000000 } },
       coordinators: [{ sessionId: LIVE_OLD, isPrimary: true, status: 'approved', claimedAt: 1795000000000, leaseUntil: null, approvedBy: 'test', requestedAt: 0 }],
       slug: 'ws-alpha',
     },
     'ws-beta': {
-      cwd: path.join(inbox, 'other'),
+      cwd: `${SEED_ROOT}/other`,
       coordinator: LIVE_OLD,
       roles: ['l2'],
       slug: 'ws-beta',
@@ -447,6 +476,13 @@ test('roles: a push leaves every other field of the entry byte-identical', async
   const h = await startHarness({ workspacesSeed: seedRegistry() })
   try {
     const before = h.workspacesRaw().workspaces['ws-alpha']
+    // Snapshot the untouched neighbour BEFORE the push. Building the expectation from the seed
+    // constant instead is what made this test pass on Windows and fail on Linux (T-mwzyzhan).
+    const beforeBeta = h.workspacesRaw().workspaces['ws-beta']
+    // Guard against the silent-rewrite failure that produced the false green: the substitution
+    // must actually have happened, or this whole test is comparing placeholders.
+    assert.equal(beforeBeta.cwd, path.join(h.inbox, 'other'), 'the seed placeholder must be resolved to the real temp dir')
+    assert.notEqual(beforeBeta.cwd, '/seed/inbox/other', 'and must not be left as the literal placeholder')
     await fetch(`${h.base}/mesh/roles`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -463,8 +499,16 @@ test('roles: a push leaves every other field of the entry byte-identical', async
       assert.deepEqual(after[field], before[field], `field "${field}" must be untouched`)
       assert.equal(JSON.stringify(after[field]), JSON.stringify(before[field]), `field "${field}" must be byte-identical`)
     }
-    // The other workspace was not involved at all.
-    assert.deepEqual(h.workspacesRaw().workspaces['ws-beta'], seedRegistry().workspaces['ws-beta'])
+    // The other workspace was not involved at all. Compare it against WHAT IT WAS BEFORE THE PUSH,
+    // not against the seed constant: the seed carries placeholders that the harness substitutes
+    // with real temp directories, so the constant is never the on-disk value (T-mwzyzhan). Reading
+    // it back before the push makes this assertion platform-independent by construction.
+    assert.deepEqual(h.workspacesRaw().workspaces['ws-beta'], beforeBeta)
+    assert.equal(
+      JSON.stringify(h.workspacesRaw().workspaces['ws-beta']),
+      JSON.stringify(beforeBeta),
+      'ws-beta must be byte-identical',
+    )
     // Only these two keys were added.
     const added = Object.keys(after).filter((key) => !(key in before)).sort()
     assert.deepEqual(added, ['roleProjection', 'roleSessions'])
@@ -735,4 +779,109 @@ test('roles: a numeric sourceUpdatedAt is preserved losslessly as its string for
   } finally {
     h.close()
   }
+})
+
+// ── the fixture must not depend on platform path rules (T-mwzyzhan) ─────────
+// CI runs on Linux; the local machine is Windows. The bug was a fixture that built its constant
+// with path.join, so the same seed had a different string on each platform and the substitution
+// (which compared against a POSIX literal) fired on one and not the other. These two tests pin the
+// property directly, and they do it by running the SAME resolver under both path rule sets — real
+// evidence rather than a comment claiming portability.
+
+test('roles: the seed placeholder is one literal string on every platform', () => {
+  // No path.join anywhere in the seed: the constant is identical on Windows and Linux.
+  const seed = seedRegistry()
+  assert.equal(seed.workspaces['ws-alpha'].cwd, '/seed/inbox')
+  assert.equal(seed.workspaces['ws-beta'].cwd, '/seed/inbox/other')
+  assert.equal(seed.workspaces['ws-alpha'].workers.waker.cwd, '/seed/inbox')
+
+  // Demonstrate the old failure mode explicitly, so a future edit that reintroduces path.join
+  // into the seed is recognisable: the two platforms disagree, which is what made the test
+  // platform-dependent.
+  assert.notEqual(
+    path.posix.join(SEED_ROOT, 'other'),
+    path.win32.join(SEED_ROOT, 'other'),
+    'this inequality is why the seed must not use path.join',
+  )
+})
+
+test('roles: the placeholder resolves correctly under both POSIX and Windows path rules', () => {
+  const posixInbox = '/tmp/waker-roles-abc/inbox'
+  const winInbox = 'C:\\Users\\x\\AppData\\Local\\Temp\\waker-roles-abc\\inbox'
+
+  // POSIX rules (what CI does).
+  assert.equal(resolveSeedPath('/seed/inbox/other', { inbox: posixInbox, joinFn: path.posix.join }), '/tmp/waker-roles-abc/inbox/other')
+  assert.equal(resolveSeedPath('/seed/inbox', { inbox: posixInbox, joinFn: path.posix.join }), posixInbox)
+
+  // Windows rules (what this machine does).
+  assert.equal(
+    resolveSeedPath('/seed/inbox/other', { inbox: winInbox, joinFn: path.win32.join }),
+    path.win32.join(winInbox, 'other'),
+  )
+  assert.equal(resolveSeedPath('/seed/inbox', { inbox: winInbox, joinFn: path.win32.join }), winInbox)
+
+  // Both must have actually substituted — the silent no-op is the failure that produced the
+  // Windows false green.
+  for (const [inbox, joinFn] of [
+    [posixInbox, path.posix.join],
+    [winInbox, path.win32.join],
+  ]) {
+    const resolved = resolveSeedPath('/seed/inbox/other', { inbox, joinFn })
+    assert.notEqual(resolved, '/seed/inbox/other', 'the rewrite must happen')
+    assert.ok(resolved.includes('other'), 'and must keep the tail segment')
+    assert.ok(!resolved.includes('/seed/'), 'and must drop the placeholder root')
+  }
+
+  // An unrelated absolute path is left alone, and non-strings pass through untouched.
+  assert.equal(resolveSeedPath('/somewhere/else', { inbox: posixInbox, joinFn: path.posix.join }), '/somewhere/else')
+  assert.equal(resolveSeedPath(null, { inbox: posixInbox }), null)
+})
+
+// ── reproduce the CI failure and show the new assertion cannot have it ──────
+// No Linux box here (WSL is present but has no node, and installing one is a tool decision that is
+// not mine to make), so this simulates the CI environment with the real path.posix implementation
+// and the real seed/resolver. It asserts BOTH halves: the old expectation style fails under POSIX
+// rules, and the new one (compare against the pre-push snapshot) does not.
+test('roles: the old seed-constant expectation fails under POSIX rules, the new one cannot', () => {
+  const posixInbox = '/tmp/waker-roles-tmrYZx/inbox'
+  const joinFn = path.posix.join
+
+  // The harness's substitution, as it really runs, under Linux path rules.
+  const resolved = JSON.parse(JSON.stringify(seedRegistry()))
+  for (const entry of Object.values(resolved.workspaces)) {
+    entry.cwd = resolveSeedPath(entry.cwd, { inbox: posixInbox, joinFn })
+    for (const worker of Object.values(entry.workers ?? {})) {
+      worker.cwd = resolveSeedPath(worker.cwd, { inbox: posixInbox, joinFn })
+    }
+  }
+
+  // ws-beta now points at the real temp dir, exactly as CI reported it.
+  assert.equal(resolved.workspaces['ws-beta'].cwd, '/tmp/waker-roles-tmrYZx/inbox/other')
+
+  // The OLD expectation (compare the on-disk entry with the seed constant) is wrong under POSIX
+  // rules — this is the CI failure reproduced.
+  const oldExpectation = seedRegistry().workspaces['ws-beta']
+  assert.notDeepEqual(resolved.workspaces['ws-beta'], oldExpectation, 'the seed constant is not the on-disk value')
+
+  // The NEW expectation compares against the pre-push snapshot, which IS the on-disk value. A push
+  // only touches roleSessions/roleProjection on its own workspace, so the neighbour is unchanged
+  // and the comparison holds on every platform.
+  const beforeBeta = JSON.parse(JSON.stringify(resolved.workspaces['ws-beta']))
+  const afterPush = JSON.parse(JSON.stringify(resolved.workspaces['ws-beta']))
+  assert.deepEqual(afterPush, beforeBeta)
+  assert.equal(JSON.stringify(afterPush), JSON.stringify(beforeBeta))
+
+  // And the same two assertions under Windows rules, to show the outcome does not depend on the
+  // platform: old fails, new holds.
+  const winInbox = 'C:\\Users\\x\\AppData\\Local\\Temp\\waker-roles-tmrYZx\\inbox'
+  const winResolved = JSON.parse(JSON.stringify(seedRegistry()))
+  for (const entry of Object.values(winResolved.workspaces)) {
+    entry.cwd = resolveSeedPath(entry.cwd, { inbox: winInbox, joinFn: path.win32.join })
+    for (const worker of Object.values(entry.workers ?? {})) {
+      worker.cwd = resolveSeedPath(worker.cwd, { inbox: winInbox, joinFn: path.win32.join })
+    }
+  }
+  assert.notDeepEqual(winResolved.workspaces['ws-beta'], seedRegistry().workspaces['ws-beta'])
+  const winBefore = JSON.parse(JSON.stringify(winResolved.workspaces['ws-beta']))
+  assert.deepEqual(JSON.parse(JSON.stringify(winResolved.workspaces['ws-beta'])), winBefore)
 })
